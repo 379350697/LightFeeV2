@@ -90,10 +90,19 @@ class AccountRiskSnapshot:
     available_balance_quote: Optional[float] = None
     supported: bool = True
     stale: bool = False
+    # Account-wide zero maintenance is normally unsupported (V1 behavior).
+    # Bybit isolated accounts are the verified exception when private position
+    # truth has established that no contracts are open.
+    zero_maintenance_is_normal: bool = False
 
     def __post_init__(self) -> None:
         if not (self.maintenance_margin_quote > 0 and self.maintenance_margin_quote == self.maintenance_margin_quote):
-            self.supported = False
+            self.supported = bool(
+                self.zero_maintenance_is_normal
+                and self.maintenance_margin_quote == 0.0
+                and self.equity_quote >= 0.0
+                and self.equity_quote == self.equity_quote
+            )
             self.health_ratio = 0.0
         elif self.supported and self.health_ratio == 0.0:
             self.health_ratio = self.equity_quote / self.maintenance_margin_quote

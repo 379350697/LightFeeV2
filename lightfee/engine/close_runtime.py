@@ -409,6 +409,58 @@ class CloseRuntime:
             },
         )
         return True
+
+    async def _try_terminalize_billing_evidence_gap(
+        self,
+        reconciliation: dict[str, Any],
+        payload: dict[str, Any],
+        now_ms: int,
+        *,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> bool:
+        """End a physically proven close whose historical entry bill is unavailable.
+
+        A legacy close snapshot may have no durable entry-fee provenance.  Retrying
+        its close fills cannot manufacture that evidence, so this is not a retryable
+        transport failure.  It is only terminal after both exchange legs are proved
+        flat; the resulting event deliberately remains financially provisional.
+        """
+        if str(reconciliation.get("kind") or "final") != "final":
+            return False
+        if payload.get("close_quantity_evidence_complete") is not True:
+            return False
+        position_id = str(reconciliation.get("position_id") or "")
+        if any(
+            str(getattr(position, "position_id", "")) == position_id
+            for position in self.ctx.state.open_positions.values()
+        ):
+            return False
+        terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+        )
+        if terminal_sizes is None:
+            return False
+        long_live_size, short_live_size = terminal_sizes
+        if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
+            return False
+        self.ctx.journal.append_critical(
+            now_ms,
+            "exit.billing_evidence_unavailable",
+            {
+                **payload,
+                "terminal_accounting_status": "provisional_entry_fee_evidence_unavailable",
+                "terminal_reason": "entry_fee_evidence_unavailable_after_confirmed_flat_close",
+                "long_venue": long_venue.value,
+                "short_venue": short_venue.value,
+                "long_live_size": long_live_size,
+                "short_live_size": short_live_size,
+            },
+        )
+        return True
     def _venue_private_position_confirmed(self, venue: Venue, symbol: str) -> bool:
         if str(getattr(self.ctx.config.runtime, "mode", "") or "").lower() != "live":
             return True
@@ -578,12 +630,44 @@ class CloseRuntime:
         long_entry = float(snapshot.get("long_entry_price") or 0.0)
         short_entry = float(snapshot.get("short_entry_price") or 0.0)
         funding_quote = float(snapshot.get("captured_funding_quote") or 0.0)
-        entry_fee = float(snapshot.get("total_entry_fee_quote") or 0.0)
+        entry_fee = 0.0
+        entry_fee_source = "unavailable"
+        entry_fee_evidence_complete = False
+        entry_fee_evidence_known = snapshot.get("entry_fee_evidence_complete") is True
+        if entry_fee_evidence_known and "total_entry_fee_quote" in snapshot:
+            try:
+                candidate_entry_fee = float(snapshot.get("total_entry_fee_quote"))
+                if math.isfinite(candidate_entry_fee):
+                    entry_fee = candidate_entry_fee
+                    entry_fee_source = "total"
+                    entry_fee_evidence_complete = True
+            except (TypeError, ValueError):
+                pass
+        if entry_fee_evidence_known and not entry_fee_evidence_complete and {
+            "long_entry_fee_quote", "short_entry_fee_quote"
+        }.issubset(snapshot):
+            try:
+                long_entry_fee = float(snapshot.get("long_entry_fee_quote"))
+                short_entry_fee = float(snapshot.get("short_entry_fee_quote"))
+                if math.isfinite(long_entry_fee) and math.isfinite(short_entry_fee):
+                    entry_fee = long_entry_fee + short_entry_fee
+                    entry_fee_source = "legs"
+                    entry_fee_evidence_complete = True
+            except (TypeError, ValueError):
+                pass
         price_pnl = ((float(long["average_price"]) - long_entry) * long_qty) + (
             (short_entry - float(short["average_price"])) * short_qty
         )
         exit_fee = float(long["fee_quote"]) + float(short["fee_quote"])
-        complete = long_qty > 1e-12 and short_qty > 1e-12
+        expected_long_qty = float(snapshot.get("long_quantity") or snapshot.get("matched_quantity") or 0.0)
+        expected_short_qty = float(snapshot.get("short_quantity") or snapshot.get("matched_quantity") or 0.0)
+        close_quantity_evidence_complete = (
+            long_qty > 1e-12
+            and short_qty > 1e-12
+            and (expected_long_qty <= 1e-12 or long_qty + 1e-12 >= expected_long_qty)
+            and (expected_short_qty <= 1e-12 or short_qty + 1e-12 >= expected_short_qty)
+        )
+        complete = close_quantity_evidence_complete and entry_fee_evidence_complete
         return {
             "position_id": reconciliation.get("position_id", ""),
             "symbol": reconciliation.get("symbol", snapshot.get("symbol", "")),
@@ -604,8 +688,14 @@ class CloseRuntime:
             "price_pnl": price_pnl,
             "funding_pnl_quote": funding_quote,
             "entry_fee_quote": entry_fee,
+            "entry_fee_source": entry_fee_source,
+            "entry_fee_evidence_complete": entry_fee_evidence_complete,
             "exit_fee_quote": exit_fee,
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
+            "net_quote_status": "final" if complete else "provisional",
+            "expected_long_closed_qty": expected_long_qty,
+            "expected_short_closed_qty": expected_short_qty,
+            "close_quantity_evidence_complete": close_quantity_evidence_complete,
             "venue_statement_reconciled": complete,
             "evidence_gap": not complete,
             "duplicate_close_leg_suppressed_count": len(long_duplicates)
@@ -700,15 +790,36 @@ class CloseRuntime:
                 legs=reconciliation.get("short_legs"),
             )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
+                payload = self._exit_reconciled_payload_from_leg_fills(
+                    reconciliation,
+                    long_fills,
+                    short_fills,
+                    now_ms,
+                )
+                if not payload["venue_statement_reconciled"]:
+                    self.ctx.journal.append(
+                        "exit.billing_unreconciled",
+                        payload,
+                    )
+                    terminalized = await self._try_terminalize_billing_evidence_gap(
+                        reconciliation,
+                        payload,
+                        now_ms,
+                        symbol=symbol,
+                        long_venue=long_venue,
+                        short_venue=short_venue,
+                    )
+                    if terminalized:
+                        changed = True
+                        continue
+                    self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+                    retained.append(reconciliation)
+                    changed = True
+                    continue
                 self.ctx.journal.append_critical(
                     now_ms,
                     "exit.reconciled",
-                    self._exit_reconciled_payload_from_leg_fills(
-                        reconciliation,
-                        long_fills,
-                        short_fills,
-                        now_ms,
-                    ),
+                    payload,
                 )
                 changed = True
                 continue

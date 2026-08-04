@@ -115,6 +115,7 @@ V1_OPENPOSITION_REQUIRED_FIELDS = {
     "long_entry_fee_quote",
     "short_entry_fee_quote",
     "total_entry_fee_quote",
+    "entry_fee_evidence_complete",
     # Net/Peak
     "peak_net_quote",
     "current_net_quote",

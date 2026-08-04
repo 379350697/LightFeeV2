@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Optional
 
+from lightfee.engine.pending_entry_hedge_delta import note_pending_entry_hedge_filled
+from lightfee.engine.pending_entry_runtime import apply_pending_entry_hedge_progress
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalDecision,
     PendingEntryTerminalizer,
@@ -54,6 +57,16 @@ from lightfee.engine.recovery_decision_core import (
 
 
 LEGACY_RECOVERY_BLOCK_CLEARABLE_REASONS = LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
+
+
+_TERMINAL_CLOSE_EVENT_KINDS = frozenset(
+    {
+        "exit.closed",
+        "exit.reconciled",
+        "exit.billing_evidence_unavailable",
+        "recovery.flat",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +238,9 @@ def _deserialize_open_position(data: dict[str, Any]) -> OpenPosition:
         long_entry_fee_quote=float(data.get("long_entry_fee_quote", 0)),
         short_entry_fee_quote=float(data.get("short_entry_fee_quote", 0)),
         total_entry_fee_quote=float(data.get("total_entry_fee_quote", 0)),
+        entry_fee_evidence_complete=bool(
+            data.get("entry_fee_evidence_complete", False)
+        ),
         funding_edge_bps_entry=float(data.get("funding_edge_bps_entry", 0)),
         total_funding_edge_bps_entry=float(data.get("total_funding_edge_bps_entry", 0)),
         expected_edge_bps_entry=float(data.get("expected_edge_bps_entry", 0)),
@@ -355,6 +371,7 @@ def _serialize_open_position(pos: OpenPosition) -> dict[str, Any]:
         "long_entry_fee_quote": pos.long_entry_fee_quote,
         "short_entry_fee_quote": pos.short_entry_fee_quote,
         "total_entry_fee_quote": pos.total_entry_fee_quote,
+        "entry_fee_evidence_complete": pos.entry_fee_evidence_complete,
         "funding_edge_bps_entry": pos.funding_edge_bps_entry,
         "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
         "expected_edge_bps_entry": pos.expected_edge_bps_entry,
@@ -753,7 +770,7 @@ def _apply_journal_replay_to_state(
     Processes events that happened AFTER the snapshot was written:
     - entry.opened / recovery.live_detected → add position
     - entry.pending_registered / entry.hedge_submitted → recreate pending entry
-    - exit.closed / recovery.flat → remove position
+    - terminal close events / recovery.flat → remove all close work for position
     - exit.partial_closed → reduce matched_quantity
     - exit.pending_close_registered → recreate pending close
     - runtime.lifecycle_changed / risk_mode_changed → update modes
@@ -766,6 +783,20 @@ def _apply_journal_replay_to_state(
             pid = payload.get("position_id", "")
             if pid and pid not in state.open_positions:
                 state.open_positions[pid] = _deserialize_open_position(payload)
+            if kind == "entry.opened" and pid:
+                # A durable position is the terminal successor of its pending
+                # entry.  Do not re-open that stale pending state on replay.
+                PendingEntryTerminalizer.remove_if_allowed(
+                    state.pending_entries,
+                    pid,
+                    PendingEntryTerminalDecision(
+                        outcome="open_position",
+                        reason="durable_entry_opened_journal_successor",
+                        terminal=True,
+                        allows_pending_removal=True,
+                        healthy=True,
+                    ),
+                )
 
         # V1: entry.pending_registered — recreate pending entry from journal
         elif kind == "entry.pending_registered":
@@ -780,11 +811,59 @@ def _apply_journal_replay_to_state(
                 if pe is not None:
                     state.pending_entries[pid] = pe
 
-        elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
+        elif kind in {
+            "pending_entry.hedge_submit_attempt",
+            "pending_entry.hedge_submit_result",
+        }:
+            pending_id = str(
+                payload.get("pending_id")
+                or payload.get("position_id")
+                or payload.get("entry_id")
+                or ""
+            )
+            pending = state.pending_entries.get(pending_id)
+            if pending is not None:
+                is_confirmed_fill = (
+                    kind == "pending_entry.hedge_submit_result"
+                    and payload.get("outcome") == "filled"
+                )
+                is_confirmed_rejection = (
+                    kind == "pending_entry.hedge_submit_result"
+                    and payload.get("outcome") == "error"
+                    and bool(payload.get("is_rejected", False))
+                )
+                fill_restored = (
+                    is_confirmed_fill
+                    and _apply_pending_entry_hedge_fill_from_journal(pending, payload)
+                )
+                if not fill_restored:
+                    _apply_pending_entry_hedge_owner_from_journal(
+                        pending,
+                        payload,
+                        requires_reconciliation=not is_confirmed_rejection,
+                    )
+                if is_confirmed_rejection:
+                    # The venue confirms this CID never became a live hedge;
+                    # retain the attempt number but allow the normal retry.
+                    pending.hedge_inflight = None
+                    prior_uncertain = getattr(
+                        pending,
+                        "_replay_uncertain_outcome_before_hedge_submit",
+                        None,
+                    )
+                    if isinstance(prior_uncertain, bool):
+                        pending.uncertain_outcome = prior_uncertain
+                    if hasattr(
+                        pending, "_replay_uncertain_outcome_before_hedge_submit"
+                    ):
+                        delattr(
+                            pending, "_replay_uncertain_outcome_before_hedge_submit"
+                        )
+
+        elif kind in _TERMINAL_CLOSE_EVENT_KINDS:
             pid = payload.get("position_id", "")
             if pid:
-                state.open_positions.pop(pid, None)
-                state.pending_closes.pop(pid, None)
+                _clear_terminal_close_state(state, str(pid))
 
         # V1: exit.pending_close_registered — recreate pending close from journal
         elif kind == "exit.pending_close_registered":
@@ -858,9 +937,179 @@ def _apply_journal_replay_to_state(
                 state.operator.requested_mode = None
 
 
+def _apply_pending_entry_hedge_owner_from_journal(
+    pending: PendingEntry,
+    payload: dict[str, Any],
+    *,
+    requires_reconciliation: bool,
+) -> None:
+    """Restore a submitted hedge CID as an unresolved exchange owner.
+
+    The submit record is written before the exchange call.  Therefore any
+    record that reaches replay represents a request that may have reached the
+    venue, even when no fill result was durably recorded.  Keeping that owner
+    forces reconciliation by CID and prevents a restart from submitting a
+    duplicate hedge.
+    """
+    client_order_id = str(payload.get("hedge_client_order_id") or "")
+    if client_order_id:
+        pending.hedge_client_order_id = client_order_id
+
+    try:
+        attempt = int(payload.get("hedge_attempt", 0) or 0)
+    except (TypeError, ValueError):
+        attempt = 0
+    pending.hedge_attempt_count = max(pending.hedge_attempt_count, attempt)
+
+    order_id = str(
+        payload.get("hedge_order_id") or payload.get("order_id") or ""
+    )
+    if order_id:
+        pending.hedge_order_id = order_id
+
+    inflight: HedgeInflight | None = None
+    raw_inflight = payload.get("hedge_inflight")
+    if raw_inflight is not None:
+        try:
+            inflight = _restore_hedge_inflight(raw_inflight)
+        except (TypeError, ValueError):
+            inflight = None
+
+    if inflight is None and client_order_id:
+        try:
+            venue = Venue.from_str(str(payload.get("hedge_venue") or ""))
+        except (TypeError, ValueError, AttributeError):
+            venue = pending.hedge_venue()
+        try:
+            side = Side(str(payload.get("hedge_side") or "").lower())
+        except (TypeError, ValueError):
+            side = pending.hedge_side()
+        try:
+            quantity = float(
+                payload.get("hedge_quantity", pending.missing_hedge_quantity())
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            quantity = pending.missing_hedge_quantity()
+        inflight = HedgeInflight(
+            client_order_id=client_order_id,
+            venue=venue,
+            side=side,
+            quantity=quantity,
+            attempt=attempt,
+            submitted_at_ms=0,
+        )
+
+    if inflight is not None:
+        pending.hedge_inflight = inflight
+
+    if requires_reconciliation:
+        # An accepted zero-fill acknowledgement is explicitly unresolved.  The
+        # attempt record is also treated as uncertain: the process may have
+        # died after the request left the host but before its response was
+        # recorded.
+        prior_uncertain = payload.get("uncertain_outcome_before_submit")
+        if isinstance(prior_uncertain, bool):
+            setattr(
+                pending,
+                "_replay_uncertain_outcome_before_hedge_submit",
+                prior_uncertain,
+            )
+        pending.uncertain_outcome = True
+        if payload.get("outcome") == "accepted_fill_unconfirmed":
+            pending.outcome = "hedge_accepted_fill_unconfirmed"
+
+
+def _apply_pending_entry_hedge_fill_from_journal(
+    pending: PendingEntry,
+    payload: dict[str, Any],
+) -> bool:
+    """Restore a durably confirmed hedge fill without reopening an owner.
+
+    V1 persists the pending-entry state after a confirmed hedge fill with the
+    cumulative fill applied and ``inflight_hedge`` cleared.  The result event
+    carries that same cumulative quantity, so replay must consume it exactly
+    once instead of treating its CID as an unresolved submission.
+
+    A malformed or legacy event without a usable cumulative quantity is not
+    sufficient evidence to retire the order owner; its caller retains the
+    existing fail-closed reconciliation path in that case.
+    """
+    try:
+        total_quantity = float(payload.get("hedge_leg_filled"))
+    except (TypeError, ValueError):
+        return False
+    if not isfinite(total_quantity) or total_quantity < 0.0:
+        return False
+
+    client_order_id = str(payload.get("hedge_client_order_id") or "")
+    if client_order_id:
+        pending.hedge_client_order_id = client_order_id
+
+    try:
+        attempt = int(payload.get("hedge_attempt", 0) or 0)
+    except (TypeError, ValueError):
+        attempt = 0
+    pending.hedge_attempt_count = max(pending.hedge_attempt_count, attempt)
+
+    order_id = str(payload.get("hedge_order_id") or payload.get("order_id") or "")
+    try:
+        fill_price = float(payload.get("hedge_fill_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        fill_price = 0.0
+    if not isfinite(fill_price) or fill_price < 0.0:
+        fill_price = 0.0
+
+    apply_pending_entry_hedge_progress(
+        pending,
+        new_total_quantity=total_quantity,
+        price=fill_price,
+        order_id=order_id,
+        quality="journal_confirmed",
+    )
+    pending.hedge_inflight = None
+    note_pending_entry_hedge_filled(pending)
+    prior_uncertain = getattr(
+        pending,
+        "_replay_uncertain_outcome_before_hedge_submit",
+        None,
+    )
+    if isinstance(prior_uncertain, bool):
+        # A confirmed (including partial) fill resolves the submit attempt.
+        # Preserve any uncertainty that existed before that attempt, exactly
+        # as the live path does when it applies a positive fill response.
+        pending.uncertain_outcome = prior_uncertain
+    if hasattr(pending, "_replay_uncertain_outcome_before_hedge_submit"):
+        delattr(pending, "_replay_uncertain_outcome_before_hedge_submit")
+    if pending.missing_hedge_quantity() <= 1e-9:
+        pending.uncertain_outcome = False
+        pending.outcome = "filled"
+    return True
+
+
 def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
     """V1: restore PendingEntry from journal replay payload."""
     try:
+        serialized = payload.get("pending_entry")
+        if isinstance(serialized, dict):
+            pending_id = str(
+                serialized.get("pending_id")
+                or payload.get("pending_id")
+                or payload.get("position_id")
+                or payload.get("entry_id")
+                or ""
+            )
+            if pending_id:
+                # entry.pending_registered carries the exact EngineState
+                # schema.  Reuse its sole canonical decoder rather than
+                # maintaining a lossy second journal-only decoder.
+                restored_state = _restore_state_from_snapshot_dict(
+                    {"pending_entries": {pending_id: serialized}}
+                )
+                restored = restored_state.pending_entries.get(pending_id)
+                if restored is not None:
+                    return restored
+
         def venue_from(value: Any, default: Venue) -> Venue:
             if isinstance(value, Venue):
                 return value
@@ -984,6 +1233,32 @@ def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
         )
     except Exception:
         return None
+
+
+def _clear_terminal_close_state(state: EngineState, position_id: str) -> None:
+    """Remove every local close owner once exchange truth says it is terminal."""
+    state.open_positions.pop(position_id, None)
+    state.pending_closes = {
+        close_id: pending
+        for close_id, pending in state.pending_closes.items()
+        if close_id != position_id
+        and str(getattr(pending, "position_id", "") or "") != position_id
+    }
+    state.pending_passive_closes = {
+        pending_id: pending
+        for pending_id, pending in state.pending_passive_closes.items()
+        if pending_id != position_id
+        and str(getattr(pending, "position_id", "") or "") != position_id
+    }
+    state.set_pending_close_reconciliations(
+        [
+            item
+            for item in normalize_pending_close_reconciliations(
+                state.pending_close_reconciliations
+            )
+            if str(item.get("position_id") or "") != position_id
+        ]
+    )
 
 
 def recover_from_snapshot(

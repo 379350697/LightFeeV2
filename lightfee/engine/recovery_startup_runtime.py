@@ -749,6 +749,7 @@ class RecoveryStartupRuntime:
         if kind not in {
             "pending_entry.positive_fill_live_truth_conflict",
             "pending_entry.terminalizer_decision",
+            "runtime.entry_owner_claimed",
         }:
             return False
         if (
@@ -757,6 +758,14 @@ class RecoveryStartupRuntime:
             != "positive_fill_live_truth_conflict"
         ):
             return False
+        if kind == "runtime.entry_owner_claimed":
+            try:
+                return (
+                    float(payload.get("long_quantity") or 0.0) > 1e-9
+                    or float(payload.get("short_quantity") or 0.0) > 1e-9
+                )
+            except (TypeError, ValueError):
+                return False
         try:
             live_long = float(payload.get("live_long_quantity") or 0.0)
             live_short = float(payload.get("live_short_quantity") or 0.0)

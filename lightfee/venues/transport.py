@@ -3606,18 +3606,127 @@ class VenueTransport(MarketDataClient):
                 if equity is None:
                     return None
                 maint = _parse_optional_float(row.get("totalMaintenanceMargin"))
-                if maint is None:
-                    return None
-                if maint <= 0.0:
-                    return None
-                snapshot = ARS(
-                    venue=spec.venue_id,
-                    equity_quote=equity,
-                    maintenance_margin_quote=maint,
-                    health_ratio=equity / maint,
-                    observed_at_ms=now_ms,
-                    source="bybit_wallet_balance",
+                if maint is not None and maint > 0.0:
+                    snapshot = ARS(
+                        venue=spec.venue_id,
+                        equity_quote=equity,
+                        maintenance_margin_quote=maint,
+                        health_ratio=equity / maint,
+                        observed_at_ms=now_ms,
+                        source="bybit_wallet_balance",
+                    )
+                    snapshot.available_balance_quote = _parse_optional_float(row.get("totalAvailableBalance"))
+                    return snapshot
+
+                # In Bybit ISOLATED_MARGIN, account-wide maintenance fields are
+                # not applicable.  Only treat that as normal after private
+                # position truth proves every derivative category is flat.
+                account_info = await self._request(
+                    "GET", "/v5/account/info", private=True,
                 )
+                account_result = account_info.get("result", {}) if isinstance(account_info, dict) else {}
+                margin_mode = str(
+                    account_result.get("marginMode", "")
+                    if isinstance(account_result, dict)
+                    else ""
+                ).upper()
+                if margin_mode != "ISOLATED_MARGIN":
+                    return None
+
+                async def bybit_position_rows(
+                    category: str,
+                    *,
+                    settle_coin: str | None = None,
+                ) -> list[dict[str, Any]] | None:
+                    """Read every Bybit position page or fail closed."""
+                    rows: list[dict[str, Any]] = []
+                    cursor = ""
+                    seen_cursors: set[str] = set()
+                    for _ in range(100):
+                        params: dict[str, Any] = {"category": category, "limit": 200}
+                        if settle_coin:
+                            params["settleCoin"] = settle_coin
+                        if cursor:
+                            params["cursor"] = cursor
+                        positions_raw = await self._request(
+                            "GET", "/v5/position/list", params=params, private=True,
+                        )
+                        positions_result = (
+                            positions_raw.get("result", {})
+                            if isinstance(positions_raw, dict)
+                            else {}
+                        )
+                        page_rows = (
+                            positions_result.get("list", [])
+                            if isinstance(positions_result, dict)
+                            else None
+                        )
+                        if not isinstance(page_rows, list) or not all(
+                            isinstance(position_row, dict) for position_row in page_rows
+                        ):
+                            return None
+                        rows.extend(page_rows)
+                        next_cursor = str(
+                            positions_result.get("nextPageCursor", "")
+                        )
+                        if not next_cursor:
+                            return rows
+                        if next_cursor in seen_cursors:
+                            return None
+                        seen_cursors.add(next_cursor)
+                        cursor = next_cursor
+                    return None
+
+                # A USDT-linear-only probe cannot establish account-wide
+                # normality.  Query all documented derivative categories and
+                # paginate each one before accepting zero maintenance margin.
+                position_rows: list[dict[str, Any]] = []
+                for category, settle_coin in (
+                    ("linear", "USDT"),
+                    ("linear", "USDC"),
+                    ("inverse", None),
+                    ("option", None),
+                ):
+                    category_rows = await bybit_position_rows(
+                        category, settle_coin=settle_coin,
+                    )
+                    if category_rows is None:
+                        return None
+                    position_rows.extend(category_rows)
+                open_position_margins: list[float] = []
+                for position_row in position_rows:
+                    size = _parse_optional_float(position_row.get("size"))
+                    if size is None:
+                        return None
+                    if abs(size) <= 1e-12:
+                        continue
+                    position_mm = _parse_optional_float(position_row.get("positionMM"))
+                    if position_mm is None or position_mm <= 0.0:
+                        # A live isolated position without numeric per-position
+                        # MM remains V1's unsupported/degraded condition.
+                        return None
+                    open_position_margins.append(position_mm)
+
+                if open_position_margins:
+                    maint = sum(open_position_margins)
+                    snapshot = ARS(
+                        venue=spec.venue_id,
+                        equity_quote=equity,
+                        maintenance_margin_quote=maint,
+                        health_ratio=equity / maint,
+                        observed_at_ms=now_ms,
+                        source="bybit_isolated_all_derivative_position_mm",
+                    )
+                else:
+                    snapshot = ARS(
+                        venue=spec.venue_id,
+                        equity_quote=equity,
+                        maintenance_margin_quote=0.0,
+                        health_ratio=0.0,
+                        observed_at_ms=now_ms,
+                        source="bybit_isolated_all_derivative_position_truth",
+                        zero_maintenance_is_normal=True,
+                    )
                 snapshot.available_balance_quote = _parse_optional_float(row.get("totalAvailableBalance"))
                 return snapshot
 

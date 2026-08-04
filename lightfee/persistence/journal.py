@@ -329,6 +329,7 @@ def replay_journal_records(
     _timeline_interesting = frozenset({
         "entry.opened", "entry.pending_registered",
         "exit.closed", "exit.partial_closed", "exit.reconciled",
+        "exit.billing_evidence_unavailable",
         "exit.pending_close_registered",
         "recovery.live_detected", "recovery.flat", "recovery.blocked",
         "recovery.mismatch_detected", "recovery.mismatch_flattened",
@@ -377,7 +378,12 @@ def replay_journal_records(
                     "seq": record.get("seq"),
                 })
 
-        elif kind in ("exit.closed", "exit.reconciled", "recovery.flat"):
+        elif kind in (
+            "exit.closed",
+            "exit.reconciled",
+            "exit.billing_evidence_unavailable",
+            "recovery.flat",
+        ):
             pid = payload.get("position_id", "")
             if pid and pid in positions:
                 del positions[pid]

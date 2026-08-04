@@ -33,6 +33,10 @@ class OpenPosition:
     long_entry_fee_quote: float = 0.0
     short_entry_fee_quote: float = 0.0
     total_entry_fee_quote: float = 0.0
+    # True only when these fee values came from actual entry fill evidence.
+    # Numeric zero alone is not evidence: legacy snapshots defaulted missing
+    # fees to zero and must remain provisional during close reconciliation.
+    entry_fee_evidence_complete: bool = False
     # --- PnL attribution (matches Rust V1 realized_* fields) ---
     realized_price_pnl_quote: float = 0.0
     realized_exit_fee_quote: float = 0.0
@@ -1135,6 +1139,7 @@ class EngineState:
                     "long_entry_fee_quote": pos.long_entry_fee_quote,
                     "short_entry_fee_quote": pos.short_entry_fee_quote,
                     "total_entry_fee_quote": pos.total_entry_fee_quote,
+                    "entry_fee_evidence_complete": pos.entry_fee_evidence_complete,
                     "funding_edge_bps_entry": pos.funding_edge_bps_entry,
                     "total_funding_edge_bps_entry": pos.total_funding_edge_bps_entry,
                     "expected_edge_bps_entry": pos.expected_edge_bps_entry,
@@ -1195,6 +1200,7 @@ class EngineState:
                     "long_side": p.long_side.value,
                     "short_side": p.short_side.value,
                     "created_at_ms": p.created_at_ms,
+                    "metadata": p.metadata,
                     "maker_order_id": p.maker_order_id,
                     "hedge_order_id": p.hedge_order_id,
                     "maker_client_order_id": p.maker_client_order_id,
@@ -1202,6 +1208,7 @@ class EngineState:
                     "maker_leg_filled": p.maker_leg_filled,
                     "hedge_leg_filled": p.hedge_leg_filled,
                     "deadline_ms": p.deadline_ms,
+                    "fallback_route": p.fallback_route,
                     "uncertain_outcome": p.uncertain_outcome,
                     "reconcile_attempt": p.reconcile_attempt,
                     "reconcile_next_attempt_ms": p.reconcile_next_attempt_ms,
@@ -1210,9 +1217,12 @@ class EngineState:
                     "maker_fill_price": p.maker_fill_price,
                     "hedge_fill_price": p.hedge_fill_price,
                     "hedge_inflight": p.hedge_inflight.to_dict() if p.hedge_inflight else "",
+                    "hedge_attempt_count": p.hedge_attempt_count,
                     "repair_state": p.repair_state,
                     "long_quantity": p.long_quantity,
                     "short_quantity": p.short_quantity,
+                    "run_id": p.run_id,
+                    "entry_route": p.entry_route,
                     "maker_leg": p.maker_leg,
                     "outcome": p.outcome,
                     "opportunity_type": p.opportunity_type,
@@ -1259,6 +1269,7 @@ class EngineState:
                     ),
                     "created_cycle": p.created_cycle,
                     "repost_attempt_count": p.repost_attempt_count,
+                    "repost_count": p.repost_count,
                     "passive_attempt_count": p.passive_attempt_count,
                     "passive_ops_total": p.passive_ops_total,
                     "maker_remainder_slices": [
@@ -1271,6 +1282,7 @@ class EngineState:
                     "frozen_candidate": p.frozen_candidate,
                     "passive_order": p.passive_order.to_dict() if p.passive_order else None,
                     "next_progress_poll_ms": p.next_progress_poll_ms,
+                    "zero_fill_since_ms": p.zero_fill_since_ms,
                 }
                 for pid, p in self.pending_entries.items()
             },

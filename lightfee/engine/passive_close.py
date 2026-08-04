@@ -978,6 +978,116 @@ class PassiveCloseExecutor:
                 pending = state.pending_passive_closes.get(position_id)
                 if pending is None:
                     return True
+
+                # A zero-fill terminal maker response is not enough evidence
+                # to discard its identity.  Confirm executions once before a
+                # phase fallback; this protects against delayed Bybit fills.
+                if (
+                    progress.state in (
+                        PassiveOrderState.FILLED,
+                        PassiveOrderState.CANCELED,
+                        PassiveOrderState.EXPIRED,
+                    )
+                    and progress.cumulative_quantity <= 1e-9
+                    and pending.maker_fill.quantity <= 1e-9
+                ):
+                    try:
+                        terminal_truth = await adapter.fetch_order_fill_reconciliation(
+                            position.symbol,
+                            progress.order_id or maker_order_id,
+                            progress.client_order_id or maker_client_id,
+                        )
+                    except Exception as exc:
+                        self._journal.append(
+                            "exit.passive_close_terminal_zero_fill_truth_unavailable",
+                            {
+                                "position_id": position_id,
+                                "symbol": position.symbol,
+                                "maker_venue": maker_venue.value,
+                                "maker_order_id": progress.order_id or maker_order_id,
+                                "maker_client_order_id": progress.client_order_id or maker_client_id,
+                                "state": progress.state.value,
+                                "error": str(exc),
+                                "decision": "retain_pending",
+                            },
+                        )
+                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                        return False
+                    if terminal_truth is None:
+                        self._journal.append(
+                            "exit.passive_close_terminal_zero_fill_truth_unavailable",
+                            {
+                                "position_id": position_id,
+                                "symbol": position.symbol,
+                                "maker_venue": maker_venue.value,
+                                "maker_order_id": progress.order_id or maker_order_id,
+                                "maker_client_order_id": progress.client_order_id or maker_client_id,
+                                "state": progress.state.value,
+                                "decision": "retain_pending",
+                            },
+                        )
+                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                        return False
+                    terminal_quantity = max(
+                        float(getattr(terminal_truth, "quantity", 0.0) or 0.0),
+                        0.0,
+                    )
+                    if (
+                        terminal_quantity <= 1e-9
+                        and progress.state == PassiveOrderState.FILLED
+                    ):
+                        # A terminal order status that says FILLED while its
+                        # execution query says zero is internally inconsistent.
+                        # Do not turn that contradiction into a new close leg.
+                        self._journal.append(
+                            "exit.passive_close_terminal_zero_fill_truth_inconsistent",
+                            {
+                                "position_id": position_id,
+                                "symbol": position.symbol,
+                                "maker_venue": maker_venue.value,
+                                "maker_order_id": progress.order_id or maker_order_id,
+                                "maker_client_order_id": progress.client_order_id or maker_client_id,
+                                "state": progress.state.value,
+                                "decision": "retain_pending",
+                            },
+                        )
+                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                        return False
+                    if terminal_quantity > 1e-9:
+                        progress = PassiveOrderProgress(
+                            venue=maker_venue,
+                            symbol=position.symbol,
+                            side=maker_side,
+                            order_id=(
+                                str(getattr(terminal_truth, "order_id", "") or "")
+                                or progress.order_id
+                                or maker_order_id
+                            ),
+                            client_order_id=(
+                                str(getattr(terminal_truth, "client_order_id", "") or "")
+                                or progress.client_order_id
+                                or maker_client_id
+                            ),
+                            cumulative_quantity=terminal_quantity,
+                            average_price=float(
+                                getattr(terminal_truth, "average_price", 0.0) or 0.0
+                            ),
+                            fee_quote=float(getattr(terminal_truth, "fee_quote", 0.0) or 0.0),
+                            last_fill_time_ms=int(
+                                getattr(terminal_truth, "filled_at_ms", 0) or 0
+                            ),
+                            state=PassiveOrderState.FILLED,
+                            observed_at_ms=now_ms,
+                        )
+                        self._journal.append(
+                            "exit.passive_close_terminal_zero_fill_reconciled_fill",
+                            {
+                                "position_id": position_id,
+                                "maker_order_id": progress.order_id,
+                                "maker_client_order_id": progress.client_order_id,
+                                "reconciled_quantity": terminal_quantity,
+                            },
+                        )
                 self._apply_maker_progress(pending, progress, now_ms)
 
                 # Terminal passive states → handle
@@ -3750,6 +3860,7 @@ class PassiveCloseExecutor:
             "long_entry_fee_quote": position.long_entry_fee_quote,
             "short_entry_fee_quote": position.short_entry_fee_quote,
             "total_entry_fee_quote": position.total_entry_fee_quote,
+            "entry_fee_evidence_complete": position.entry_fee_evidence_complete,
             "captured_funding_quote": position.captured_funding_quote,
             "opened_at_ms": position.opened_at_ms,
         }

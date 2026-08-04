@@ -72,6 +72,24 @@ class TestJournalReplayEngine:
         result = replay_journal_records(records)
         assert result["open_position_count"] == 0
 
+    def test_replay_billing_evidence_terminal_closes_position(self):
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1_000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "pos-billing", "symbol": "ETHUSDT"},
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 5_000,
+                "kind": "exit.billing_evidence_unavailable",
+                "payload": {"position_id": "pos-billing"},
+            },
+        ]
+
+        result = replay_journal_records(records)
+
+        assert result["open_position_count"] == 0
+
     def test_replay_partial_close_reduces_quantity(self):
         records = [
             {

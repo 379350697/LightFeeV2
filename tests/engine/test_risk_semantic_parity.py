@@ -388,6 +388,18 @@ class TestAccountRiskSnapshot:
         )
         assert snap.supported is False
 
+    def test_verified_zero_maintenance_is_supported_without_health_ratio(self):
+        snap = AccountRiskSnapshot(
+            venue=Venue.BYBIT,
+            equity_quote=10000.0,
+            maintenance_margin_quote=0.0,
+            health_ratio=0.0,
+            observed_at_ms=1000,
+            zero_maintenance_is_normal=True,
+        )
+        assert snap.supported is True
+        assert snap.health_ratio == 0.0
+
     def test_staleness_detection(self):
         snap = make_risk_snapshot(Venue.BINANCE, observed_at_ms=1000)
         assert snap.is_effectively_stale(now_ms=100_000, max_age_ms=30_000)

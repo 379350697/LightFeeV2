@@ -1493,6 +1493,95 @@ class LiveRuntime:
             },
         )
 
+    def _mark_pending_entry_hedge_accepted_fill_unconfirmed(
+        self,
+        pending,
+        *,
+        entry_id: str,
+        now_ms: int,
+        hedge_client_order_id: str,
+        hedge_attempt: int,
+        fill,
+        source: str,
+    ) -> None:
+        """Keep the accepted hedge owner until exchange truth resolves zero fill.
+
+        IOC acknowledgements with no immediate fill are not rejections.  Both
+        live ticks and startup recovery use this transition so neither can
+        discard the CID and submit a duplicate hedge before reconciliation.
+        """
+        acknowledged_order_id = str(getattr(fill, "order_id", "") or "")
+        acknowledged_client_order_id = str(
+            getattr(fill, "client_order_id", "") or hedge_client_order_id
+        )
+        if acknowledged_order_id:
+            pending.hedge_order_id = acknowledged_order_id
+        pending.hedge_client_order_id = acknowledged_client_order_id
+        pending.uncertain_outcome = True
+        pending.outcome = "hedge_accepted_fill_unconfirmed"
+        # The exchange accepted an IOC request but has not supplied a fill
+        # result.  Persist the exact owner before returning so a crash cannot
+        # turn an accepted order into a fresh hedge submission on restart.
+        self.journal.append_critical(
+            now_ms,
+            "pending_entry.hedge_submit_result",
+            {
+                "entry_id": entry_id,
+                "symbol": pending.symbol,
+                "outcome": "accepted_fill_unconfirmed",
+                "hedge_client_order_id": acknowledged_client_order_id,
+                "hedge_attempt": hedge_attempt,
+                "order_id": acknowledged_order_id,
+                "hedge_inflight": (
+                    pending.hedge_inflight.to_dict()
+                    if pending.hedge_inflight is not None
+                    else None
+                ),
+                "requires_reconciliation": True,
+                "source": source,
+            },
+        )
+
+    def _persist_pending_entry_hedge_submit_attempt(
+        self,
+        pending,
+        *,
+        entry_id: str,
+        now_ms: int,
+        hedge_venue: Venue,
+        hedge_price: float,
+    ) -> None:
+        """Durably retain hedge ownership before the exchange submission.
+
+        A client order ID is an ownership record, not merely diagnostic data.
+        Recording the fully populated inflight record with fsync before
+        ``place_order`` makes restart recovery reconcile that exact CID instead
+        of issuing a second IOC hedge after an ambiguous transport outcome.
+        """
+        inflight = pending.hedge_inflight
+        if inflight is None:
+            raise RuntimeError("missing hedge inflight owner before submit")
+        self.journal.append_critical(
+            now_ms,
+            "pending_entry.hedge_submit_attempt",
+            {
+                "entry_id": entry_id,
+                "pending_id": pending.pending_id,
+                "position_id": pending.pending_id,
+                "symbol": pending.symbol,
+                "hedge_venue": hedge_venue.value,
+                "hedge_side": pending.hedge_side().value,
+                "hedge_quantity": inflight.quantity,
+                "hedge_price_hint": hedge_price,
+                "hedge_client_order_id": inflight.client_order_id,
+                "hedge_attempt": inflight.attempt,
+                "maker_leg_filled": pending.maker_leg_filled,
+                "hedge_leg_filled": pending.hedge_leg_filled,
+                "hedge_inflight": inflight.to_dict(),
+                "uncertain_outcome_before_submit": pending.uncertain_outcome,
+            },
+        )
+
     def _emit_startup_order_path_preflight(self) -> None:
         """Emit sanitized startup visibility for order signing/dependency readiness."""
         blocked = {"api_key", "api_secret", "secret", "signature", "private_key", "headers", "auth"}
@@ -7352,7 +7441,13 @@ class LiveRuntime:
                 self._apply_reconcile_backoff(pending, now_ms)
                 continue
 
-            if not pending.uncertain_outcome:
+            # ``uncertain_outcome`` describes submit certainty, not whether
+            # this entry still owns exchange exposure.  A journal-confirmed
+            # hedge fill may be certain while still requiring the V1
+            # reconciliation/finalization path to create OpenPosition (or
+            # preserve residual work).  Only known zero-fill work is safe to
+            # remove without that terminal decision.
+            if not pending.uncertain_outcome and not pending.has_any_fill():
                 resolved_ids.append(entry_id)
                 continue
 
@@ -8540,6 +8635,13 @@ class LiveRuntime:
                 attempt=pending.hedge_attempt_count,
                 submitted_at_ms=now_ms,
             )
+            self._persist_pending_entry_hedge_submit_attempt(
+                pending,
+                entry_id=pending.pending_id,
+                now_ms=now_ms,
+                hedge_venue=hedge_venue,
+                hedge_price=hedge_price,
+            )
 
             req = OrderRequest(
                 venue=hedge_venue,
@@ -8573,8 +8675,15 @@ class LiveRuntime:
                     pending.uncertain_outcome = False
                     pending.outcome = "filled"
                 return True
-            pending.hedge_inflight = None
-            note_pending_entry_hedge_filled(pending)
+            self._mark_pending_entry_hedge_accepted_fill_unconfirmed(
+                pending,
+                entry_id=pending.pending_id,
+                now_ms=now_ms,
+                hedge_client_order_id=recovery_cid,
+                hedge_attempt=pending.hedge_attempt_count,
+                fill=fill,
+                source="startup_recovery",
+            )
             return False
         except OrderSubmitError as e:
             hedge_client_order_id = (
@@ -8802,20 +8911,12 @@ class LiveRuntime:
                 submitted_at_ms=now_ms,
             )
 
-            self.journal.append(
-                "pending_entry.hedge_submit_attempt",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "hedge_venue": hedge_venue.value,
-                    "hedge_side": pending.hedge_side().value,
-                    "hedge_quantity": normalized,
-                    "hedge_price_hint": hedge_price,
-                    "hedge_client_order_id": hedge_cloid,
-                    "hedge_attempt": attempt,
-                    "maker_leg_filled": pending.maker_leg_filled,
-                    "hedge_leg_filled": pending.hedge_leg_filled,
-                },
+            self._persist_pending_entry_hedge_submit_attempt(
+                pending,
+                entry_id=entry_id,
+                now_ms=now_ms,
+                hedge_venue=hedge_venue,
+                hedge_price=hedge_price,
             )
 
             req = OrderRequest(
@@ -8871,19 +8972,14 @@ class LiveRuntime:
                     pending.outcome = "filled"
                 return True
 
-            # Zero fill — hedge order was placed but didn't fill (IOC/taker)
-            pending.hedge_inflight = None
-            note_pending_entry_hedge_filled(pending)
-            self.journal.append(
-                "pending_entry.hedge_submit_result",
-                {
-                    "entry_id": entry_id,
-                    "symbol": pending.symbol,
-                    "outcome": "zero_fill",
-                    "hedge_client_order_id": hedge_cloid,
-                    "hedge_attempt": attempt,
-                    "order_id": getattr(fill, "order_id", ""),
-                },
+            self._mark_pending_entry_hedge_accepted_fill_unconfirmed(
+                pending,
+                entry_id=entry_id,
+                now_ms=now_ms,
+                hedge_client_order_id=hedge_cloid,
+                hedge_attempt=attempt,
+                fill=fill,
+                source="live_tick",
             )
             return False
 

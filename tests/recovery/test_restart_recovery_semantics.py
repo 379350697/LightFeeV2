@@ -16,6 +16,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from lightfee.core.domain import Side, Venue
 from lightfee.engine.recovery import (
     RecoveredState,
     RecoveryBlockedState,
@@ -443,6 +444,41 @@ class TestSnapshotRecovery:
         state = recover_from_snapshot(snap, journal)
         assert "p1" not in state.open_positions
 
+    def test_billing_evidence_terminal_event_clears_all_close_work(self, tmp_path):
+        state = EngineState(lifecycle=EngineLifecycle.RUNNING)
+        _add_open_position(state, "p1")
+        _add_pending_close(state, "close-1", "p1")
+        state.pending_passive_closes["p1"] = PendingPassiveClose(
+            position_id="p1", reason="manual"
+        )
+        state.set_pending_close_reconciliations(
+            [{"position_id": "p1", "kind": "final", "closed_at_ms": 1_000}]
+        )
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        snap.write(state.to_dict())
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            journal.append_critical(
+                2_000,
+                "exit.billing_evidence_unavailable",
+                {
+                    "position_id": "p1",
+                    "terminal_accounting_status": (
+                        "provisional_entry_fee_evidence_unavailable"
+                    ),
+                },
+            )
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snap, Journal(tmp_path / "journal.jsonl"))
+
+        assert "p1" not in recovered.open_positions
+        assert not recovered.pending_closes
+        assert not recovered.pending_passive_closes
+        assert not recovered.pending_close_reconciliations
+
     def test_journal_replay_restores_pending_entry_registered_event(self, tmp_path):
         snap = SnapshotStore(tmp_path / "snapshot.json")
         journal_path = tmp_path / "journal.jsonl"
@@ -489,3 +525,269 @@ class TestSnapshotRecovery:
         assert pending.hedge_client_order_id == "hedge-client-1"
         assert pending.maker_leg_filled == 0.4
         assert pending.hedge_leg_filled == 0.1
+
+    def test_journal_replay_restores_full_pending_successor_snapshot(self, tmp_path):
+        pending = PendingEntry(
+            pending_id="entry-full-persisted",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=2.5,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_234,
+            metadata={"source": "handoff"},
+            fallback_route="aggressive",
+            run_id="run-1",
+            entry_route="passive_incremental",
+            hedge_attempt_count=2,
+            repost_count=3,
+        )
+        source_state = EngineState()
+        source_state.pending_entries[pending.pending_id] = pending
+        serialized = source_state.to_dict()["pending_entries"][pending.pending_id]
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        snap.write({"lifecycle": "running", "run_id": "test-run"})
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            journal.append_critical(
+                1_300,
+                "entry.pending_registered",
+                {
+                    "entry_id": pending.pending_id,
+                    "pending_id": pending.pending_id,
+                    "position_id": pending.pending_id,
+                    "symbol": pending.symbol,
+                    "pending_entry": serialized,
+                    "persistence_schema": "engine_state.pending_entry.v1",
+                },
+            )
+            journal.append_critical(
+                1_301,
+                "runtime.entry_owner_handoff_complete",
+                {
+                    "entry_id": pending.pending_id,
+                    "owner_destination": "pending_entry",
+                },
+            )
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snap, Journal(tmp_path / "journal.jsonl"))
+
+        restored = recovered.pending_entries[pending.pending_id]
+        assert restored.metadata == {"source": "handoff"}
+        assert restored.fallback_route == "aggressive"
+        assert restored.run_id == "run-1"
+        assert restored.entry_route == "passive_incremental"
+        assert restored.hedge_attempt_count == 2
+        assert restored.repost_count == 3
+
+    def test_replay_releases_confirmed_rejected_hedge_attempt(self, tmp_path):
+        """A durable explicit rejection is safe to retry after restart."""
+        pending = PendingEntry(
+            pending_id="entry-rejected-hedge",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+        )
+        source_state = EngineState()
+        source_state.pending_entries[pending.pending_id] = pending
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        snap.write(source_state.to_dict())
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            journal.append_critical(
+                1_100,
+                "pending_entry.hedge_submit_attempt",
+                {
+                    "entry_id": pending.pending_id,
+                    "hedge_venue": "okx",
+                    "hedge_side": "sell",
+                    "hedge_quantity": 1.0,
+                    "hedge_client_order_id": "hedge-rejected-cid",
+                    "hedge_attempt": 1,
+                    "uncertain_outcome_before_submit": False,
+                    "hedge_inflight": {
+                        "client_order_id": "hedge-rejected-cid",
+                        "venue": "okx",
+                        "side": "sell",
+                        "quantity": 1.0,
+                        "attempt": 1,
+                        "submitted_at_ms": 1_100,
+                        "soft_deadline_logged": False,
+                    },
+                },
+            )
+            journal.append_critical(
+                1_101,
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": pending.pending_id,
+                    "outcome": "error",
+                    "is_rejected": True,
+                    "hedge_client_order_id": "hedge-rejected-cid",
+                    "hedge_attempt": 1,
+                },
+            )
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snap, Journal(tmp_path / "journal.jsonl"))
+        restored = recovered.pending_entries[pending.pending_id]
+        assert restored.hedge_inflight is None
+        assert restored.hedge_attempt_count == 1
+        assert restored.uncertain_outcome is False
+
+    def test_replay_restores_confirmed_hedge_fill_without_inflight_owner(self, tmp_path):
+        """A fill durable before a crash is V1-complete, not an unknown CID."""
+        pending = PendingEntry(
+            pending_id="entry-filled-hedge",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            maker_fill_price=50_000.0,
+        )
+        source_state = EngineState()
+        source_state.pending_entries[pending.pending_id] = pending
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        snap.write(source_state.to_dict())
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            journal.append_critical(
+                1_100,
+                "pending_entry.hedge_submit_attempt",
+                {
+                    "entry_id": pending.pending_id,
+                    "hedge_venue": "okx",
+                    "hedge_side": "sell",
+                    "hedge_quantity": 1.0,
+                    "hedge_client_order_id": "hedge-filled-cid",
+                    "hedge_attempt": 1,
+                    "uncertain_outcome_before_submit": False,
+                    "hedge_inflight": {
+                        "client_order_id": "hedge-filled-cid",
+                        "venue": "okx",
+                        "side": "sell",
+                        "quantity": 1.0,
+                        "attempt": 1,
+                        "submitted_at_ms": 1_100,
+                        "soft_deadline_logged": False,
+                    },
+                },
+            )
+            journal.append_critical(
+                1_101,
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": pending.pending_id,
+                    "outcome": "filled",
+                    "hedge_client_order_id": "hedge-filled-cid",
+                    "hedge_order_id": "exchange-order-1",
+                    "hedge_attempt": 1,
+                    "hedge_fill_quantity": 1.0,
+                    "hedge_fill_price": 50_001.0,
+                    "hedge_leg_filled": 1.0,
+                    "missing_hedge_remaining": 0.0,
+                },
+            )
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snap, Journal(tmp_path / "journal.jsonl"))
+        restored = recovered.pending_entries[pending.pending_id]
+
+        assert restored.hedge_inflight is None
+        assert restored.hedge_client_order_id == "hedge-filled-cid"
+        assert restored.hedge_order_id == "exchange-order-1"
+        assert restored.hedge_attempt_count == 1
+        assert restored.hedge_leg_filled == pytest.approx(1.0)
+        assert restored.hedge_fill_price == pytest.approx(50_001.0)
+        assert restored.missing_hedge_quantity() == pytest.approx(0.0)
+        assert restored.uncertain_outcome is False
+        assert restored.outcome == "filled"
+
+    def test_replay_partial_confirmed_hedge_fill_restores_prior_uncertainty(self, tmp_path):
+        """A known partial fill is retryable, rather than an unknown submit."""
+        pending = PendingEntry(
+            pending_id="entry-partial-hedge",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=2.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000,
+            maker_leg="long",
+            maker_leg_filled=2.0,
+        )
+        source_state = EngineState()
+        source_state.pending_entries[pending.pending_id] = pending
+        snap = SnapshotStore(tmp_path / "snapshot.json")
+        snap.write(source_state.to_dict())
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            journal.append_critical(
+                1_100,
+                "pending_entry.hedge_submit_attempt",
+                {
+                    "entry_id": pending.pending_id,
+                    "hedge_venue": "okx",
+                    "hedge_side": "sell",
+                    "hedge_quantity": 2.0,
+                    "hedge_client_order_id": "hedge-partial-cid",
+                    "hedge_attempt": 1,
+                    "uncertain_outcome_before_submit": False,
+                    "hedge_inflight": {
+                        "client_order_id": "hedge-partial-cid",
+                        "venue": "okx",
+                        "side": "sell",
+                        "quantity": 2.0,
+                        "attempt": 1,
+                        "submitted_at_ms": 1_100,
+                        "soft_deadline_logged": False,
+                    },
+                },
+            )
+            journal.append_critical(
+                1_101,
+                "pending_entry.hedge_submit_result",
+                {
+                    "entry_id": pending.pending_id,
+                    "outcome": "filled",
+                    "hedge_client_order_id": "hedge-partial-cid",
+                    "hedge_order_id": "exchange-order-partial",
+                    "hedge_attempt": 1,
+                    "hedge_fill_quantity": 1.0,
+                    "hedge_fill_price": 50_001.0,
+                    "hedge_leg_filled": 1.0,
+                    "missing_hedge_remaining": 1.0,
+                },
+            )
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snap, Journal(tmp_path / "journal.jsonl"))
+        restored = recovered.pending_entries[pending.pending_id]
+
+        assert restored.hedge_inflight is None
+        assert restored.hedge_leg_filled == pytest.approx(1.0)
+        assert restored.missing_hedge_quantity() == pytest.approx(1.0)
+        assert restored.uncertain_outcome is False
+        assert restored.outcome == ""

@@ -10216,6 +10216,111 @@ class TestBybitRiskSnapshotEmptyStringV1Parity:
         assert result is None, "Empty maintenance_margin MUST return None (V1 parity)"
 
     @pytest.mark.asyncio
+    async def test_empty_maintenance_margin_is_normal_only_for_isolated_flat_truth(self):
+        """Blank account MM is normal only after both Bybit truth checks pass."""
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            if path == "/v5/account/wallet-balance":
+                return self._bybit_wallet_balance_response(
+                    total_equity="10000.50",
+                    total_maintenance_margin="",
+                )
+            if path == "/v5/account/info":
+                return {"retCode": 0, "result": {"marginMode": "ISOLATED_MARGIN"}}
+            if path == "/v5/position/list":
+                assert params["limit"] == 200
+                assert params["category"] in {"linear", "inverse", "option"}
+                return {"retCode": 0, "result": {"list": []}}
+            raise AssertionError(path)
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+
+        assert result is not None
+        assert result.supported is True
+        assert result.maintenance_margin_quote == 0.0
+        assert result.health_ratio == 0.0
+        assert result.source == "bybit_isolated_all_derivative_position_truth"
+
+    @pytest.mark.asyncio
+    async def test_empty_maintenance_margin_uses_per_position_mm_for_isolated_open_position(self):
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            if path == "/v5/account/wallet-balance":
+                return self._bybit_wallet_balance_response(
+                    total_equity="10000.50",
+                    total_maintenance_margin="",
+                )
+            if path == "/v5/account/info":
+                return {"retCode": 0, "result": {"marginMode": "ISOLATED_MARGIN"}}
+            if path == "/v5/position/list":
+                if params.get("category") != "linear" or params.get("settleCoin") != "USDT":
+                    return {"retCode": 0, "result": {"list": []}}
+                return {
+                    "retCode": 0,
+                    "result": {"list": [{"size": "2", "positionMM": "125.25"}]},
+                }
+            raise AssertionError(path)
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+
+        assert result is not None
+        assert result.supported is True
+        assert result.maintenance_margin_quote == 125.25
+        assert result.health_ratio == pytest.approx(10000.50 / 125.25)
+        assert result.source == "bybit_isolated_all_derivative_position_mm"
+
+    @pytest.mark.asyncio
+    async def test_empty_maintenance_margin_with_live_position_missing_mm_remains_unsupported(self):
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            if path == "/v5/account/wallet-balance":
+                return self._bybit_wallet_balance_response(total_maintenance_margin="")
+            if path == "/v5/account/info":
+                return {"retCode": 0, "result": {"marginMode": "ISOLATED_MARGIN"}}
+            if path == "/v5/position/list":
+                if params.get("category") != "linear" or params.get("settleCoin") != "USDT":
+                    return {"retCode": 0, "result": {"list": []}}
+                return {"retCode": 0, "result": {"list": [{"size": "2", "positionMM": ""}]}}
+            raise AssertionError(path)
+
+        transport._request = mock_request
+        assert await transport.fetch_account_risk_snapshot() is None
+
+    @pytest.mark.asyncio
+    async def test_empty_maintenance_margin_does_not_miss_a_later_position_page(self):
+        transport = self._make_bybit_transport()
+
+        async def mock_request(method, path, params=None, body=None, private=False):
+            if path == "/v5/account/wallet-balance":
+                return self._bybit_wallet_balance_response(total_maintenance_margin="")
+            if path == "/v5/account/info":
+                return {"retCode": 0, "result": {"marginMode": "ISOLATED_MARGIN"}}
+            if path == "/v5/position/list":
+                if params == {"category": "linear", "settleCoin": "USDT", "limit": 200}:
+                    return {"retCode": 0, "result": {"list": [], "nextPageCursor": "next"}}
+                if params == {
+                    "category": "linear", "settleCoin": "USDT", "limit": 200,
+                    "cursor": "next",
+                }:
+                    return {
+                        "retCode": 0,
+                        "result": {"list": [{"size": "1", "positionMM": "3"}]},
+                    }
+                return {"retCode": 0, "result": {"list": []}}
+            raise AssertionError(path)
+
+        transport._request = mock_request
+        result = await transport.fetch_account_risk_snapshot()
+
+        assert result is not None
+        assert result.maintenance_margin_quote == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
     async def test_dash_maintenance_margin_returns_none(self):
         """Bybit totalMaintenanceMargin='--' MUST return None (V1 parity)."""
         transport = self._make_bybit_transport()

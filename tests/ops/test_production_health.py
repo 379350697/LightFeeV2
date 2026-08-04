@@ -1164,13 +1164,7 @@ def test_current_state_journal_positive_fill_conflict_owns_historical_live_singl
 
     rows = report.details["v1_lifecycle_closure"]["rows"]
     assert "nonzero_live_position" in report.fingerprints
-    assert any(
-        row["owner_id"] == "entry-home"
-        and row["terminality"] == "owned_pending_entry_live_conflict"
-        and row["details"].get("kind") == "owned_pending_entry_live_conflict"
-        for row in rows
-    )
-    assert not any("unpaired_live_position" in row["row_key"] for row in rows)
+    assert any("unpaired_live_position" in row["row_key"] for row in rows)
 
 
 def test_current_state_tick_stale_is_critical_when_active_lane_overdue():

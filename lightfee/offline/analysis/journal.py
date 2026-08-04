@@ -124,6 +124,8 @@ _PAPER_OUTCOME_KINDS = frozenset({
 _QUICK_FLAT_TERMINAL_KIND_PRIORITY = {
     "runtime.position_drift_corrected": 10,
     "exit.closed": 20,
+    "exit.billing_evidence_unavailable": 24,
+    "exit.reconciled": 25,
     "runtime.position_lifecycle_terminal": 30,
     "recovery.flat": 40,
 }
@@ -172,14 +174,30 @@ def summarize_quick_flat_events(
     quick_flat_positions: dict[str, dict] = {}
     duplicate_event_count = 0
     low_confidence_event_count = 0
+    unreconciled_billing_count = 0
+    unreconciled_billing_positions: set[str] = set()
     window_ms = int(quick_flat_window_ms or 0)
 
     for record in records:
         kind = str(record.get("kind", "") or "")
-        if kind not in _QUICK_FLAT_TERMINAL_KIND_PRIORITY:
-            continue
         payload = _event_payload(record)
         position_id = str(payload.get("position_id", "") or "")
+        is_unreconciled_billing = (
+            kind == "exit.billing_unreconciled"
+            or kind == "exit.billing_evidence_unavailable"
+            or (
+                kind == "exit.reconciled"
+                and payload.get("venue_statement_reconciled") is not True
+            )
+        )
+        if is_unreconciled_billing and position_id:
+            # Reconciliation retries emit the same unresolved position again;
+            # this is an outstanding-position count, never a retry count.
+            if position_id not in unreconciled_billing_positions:
+                unreconciled_billing_positions.add(position_id)
+                unreconciled_billing_count += 1
+        if kind not in _QUICK_FLAT_TERMINAL_KIND_PRIORITY:
+            continue
         if not position_id:
             continue
 
@@ -225,6 +243,7 @@ def summarize_quick_flat_events(
         "quick_flat_duplicate_event_count": duplicate_event_count,
         "low_confidence_event_count": low_confidence_event_count,
         "close_identity_confidence": close_identity_confidence,
+        "quick_flat_unreconciled_billing_count": unreconciled_billing_count,
         "quick_flat_terminal_kind_counts": terminal_kind_counts,
     }
 

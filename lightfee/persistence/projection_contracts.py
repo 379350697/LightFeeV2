@@ -83,6 +83,8 @@ PROJECTED_ENTRY_EXIT_KINDS: frozenset[str] = frozenset({
     "exit.passive_close_unhedged_residual",
     "exit.pending_close_registered",
     "exit.reconciled",
+    "exit.billing_unreconciled",
+    "exit.billing_evidence_unavailable",
     "exit.retry_wait",
 })
 
@@ -188,6 +190,10 @@ JOURNAL_ONLY_DIAGNOSTIC_KINDS: frozenset[str] = frozenset({
     "scan.shortlist_ready",
     "runtime.entry_dispatched",
     "runtime.entry_dispatch_error",
+    "runtime.entry_owner_claimed",
+    "runtime.entry_owner_claim_retained",
+    "runtime.entry_owner_handoff_complete",
+    "runtime.entry_owner_handoff_incomplete",
     "runtime.entry_skipped_duplicate_client_order_id",
     "runtime.entry_skipped_existing_pending",
     "runtime.entry_skipped_no_quote",

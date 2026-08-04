@@ -235,7 +235,11 @@ class RecoveryLedger:
             live_symbols.add(artifact.symbol)
             owner = _owner_for_position(owner_index, artifact)
             if owner is not None and owner.confidence != "orphan":
-                if owner.owner_type in {"pending_entry", "journal_pending_entry"}:
+                if owner.owner_type in {
+                    "pending_entry",
+                    "journal_pending_entry",
+                    "journal_entry_submission",
+                }:
                     add_work(
                         RecoveryWorkItem(
                             kind="owned_pending_entry_live_conflict",

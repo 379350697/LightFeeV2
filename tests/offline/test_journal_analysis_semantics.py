@@ -103,6 +103,20 @@ class TestEntryExitPnL:
         assert report.daily.total_fee_quote == 0.3
         assert report.daily.entry_count == 0
 
+    def test_provisional_billing_terminal_never_realizes_pnl(self):
+        records = [
+            make_record(
+                "exit.billing_evidence_unavailable",
+                {"net_quote": 12.5, "exit_fee_quote": 0.3},
+            ),
+        ]
+
+        report = analyze_journal_records(records)
+
+        assert report.daily.exit_count == 0
+        assert report.daily.total_pnl_quote == 0.0
+        assert report.daily.total_fee_quote == 0.0
+
 
 # ── Quick-flat observability ───────────────────────────────────────────────
 
@@ -163,6 +177,79 @@ class TestQuickFlatObservability:
 
         assert summary["quick_flat_count"] == 1
         assert summary["duplicate_event_count"] == 1
+
+    def test_exit_reconciled_is_a_quick_flat_even_when_its_billing_is_historical_unverified(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.reconciled",
+                "payload": {
+                    "position_id": "p1",
+                    "reason": "funding_capture",
+                    "venue_statement_reconciled": False,
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(records, quick_flat_window_ms=60_000)
+
+        assert summary["quick_flat_count"] == 1
+        assert summary["quick_flat_terminal_kind_counts"] == {"exit.reconciled": 1}
+        assert summary["quick_flat_unreconciled_billing_count"] == 1
+
+    def test_billing_unreconciled_is_counted_without_becoming_a_terminal_close(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.billing_unreconciled",
+                "payload": {"position_id": "p1"},
+            },
+            {
+                "ts_ms": 2500,
+                "kind": "exit.billing_unreconciled",
+                "payload": {"position_id": "p1"},
+            },
+        ]
+
+        summary = summarize_quick_flat_events(records, quick_flat_window_ms=60_000)
+
+        assert summary["quick_flat_count"] == 0
+        assert summary["quick_flat_unreconciled_billing_count"] == 1
+
+    def test_terminal_billing_evidence_gap_is_physical_terminal_but_not_financially_reconciled(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.billing_evidence_unavailable",
+                "payload": {
+                    "position_id": "p1",
+                    "terminal_accounting_status": "provisional_entry_fee_evidence_unavailable",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(records, quick_flat_window_ms=60_000)
+
+        assert summary["quick_flat_count"] == 1
+        assert summary["quick_flat_terminal_kind_counts"] == {
+            "exit.billing_evidence_unavailable": 1,
+        }
+        assert summary["quick_flat_unreconciled_billing_count"] == 1
 
     def test_journal_report_exposes_deduplicated_quick_flat_counts(self):
         records = [

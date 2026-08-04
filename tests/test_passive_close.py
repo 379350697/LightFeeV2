@@ -6804,6 +6804,116 @@ class TestReduceOnlyRejectedEscalation:
         ]
         assert len(terminal_events) == 1
 
+    def test_canceled_zero_fill_retains_maker_until_execution_truth_is_available(self):
+        """A single canceled/zero progress response cannot arm a new close leg."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE,
+            side=Side.SELL,
+            order_id="canceled-maker",
+            client_order_id="canceled-client",
+            cumulative_quantity=0.0,
+            average_price=0.0,
+            state=PassiveOrderState.CANCELED,
+        ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        maker_adapter.submit_passive_order = AsyncMock()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                zero_fill_cycles_in_phase=PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES - 1,
+                maker_order_id="canceled-maker",
+                maker_client_order_id="canceled-client",
+                maker_resting_limit_price=50_000.0,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(executor.drive_pending_passive_close(state, position.position_id))
+
+        assert result is False
+        maker_adapter.fetch_order_fill_reconciliation.assert_awaited_once_with(
+            "BTCUSDT", "canceled-maker", "canceled-client",
+        )
+        assert pending.phase_state.maker_order_id == "canceled-maker"
+        assert pending.phase_state.phase == PassiveExecutionPhase.LOW_SLIPPAGE_MAKER
+        assert pending.next_retry_at_ms > 0
+        assert any(
+            event["kind"] == "exit.passive_close_terminal_zero_fill_truth_unavailable"
+            for event in journal.read_all()
+        )
+
+    def test_filled_zero_progress_with_zero_execution_truth_is_retained(self):
+        """Contradictory terminal status must not initiate a second close leg."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE,
+            side=Side.SELL,
+            order_id="filled-zero-maker",
+            client_order_id="filled-zero-client",
+            cumulative_quantity=0.0,
+            average_price=0.0,
+            state=PassiveOrderState.FILLED,
+        ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            average_price=0.0,
+            order_id="filled-zero-maker",
+            client_order_id="filled-zero-client",
+            filled_at_ms=0,
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="filled-zero-maker",
+                maker_client_order_id="filled-zero-client",
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(executor.drive_pending_passive_close(state, position.position_id))
+
+        assert result is False
+        assert pending.phase_state.maker_order_id == "filled-zero-maker"
+        assert pending.next_retry_at_ms > 0
+        assert any(
+            event["kind"] == "exit.passive_close_terminal_zero_fill_truth_inconsistent"
+            for event in journal.read_all()
+        )
+
     def test_order_submit_error_rejected_escalates_to_dual_taker(self):
         """OrderSubmitError with is_rejected=True transitions to DUAL_TAKER."""
         journal = _open_journal()

@@ -295,6 +295,7 @@ def build_open_position(
         long_entry_fee_quote=long_entry_fee_quote,
         short_entry_fee_quote=short_entry_fee_quote,
         total_entry_fee_quote=total_entry_fee_quote,
+        entry_fee_evidence_complete=True,
         current_net_quote=-total_entry_fee_quote,
         peak_net_quote=-total_entry_fee_quote,
         funding_timestamp_ms=inferred_first_funding_ms,

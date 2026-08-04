@@ -617,21 +617,21 @@ def test_journal_owned_order_is_owned_pending_entry_when_local_pending_is_absent
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
 
 
-def test_journal_positive_fill_conflict_owns_live_position_after_pending_removed():
+def test_unhanded_entry_submission_blocks_matching_live_position_after_restart():
     owner_index = RecoveryOwnerIndex.from_state_and_journal(
         {"pending_entries": [], "open_positions": []},
         [
             {
-                "kind": "pending_entry.positive_fill_live_truth_conflict",
+                "kind": "runtime.entry_owner_claimed",
                 "payload": {
                     "entry_id": "entry-home",
                     "symbol": "HOMEUSDT",
-                    "maker_leg_filled": 1600.0,
-                    "hedge_leg_filled": 1600.0,
-                    "matched_quantity": 1600.0,
-                    "live_long_quantity": 0.0,
-                    "live_short_quantity": 1600.0,
-                    "live_balanced_quantity": 0.0,
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "long_quantity": 1600.0,
+                    "short_quantity": 1600.0,
                 },
             }
         ],
@@ -656,8 +656,8 @@ def test_journal_positive_fill_conflict_owns_live_position_after_pending_removed
 
     item = ledger.work_items[0]
     assert item.kind == "owned_pending_entry_live_conflict"
-    assert item.owner.owner_type == "journal_pending_entry"
+    assert item.owner.owner_type == "journal_entry_submission"
     assert item.owner.owner_id == "entry-home"
     assert item.owner.confidence == "probable"
     assert item.decision.outcome == "pending_entry_live_conflict_requires_cleanup"
-    assert not any(item.kind == "unpaired_live_position" for item in ledger.work_items)
+    assert item.blocks_all_new_entries is True

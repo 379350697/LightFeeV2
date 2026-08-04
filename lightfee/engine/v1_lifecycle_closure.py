@@ -1161,6 +1161,7 @@ _EVENT_KIND_PHASES = {
     "exit.close_chunk_submitted": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.close_residual_detected": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "exit.closed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.billing_evidence_unavailable": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.compensated": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.reconciled": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.passive_close_fallback_terminal_flat": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

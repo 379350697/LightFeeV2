@@ -521,8 +521,11 @@ class EntrySyncExecutor:
             long_venue=ctx.long_venue,
             short_venue=ctx.short_venue,
             target_quantity=ctx.long_quantity,
-            long_side=Side.BUY if maker_is_long else Side.SELL,
-            short_side=Side.SELL if maker_is_long else Side.BUY,
+            # The arbitrage direction is an invariant: long leg always buys
+            # and short leg always sells.  maker_is_long only selects which
+            # canonical leg posts passively; it must never invert exposure.
+            long_side=Side.BUY,
+            short_side=Side.SELL,
             created_at_ms=now_ms,
             maker_order_id=maker_order_id,
             hedge_order_id=hedge_order_id,

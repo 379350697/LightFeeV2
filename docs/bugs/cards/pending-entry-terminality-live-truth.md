@@ -20,6 +20,12 @@ evidence must map to the matrix before runtime code changes.
 - `stale_accepted_order`
 - planned hedge client order id queried before submit.
 - `pending_entry` cleared from momentary flat position snapshots.
+- A journal-replayed confirmed hedge fill has `uncertain_outcome=false`, then
+  startup force reconciliation or the normal tick removes its pending owner
+  before `entry.opened` / `OpenPosition` is recorded.
+- `force_reconcile_pending_entry_resolved` or
+  `pending_entry_reconcile_resolved` follows a confirmed positive replay fill,
+  but there is no corresponding `entry.opened`.
 - Balanced live-position evidence has quantity but missing local order/price details.
 - `pending_entry.finalize_deferred_unresolved_maker_zero_fill`
 - `pending_entry.finalize_fill_reconciliation_ignored_stale_zero`
@@ -83,6 +89,12 @@ Positive local matched fills are not balanced live-position evidence unless
 the exchange truth contains direction-correct live long and short quantities
 covering the matched local quantity. A single live leg must defer/fail-closed
 with explicit evidence, not emit `entry.opened`.
+
+`uncertain_outcome` describes submit certainty, not terminality or ownership.
+Any `PendingEntry.has_any_fill()` result, including a journal-confirmed partial
+or full hedge fill, must pass through exchange reconciliation and the shared
+V1 finalizer/residual decision before removal. Only an explicit known zero-fill
+outcome may bypass that path; a deferred finalizer retains the pending owner.
 
 Zero-fill reconciliation is terminal evidence only when the maker/order status
 is terminal no-fill. A nonterminal maker order with zero fill keeps the pending
@@ -148,6 +160,10 @@ side is an evidence gap/fail-closed condition, not default buy.
 ## V1 / Exchange Semantics
 
 - V1 keeps accepted maker evidence uncertain until terminal no-fill/fill evidence exists.
+- V1 startup pending-entry processing keeps the runtime owner until the
+  balanced exchange result is finalized into managed state (or residual/fail-
+  closed work). A confirmed fill never authorizes dropping the local owner
+  before that decision.
 - V1 does not query a planned hedge CID before that hedge is submitted.
 - V1 can finalize balanced entries from live-position quantity and price evidence, even if local order ids are missing after recovery.
 - Duplicate client-id cleanup must be reconciled against live position truth before treating an old filled order as full cleanup.
@@ -214,6 +230,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 
 | Date | Attempt | Status | Why |
 |---|---|---|---|
+| 2026-08-04 | Gate startup and normal direct removal on known zero fill | effective locally | `uncertain_outcome=false` had been treated as terminal even after replayed positive maker/hedge fill. Both paths now send every positive fill through existing exchange reconciliation and V1 finalization/residual ownership. Deployment and cloud truth verification remain pending. |
 | 2026-05-17 | Pending hedge inflight metadata / deadline / cleanup parity | effective locally | Fixed direct-pop and cleanup semantics but later live truth exposed additional false-flat cases. |
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
@@ -247,6 +264,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 
 | Date | Symbols / Venues | Commit / Fix | Result | Detail |
 |---|---|---|---|---|
+| 2026-08-04 | synthetic `HOMEUSDT` OKX/Bybit confirmed replay fill | working tree | local green; deploy pending | [CL-093 confirmed replay fill ownership](../daily/2026-08-04.md#cluster-cl-093-confirmed-replay-fill-owner-terminalization) |
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-06-01 | `ARIAUSDT` Bybit/Binance | `f1727c1`; cloud verified | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable; second deploy converted pending to open and flattened excess, then exposed drift-correction false-negative latching; final deploy reached running/flat/no-open-orders | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
@@ -271,6 +289,8 @@ side is an evidence gap/fail-closed condition, not default buy.
 ## Regression Harness
 
 - `tests/test_pending_entry_v1_semantic_drift.py`
+  (`test_confirmed_replay_fill_finalizes_once_instead_of_erasing_owner`,
+  `test_confirmed_partial_replay_fill_remains_owned_until_reconciliation`)
 - `tests/test_live_entry_hedge_root_fix.py`
 - `tests/engine/test_recovery_ledger.py`
 - `tests/engine/test_recovery_owner_index.py`
@@ -343,3 +363,7 @@ side is an evidence gap/fail-closed condition, not default buy.
     `RUNNING_CLEAN` clear after `no_live_positions`. Do not use position-flat
     truth to clear `orphan_maker_order`; require open-order truth for that
     blocker.
+25. For a journal-replayed confirmed fill, verify both startup force recovery
+    and the normal tick construct exactly one managed open position (or retain
+    residual/fail-closed work) before removing the pending owner. Do not use
+    `uncertain_outcome=false` as a deletion authority.

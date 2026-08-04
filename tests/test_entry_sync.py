@@ -216,6 +216,34 @@ class TestEntrySyncMakerReject:
         assert result.state in (EntryState.FAILED, EntryState.FAILED_WITH_RESIDUAL)
         assert result.has_uncertainty is True
 
+    @pytest.mark.asyncio
+    async def test_short_maker_pending_keeps_canonical_long_short_sides(
+        self, adapters, journal
+    ):
+        """Maker selection must not reverse the arbitrage direction."""
+        adapters[Venue.OKX].place_order_outcomes = [_make_uncertain("timeout")]
+        ctx = EntryContext(
+            entry_id="short-maker-pending",
+            symbol="BTCUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            long_quantity=0.01,
+            short_quantity=0.01,
+            long_price_hint=50_000.0,
+            short_price_hint=50_000.0,
+            maker_leg=Side.SELL,
+            entry_type=EntryType.STANDARD_DUAL_TAKER,
+            created_at_ms=1_000,
+        )
+
+        result = await EntrySyncExecutor(adapters=adapters, journal=journal).execute(ctx)
+
+        assert result.pending_entry is not None
+        assert result.pending_entry.long_side is Side.BUY
+        assert result.pending_entry.short_side is Side.SELL
+        assert result.pending_entry.maker_venue() is Venue.OKX
+        assert result.pending_entry.hedge_venue() is Venue.BINANCE
+
 
 class TestPendingEntryHedgeDrive:
     @pytest.mark.asyncio

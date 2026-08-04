@@ -33,6 +33,7 @@ _ORDER_KINDS = frozenset({
 _ENTRY_EXIT_KINDS = frozenset({
     "entry.opened",
     "exit.closed",
+    "exit.billing_evidence_unavailable",
 })
 
 _LEDGER_POSITION_OPEN_KINDS = frozenset({
@@ -42,6 +43,7 @@ _LEDGER_POSITION_OPEN_KINDS = frozenset({
 
 _LEDGER_POSITION_CLOSE_KINDS = frozenset({
     "exit.closed",
+    "exit.billing_evidence_unavailable",
     "recovery.flat",
     "runtime.position_lifecycle_terminal",
 })

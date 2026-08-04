@@ -13,6 +13,10 @@ from lightfee.core.domain import (
     TimeInForce,
     Venue,
 )
+from lightfee.engine.entry import EntryContext, EntryState, EntryType
+from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
+from lightfee.engine.entry_sync import EntryExecutionResult
+from lightfee.engine.execution_planner import ExecutionRoute
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
@@ -22,6 +26,7 @@ from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+from lightfee.venues.cid import generate_exchange_cid
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
 
 
@@ -438,6 +443,8 @@ def _pending_close_reconciliation(**overrides) -> dict:
             "short_venue": Venue.BYBIT.value,
             "long_entry_price": 1.0,
             "short_entry_price": 1.03,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
         },
         "long_legs": [{
             "venue": Venue.OKX.value,
@@ -684,6 +691,8 @@ async def test_pending_close_reconciliation_uses_snapshot_after_lifecycle_flat(
             "matched_quantity": 20.0,
             "long_entry_price": 1.0,
             "short_entry_price": 1.03,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
         },
         "long_legs": [{
             "venue": Venue.OKX.value,
@@ -833,6 +842,8 @@ async def test_pending_close_reconciliation_waits_until_next_live_cycle(config, 
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
         },
         "long_legs": [{
             "venue": Venue.OKX.value,
@@ -919,6 +930,8 @@ async def test_pending_close_reconciliation_drain_restores_running_lifecycle(
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
         },
         "long_legs": [{
             "venue": Venue.OKX.value,
@@ -1342,6 +1355,7 @@ async def test_pending_close_reconciliation_fetches_all_v1_leg_records(
             "short_entry_price": 1.05,
             "captured_funding_quote": 0.5,
             "total_entry_fee_quote": 0.1,
+            "entry_fee_evidence_complete": True,
         },
         "long_legs": [
             {"venue": Venue.OKX.value, "order_id": "okx-close-1", "client_order_id": "okx-cid-1"},
@@ -1422,6 +1436,8 @@ async def test_pending_close_reconciliation_does_not_depend_on_entry_reconciler(
             "short_venue": Venue.BYBIT.value,
             "long_entry_price": 1.0,
             "short_entry_price": 1.03,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
         },
         "long_legs": [{
             "venue": Venue.OKX.value,
@@ -1439,6 +1455,158 @@ async def test_pending_close_reconciliation_does_not_depend_on_entry_reconciler(
 
     assert runtime.state.pending_close_reconciliations == []
     assert "exit.reconciled" in [record["kind"] for record in tmp_journal.read_all()]
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_terminalizes_confirmed_flat_close_with_missing_entry_fee_evidence(
+    config, tmp_journal,
+):
+    """Physical close evidence without entry-fee evidence is provisional only."""
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-force-order", "bybit-force-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=20.0, average_price=1.02, order_id="bybit-force-order",
+            client_order_id="bybit-force-cid", fee_quote=0.01,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-billing-pending",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-billing-pending",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "matched_quantity": 20.0,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.03,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-force-order",
+            "client_order_id": "bybit-force-cid",
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    assert "exit.reconciled" not in [record["kind"] for record in records]
+    billing = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_unreconciled"
+    ][0]
+    assert billing["venue_statement_reconciled"] is False
+    assert billing["entry_fee_evidence_complete"] is False
+    assert billing["net_quote_status"] == "provisional"
+    terminal = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_evidence_unavailable"
+    ][0]
+    assert terminal["terminal_accounting_status"] == "provisional_entry_fee_evidence_unavailable"
+    assert terminal["long_live_size"] == 0.0
+    assert terminal["short_live_size"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_stays_pending_when_exchange_is_not_flat(config, tmp_journal):
+    _mark_live(config)
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: _UnavailableCloseLegAdapter(Venue.OKX, live_quantity=0.0),
+        Venue.BYBIT: _UnavailableCloseLegAdapter(Venue.BYBIT, live_quantity=0.5),
+    })
+    runtime.journal = tmp_journal
+
+    terminalized = await runtime.close_runtime._try_terminalize_billing_evidence_gap(
+        {"position_id": "entry-still-open", "kind": "final"},
+        {"close_quantity_evidence_complete": True},
+        3000,
+        symbol="BEATUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+    )
+
+    assert terminalized is False
+    assert "exit.billing_evidence_unavailable" not in [
+        record["kind"] for record in tmp_journal.read_all()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_entry_dispatch_retains_pre_submit_owner_when_executor_has_no_local_successor(
+    config, tmp_journal,
+):
+    class _NoSuccessorExecutor:
+        async def execute(self, ctx):
+            return EntryExecutionResult(
+                route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                state=EntryState.COMPLETED,
+            )
+
+    runtime = LiveRuntime(config)
+    runtime.journal = tmp_journal
+    runtime.entry_executor = _NoSuccessorExecutor()
+    ctx = EntryContext(
+        entry_id="entry-owner-retained",
+        symbol="BEATUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        long_quantity=20.0,
+        short_quantity=20.0,
+        long_price_hint=1.0,
+        short_price_hint=1.0,
+        maker_leg=Side.BUY,
+        entry_type=EntryType.PASSIVE_INCREMENTAL,
+    )
+
+    completed = await EntryDispatchRuntime(runtime)._execute_entry_context(
+        ctx=ctx,
+        candidate=SimpleNamespace(symbol="BEATUSDT"),
+        route=ExecutionRoute.PASSIVE_INCREMENTAL,
+        effective_quantity=20.0,
+        price_hint=1.0,
+        maker_venue=Venue.OKX,
+        maker_leg=Side.BUY,
+        maker_bbo_evidence={},
+        now_ms=3000,
+    )
+
+    assert completed is True
+    records = tmp_journal.read_all()
+    kinds = [record["kind"] for record in records]
+    assert "runtime.entry_owner_handoff_complete" not in kinds
+    assert "runtime.entry_owner_handoff_incomplete" in kinds
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []}, records,
+    )
+    hedge_cid = generate_exchange_cid(ctx.entry_id, "h", Venue.BYBIT)
+    owner = owner_index.owner_for_order(
+        SimpleNamespace(order_id="", client_order_id=hedge_cid)
+    )
+    assert owner.owner_type == "journal_entry_submission"
+    assert owner.owner_id == ctx.entry_id
 
 
 @pytest.mark.asyncio
@@ -2529,6 +2697,118 @@ async def test_positive_fill_finalize_records_balanced_live_truth_on_open(
     assert decision["live_long_quantity"] == pytest.approx(1600.0)
     assert decision["live_short_quantity"] == pytest.approx(1600.0)
     assert decision["live_balanced_quantity"] == pytest.approx(1600.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_path", ("startup_force", "normal_tick"))
+async def test_confirmed_replay_fill_finalizes_once_instead_of_erasing_owner(
+    config, tmp_journal, recovery_path,
+):
+    """A known post-submit fill is positive recovery work, not a clean owner.
+
+    This is the crash window after ``pending_entry.hedge_submit_result:filled``
+    is durable but before ``entry.opened`` is durable.  V1 requires exchange
+    truth plus the shared finalizer before the pending owner can disappear.
+    """
+    _mark_live(config)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.OKX: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="HOMEUSDT",
+                side=Side.BUY,
+                quantity=1600.0,
+                entry_price=0.02852,
+                observed_at_ms=1781376760000,
+            )),
+            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="HOMEUSDT",
+                side=Side.SELL,
+                quantity=1600.0,
+                entry_price=0.028914,
+                observed_at_ms=1781376760000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(PositionReconciliationResult(
+        position_id="entry-confirmed-replay-fill",
+        symbol="HOMEUSDT",
+        long_status="filled",
+        short_status="filled",
+        is_flat=False,
+    ))
+    pending = _pending_entry(
+        pending_id="entry-confirmed-replay-fill",
+        symbol="HOMEUSDT",
+        long_venue=Venue.OKX,
+        short_venue=Venue.BYBIT,
+        target_quantity=1600.0,
+        maker_leg="long",
+        maker_order_id="home-maker-order",
+        maker_client_order_id="home-maker-cid",
+        hedge_order_id="home-hedge-order",
+        hedge_client_order_id="home-hedge-cid",
+        maker_leg_filled=1600.0,
+        hedge_leg_filled=1600.0,
+        maker_fill_price=0.02852,
+        hedge_fill_price=0.028914,
+        uncertain_outcome=False,
+        outcome="filled",
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    reconcile = (
+        runtime._reconcile_pending_entries_force
+        if recovery_path == "startup_force"
+        else runtime._reconcile_pending_state
+    )
+    await reconcile(now_ms=1781376760000)
+    await reconcile(now_ms=1781376760001)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    opened = runtime.state.open_positions[pending.pending_id]
+    assert opened.matched_quantity == pytest.approx(1600.0)
+    assert opened.long_quantity == pytest.approx(1600.0)
+    assert opened.short_quantity == pytest.approx(1600.0)
+    assert [event["kind"] for event in tmp_journal.read_all()].count("entry.opened") == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmed_partial_replay_fill_remains_owned_until_reconciliation(
+    config, tmp_journal,
+):
+    """Known partial hedge fill must not be erased merely because it is certain."""
+    runtime = _runtime(
+        config,
+        tmp_journal,
+        _CapturingReconciler(PositionReconciliationResult(
+            position_id="entry-confirmed-partial-replay-fill",
+            symbol="HOMEUSDT",
+        )),
+    )
+    pending = _pending_entry(
+        pending_id="entry-confirmed-partial-replay-fill",
+        symbol="HOMEUSDT",
+        target_quantity=2.0,
+        maker_leg_filled=2.0,
+        hedge_leg_filled=1.0,
+        maker_fill_price=0.02852,
+        hedge_fill_price=0.028914,
+        maker_order_id="home-maker-order",
+        hedge_order_id="home-hedge-order",
+        uncertain_outcome=False,
+        outcome="",
+        reconcile_next_attempt_ms=5_000,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=4_000)
+
+    assert pending.pending_id in runtime.state.pending_entries
+    assert pending.missing_hedge_quantity() == pytest.approx(1.0)
 
 
 @pytest.mark.asyncio

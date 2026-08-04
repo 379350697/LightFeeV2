@@ -30,6 +30,26 @@ class EntryDispatchRuntime:
     def __init__(self, ctx: EntryDispatchRuntimeContext) -> None:
         self.ctx = ctx
 
+    def _complete_entry_owner_handoff(
+        self,
+        *,
+        now_ms: int,
+        entry_id: str,
+        destination: str,
+    ) -> None:
+        """Durably retire a pre-submit owner only after its successor exists."""
+        self.ctx.journal.append_critical(
+            now_ms,
+            "runtime.entry_owner_handoff_complete",
+            {"entry_id": entry_id, "owner_destination": destination},
+        )
+
+    def _pending_entry_recovery_payload(self, pending_id: str) -> dict[str, Any]:
+        """Return the canonical persisted pending-entry schema for replay."""
+        pending_entries = self.ctx.state.to_dict().get("pending_entries", {})
+        pending_entry = pending_entries.get(pending_id, {})
+        return dict(pending_entry) if isinstance(pending_entry, dict) else {}
+
     def get_venue_adapter(self, *args: Any, **kwargs: Any):
         return self.ctx.get_venue_adapter(*args, **kwargs)
 
@@ -1399,6 +1419,41 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            # Write a durable owner before the first await that may submit an
+            # exchange order.  A crash in this handoff window must recover the
+            # position as an entry in progress, never as an unrelated orphan.
+            # maker_leg chooses the execution venue, not trade direction.
+            long_side = Side.BUY
+            short_side = Side.SELL
+            claimed_maker_venue = (
+                ctx.long_venue if maker_leg == Side.BUY else ctx.short_venue
+            )
+            claimed_hedge_venue = (
+                ctx.short_venue if maker_leg == Side.BUY else ctx.long_venue
+            )
+            maker_client_order_id = generate_exchange_cid(
+                ctx.entry_id, "m", claimed_maker_venue
+            )
+            hedge_client_order_id = generate_exchange_cid(
+                ctx.entry_id, "h", claimed_hedge_venue
+            )
+            self.ctx.journal.append_critical(
+                now_ms,
+                "runtime.entry_owner_claimed",
+                {
+                    "entry_id": ctx.entry_id,
+                    "symbol": candidate.symbol,
+                    "long_venue": ctx.long_venue.value,
+                    "short_venue": ctx.short_venue.value,
+                    "long_side": long_side.value,
+                    "short_side": short_side.value,
+                    "long_quantity": ctx.long_quantity,
+                    "short_quantity": ctx.short_quantity,
+                    "maker_client_order_id": maker_client_order_id,
+                    "hedge_client_order_id": hedge_client_order_id,
+                    "owner_state": "submitting",
+                },
+            )
             result = await self.ctx.entry_executor.execute(ctx)
             self.ctx.journal.append(
                 "runtime.entry_dispatched",
@@ -1425,6 +1480,11 @@ class EntryDispatchRuntime:
                     price=price_hint,
                     bbo=maker_bbo_evidence,
                 )
+                self._complete_entry_owner_handoff(
+                    now_ms=now_ms,
+                    entry_id=ctx.entry_id,
+                    destination="rejected",
+                )
                 return True
             if result.open_position is not None:
                 self.ctx.state.open_positions[result.open_position.position_id] = result.open_position
@@ -1450,6 +1510,11 @@ class EntryDispatchRuntime:
                             "reason": "maker rejected is terminal in V1",
                         },
                     )
+                    self._complete_entry_owner_handoff(
+                        now_ms=now_ms,
+                        entry_id=ctx.entry_id,
+                        destination="rejected",
+                    )
                     return True
                 # Track pending entry for reconciliation
                 if getattr(result.pending_entry, "created_cycle", 0) == 0:
@@ -1468,6 +1533,29 @@ class EntryDispatchRuntime:
                 self.ctx.state.pending_entries[result.pending_entry.pending_id] = result.pending_entry
                 self.ctx._recovery_dedup_index[result.pending_entry.maker_client_order_id] = result.pending_entry.pending_id
                 self.ctx._recovery_dedup_index[result.pending_entry.hedge_client_order_id] = result.pending_entry.pending_id
+                # This is the durable successor for the pre-submit owner
+                # claim.  It must precede handoff so a crash can recreate the
+                # exact pending state (including inflight ownership) from the
+                # journal without waiting for a later snapshot.
+                pending_snapshot = self._pending_entry_recovery_payload(
+                    result.pending_entry.pending_id
+                )
+                self.ctx.journal.append_critical(
+                    now_ms,
+                    "entry.pending_registered",
+                    {
+                        "pending_id": result.pending_entry.pending_id,
+                        "entry_id": ctx.entry_id,
+                        "position_id": result.pending_entry.pending_id,
+                        "symbol": result.pending_entry.symbol,
+                        "long_venue": result.pending_entry.long_venue.value,
+                        "short_venue": result.pending_entry.short_venue.value,
+                        "maker_client_order_id": result.pending_entry.maker_client_order_id,
+                        "hedge_client_order_id": result.pending_entry.hedge_client_order_id,
+                        "pending_entry": pending_snapshot,
+                        "persistence_schema": "engine_state.pending_entry.v1",
+                    },
+                )
                 self.ctx.journal.append(
                     "runtime.pending_entry_registered",
                     {
@@ -1485,6 +1573,38 @@ class EntryDispatchRuntime:
                         "first_funding_leg": result.pending_entry.first_funding_leg,
                     },
                 )
+            if (
+                result.open_position is None
+                and result.pending_entry is None
+                and result.route != ExecutionRoute.REJECTED
+            ):
+                # No local successor means the exchange outcome is not proven.
+                # Keep the pre-submit claim so restart recovery can reconcile the
+                # deterministic CIDs instead of classifying either leg as orphan.
+                self.ctx.journal.append_critical(
+                    now_ms,
+                    "runtime.entry_owner_handoff_incomplete",
+                    {
+                        "entry_id": ctx.entry_id,
+                        "symbol": candidate.symbol,
+                        "route": result.route.value,
+                        "state": result.state.value,
+                        "maker_client_order_id": maker_client_order_id,
+                        "hedge_client_order_id": hedge_client_order_id,
+                        "reason": "executor_completed_without_local_recovery_owner",
+                    },
+                )
+                return True
+            destination = (
+                "open_position" if result.open_position is not None
+                else "pending_entry" if result.pending_entry is not None
+                else "rejected"
+            )
+            self._complete_entry_owner_handoff(
+                now_ms=now_ms,
+                entry_id=ctx.entry_id,
+                destination=destination,
+            )
         except Exception as e:
             error_text = str(e)
             if self._entry_reject_is_post_only_would_take(error_text):
@@ -1506,6 +1626,13 @@ class EntryDispatchRuntime:
             self.ctx.journal.append(
                 "runtime.entry_dispatch_error",
                 {"entry_id": ctx.entry_id, "error": error_text},
+            )
+            self.ctx.journal.append(
+                "runtime.entry_owner_claim_retained",
+                {
+                    "entry_id": ctx.entry_id,
+                    "reason": "entry_executor_exception_outcome_uncertain",
+                },
             )
             return False
 

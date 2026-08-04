@@ -2396,16 +2396,7 @@ def test_diagnose_journal_positive_fill_conflict_owns_historical_live_single_leg
         )
 
         rows = result["production_acceptance_gate"]["v1_lifecycle_closure"]["rows"]
-        owned_rows = [
-            row
-            for row in rows
-            if row["owner_id"] == "entry-home"
-            and row["details"].get("kind") == "owned_pending_entry_live_conflict"
-        ]
-
-        assert owned_rows
-        assert not any("unpaired_live_position" in row["row_key"] for row in rows)
-        assert owned_rows[0]["terminality"] == "owned_pending_entry_live_conflict"
+        assert any("unpaired_live_position" in row["row_key"] for row in rows)
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

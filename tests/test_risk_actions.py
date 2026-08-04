@@ -165,6 +165,22 @@ class TestEvaluateVenueHealth:
         view = evaluate_venue_health(strategy, Venue.OKX, 1000, True, snap)
         assert view.action == VenueHealthAction.PAUSE_ENTRY
 
+    def test_verified_zero_maintenance_snapshot_is_normal(self):
+        strategy = _strategy(unsupported_risk_snapshot_behavior="death_line")
+        snap = AccountRiskSnapshot(
+            venue=Venue.BYBIT,
+            equity_quote=100.0,
+            maintenance_margin_quote=0.0,
+            health_ratio=0.0,
+            observed_at_ms=1000,
+            source="bybit_isolated_flat_position_truth",
+            zero_maintenance_is_normal=True,
+        )
+        view = evaluate_venue_health(strategy, Venue.BYBIT, 1000, True, snap)
+        assert snap.supported is True
+        assert view.action == VenueHealthAction.NORMAL
+        assert view.degraded is False
+
     def test_high_order_health_risk_forces_reduce_only(self):
         strategy = _strategy()
         snap = _snapshot(Venue.BINANCE, 500.0, 100.0, 10000)

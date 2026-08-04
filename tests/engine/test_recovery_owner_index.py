@@ -222,7 +222,7 @@ def test_terminal_journal_event_keeps_submitted_order_owner_fact():
     assert owner.confidence == "probable"
 
 
-def test_positive_fill_live_conflict_journal_owns_matching_live_position():
+def test_positive_fill_journal_without_per_leg_venue_does_not_claim_live_position():
     index = RecoveryOwnerIndex.from_state_and_journal(
         {"pending_entries": [], "open_positions": []},
         [
@@ -252,10 +252,263 @@ def test_positive_fill_live_conflict_journal_owns_matching_live_position():
         )
     )
 
-    assert owner.owner_type == "journal_pending_entry"
-    assert owner.owner_id == "entry-home"
+    assert owner.owner_type == "exchange_position"
+    assert owner.confidence == "orphan"
+
+
+def test_unhanded_entry_submission_claim_owns_matching_live_position():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [{
+            "kind": "runtime.entry_owner_claimed",
+            "payload": {
+                "entry_id": "entry-handoff",
+                "symbol": "HOMEUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "long_side": "buy",
+                "short_side": "sell",
+                "long_quantity": 1600.0,
+                "short_quantity": 1600.0,
+            },
+        }],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "journal_entry_submission"
+    assert owner.owner_id == "entry-handoff"
     assert owner.confidence == "probable"
-    assert owner.evidence["position_scope"] == "journal_positive_fill_live_conflict"
+    assert owner.evidence["position_scope"] == "journal_entry_submission"
+
+
+def test_short_maker_claim_uses_canonical_long_buy_short_sell_positions():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [{
+            "kind": "runtime.entry_owner_claimed",
+            "payload": {
+                "entry_id": "entry-short-maker",
+                "symbol": "HOMEUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+                "long_side": "buy",
+                "short_side": "sell",
+                "long_quantity": 1600.0,
+                "short_quantity": 1600.0,
+            },
+        }],
+    )
+
+    long_owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="okx",
+            symbol="HOMEUSDT",
+            side="buy",
+            quantity=1600.0,
+        )
+    )
+    short_owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert long_owner.owner_type == "journal_entry_submission"
+    assert short_owner.owner_type == "journal_entry_submission"
+
+
+def test_pending_handoff_without_durable_successor_keeps_pre_submit_claim():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "runtime.entry_owner_claimed",
+                "payload": {
+                    "entry_id": "entry-crash-window",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "long_quantity": 1600.0,
+                    "short_quantity": 1600.0,
+                },
+            },
+            {
+                "kind": "runtime.entry_owner_handoff_complete",
+                "payload": {
+                    "entry_id": "entry-crash-window",
+                    "owner_destination": "pending_entry",
+                },
+            },
+        ],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "journal_entry_submission"
+
+
+def test_pending_handoff_with_durable_successor_retires_pre_submit_claim():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "runtime.entry_owner_claimed",
+                "payload": {
+                    "entry_id": "entry-complete-pending",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "long_quantity": 1600.0,
+                    "short_quantity": 1600.0,
+                },
+            },
+            {
+                "kind": "entry.pending_registered",
+                "payload": {
+                    "entry_id": "entry-complete-pending",
+                    "pending_id": "entry-complete-pending",
+                    "symbol": "HOMEUSDT",
+                },
+            },
+            {
+                "kind": "runtime.entry_owner_handoff_complete",
+                "payload": {
+                    "entry_id": "entry-complete-pending",
+                    "owner_destination": "pending_entry",
+                },
+            },
+        ],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.confidence == "orphan"
+
+
+def test_unhanded_entry_submission_claim_owns_both_deterministic_leg_cids():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [{
+            "kind": "runtime.entry_owner_claimed",
+            "payload": {
+                "entry_id": "entry-cids",
+                "symbol": "HOMEUSDT",
+                "maker_client_order_id": "maker-cid",
+                "hedge_client_order_id": "hedge-cid",
+            },
+        }],
+    )
+
+    for client_order_id in ("maker-cid", "hedge-cid"):
+        owner = index.owner_for_order(
+            ExchangeArtifact(kind="order", client_order_id=client_order_id)
+        )
+        assert owner.owner_type == "journal_entry_submission"
+        assert owner.owner_id == "entry-cids"
+
+
+def test_entry_submission_claim_does_not_own_same_symbol_position_on_other_venue():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [{
+            "kind": "runtime.entry_owner_claimed",
+            "payload": {
+                "entry_id": "entry-handoff",
+                "symbol": "HOMEUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "long_side": "buy",
+                "short_side": "sell",
+                "long_quantity": 1600.0,
+                "short_quantity": 1600.0,
+            },
+        }],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="okx",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "exchange_position"
+    assert owner.confidence == "orphan"
+
+
+def test_completed_entry_submission_claim_does_not_mask_an_orphan_position():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [
+            {
+                "kind": "runtime.entry_owner_claimed",
+                "payload": {
+                    "entry_id": "entry-complete",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "long_side": "buy",
+                    "short_side": "sell",
+                    "long_quantity": 1600.0,
+                    "short_quantity": 1600.0,
+                },
+            },
+            {
+                "kind": "runtime.entry_owner_handoff_complete",
+                "payload": {"entry_id": "entry-complete"},
+            },
+        ],
+    )
+
+    owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="HOMEUSDT",
+            side="sell",
+            quantity=1600.0,
+        )
+    )
+
+    assert owner.owner_type == "exchange_position"
+    assert owner.confidence == "orphan"
 
 
 def test_positive_fill_live_conflict_journal_does_not_own_mismatched_position():

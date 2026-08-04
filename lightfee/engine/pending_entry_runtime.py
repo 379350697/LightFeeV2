@@ -110,7 +110,12 @@ class PendingEntryRuntime:
                 self.ctx._apply_reconcile_backoff(pending, now_ms)
                 continue
 
-            if not pending.uncertain_outcome:
+            # Submit certainty is not terminality.  Confirmed positive maker
+            # or hedge fills must still reconcile exchange truth and run the
+            # shared finalizer; otherwise a restart can erase a real paired
+            # position before ``entry.opened`` is recorded.  Only known
+            # zero-fill work may bypass that path.
+            if not pending.uncertain_outcome and not pending.has_any_fill():
                 resolved_entry_ids.append(entry_id)
                 continue
 

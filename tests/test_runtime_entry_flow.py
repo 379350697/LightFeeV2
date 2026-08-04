@@ -1649,6 +1649,46 @@ class TestPlannerDispatchIntegration:
         assert pending.passive_manager_runtime.consecutive_failures == 0
 
     @pytest.mark.asyncio
+    async def test_short_maker_dispatch_keeps_direction_and_durable_pending_successor(
+        self, config, tmp_journal
+    ):
+        config.strategy.maker_leg_default = "sell"
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
+        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
+        runtime = LiveRuntime(config, venue_adapters=adapters)
+        runtime.journal = tmp_journal
+        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
+
+        assert await runtime._dispatch_entry(
+            self._candidate(), 5_000, price_hint=50_000.0
+        ) is True
+
+        pending = next(iter(runtime.state.pending_entries.values()))
+        assert pending.long_side is Side.BUY
+        assert pending.short_side is Side.SELL
+        assert pending.maker_venue() is Venue.OKX
+        assert pending.hedge_venue() is Venue.BINANCE
+        records = runtime.journal.read_all()
+        claim = [
+            record["payload"] for record in records
+            if record["kind"] == "runtime.entry_owner_claimed"
+        ][-1]
+        assert claim["long_side"] == "buy"
+        assert claim["short_side"] == "sell"
+        registered = [
+            record["payload"] for record in records
+            if record["kind"] == "entry.pending_registered"
+        ][-1]
+        assert registered["pending_entry"]["long_side"] == "buy"
+        assert registered["pending_entry"]["short_side"] == "sell"
+        handoff = [
+            record["payload"] for record in records
+            if record["kind"] == "runtime.entry_owner_handoff_complete"
+        ][-1]
+        assert handoff["owner_destination"] == "pending_entry"
+
+    @pytest.mark.asyncio
     async def test_final_gate_blocks_fresh_bbo_with_excessive_leg_skew(
         self, config, tmp_journal,
     ):

@@ -2437,6 +2437,154 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         ]
 
     @pytest.mark.asyncio
+    async def test_accepted_zero_fill_retains_inflight_owner_for_reconciliation(self, tmp_path):
+        runtime = _make_open_runtime(
+            tmp_path,
+            passive_small_fill_buffer_notional_quote=1.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            price=0.0,
+            order_id="",
+            client_order_id="bybit-accepted-zero-fill-cid",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(2.0, 40.0, 1_100),
+            ],
+        )
+
+        driven = await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2_000)
+
+        assert driven is False
+        assert pending.hedge_inflight is not None
+        assert pending.hedge_order_id == ""
+        assert pending.hedge_client_order_id == "bybit-accepted-zero-fill-cid"
+        assert pending.outcome == "hedge_accepted_fill_unconfirmed"
+        assert pending.uncertain_outcome is True
+        assert len(hedge_adapter._place_order_calls) == 1
+        assert (await runtime._drive_missing_hedge_live(pending, pending.pending_id, 2_001)) is False
+        assert len(hedge_adapter._place_order_calls) == 1
+        result = [
+            event["payload"] for event in runtime.journal.read_all()
+            if event["kind"] == "pending_entry.hedge_submit_result"
+        ][-1]
+        assert result["outcome"] == "accepted_fill_unconfirmed"
+        assert result["requires_reconciliation"] is True
+
+    @pytest.mark.asyncio
+    async def test_accepted_zero_fill_owner_survives_restart_replay(self, tmp_path):
+        """A crash after zero-fill acknowledgement must not issue hedge #2."""
+        from lightfee.engine.recovery import recover_from_snapshot
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        runtime = _make_open_runtime(
+            tmp_path,
+            passive_small_fill_buffer_notional_quote=1.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            price=0.0,
+            order_id="zero-fill-order",
+            client_order_id="zero-fill-cid",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-zero-fill-restart",
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(2.0, 40.0, 1_100),
+            ],
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+        snapshot = SnapshotStore(tmp_path / "before-zero-fill.json")
+        snapshot.write(runtime.state.to_dict())
+
+        assert await runtime._drive_missing_hedge_live(
+            pending, pending.pending_id, 2_000
+        ) is False
+        assert len(hedge_adapter._place_order_calls) == 1
+
+        recovered = recover_from_snapshot(snapshot, runtime.journal)
+        recovered_pending = recovered.pending_entries[pending.pending_id]
+        assert recovered_pending.hedge_inflight is not None
+        # The original submitted CID remains the reconciliation owner even
+        # when a venue reply supplies a different client-id representation.
+        attempt = [
+            event["payload"] for event in runtime.journal.read_all()
+            if event["kind"] == "pending_entry.hedge_submit_attempt"
+        ][-1]
+        assert recovered_pending.hedge_inflight.client_order_id == attempt[
+            "hedge_client_order_id"
+        ]
+        assert recovered_pending.hedge_client_order_id == "zero-fill-cid"
+        assert recovered_pending.hedge_inflight.venue == Venue.BYBIT
+        assert recovered_pending.hedge_inflight.side == Side.SELL
+        assert recovered_pending.uncertain_outcome is True
+        assert recovered_pending.outcome == "hedge_accepted_fill_unconfirmed"
+
+    @pytest.mark.asyncio
+    async def test_startup_zero_fill_retains_inflight_owner_for_reconciliation(
+        self, tmp_path
+    ):
+        """Startup recovery must use the same zero-fill ownership transition."""
+        runtime = _make_open_runtime(
+            tmp_path,
+            passive_small_fill_buffer_notional_quote=1.0,
+        )
+        hedge_adapter = _CountingVenueAdapter(Venue.BYBIT)
+        hedge_adapter.place_order_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            price=0.0,
+            order_id="recovery-zero-fill-order",
+            client_order_id="recovery-zero-fill-cid",
+        )
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = _make_pending_entry_for_hedge_delta(
+            pending_id="entry-recovery-zero-fill",
+            maker_leg_filled=2.0,
+            target_quantity=2.0,
+            maker_remainder_slices=[
+                PendingEntryRemainderSlice(2.0, 40.0, 1_100),
+            ],
+        )
+
+        driven = await runtime._recover_drive_missing_hedge(
+            pending, "startup_recovery"
+        )
+
+        assert driven is False
+        assert pending.hedge_inflight is not None
+        assert pending.hedge_order_id == "recovery-zero-fill-order"
+        assert pending.hedge_client_order_id == "recovery-zero-fill-cid"
+        assert pending.outcome == "hedge_accepted_fill_unconfirmed"
+        assert pending.uncertain_outcome is True
+        assert len(hedge_adapter._place_order_calls) == 1
+        assert await runtime._recover_drive_missing_hedge(pending, "startup_recovery") is False
+        assert len(hedge_adapter._place_order_calls) == 1
+        result = [
+            event["payload"] for event in runtime.journal.read_all()
+            if event["kind"] == "pending_entry.hedge_submit_result"
+        ][-1]
+        assert result["source"] == "startup_recovery"
+        assert result["requires_reconciliation"] is True
+
+    @pytest.mark.asyncio
     async def test_startup_recovery_and_normal_tick_share_small_fill_decision(
         self,
         tmp_path,
@@ -2819,8 +2967,8 @@ class TestRealPathAbortCleanupDeadline:
         assert "pending_entry.hedge_non_retryable_auth_signing_failure" in kinds
 
     @pytest.mark.asyncio
-    async def test_missing_hedge_retries_use_attempt_scoped_client_ids(self, tmp_path):
-        """V1 seeds each hedge retry with the incremented hedge attempt."""
+    async def test_missing_hedge_zero_ack_waits_for_client_id_reconciliation(self, tmp_path):
+        """A zero-fill response remains ambiguous while its request CID exists."""
 
         runtime = _make_open_runtime(tmp_path)
         hedge_adapter = _FakeVenueAdapter(Venue.ASTER)
@@ -2852,14 +3000,14 @@ class TestRealPathAbortCleanupDeadline:
 
         assert first is False
         assert second is False
-        assert pending.hedge_attempt_count == 2
-        assert first_cid != second_cid
+        assert pending.hedge_attempt_count == 1
+        assert first_cid == second_cid
         assert [
             call.client_order_id for call in hedge_adapter._place_order_calls
-        ] == [first_cid, second_cid]
+        ] == [first_cid]
         assert [
             call.time_in_force for call in hedge_adapter._place_order_calls
-        ] == [TimeInForce.IOC, TimeInForce.IOC]
+        ] == [TimeInForce.IOC]
 
     @pytest.mark.asyncio
     async def test_flat_reconcile_retains_uncertain_maker_order(self, tmp_path):
