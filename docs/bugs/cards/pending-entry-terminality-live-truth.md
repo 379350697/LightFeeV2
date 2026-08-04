@@ -230,7 +230,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 
 | Date | Attempt | Status | Why |
 |---|---|---|---|
-| 2026-08-04 | Gate startup and normal direct removal on known zero fill | effective locally | `uncertain_outcome=false` had been treated as terminal even after replayed positive maker/hedge fill. Both paths now send every positive fill through existing exchange reconciliation and V1 finalization/residual ownership. Deployment and cloud truth verification remain pending. |
+| 2026-08-04 | Gate startup and normal direct removal on known zero fill | deployed; cloud health verified | `uncertain_outcome=false` had been treated as terminal even after replayed positive maker/hedge fill. Both paths now send every positive fill through existing exchange reconciliation and V1 finalization/residual ownership. Commit `3c42aea` is deployed; all-venue current truth is clean, while a fresh replay-fill production trigger remains watch-only evidence. |
 | 2026-05-17 | Pending hedge inflight metadata / deadline / cleanup parity | effective locally | Fixed direct-pop and cleanup semantics but later live truth exposed additional false-flat cases. |
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
 | 2026-05-27 | PRL balanced live-position hydration | effective | Closed quantity-without-price/order evidence gap; pending finalized by V1 quantity+price semantics. |
@@ -264,7 +264,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 
 | Date | Symbols / Venues | Commit / Fix | Result | Detail |
 |---|---|---|---|---|
-| 2026-08-04 | synthetic `HOMEUSDT` OKX/Bybit confirmed replay fill | working tree | local green; deploy pending | [CL-093 confirmed replay fill ownership](../daily/2026-08-04.md#cluster-cl-093-confirmed-replay-fill-owner-terminalization) |
+| 2026-08-04 | synthetic `HOMEUSDT` OKX/Bybit confirmed replay fill | `3c42aea` | deployed; cloud health green; behavior watch | [CL-093 confirmed replay fill ownership](../daily/2026-08-04.md#cluster-cl-093-confirmed-replay-fill-owner-terminalization) |
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-06-01 | `ARIAUSDT` Bybit/Binance | `f1727c1`; cloud verified | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable; second deploy converted pending to open and flattened excess, then exposed drift-correction false-negative latching; final deploy reached running/flat/no-open-orders | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
