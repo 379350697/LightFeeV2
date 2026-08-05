@@ -147,6 +147,7 @@ def _mock_adapter_with_tick(venue=Venue.BINANCE, tick=0.01):
     adapter.price_tick_size = lambda symbol=None, _tick=tick: _tick
     adapter.normalize_quantity = AsyncMock(side_effect=lambda symbol, quantity: quantity)
     adapter.query_passive_order_progress = AsyncMock(return_value=None)
+    adapter.fetch_open_orders = AsyncMock(return_value=[])
     return adapter
 
 
@@ -5377,6 +5378,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
                 quantity=0.0, entry_price=0.0, observed_at_ms=3000,
             ))
             adapter.place_order = AsyncMock()
+            adapter.fetch_open_orders = AsyncMock(return_value=[])
         long_adapter.submit_passive_order = AsyncMock()
         short_adapter.submit_passive_order = AsyncMock()
 

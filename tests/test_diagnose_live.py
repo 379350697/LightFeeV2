@@ -1579,6 +1579,106 @@ def test_run_diagnose_weak_order_truth_resolution_does_not_green(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_warns_on_persistent_billing_unreconciled(monkeypatch):
+    """A persistent exit.billing_unreconciled with no terminal successor must
+    not be concluded healthy."""
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_passive_closes": [],
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 1780657210000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1780657201000,
+                "kind": "exit.billing_unreconciled",
+                "payload": {
+                    "position_id": "entry-home-unreconciled-a",
+                    "symbol": "HOMEUSDT",
+                    "close_quantity_evidence_complete": False,
+                    "venue_statement_reconciled": False,
+                },
+            },
+            {
+                "ts_ms": 1780657202000,
+                "kind": "exit.billing_unreconciled",
+                "payload": {
+                    "position_id": "entry-home-unreconciled-b",
+                    "symbol": "HOMEUSDT",
+                    "close_quantity_evidence_complete": False,
+                    "venue_statement_reconciled": False,
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HOMEUSDT",
+            venues=["bybit"],
+            now_ms=1780657215000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["unresolved_billing_unreconciled_count"] == 2
+        assert "billing_unreconciled_unresolved" in gate["blocking_reasons"]
+        assert "unresolved_billing_unreconciled" in result["health"]["fingerprints"]
+        assert result["conclusion"]["status"] != "healthy"
+
+        # A terminal successor clears the warning.
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1780657201000,
+                "kind": "exit.billing_unreconciled",
+                "payload": {
+                    "position_id": "entry-home-unreconciled-a",
+                    "symbol": "HOMEUSDT",
+                    "close_quantity_evidence_complete": False,
+                    "venue_statement_reconciled": False,
+                },
+            },
+            {
+                "ts_ms": 1780657202000,
+                "kind": "exit.billing_evidence_unavailable",
+                "payload": {
+                    "position_id": "entry-home-unreconciled-a",
+                    "symbol": "HOMEUSDT",
+                    "terminal_reason": (
+                        "terminal_live_flat_incomplete_close_quantity_evidence"
+                    ),
+                    "close_quantity_evidence_complete": False,
+                    "net_quote_status": "provisional",
+                },
+            },
+        ])
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="HOMEUSDT",
+            venues=["bybit"],
+            now_ms=1780657215000,
+        )
+        gate = result["production_acceptance_gate"]
+        assert gate["unresolved_billing_unreconciled_count"] == 0
+        assert "billing_unreconciled_unresolved" not in gate["blocking_reasons"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_diagnose_resolves_moveusdt_ack_only_duplicate_after_terminal_flat(monkeypatch):
     from scripts import diagnose_live as dl
 

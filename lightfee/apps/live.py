@@ -302,6 +302,10 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
+    # Never let httpx/httpcore write full private request URLs (signed query
+    # params) into journald at INFO.  See configure_http_client_logging.
+    from lightfee.venues.transport import configure_http_client_logging
+    configure_http_client_logging()
 
     parser = argparse.ArgumentParser(description="lightfee-live: Live trading process")
     parser.add_argument(

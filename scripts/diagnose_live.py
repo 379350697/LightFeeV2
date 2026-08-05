@@ -45,7 +45,7 @@ from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
 
 # Schema version — bump when output shape changes
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # Default paths (production-correct)
@@ -3508,6 +3508,8 @@ def _build_production_acceptance_gate(
     position_opened_count = 0
     residual_count = 0
     exception_conclusions: dict[str, str] = {}
+    terminal_close_position_ids: set[str] = set()
+    billing_unreconciled_events: list[dict[str, Any]] = []
     runtime_progress = _runtime_progress_from_state(local_state)
     runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
     ws_bbo_effective_mode = (
@@ -3701,8 +3703,31 @@ def _build_production_acceptance_gate(
             position_opened_count += 1
             exception_conclusions["position_opened"] = "insufficient_evidence"
 
+        elif kind in {
+            "exit.closed",
+            "exit.reconciled",
+            "exit.billing_evidence_unavailable",
+            "recovery.flat",
+            "runtime.position_lifecycle_terminal",
+        }:
+            pid = str(payload.get("position_id") or "")
+            if pid:
+                terminal_close_position_ids.add(pid)
+        elif kind == "exit.billing_unreconciled":
+            billing_unreconciled_events.append(rec)
+
         if "residual" in kind or "residual" in reason:
             residual_count += 1
+
+    unresolved_billing_unreconciled_position_ids: set[str] = set()
+    for rec in billing_unreconciled_events:
+        payload = _payload_dict(rec)
+        pid = str(payload.get("position_id") or "")
+        if pid and pid not in terminal_close_position_ids:
+            unresolved_billing_unreconciled_position_ids.add(pid)
+    unresolved_billing_unreconciled_count = len(
+        unresolved_billing_unreconciled_position_ids
+    )
 
     passive_maker_fill_rate = (
         sum(fill_ratios) / len(fill_ratios)
@@ -3898,6 +3923,9 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("local_l2_residual_runtime_enabled")
     if unresolved_order_truth_gap_count:
         blocking_reasons.append("order_truth_gap_unresolved")
+    if unresolved_billing_unreconciled_count:
+        blocking_reasons.append("billing_unreconciled_unresolved")
+        fingerprints.append("unresolved_billing_unreconciled")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -3988,6 +4016,7 @@ def _build_production_acceptance_gate(
         "hyperliquid_balance_view_advice": hyperliquid_balance_view_advice,
         "resolved_order_truth_gap_count": resolved_order_truth_gap_count,
         "unresolved_order_truth_gap_count": unresolved_order_truth_gap_count,
+        "unresolved_billing_unreconciled_count": unresolved_billing_unreconciled_count,
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "required_position_truth_unavailable_count": (
             required_position_truth_unavailable_count

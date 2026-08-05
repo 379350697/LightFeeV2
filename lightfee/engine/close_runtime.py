@@ -410,6 +410,63 @@ class CloseRuntime:
         )
         return True
 
+    async def _probe_venue_open_order_flat(
+        self,
+        venue: Venue,
+        symbol: str,
+    ) -> tuple[bool | None, str | None]:
+        """Return (flat_or_None, evidence) for a venue's open-order truth.
+
+        (True, None) — trusted flat; (False, evidence) — trusted non-flat;
+        (None, error) — truth query failed or unsupported (untrusted).  Uses the
+        shared strict probe so an unknown/empty response is never treated as
+        proven flat.
+        """
+        adapter = self.ctx.venue_adapters.get(venue)
+        if adapter is None:
+            return None, "adapter_missing"
+        from lightfee.engine.exchange_truth import probe_venue_open_orders_flat
+
+        return await probe_venue_open_orders_flat(adapter, venue, symbol)
+
+    async def _fetch_pending_close_terminal_live_flat_truth(
+        self,
+        *,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> tuple[tuple[float, float] | None, str | None]:
+        """Probe both venues' position + open-order truth for a pending close.
+
+        Returns ((long_size, short_size), open_order_evidence) when both
+        position probes succeed; None if any position probe fails.  Open-order
+        truth is separately reported: None evidence when both venues report
+        trusted flat, or a string describing the blocker otherwise.
+        """
+        terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+        )
+        if terminal_sizes is None:
+            return None, None
+        long_oo_flat, long_oo_evidence = await self._probe_venue_open_order_flat(
+            long_venue, symbol
+        )
+        short_oo_flat, short_oo_evidence = await self._probe_venue_open_order_flat(
+            short_venue, symbol
+        )
+        if long_oo_flat is not True or short_oo_flat is not True:
+            evidence = (
+                long_oo_evidence
+                if long_oo_flat is not True
+                else short_oo_evidence
+            )
+            if evidence is None:
+                evidence = "open_orders_flat"
+            return terminal_sizes, evidence
+        return terminal_sizes, None
+
     async def _try_terminalize_billing_evidence_gap(
         self,
         reconciliation: dict[str, Any],
@@ -425,11 +482,12 @@ class CloseRuntime:
         A legacy close snapshot may have no durable entry-fee provenance.  Retrying
         its close fills cannot manufacture that evidence, so this is not a retryable
         transport failure.  It is only terminal after both exchange legs are proved
-        flat; the resulting event deliberately remains financially provisional.
+        flat, including open-order truth; the resulting event deliberately remains
+        financially provisional.  The close-quantity-incomplete branch (one leg has
+        no close fill quantity) is provisional exactly like a missing entry fee:
+        exchange truth can prove flatness but cannot manufacture a PnL fact.
         """
         if str(reconciliation.get("kind") or "final") != "final":
-            return False
-        if payload.get("close_quantity_evidence_complete") is not True:
             return False
         position_id = str(reconciliation.get("position_id") or "")
         if any(
@@ -437,27 +495,70 @@ class CloseRuntime:
             for position in self.ctx.state.open_positions.values()
         ):
             return False
-        terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
-            symbol=symbol,
-            long_venue=long_venue,
-            short_venue=short_venue,
+        terminal_sizes, open_order_evidence = (
+            await self._fetch_pending_close_terminal_live_flat_truth(
+                symbol=symbol,
+                long_venue=long_venue,
+                short_venue=short_venue,
+            )
         )
         if terminal_sizes is None:
             return False
         long_live_size, short_live_size = terminal_sizes
         if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
             return False
+        if open_order_evidence is not None:
+            return False
+
+        close_quantity_evidence_complete = (
+            payload.get("close_quantity_evidence_complete") is True
+        )
+        if close_quantity_evidence_complete:
+            terminal_reason = (
+                "entry_fee_evidence_unavailable_after_confirmed_flat_close"
+            )
+            terminal_accounting_status = (
+                "provisional_entry_fee_evidence_unavailable"
+            )
+            terminal_payload = dict(payload)
+        else:
+            terminal_reason = (
+                "terminal_live_flat_incomplete_close_quantity_evidence"
+            )
+            terminal_accounting_status = (
+                "provisional_close_quantity_evidence_incomplete"
+            )
+            # One leg has no close-fill evidence, so any computed price/fee/PnL
+            # would be manufactured.  Carry only known quantities and identities;
+            # never emit a guessed net_quote or realized PnL.
+            terminal_payload = {
+                key: value
+                for key, value in payload.items()
+                if key
+                not in {
+                    "net_quote",
+                    "net_quote_status",
+                    "price_pnl",
+                    "funding_pnl_quote",
+                    "entry_fee_quote",
+                    "exit_fee_quote",
+                    "long_average_price",
+                    "short_average_price",
+                }
+            }
+            terminal_payload["net_quote_status"] = "provisional"
         self.ctx.journal.append_critical(
             now_ms,
             "exit.billing_evidence_unavailable",
             {
-                **payload,
-                "terminal_accounting_status": "provisional_entry_fee_evidence_unavailable",
-                "terminal_reason": "entry_fee_evidence_unavailable_after_confirmed_flat_close",
+                **terminal_payload,
+                "terminal_accounting_status": terminal_accounting_status,
+                "terminal_reason": terminal_reason,
                 "long_venue": long_venue.value,
                 "short_venue": short_venue.value,
                 "long_live_size": long_live_size,
                 "short_live_size": short_live_size,
+                "open_order_truth_flat": open_order_evidence is None,
             },
         )
         return True

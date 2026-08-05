@@ -60,6 +60,23 @@ from lightfee.venues.specs import (
 )
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
+import logging
+
+
+# httpx/httpcore emit full request URLs (including signed query params) at INFO.
+# The root logger is configured to INFO in the app entrypoints, so without an
+# explicit override every private Aster request URL — signature, signer, nonce,
+# user — would be written to journald.  Force these libraries to WARNING so
+# they only surface genuine failures, never signed query strings.
+def configure_http_client_logging() -> None:
+    for name in ("httpx", "httpcore", "httpcore.http11", "httpcore.http2"):
+        logger = logging.getLogger(name)
+        if logger.level == logging.NOTSET or logger.level < logging.WARNING:
+            logger.setLevel(logging.WARNING)
+
+
+configure_http_client_logging()
+
 
 ASTER_DEFAULT_REMAINING_OPENABLE_LEVERAGE = 4
 OKX_POSITION_REST_CACHE_MAX_AGE_MS = 30_000

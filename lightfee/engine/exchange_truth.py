@@ -151,6 +151,97 @@ def _venue_contract_symbol(spec: Any, symbol: str) -> str:
     return symbol
 
 
+def parse_open_orders_response(
+    raw: Any,
+) -> tuple[list[Any] | None, str | None]:
+    """Strictly parse an open-orders response into a list.
+
+    Returns (orders, None) only when the response is a recognized, successfully
+    parsed open-order container.  Any unknown shape, missing field, or parse
+    failure returns (None, reason) so the caller treats the probe as untrusted —
+    an empty/None/unknown response is NOT equivalent to a proven flat.
+    """
+    if isinstance(raw, list):
+        # A bare list may itself be the order collection (Aster/Bybit style).
+        return list(raw), None
+    if not isinstance(raw, dict):
+        return None, "open_orders_response_not_mapping"
+    # Bybit /api/v5/order/realtime nests orders under result.list.
+    result = raw.get("result")
+    if isinstance(result, dict):
+        result_list = result.get("list")
+        if isinstance(result_list, list):
+            return list(result_list), None
+        if result_list is not None:
+            return None, "open_orders_response_result_list_not_list"
+        if not result:
+            return None, "open_orders_response_result_empty"
+    for key in ("data", "list", "orders"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return list(value), None
+        if value is not None and not isinstance(value, list):
+            return None, f"open_orders_response_field_not_list:{key}"
+    if not raw:
+        return None, "open_orders_response_empty"
+    return None, "open_orders_response_unrecognized_shape"
+
+
+async def probe_venue_open_orders_flat(
+    adapter: Any,
+    venue: Venue,
+    symbol: str,
+    *,
+    transport: Any = None,
+) -> tuple[bool | None, str | None]:
+    """Return (flat_or_None, evidence) for a venue's open-order truth.
+
+    (True, None) — trusted flat (recognized empty open-order list);
+    (False, evidence) — trusted non-flat (recognized non-empty list);
+    (None, error) — truth query failed, unsupported, or the response shape was
+    not a recognized open-order container.  The caller must not terminalize on
+    (None, error).
+    """
+    fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
+    if callable(fetch_open_orders):
+        try:
+            raw = await fetch_open_orders(symbol)
+        except Exception as exc:
+            return None, str(exc)
+        if isinstance(raw, dict) and raw.get("error"):
+            return None, str(raw["error"])
+        orders, reason = parse_open_orders_response(raw)
+        if orders is None:
+            return None, reason or "open_orders_untrusted"
+        if orders:
+            return False, f"open_orders_count={len(orders)}"
+        return True, None
+
+    transport = getattr(adapter, "_transport", None) if transport is None else transport
+    if transport is None or not hasattr(transport, "_request"):
+        return None, "open_orders_query_unsupported"
+    try:
+        credential = getattr(transport, "_credential", None)
+        raw, _ = await request_venue_operation(
+            transport,
+            venue,
+            VenueOperation.OPEN_ORDERS,
+            symbol=symbol,
+            account_address=str(getattr(credential, "account_address", "") or ""),
+            agent_wallet_address=str(
+                getattr(credential, "agent_wallet_address", "") or ""
+            ),
+        )
+    except Exception as exc:
+        return None, str(exc)
+    orders, reason = parse_open_orders_response(raw)
+    if orders is None:
+        return None, reason or "open_orders_untrusted"
+    if orders:
+        return False, f"open_orders_count={len(orders)}"
+    return True, None
+
+
 def _resolve_contract_param_value(
     raw_value: str,
     *,

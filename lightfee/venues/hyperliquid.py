@@ -16,7 +16,12 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.venues.specs import hyperliquid_spec
-from lightfee.venues.transport import LiveCredential, VenueTransport
+from lightfee.venues.transport import (
+    LiveCredential,
+    TransportError,
+    TransportErrorCategory,
+    VenueTransport,
+)
 
 
 class HyperliquidAdapter(VenueAdapter):
@@ -84,10 +89,19 @@ class HyperliquidAdapter(VenueAdapter):
         return await self._transport.fetch_account_balance_snapshot()
 
     async def fetch_open_orders(self, symbol: str) -> list[dict[str, Any]]:
-        """Fetch Hyperliquid open orders for the configured account."""
+        """Fetch Hyperliquid open orders for the configured account.
+
+        The raw /info openOrders response must be a recognized open-order
+        collection.  A missing account, an unrecognized shape, or a non-list
+        payload is NOT equivalent to "no open orders": it raises so the caller
+        keeps the close pending instead of treating unknown truth as proven flat.
+        """
         cred = self._credential
         if cred is None or not cred.account_address:
-            return []
+            raise TransportError(
+                TransportErrorCategory.AUTH_FAILURE,
+                "hyperliquid open orders require account_address",
+            )
 
         raw = await self._transport._request(
             "POST",
@@ -97,9 +111,17 @@ class HyperliquidAdapter(VenueAdapter):
         )
         rows: Any = raw
         if isinstance(raw, dict):
-            rows = raw.get("openOrders", raw.get("orders", raw.get("data", [])))
+            for key in ("openOrders", "orders", "data"):
+                if key in raw:
+                    rows = raw[key]
+                    break
         if not isinstance(rows, list):
-            return []
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                "hyperliquid openOrders response not a list",
+                status_code=0,
+                body=str(raw)[:500] if raw is not None else "",
+            )
 
         venue_symbol = self._transport._venue_symbol(symbol).upper()
         canonical_symbol = symbol.upper()

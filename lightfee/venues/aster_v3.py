@@ -121,6 +121,12 @@ def _microsecond_nonce() -> int:
     return int(time.time() * 1_000_000)
 
 
+def _body_is_invalid_symbol(body: str) -> bool:
+    """Return True if an Aster response body is a -1121 Invalid symbol."""
+    text = str(body or "").lower()
+    return "-1121" in text or "invalid symbol" in text
+
+
 def _extract_rows(raw: Any) -> list[dict[str, Any]]:
     if isinstance(raw, list):
         return [row for row in raw if isinstance(row, dict)]
@@ -366,25 +372,33 @@ class AsterV3Client:
                 if response.status_code in (401, 403)
                 else TransportErrorCategory.REQUEST_REJECTED
             )
-            raise TransportError(
+            exc = TransportError(
                 category,
                 f"aster_v3 {method_upper} {path} rejected status={response.status_code}",
                 status_code=response.status_code,
                 body=text,
                 headers=dict(response.headers),
             )
+            if _body_is_invalid_symbol(text):
+                exc.invalid_symbol = True
+                exc.invalid_symbol_body = exc.body
+            raise exc
         try:
             raw = response.json()
         except ValueError:
             raw = {}
         if isinstance(raw, dict) and str(raw.get("code", "0")) not in ("0", "200"):
-            raise TransportError(
+            exc = TransportError(
                 TransportErrorCategory.REQUEST_REJECTED,
                 f"aster_v3 {method_upper} {path} rejected code={raw.get('code')} msg={raw.get('msg', '')}",
                 status_code=response.status_code,
                 body=json.dumps(raw, ensure_ascii=False),
                 headers=dict(response.headers),
             )
+            if str(raw.get("code", "")) == "-1121":
+                exc.invalid_symbol = True
+                exc.invalid_symbol_body = exc.body
+            raise exc
         self._record_success_response(scopes)
         return raw
 
@@ -652,7 +666,15 @@ class AsterV3Client:
             return None
         try:
             raw = await self._request("GET", ASTER_V3_ORDER_PATH, params=params)
-        except TransportError:
+        except TransportError as exc:
+            if getattr(exc, "invalid_symbol", False):
+                # A -1121 here is proof the symbol is no longer tradable; the
+                # caller must mark it unsupported and fail closed rather than
+                # treat the missing progress as a benign retry signal.
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    f"aster_v3 query invalid symbol: {exc}",
+                ) from exc
             return None
         rows = _extract_rows(raw)
         data = rows[0] if rows else raw if isinstance(raw, dict) else {}

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import io
 import json
+import logging
 import os
 import time
 from typing import Any
@@ -6764,6 +6766,363 @@ class TestAsterAdapterSymbolCatalog:
 
         assert adapter.supported_symbols() == ["BTCUSDT"]
 
+    @pytest.mark.asyncio
+    async def test_ensure_supported_symbols_loaded_refreshes_after_ttl(self):
+        """Aster directory must not be permanently valid after one load."""
+        from lightfee.venues.aster import (
+            AsterAdapter,
+            _ASTER_EXCHANGE_INFO_TTL_MS,
+        )
+
+        adapter = AsterAdapter(mode="paper")
+        requests = []
+
+        async def mock_request(method, path, **kwargs):
+            requests.append((path, dict(kwargs)))
+            return {
+                "symbols": [
+                    {"symbol": "BTCUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                    {"symbol": "COTIUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                ]
+            }
+
+        adapter._transport._request = mock_request
+        await adapter.ensure_supported_symbols_loaded()
+        assert "COTIUSDT" in adapter.supported_symbols()
+        assert len(requests) == 1
+
+        # Second load within TTL must not hit exchangeInfo again.
+        adapter._symbol_metadata_loaded_at_ms = (
+            int(time.time() * 1000) - _ASTER_EXCHANGE_INFO_TTL_MS - 1
+        )
+        await adapter.ensure_supported_symbols_loaded()
+        assert len(requests) == 2
+
+    @pytest.mark.asyncio
+    async def test_aster_1121_marks_symbol_unsupported_and_drops_from_catalog(self):
+        """A -1121 Invalid symbol on a private request must invalidate the local
+        catalog entry immediately and never be treated as a flat position."""
+        from lightfee.venues.aster import AsterAdapter
+
+        adapter = AsterAdapter(mode="paper")
+        adapter._transport.set_symbol_metadata({
+            "COTIUSDT": {"symbol": "COTIUSDT", "status": "TRADING"},
+            "HOMEUSDT": {"symbol": "HOMEUSDT", "status": "TRADING"},
+        })
+
+        async def mock_request(method, path, **kwargs):
+            return {
+                "symbols": [
+                    {"symbol": "COTIUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                    {"symbol": "HOMEUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                ]
+            }
+
+        adapter._transport._request = mock_request
+        await adapter.ensure_supported_symbols_loaded()
+        assert "COTIUSDT" in adapter.supported_symbols()
+        assert "HOMEUSDT" in adapter.supported_symbols()
+
+        adapter.mark_symbol_unsupported(
+            "COTIUSDT",
+            endpoint="/fapi/v3/positionRisk",
+            exchange_code="-1121",
+        )
+
+        assert "COTIUSDT" not in adapter.supported_symbols()
+        assert "HOMEUSDT" in adapter.supported_symbols()
+        diagnostics = adapter._transport.order_diagnostics
+        assert any(
+            event.get("kind") == "venues.aster.unsupported_symbol"
+            and event["payload"].get("symbol") == "COTIUSDT"
+            and event["payload"].get("exchange_code") == "-1121"
+            for event in diagnostics
+        )
+
+    @pytest.mark.asyncio
+    async def test_aster_unsupported_symbol_never_flat_until_account_truth(self):
+        """-1121 must not be consumed as flat; only a successful full-account
+        truth probe that excludes the symbol can prove flat."""
+        import tempfile
+        from pathlib import Path
+
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.engine.passive_close import PassiveCloseExecutor
+        from lightfee.persistence.journal import Journal
+
+        adapter = AsterAdapter(mode="paper")
+        adapter._mode = "live"
+        adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
+
+        async def mock_request(method, path, **kwargs):
+            return {
+                "symbols": [
+                    {"symbol": "COTIUSDT", "status": "TRADING", "contractType": "PERPETUAL"},
+                ]
+            }
+
+        adapter._transport._request = mock_request
+        await adapter.ensure_supported_symbols_loaded()
+
+        d = tempfile.mkdtemp()
+        journal = Journal(Path(d) / "test.log")
+        journal.open()
+        executor = PassiveCloseExecutor({Venue.ASTER: adapter}, journal)
+
+        # In live mode with no private client, directed fetch_position raises
+        # (never returns 0.0). Only a successful full-account truth probe that
+        # excludes COTIUSDT can prove flat.
+        adapter.fetch_all_positions = AsyncMock(return_value=[])
+        probe = await executor._probe_venue_flatness_evidence(
+            Venue.ASTER, "COTIUSDT", {Venue.ASTER: adapter}
+        )
+        assert probe["flat"] is True
+
+        # Full-account truth unavailable -> not flat (fail-closed).
+        adapter.fetch_all_positions = AsyncMock(
+            side_effect=TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                "account truth unavailable",
+            )
+        )
+        probe = await executor._probe_venue_flatness_evidence(
+            Venue.ASTER, "COTIUSDT", {Venue.ASTER: adapter}
+        )
+        assert probe["flat"] is False
+        assert probe["error"] is not None
+        journal.close()
+
+    @pytest.mark.asyncio
+    async def test_aster_1121_on_private_position_marks_unsupported_and_raises(self):
+        """A live Aster private position request returning -1121 must mark the
+        symbol unsupported and propagate the error, never return a flat position."""
+        from lightfee.venues.aster import AsterAdapter
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/positionRisk"
+            return httpx.Response(
+                400,
+                json={"code": -1121, "msg": "Invalid symbol."},
+            )
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+        )
+        try:
+            adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
+            adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            with pytest.raises(TransportError) as exc:
+                await adapter.fetch_position("COTIUSDT")
+            assert exc.value.status_code == 400
+            assert "-1121" in exc.value.body or "-1121" in str(exc.value)
+
+            assert "COTIUSDT" not in adapter.supported_symbols()
+            diagnostics = adapter._transport.order_diagnostics
+            assert any(
+                event.get("kind") == "venues.aster.unsupported_symbol"
+                and event["payload"].get("symbol") == "COTIUSDT"
+                and event["payload"].get("exchange_code") == "-1121"
+                for event in diagnostics
+            )
+        finally:
+            await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_private_http_logging_redacts_signed_query(self):
+        """Importing the venue transport must force httpx/httpcore to WARNING so
+        no full signed private request URL is written at INFO."""
+        # The module-level call at import is the fix; without it these loggers
+        # inherit INFO from the root logger and leak signed query params.
+        for name in ("httpx", "httpcore"):
+            assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, (
+                f"{name} logger must default to WARNING after transport import"
+            )
+
+        root = logging.getLogger()
+        old_level = root.level
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(name)s %(levelname)s %(message)s")
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+        try:
+            root.setLevel(logging.INFO)
+
+            async def handler(request):
+                return httpx.Response(200, json=[])
+
+            from lightfee.venues.aster_v3 import AsterV3Client
+
+            client = AsterV3Client(
+                credential=LiveCredential(api_secret="0x" + "1" * 64),
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            )
+            try:
+                await client.fetch_open_orders(None)
+            finally:
+                await client.close()
+
+            text = stream.getvalue()
+            for token in ("signature=", "signer=", "nonce=", "user=", "api_key", "api-secret"):
+                assert token not in text, f"private query leaked into logs: {token!r}"
+            assert "httpx" not in text, "httpx INFO request logging should be suppressed"
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+
+    @pytest.mark.asyncio
+    async def test_aster_1121_on_place_order_marks_unsupported_and_raises(self):
+        """POST /fapi/v3/order returning -1121 must mark the symbol unsupported,
+        propagate the rejection, and never leave the symbol in the catalog."""
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.core.domain import OrderRequest, Side
+        from lightfee.core.errors import OrderSubmitError
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/order"
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+        )
+        try:
+            adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
+            adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            with pytest.raises(OrderSubmitError) as exc:
+                await adapter.place_order(OrderRequest(
+                    venue=Venue.ASTER, symbol="COTIUSDT", side=Side.BUY, quantity=20.0,
+                ))
+            assert exc.value.is_rejected
+            assert "COTIUSDT" not in adapter.supported_symbols()
+            diagnostics = adapter._transport.order_diagnostics
+            unsupported = [
+                event for event in diagnostics
+                if event.get("kind") == "venues.aster.unsupported_symbol"
+            ]
+            assert len(unsupported) == 1
+            assert unsupported[0]["payload"]["symbol"] == "COTIUSDT"
+            assert unsupported[0]["payload"]["exchange_code"] == "-1121"
+        finally:
+            await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_1121_on_submit_passive_order_marks_unsupported(self):
+        """Passive order submission hitting -1121 must also invalidate and fail
+        closed, not silently retry."""
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.core.domain import OrderRequest, Side
+        from lightfee.core.errors import OrderSubmitError
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/order"
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+        )
+        try:
+            adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
+            adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            with pytest.raises(OrderSubmitError):
+                await adapter.submit_passive_order(OrderRequest(
+                    venue=Venue.ASTER, symbol="COTIUSDT", side=Side.BUY, quantity=20.0,
+                    price=0.5,
+                ))
+            assert "COTIUSDT" not in adapter.supported_symbols()
+            diagnostics = adapter._transport.order_diagnostics
+            assert len([
+                event for event in diagnostics
+                if event.get("kind") == "venues.aster.unsupported_symbol"
+            ]) == 1
+        finally:
+            await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_1121_on_query_passive_order_progress_marks_unsupported(self):
+        """A -1121 during passive progress query must raise and invalidate
+        instead of being swallowed as a benign None."""
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.core.errors import OrderSubmitError
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            assert request.url.path == "/fapi/v3/order"
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+        )
+        try:
+            adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
+            adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            with pytest.raises(OrderSubmitError):
+                await adapter.query_passive_order_progress("COTIUSDT", "order-1")
+            assert "COTIUSDT" not in adapter.supported_symbols()
+            diagnostics = adapter._transport.order_diagnostics
+            assert len([
+                event for event in diagnostics
+                if event.get("kind") == "venues.aster.unsupported_symbol"
+            ]) == 1
+        finally:
+            await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_1121_diagnostic_is_single_across_private_paths(self):
+        """Repeated -1121 evidence from different private paths must still emit
+        only one unsupported_symbol diagnostic for the symbol."""
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.core.domain import OrderRequest, Side
+        from lightfee.core.errors import OrderSubmitError
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(api_secret=private_key),
+        )
+        try:
+            adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
+            adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            for _ in range(3):
+                with pytest.raises(OrderSubmitError):
+                    await adapter.place_order(OrderRequest(
+                        venue=Venue.ASTER, symbol="COTIUSDT", side=Side.BUY, quantity=20.0,
+                    ))
+            diagnostics = adapter._transport.order_diagnostics
+            unsupported = [
+                event for event in diagnostics
+                if event.get("kind") == "venues.aster.unsupported_symbol"
+                and event["payload"].get("symbol") == "COTIUSDT"
+            ]
+            assert len(unsupported) == 1
+        finally:
+            await adapter.shutdown()
+
 
 class TestGateAdapterSymbolCatalog:
     @pytest.mark.asyncio
@@ -9740,6 +10099,68 @@ class TestCancelAbsentOrderDetection:
             "body": {"type": "openOrders", "user": account_address},
             "private": False,
         }
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_fetch_open_orders_unknown_shape_is_untrusted(self):
+        """An unknown/malformed /info openOrders response must raise (fail
+        closed), not return [] which the strict probe would read as proven flat."""
+        from lightfee.engine.exchange_truth import probe_venue_open_orders_flat
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+        from lightfee.venues.transport import LiveCredential, TransportError
+
+        adapter = HyperliquidAdapter(
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key="0x" + "11" * 32,
+                account_address="0x" + "33" * 20,
+            ),
+        )
+
+        async def fake_request(method, path, **kwargs):
+            return {"unexpected": "shape"}
+
+        adapter._transport._request = fake_request
+
+        with pytest.raises(TransportError):
+            await adapter.fetch_open_orders("MERLUSDT")
+
+        # Through the shared strict probe the malformed response must be
+        # untrusted (flat=None), never a proven flat.
+        flat, evidence = await probe_venue_open_orders_flat(
+            adapter, Venue.HYPERLIQUID, "MERLUSDT"
+        )
+        assert flat is None
+        assert evidence is not None
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_fetch_open_orders_non_list_is_untrusted(self):
+        """A non-list /info openOrders payload (e.g. a plain scalar) must be
+        untrusted, not collapsed into an empty open-order list."""
+        from lightfee.engine.exchange_truth import probe_venue_open_orders_flat
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+        from lightfee.venues.transport import LiveCredential, TransportError
+
+        adapter = HyperliquidAdapter(
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key="0x" + "11" * 32,
+                account_address="0x" + "33" * 20,
+            ),
+        )
+
+        async def fake_request(method, path, **kwargs):
+            return "not-a-list"
+
+        adapter._transport._request = fake_request
+
+        with pytest.raises(TransportError):
+            await adapter.fetch_open_orders("MERLUSDT")
+
+        flat, evidence = await probe_venue_open_orders_flat(
+            adapter, Venue.HYPERLIQUID, "MERLUSDT"
+        )
+        assert flat is None
+        assert evidence is not None
 
     @pytest.mark.asyncio
     async def test_bybit_query_passive_order_progress_uses_realtime_endpoint(self):

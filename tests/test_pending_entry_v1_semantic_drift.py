@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import AsyncMock
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import (
@@ -21,12 +22,13 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import OpenPosition, PendingEntry
+from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.cid import generate_exchange_cid
+from lightfee.venues.transport import TransportError, TransportErrorCategory
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
 
 
@@ -313,6 +315,8 @@ class _CloseLegFillAdapter(_NoFillReconciliationAdapter):
         self.venue = venue
         self.fills = fills
         self.fill_reconciliation_calls: list[dict] = []
+        self.open_order_calls: list[str] = []
+        self.open_orders: list[Any] = []
 
     async def fetch_order_fill_reconciliation(self, symbol, order_id="", client_order_id=""):
         self.fill_reconciliation_calls.append({
@@ -331,6 +335,10 @@ class _CloseLegFillAdapter(_NoFillReconciliationAdapter):
             entry_price=0.0,
             observed_at_ms=3000,
         )
+
+    async def fetch_open_orders(self, symbol):
+        self.open_order_calls.append(symbol)
+        return list(self.open_orders)
 
 
 class _UnavailableCloseLegAdapter(_CloseLegFillAdapter):
@@ -1552,6 +1560,447 @@ async def test_billing_evidence_gap_stays_pending_when_exchange_is_not_flat(conf
     assert "exit.billing_evidence_unavailable" not in [
         record["kind"] for record in tmp_journal.read_all()
     ]
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_terminalizes_flat_with_incomplete_close_quantity(
+    config, tmp_journal,
+):
+    """HOME/HFT/COTI style: one-side close quantity is 0, but both venues'
+    position and open-order truth prove flat. The provisional terminal must be
+    written exactly once and the pending reconciliation removed."""
+    _mark_live(config)
+    # One leg has full fill identity; the other side returns a zero-quantity
+    # close fill but both venue live position and open-order truth are flat.
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = {
+        "position_id": "entry-home-billing-gap",
+        "symbol": "HOMEUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-home-billing-gap",
+            "symbol": "HOMEUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "matched_quantity": 20.0,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.03,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-close-order",
+            "client_order_id": "bybit-close-cid",
+        }],
+    }
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    assert "exit.reconciled" not in [record["kind"] for record in records]
+    billing = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_unreconciled"
+    ]
+    assert len(billing) == 1
+    terminals = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_evidence_unavailable"
+    ]
+    assert len(terminals) == 1
+    terminal = terminals[0]
+    assert terminal["terminal_reason"] == (
+        "terminal_live_flat_incomplete_close_quantity_evidence"
+    )
+    assert terminal["close_quantity_evidence_complete"] is False
+    assert terminal["net_quote_status"] == "provisional"
+    assert "net_quote" not in terminal
+    assert terminal["long_live_size"] == 0.0
+    assert terminal["short_live_size"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_stays_pending_when_open_orders_not_flat(
+    config, tmp_journal,
+):
+    """Even with flat positions, any venue open order must keep the close
+    pending; the provisional terminal must not be written."""
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    short_adapter.open_orders = [{"orderId": "bybit-resting", "symbol": "BEATUSDT"}]
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = _pending_close_reconciliation(
+        position_id="entry-open-order-pending",
+        symbol="BEATUSDT",
+    )
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    kinds = [record["kind"] for record in tmp_journal.read_all()]
+    assert "exit.billing_evidence_unavailable" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_does_not_reterminalize_after_restart(
+    config, tmp_journal,
+):
+    """Once a provisional terminal is written and the reconciliation removed,
+    a restart replay must not produce a second exit.billing_unreconciled."""
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = _pending_close_reconciliation(
+        position_id="entry-restart-billing",
+        symbol="BEATUSDT",
+    )
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+    assert runtime.state.pending_close_reconciliations == []
+    kinds = [record["kind"] for record in tmp_journal.read_all()]
+    assert kinds.count("exit.billing_evidence_unavailable") == 1
+
+    # Restart: replay the journal against a fresh state. The terminal event
+    # clears the position and its reconciliation; no new billing_unreconciled.
+    from lightfee.engine.recovery import _apply_journal_replay_to_state
+
+    restored = EngineState()
+    restored.set_pending_close_reconciliations([])
+    _apply_journal_replay_to_state(restored, tmp_journal.read_all())
+    assert restored.pending_close_reconciliations == []
+    assert "entry-restart-billing" not in restored.open_positions
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_restart_clears_stale_reconciliation_snapshot(
+    config, tmp_journal,
+):
+    """Crash window: the journal already contains the provisional terminal but
+    the persisted snapshot still carries the reconciliation.  A restart must
+    clear the stale reconciliation from the terminal event, not re-emit
+    exit.billing_unreconciled."""
+    from lightfee.engine.recovery import (
+        _apply_journal_replay_to_state,
+        recover_from_snapshot,
+    )
+    from lightfee.persistence.snapshot_store import SnapshotStore
+
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = _pending_close_reconciliation(
+        position_id="entry-crash-window-billing",
+        symbol="BEATUSDT",
+    )
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+    kinds = [record["kind"] for record in tmp_journal.read_all()]
+    assert kinds.count("exit.billing_evidence_unavailable") == 1
+
+    # Simulate the crash window: the terminal event was journaled, but a stale
+    # snapshot (written just before the crash) still holds the reconciliation.
+    snapshot_store = SnapshotStore(str(config.persistence.snapshot_path))
+    stale_snapshot = {
+        "lifecycle": "reconciling",
+        "risk_mode": "running",
+        "open_positions": {},
+        "pending_close_reconciliations": [
+            dict(reconciliation),
+        ],
+        "pending_entries": {},
+        "pending_passive_closes": {},
+        "pending_residual_repairs": [],
+        "pending_closes": {},
+    }
+    snapshot_store.write(stale_snapshot)
+
+    restored = recover_from_snapshot(snapshot_store, tmp_journal)
+    assert restored.pending_close_reconciliations == []
+    assert "entry-crash-window-billing" not in restored.open_positions
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_never_terminalizes_with_incomplete_truth(
+    config, tmp_journal,
+):
+    """When any venue truth probe fails (position or open orders), the close
+    must stay pending; no provisional bill is written."""
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+
+    class _TruthFailAdapter(_CloseLegFillAdapter):
+        async def fetch_position(self, symbol):
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                "position truth unavailable",
+            )
+
+        async def fetch_open_orders(self, symbol):
+            raise TransportError(
+                TransportErrorCategory.TRANSPORT_FAILURE,
+                "open order truth unavailable",
+            )
+
+    short_adapter = _TruthFailAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = _pending_close_reconciliation(
+        position_id="entry-truth-fail",
+        symbol="BEATUSDT",
+    )
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    kinds = [record["kind"] for record in tmp_journal.read_all()]
+    assert "exit.billing_evidence_unavailable" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_uses_venue_operation_fallback_for_open_orders(
+    config, tmp_journal,
+):
+    """Real OKX/BYBIT adapters do not expose fetch_open_orders; open-order truth
+    must route through the venue operation contract so flat + no-open-orders
+    still terminalizes the close-quantity-incomplete branch."""
+    from types import SimpleNamespace as _SN
+
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    # Remove fetch_open_orders so only the venue-operation fallback can answer.
+    short_adapter.fetch_open_orders = None
+    long_adapter.fetch_open_orders = None
+
+    async def fake_request(method, path, **kwargs):
+        assert "order" in path
+        return []
+
+    for adapter in (long_adapter, short_adapter):
+        adapter._transport = _SN(
+            _request=fake_request,
+            _credential=_SN(account_address="", agent_wallet_address=""),
+        )
+
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = _pending_close_reconciliation(
+        position_id="entry-venue-op-fallback",
+        symbol="BEATUSDT",
+    )
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    terminals = [
+        record["payload"] for record in tmp_journal.read_all()
+        if record["kind"] == "exit.billing_evidence_unavailable"
+    ]
+    assert len(terminals) == 1
+    assert terminals[0]["terminal_reason"] == (
+        "terminal_live_flat_incomplete_close_quantity_evidence"
+    )
+    assert terminals[0]["open_order_truth_flat"] is True
+
+
+@pytest.mark.asyncio
+async def test_billing_evidence_gap_stays_pending_when_open_order_truth_unknown_shape(
+    config, tmp_journal,
+):
+    """An open-orders response that is None/empty-but-unrecognized must be
+    untrusted: the close stays pending and never terminalizes the billing gap."""
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=0.01,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-close-order", "bybit-close-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=0.0, average_price=0.0, order_id="bybit-close-order",
+            client_order_id="bybit-close-cid", fee_quote=0.0,
+        ),
+    })
+    # Unknown shape: fetch_open_orders returns a bare dict with no recognized
+    # list field.  This must NOT be treated as a proven flat.
+    short_adapter.fetch_open_orders = AsyncMock(return_value={"unexpected": "shape"})
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    reconciliation = _pending_close_reconciliation(
+        position_id="entry-unknown-open-orders",
+        symbol="BEATUSDT",
+    )
+    runtime.state.pending_close_reconciliations.append(reconciliation)
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    kinds = [record["kind"] for record in tmp_journal.read_all()]
+    assert "exit.billing_evidence_unavailable" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_shared_open_order_probe_treats_none_as_untrusted():
+    """The shared strict probe must never report trusted-flat for a None or
+    unknown open-orders response."""
+    from lightfee.engine.exchange_truth import probe_venue_open_orders_flat
+    from lightfee.core.domain import Venue
+
+    class _NoneOpenOrdersAdapter:
+        venue = Venue.OKX
+
+        async def fetch_open_orders(self, symbol):
+            return None
+
+    flat, evidence = await probe_venue_open_orders_flat(
+        _NoneOpenOrdersAdapter(), Venue.OKX, "BEATUSDT"
+    )
+    assert flat is None
+    assert evidence is not None
+
+
+@pytest.mark.asyncio
+async def test_shared_open_order_probe_accepts_recognized_empty_list():
+    """Recognized empty open-order lists (bare [] and result.list=[]) are
+    trusted flat."""
+    from lightfee.engine.exchange_truth import probe_venue_open_orders_flat
+    from lightfee.core.domain import Venue
+
+    class _ListAdapter:
+        venue = Venue.OKX
+
+        async def fetch_open_orders(self, symbol):
+            return []
+
+    flat, evidence = await probe_venue_open_orders_flat(
+        _ListAdapter(), Venue.OKX, "BEATUSDT"
+    )
+    assert flat is True
+    assert evidence is None
 
 
 @pytest.mark.asyncio

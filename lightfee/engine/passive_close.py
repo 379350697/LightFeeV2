@@ -55,7 +55,6 @@ from lightfee.engine.order_submit_uncertainty import (
     is_order_truth_gap,
 )
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
-from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.venues.cid import compact_client_order_id, generate_exchange_cid
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.state import (
@@ -75,7 +74,7 @@ from lightfee.venues.common import (
     venue_reduce_only_close_exempts_min_notional,
 )
 from lightfee.venues.capabilities import get_capability_flags
-from lightfee.venues.specs import VenueOperation, get_spec
+from lightfee.venues.specs import get_spec
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 from lightfee.engine.recovery import clear_legacy_recovery_block_via_core
 from lightfee.engine.recovery_decision_core import (
@@ -6170,57 +6169,9 @@ class PassiveCloseExecutor:
         if adapter is None:
             return None, "adapter_missing"
 
-        # Try adapter.fetch_open_orders(symbol) duck-type first
-        fetch_fn = getattr(adapter, "fetch_open_orders", None)
-        if callable(fetch_fn):
-            try:
-                orders = await fetch_fn(symbol)
-                if isinstance(orders, dict) and orders.get("error"):
-                    return None, str(orders["error"])
-                items = orders if isinstance(orders, list) else []
-                if items:
-                    return False, f"open_orders_count={len(items)}"
-                return True, None
-            except Exception as exc:
-                return None, str(exc)
+        from lightfee.engine.exchange_truth import probe_venue_open_orders_flat
 
-        # Fallback: try transport._request for known venues
-        transport = getattr(adapter, "_transport", None)
-        if transport is None or not hasattr(transport, "_request"):
-            # No way to query open orders — conservatively treat as untrusted (None)
-            # to preserve pending state, unless proven safe.
-            return None, "open_orders_query_unsupported"
-
-        try:
-            credential = getattr(transport, "_credential", None)
-            raw, _ = await request_venue_operation(
-                transport,
-                venue,
-                VenueOperation.OPEN_ORDERS,
-                symbol=symbol,
-                account_address=str(getattr(credential, "account_address", "") or ""),
-                agent_wallet_address=str(
-                    getattr(credential, "agent_wallet_address", "") or ""
-                ),
-            )
-
-            # Parse response to list of orders
-            items: list[Any] = []
-            if isinstance(raw, list):
-                items = raw
-            elif isinstance(raw, dict):
-                result = raw.get("result")
-                if isinstance(result, dict) and isinstance(result.get("list"), list):
-                    items = result["list"]
-                elif isinstance(raw.get("data"), list):
-                    items = raw["data"]
-                elif isinstance(raw.get("list"), list):
-                    items = raw["list"]
-            if items:
-                return False, f"open_orders_count={len(items)}"
-            return True, None
-        except Exception as exc:
-            return None, str(exc)
+        return await probe_venue_open_orders_flat(adapter, venue, symbol)
 
     # ------------------------------------------------------------------
     # Price and tick helpers
