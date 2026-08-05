@@ -3759,6 +3759,88 @@ def test_exchange_truth_classifies_okx_instrument_missing_metadata_as_flat():
     assert evidence["PRLUSDT"]["venue_symbol"] == "PRL-USDT-SWAP"
 
 
+def test_exchange_truth_position_probe_retries_transient_failure():
+    """A transient read-only position probe failure must be retried a bounded
+    number of times before recording the venue as failed."""
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeAdapter:
+        venue = "okx"
+        attempts = 0
+
+        async def fetch_position(self, symbol):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise RuntimeError("connection reset by peer")
+            return None
+
+    adapter = FakeAdapter()
+
+    positions, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_positions(adapter, ["PRLUSDT"])
+    )
+
+    assert adapter.attempts == 3
+    assert positions == {}
+    assert succeeded == {"PRLUSDT"}
+    assert failed == set()
+    assert evidence["PRLUSDT"]["classification"] == "position_probe_succeeded"
+
+
+def test_exchange_truth_position_probe_gives_up_after_bounded_retries():
+    """After the bounded retry budget is exhausted the venue is recorded as
+    failed, not left retrying forever."""
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeAdapter:
+        venue = "okx"
+        attempts = 0
+
+        async def fetch_position(self, symbol):
+            self.attempts += 1
+            raise RuntimeError("connection reset by peer")
+
+    adapter = FakeAdapter()
+
+    positions, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_positions(adapter, ["PRLUSDT"])
+    )
+
+    assert adapter.attempts == dl._EXCHANGE_TRUTH_PROBE_RETRY_COUNT + 1
+    assert "PRLUSDT" in failed
+    assert evidence["PRLUSDT"]["classification"] == "position_probe_failed"
+
+
+def test_exchange_truth_open_order_probe_retries_transient_failure():
+    """A transient read-only open-order probe failure must be retried, and
+    unsupported-symbol evidence is terminal (not retried)."""
+    import asyncio
+    from scripts import diagnose_live as dl
+
+    class FakeAdapter:
+        venue = "aster"
+
+        def __init__(self):
+            self.attempts = 0
+            self._transport = object()
+
+        async def fetch_open_orders(self, symbol):
+            self.attempts += 1
+            raise RuntimeError("connection reset by peer")
+
+    adapter = FakeAdapter()
+
+    orders, succeeded, failed, evidence = asyncio.run(
+        dl._fetch_venue_open_orders(adapter, ["PRLUSDT"])
+    )
+
+    assert adapter.attempts == dl._EXCHANGE_TRUTH_PROBE_RETRY_COUNT + 1
+    assert "PRLUSDT" in failed
+    assert evidence["PRLUSDT"]["classification"] == "open_order_probe_failed"
+
+
 def test_run_diagnose_derives_exchange_truth_venues_from_xcnusdt_position(monkeypatch):
     from scripts import diagnose_live as dl
 

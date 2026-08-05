@@ -358,9 +358,16 @@ class AsterV3Client:
                 f"aster_v3 request timeout: {method.upper()} {path}",
             ) from exc
         except httpx.HTTPError as exc:
+            # A bare ConnectError has an empty str(exc); preserve the exception
+            # class (and root cause class) so the diagnostic is classifiable.
+            # Never include the request URL: it carries the signed query.
+            cause = exc.__cause__
+            detail = str(exc) or type(exc).__name__
+            if cause is not None:
+                detail = f"{detail} ({type(cause).__name__})" if detail else type(cause).__name__
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
-                f"aster_v3 request failed: {method.upper()} {path}: {exc}",
+                f"aster_v3 request failed: {method.upper()} {path}: {detail}",
             ) from exc
 
         text = response.text

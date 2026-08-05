@@ -983,6 +983,33 @@ def _invalid_pending_close_reconciliation(raw: Any, reason: str) -> dict[str, An
     }
 
 
+def _build_reconciliation_summary(queue: list[dict[str, Any]]) -> dict[str, Any]:
+    """Export a safe summary of the reconciliation queue for diagnostics.
+
+    The summary exposes total count and per-kind breakdown so diagnose /
+    production-health can authoritatively decide whether the queue is truly
+    empty, without scanning the full task list.
+    """
+    total = len(queue)
+    by_kind: dict[str, int] = {}
+    backed_off = 0
+    unknown_status = 0
+    for item in queue:
+        if not isinstance(item, dict):
+            unknown_status += 1
+            continue
+        kind = str(item.get("kind") or "unknown")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        if int(item.get("next_attempt_ms") or 0) > 0:
+            backed_off += 1
+    return {
+        "total_count": total,
+        "by_kind": by_kind,
+        "backed_off_count": backed_off,
+        "unknown_status_count": unknown_status,
+    }
+
+
 @dataclass
 class EngineState:
     lifecycle: EngineLifecycle = EngineLifecycle.BOOTING
@@ -1094,6 +1121,9 @@ class EngineState:
             "transfer_truth": self.transfer_truth,
             "entry_liquidity_qualification_records": self.entry_liquidity_qualification_records,
             "pending_close_reconciliations": normalize_pending_close_reconciliations(
+                self.pending_close_reconciliations
+            ),
+            "pending_close_reconciliation_summary": _build_reconciliation_summary(
                 self.pending_close_reconciliations
             ),
             "last_scan": self.last_scan,

@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import math
@@ -920,6 +921,38 @@ def _unsupported_symbol_probe_error(exc: Exception) -> bool:
     )
 
 
+# Bounded retry for read-only diagnostic exchange-truth probes.  Diagnose only
+# issues GET/read requests (positions, open orders); a transient network or
+# rate-limit failure should be retried a small number of times before recording
+# the venue as failed.  This MUST never be applied to order submission paths —
+# order idempotency and uncertain-order semantics are owned by the runtime.
+_EXCHANGE_TRUTH_PROBE_RETRY_COUNT = 2
+
+
+class UnsupportedProbeVenue(Exception):
+    """Sentinel: the venue has no open-order operation contract to probe."""
+
+
+async def _readonly_probe_with_retry(probe_call):
+    """Run a read-only probe with a small bounded retry.
+
+    ``probe_call`` is a zero-argument coroutine factory.  Only transient
+    (non-semantic) failures are retried; unsupported-symbol evidence is
+    returned as-is because it is terminal.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_EXCHANGE_TRUTH_PROBE_RETRY_COUNT + 1):
+        try:
+            return await probe_call(), None
+        except Exception as exc:
+            if _unsupported_symbol_probe_error(exc):
+                return None, exc
+            last_exc = exc
+            if attempt < _EXCHANGE_TRUTH_PROBE_RETRY_COUNT:
+                await asyncio.sleep(0.2 * (attempt + 1))
+    return None, last_exc
+
+
 async def _fetch_venue_positions(
     adapter: Any, symbols: list[str],
 ) -> tuple[dict[str, Any], set[str], set[str], dict[str, Any]]:
@@ -941,7 +974,12 @@ async def _fetch_venue_positions(
             }
             return positions, succeeded, failed, evidence
         try:
-            all_positions = await fetch_all()
+            result, probe_exc = await _readonly_probe_with_retry(
+                lambda: fetch_all()
+            )
+            if probe_exc is not None:
+                raise probe_exc
+            all_positions = result
             items = all_positions if isinstance(all_positions, (list, tuple)) else []
             for pos in items:
                 qty = float(getattr(pos, "quantity", 0) or 0)
@@ -971,7 +1009,12 @@ async def _fetch_venue_positions(
 
     for sym in symbols:
         try:
-            pos = await adapter.fetch_position(sym)
+            result, probe_exc = await _readonly_probe_with_retry(
+                lambda sym=sym: adapter.fetch_position(sym)
+            )
+            if probe_exc is not None:
+                raise probe_exc
+            pos = result
             qty = float(getattr(pos, "quantity", 0) or 0)
             if abs(qty) > 1e-9:
                 positions[sym] = {
@@ -1133,7 +1176,12 @@ async def _fetch_venue_open_orders(
     venue = str(getattr(adapter, "venue", ""))
     if not symbols:
         try:
-            order_items = await _fetch_unfiltered_open_orders(adapter, transport, venue)
+            result, probe_exc = await _readonly_probe_with_retry(
+                lambda: _fetch_unfiltered_open_orders(adapter, transport, venue)
+            )
+            if probe_exc is not None:
+                raise probe_exc
+            order_items = result
             orders[UNFILTERED_PROBE_KEY] = order_items
             succeeded.add(UNFILTERED_PROBE_KEY)
             evidence[UNFILTERED_PROBE_KEY] = {
@@ -1151,27 +1199,28 @@ async def _fetch_venue_open_orders(
 
     for sym in symbols:
         venue_symbol = _probe_venue_symbol(adapter, sym)
-        try:
+
+        async def _probe_one(sym=sym, venue_symbol=venue_symbol):
             contract_venue = _venue_from_probe_text(venue)
             if contract_venue == Venue.ASTER:
                 fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
                 if callable(fetch_open_orders):
-                    raw = await fetch_open_orders(venue_symbol)
-                else:
-                    credential = getattr(transport, "_credential", None)
-                    account = str(getattr(credential, "account_address", "") or "")
-                    agent_wallet = str(
-                        getattr(credential, "agent_wallet_address", "") or ""
-                    )
-                    raw, _ = await request_venue_operation(
-                        transport,
-                        contract_venue,
-                        VenueOperation.OPEN_ORDERS,
-                        symbol=sym,
-                        account_address=account,
-                        agent_wallet_address=agent_wallet,
-                    )
-            elif contract_venue is not None:
+                    return await fetch_open_orders(venue_symbol)
+                credential = getattr(transport, "_credential", None)
+                account = str(getattr(credential, "account_address", "") or "")
+                agent_wallet = str(
+                    getattr(credential, "agent_wallet_address", "") or ""
+                )
+                raw, _ = await request_venue_operation(
+                    transport,
+                    contract_venue,
+                    VenueOperation.OPEN_ORDERS,
+                    symbol=sym,
+                    account_address=account,
+                    agent_wallet_address=agent_wallet,
+                )
+                return raw
+            if contract_venue is not None:
                 credential = getattr(transport, "_credential", None)
                 account = str(getattr(credential, "account_address", "") or "")
                 agent_wallet = str(getattr(credential, "agent_wallet_address", "") or "")
@@ -1183,15 +1232,15 @@ async def _fetch_venue_open_orders(
                     account_address=account,
                     agent_wallet_address=agent_wallet,
                 )
-            else:
-                succeeded.add(sym)
-                orders[sym] = []
-                evidence[sym] = {
-                    "classification": "open_order_probe_unsupported_venue_assumed_empty",
-                    "venue_symbol": venue_symbol,
-                }
-                continue
+                return raw
+            raise UnsupportedProbeVenue()
 
+        try:
+            raw, probe_exc = await _readonly_probe_with_retry(_probe_one)
+            if probe_exc is not None:
+                if isinstance(probe_exc, UnsupportedProbeVenue):
+                    raise probe_exc
+                raise probe_exc
             order_list = _extract_order_rows(raw)
             if isinstance(order_list, list) and order_list:
                 orders[sym] = [
@@ -1204,6 +1253,13 @@ async def _fetch_venue_open_orders(
             succeeded.add(sym)
             evidence[sym] = {
                 "classification": "open_order_probe_succeeded",
+                "venue_symbol": venue_symbol,
+            }
+        except UnsupportedProbeVenue:
+            succeeded.add(sym)
+            orders[sym] = []
+            evidence[sym] = {
+                "classification": "open_order_probe_unsupported_venue_assumed_empty",
                 "venue_symbol": venue_symbol,
             }
         except Exception as exc:
@@ -2879,6 +2935,14 @@ def _build_top_exchange_errors(
 # production acceptance gate
 # ---------------------------------------------------------------------------
 
+def _event_timestamp_ms(record: dict[str, Any]) -> int:
+    """Extract the timestamp from an event record in milliseconds."""
+    ts = record.get("ts_ms", 0)
+    if not ts:
+        ts = record.get("timestamp_ms", 0)
+    return int(ts or 0)
+
+
 def _payload_dict(record: dict[str, Any]) -> dict[str, Any]:
     payload = record.get("payload", {})
     return payload if isinstance(payload, dict) else {}
@@ -3509,6 +3573,7 @@ def _build_production_acceptance_gate(
     residual_count = 0
     exception_conclusions: dict[str, str] = {}
     terminal_close_position_ids: set[str] = set()
+    terminal_close_ts_by_position: dict[str, int] = {}
     billing_unreconciled_events: list[dict[str, Any]] = []
     runtime_progress = _runtime_progress_from_state(local_state)
     runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
@@ -3713,6 +3778,9 @@ def _build_production_acceptance_gate(
             pid = str(payload.get("position_id") or "")
             if pid:
                 terminal_close_position_ids.add(pid)
+                ts = int(_event_timestamp_ms(rec))
+                if ts > terminal_close_ts_by_position.get(pid, 0):
+                    terminal_close_ts_by_position[pid] = ts
         elif kind == "exit.billing_unreconciled":
             billing_unreconciled_events.append(rec)
 
@@ -3723,7 +3791,16 @@ def _build_production_acceptance_gate(
     for rec in billing_unreconciled_events:
         payload = _payload_dict(rec)
         pid = str(payload.get("position_id") or "")
-        if pid and pid not in terminal_close_position_ids:
+        if not pid:
+            continue
+        billing_ts = int(_event_timestamp_ms(rec))
+        # A billing_unreconciled is resolved ONLY by a terminal event for the
+        # same position that occurs at or after the billing_unreconciled
+        # timestamp.  Earlier terminal events (including exit.reconciled that
+        # was emitted before the billing_unreconciled loop reopened) must not
+        # clear the billing gap.
+        terminal_ts = terminal_close_ts_by_position.get(pid, 0)
+        if terminal_ts <= 0 or terminal_ts < billing_ts:
             unresolved_billing_unreconciled_position_ids.add(pid)
     unresolved_billing_unreconciled_count = len(
         unresolved_billing_unreconciled_position_ids
@@ -3745,6 +3822,19 @@ def _build_production_acceptance_gate(
     remaining_position_slots = max(max_concurrent_positions - open_position_count, 0)
     pending_entry_count = int(local_state.get("pending_entry_count", 0) or 0)
     pending_close_count = int(local_state.get("pending_close_count", 0) or 0)
+    pending_reconciliation_summary = local_state.get("pending_close_reconciliation_summary") or {}
+    pending_reconciliation_total = int(
+        pending_reconciliation_summary.get("total_count", 0) or 0
+    )
+    pending_reconciliation_unknown = int(
+        pending_reconciliation_summary.get("unknown_status_count", 0) or 0
+    )
+    pending_reconciliation_by_kind = (
+        pending_reconciliation_summary.get("by_kind") or {}
+    )
+    pending_reconciliation_ack_truth_gap_count = int(
+        pending_reconciliation_by_kind.get("accepted_order_truth_gap", 0) or 0
+    )
     pending_residual_repair_count = int(
         local_state.get(
             "pending_residual_repair_count",
@@ -3926,6 +4016,12 @@ def _build_production_acceptance_gate(
     if unresolved_billing_unreconciled_count:
         blocking_reasons.append("billing_unreconciled_unresolved")
         fingerprints.append("unresolved_billing_unreconciled")
+    if pending_reconciliation_total > 0:
+        blocking_reasons.append("pending_close_reconciliations_not_empty")
+        fingerprints.append("pending_close_reconciliations_not_empty")
+    elif pending_reconciliation_unknown > 0:
+        blocking_reasons.append("pending_close_reconciliations_unknown_status")
+        fingerprints.append("pending_close_reconciliations_unknown")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -4030,6 +4126,9 @@ def _build_production_acceptance_gate(
         "active_positions_with_capacity": active_positions_with_capacity,
         "pending_entry_count": pending_entry_count,
         "pending_close_count": pending_close_count,
+        "pending_close_reconciliation_total": pending_reconciliation_total,
+        "pending_close_reconciliation_ack_truth_gap": pending_reconciliation_ack_truth_gap_count,
+        "pending_close_reconciliation_summary": pending_reconciliation_summary,
         "pending_residual_repair_count": pending_residual_repair_count,
         "residual_count": residual_count,
         "quick_flat_count": quick_flat_count,

@@ -644,6 +644,36 @@ class TestBinanceAsterPostSigning:
             install_global_rate_limit_runtime(None)
 
     @pytest.mark.asyncio
+    async def test_aster_v3_http_error_message_preserves_exception_class(self):
+        """A bare httpx.ConnectError with empty text must keep the exception
+        class in the TransportError message, never leak the signed URL."""
+        from lightfee.venues.aster_v3 import AsterV3Client
+
+        private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+
+        async def handler(request):
+            raise httpx.ConnectError("", request=request)
+
+        client = AsterV3Client(
+            credential=LiveCredential(api_secret=private_key),
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        try:
+            with pytest.raises(TransportError) as exc:
+                await client.fetch_position("ASTERUSDT")
+            message = str(exc.value)
+            assert "ConnectError" in message, message
+            # The signed query string (with the private request URL) must never
+            # appear in the diagnostic message.
+            assert "signature=" not in message
+            assert "signer=" not in message
+            assert "nonce=" not in message
+            assert "user=" not in message
+            assert "asterdex.com" not in message
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
     async def test_hyperliquid_account_balance_uses_clearinghouse_withdrawable(self):
         credential = LiveCredential(
             wallet_private_key="0x" + "1" * 64,

@@ -13,6 +13,7 @@ from typing import Any
 from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.lifecycle import set_lifecycle
+from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -804,6 +805,249 @@ class CloseRuntime:
             "duplicate_close_leg_suppressed_samples": duplicate_samples[:12],
             "source": reconciliation.get("source", "pending_close_reconciliation"),
         }
+    async def _resolve_accepted_order_truth_gap(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+    ) -> bool:
+        """Resolve an accepted_order_truth_gap task through order truth or terminal-flat evidence.
+
+        NEVER enters the billing flow and NEVER emits ``exit.billing_unreconciled``.
+        Resolution paths, in order:
+
+        1. **Terminal-flat supersede**: both venues prove zero positions AND no open
+           orders → the ACK gap is moot.  Journal
+           ``exit.accepted_order_truth_gap_superseded`` and remove.
+        2. **Order-truth resolve**: probe each persisted leg identity through the
+           shared ``ORDER_TRUTH_LEDGER``.  Only confirmed execution fill
+           (``terminal_fill`` with positive reconciled quantity from a confirmed
+           fill/execution source) resolves the identity.  Weak evidence (ACK-only,
+           order detail, open/new status), zero-qty responses, and unavailable
+           adapter results all retain.  **No-fill is never resolved by identity
+           alone;** it requires the remote terminal-flat + no-open-order probe from
+           path (1).
+        3. **Retain with backoff**: any identity unresolved AND position not
+           terminal-flat → retain (backed off, NO billing cycle).
+
+        Returns True when the task was resolved / superseded (caller removes it);
+        returns False when the task must be retained.
+        """
+        kind = str(reconciliation.get("kind") or "")
+        if kind != "accepted_order_truth_gap":
+            return False
+
+        position_id = str(reconciliation.get("position_id") or "")
+        snapshot = reconciliation.get("position_snapshot") or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        long_venue = self._venue_from_close_reconciliation(
+            reconciliation.get("long_venue") or snapshot.get("long_venue")
+        )
+        short_venue = self._venue_from_close_reconciliation(
+            reconciliation.get("short_venue") or snapshot.get("short_venue")
+        )
+        symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
+
+        # Always attempt strict remote terminal-flat + no-open-order evidence
+        # first, regardless of local open_positions presence.  Exchange truth
+        # outranks recovered/local state — local presence may never veto
+        # remote terminal truth.
+        if long_venue is not None and short_venue is not None and symbol:
+            terminal_sizes, open_order_evidence = (
+                await self._fetch_pending_close_terminal_live_flat_truth(
+                    symbol=symbol,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                )
+            )
+            # Terminal-flat supersede: both positions are provably zero AND no
+            # open orders are present.  The ACK truth gap is moot — the
+            # position is gone from exchange.  Only applies when terminal truth
+            # is available; an unavailable probe falls through to order-truth
+            # resolution below.
+            if terminal_sizes is not None:
+                long_live_size, short_live_size = terminal_sizes
+                if (
+                    abs(long_live_size) <= 1e-9
+                    and abs(short_live_size) <= 1e-9
+                    and open_order_evidence is None
+                ):
+                    next_attempt_count = int(reconciliation.get("attempt_count") or 0) + 1
+                    self.ctx.journal.append(
+                        "exit.accepted_order_truth_gap_superseded",
+                        {
+                            "position_id": position_id,
+                            "symbol": symbol,
+                            "kind": kind,
+                            "long_venue": long_venue.value,
+                            "short_venue": short_venue.value,
+                            "long_live_size": long_live_size,
+                            "short_live_size": short_live_size,
+                            "attempt_count": next_attempt_count,
+                            "closed_at_ms": int(reconciliation.get("closed_at_ms") or 0),
+                            "superseded_at_ms": now_ms,
+                            "superseded_by": "terminal_live_flat_truth",
+                            "lifetime_ms": max(
+                                0,
+                                now_ms - max(0, int(reconciliation.get("closed_at_ms") or 0)),
+                            ),
+                        },
+                    )
+                    return True
+
+        # Not conclusively terminal-flat — probe every persisted order
+        # identity through the shared ledger (fail-closed).
+        resolved = await self._probe_accepted_order_truth(reconciliation, now_ms)
+        if resolved:
+            return True
+        return False
+
+    async def _probe_accepted_order_truth(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+    ) -> bool:
+        """Probe every persisted leg identity through the shared
+        ``OrderTruthLedger``.
+
+        Each unique (order_id, client_order_id, venue) identity is probed
+        **exactly once** via the venue adapter and then routed through
+        ``OrderTruthLedger.resolve_order_success()`` for weak-evidence
+        discrimination.
+
+        - **CONFIRMED_FILL** (positive qty from a confirmed fill/execution
+          source) → that identity is resolved.
+        - **Everything else** — including ACK-only responses, zero-qty order
+          detail, open/new status, unsupported venue, unavailable adapter,
+          or any exception — remains unresolved.
+
+        No-fill resolution (``terminal_no_fill``) is **not** decided here;
+        it belongs exclusively to the terminal-live-flat + no-open-order
+        probe in ``_resolve_accepted_order_truth_gap``.
+
+        Returns True only when **every** probed identity has a confirmed-fill
+        decision from the ledger.
+        """
+        snapshot = reconciliation.get("position_snapshot") or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
+        position_id = str(reconciliation.get("position_id") or "")
+        target_qty = float(reconciliation.get("requested_quantity") or 0.0)
+
+        long_venue = self._venue_from_close_reconciliation(
+            reconciliation.get("long_venue") or snapshot.get("long_venue")
+        )
+        short_venue = self._venue_from_close_reconciliation(
+            reconciliation.get("short_venue") or snapshot.get("short_venue")
+        )
+
+        probed: set[tuple[str, str, str]] = set()
+        any_unavailable = False
+
+        for side_key, leg_list, venue in [
+            ("long", reconciliation.get("long_legs"), long_venue),
+            ("short", reconciliation.get("short_legs"), short_venue),
+        ]:
+            if not isinstance(leg_list, list):
+                # Malformed leg collection → fail-closed.
+                any_unavailable = True
+                continue
+            # An empty list is the normal case for the opposite (non-ACK)
+            # side — passive_close._register_accepted_order_truth_gap
+            # deliberately records only the ACK-triggering leg.  Skip it
+            # without marking unavailable.
+            if not leg_list:
+                continue
+            if venue is None:
+                # Legs present but no venue → cannot probe.
+                any_unavailable = True
+                continue
+            for leg in leg_list:
+                if not isinstance(leg, dict):
+                    any_unavailable = True
+                    continue
+                order_id = str(leg.get("order_id") or "")
+                client_order_id = str(leg.get("client_order_id") or "")
+                if not order_id and not client_order_id:
+                    any_unavailable = True
+                    continue
+                venue_key = venue.value if isinstance(venue, Venue) else str(venue)
+                identity = (order_id, client_order_id, venue_key)
+                if identity in probed:
+                    continue
+                probed.add(identity)
+
+                adapter = self.ctx.venue_adapters.get(venue)
+                if adapter is None:
+                    any_unavailable = True
+                    continue
+                fetch = getattr(adapter, "fetch_order_fill_reconciliation", None)
+                if not callable(fetch):
+                    any_unavailable = True
+                    continue
+
+                fill = None
+                try:
+                    fill = await fetch(symbol, order_id, client_order_id)
+                    self._flush_adapter_order_diagnostics(adapter)
+                except Exception:
+                    any_unavailable = True
+                    continue
+
+                if fill is None:
+                    any_unavailable = True
+                    continue
+
+                # Route through the shared ledger to discriminate confirmed
+                # fill/execution truth from weak evidence (ACK, order detail,
+                # open/new status, zero-qty order detail, etc.).
+                fill_metadata = getattr(fill, "metadata", None) or {}
+                decision = ORDER_TRUTH_LEDGER.resolve_order_success(
+                    venue=venue,
+                    symbol=symbol,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    target_qty=target_qty,
+                    reconciliation=fill,
+                    metadata=fill_metadata,
+                    # No live_position — exchange truth outranks local state.
+                    # No-fill resolution stays in the terminal-flat probe.
+                    live_position=None,
+                    open_order_present=None,
+                )
+                if not decision.confirmed_fill:
+                    # Weak / zero / unavailable / open / unsupported → retain.
+                    any_unavailable = True
+
+        # Must have probed at least one identity — a task with no
+        # identity-bearing legs at all cannot resolve.
+        if not probed:
+            return False
+
+        if any_unavailable:
+            return False
+
+        # Every probed identity is a ledger-confirmed fill.
+        next_attempt_count = int(reconciliation.get("attempt_count") or 0) + 1
+        self.ctx.journal.append(
+            "exit.accepted_order_truth_gap_resolved",
+            {
+                "position_id": position_id,
+                "symbol": symbol,
+                "kind": "accepted_order_truth_gap",
+                "attempt_count": next_attempt_count,
+                "closed_at_ms": int(reconciliation.get("closed_at_ms") or 0),
+                "resolved_at_ms": now_ms,
+                "resolved_by": "order_fill_confirmed_by_ledger",
+                "lifetime_ms": max(
+                    0,
+                    now_ms - max(0, int(reconciliation.get("closed_at_ms") or 0)),
+                ),
+            },
+        )
+        return True
+
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
         self.ctx.state.set_pending_close_reconciliations(
             getattr(self.ctx.state, "pending_close_reconciliations", [])
@@ -830,9 +1074,45 @@ class CloseRuntime:
                 continue
             eligible.append(reconciliation)
 
+        # ------------------------------------------------------------------
+        # Separate accepted_order_truth_gap tasks from billing tasks.
+        # ACK truth-gap tasks MUST NOT enter the billing flow; they are
+        # resolved / superseded exclusively through order truth or
+        # terminal-flat evidence.  Only kind "final" / "partial" tasks
+        # proceed to financial (fill-fetch + bill) reconciliation.
+        # ------------------------------------------------------------------
+        order_truth_eligible: list[dict[str, Any]] = []
+        billing_eligible: list[dict[str, Any]] = []
+        for reconciliation in eligible:
+            if str(reconciliation.get("kind") or "") == "accepted_order_truth_gap":
+                order_truth_eligible.append(reconciliation)
+            else:
+                billing_eligible.append(reconciliation)
+
         changed = False
+
+        # -- Order-truth resolution (no billing) ---------------------------
         for reconciliation in sorted(
-            eligible,
+            order_truth_eligible,
+            key=lambda item: (
+                int(item.get("closed_at_ms") or 0),
+                str(item.get("position_id") or ""),
+            ),
+        ):
+            resolved = await self._resolve_accepted_order_truth_gap(
+                reconciliation, now_ms
+            )
+            if resolved:
+                changed = True
+                continue
+            # Retain with backoff — NEVER emit billing events.
+            self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+            retained.append(reconciliation)
+            changed = True
+
+        # -- Billing reconciliation (final / partial tasks only) -----------
+        for reconciliation in sorted(
+            billing_eligible,
             key=lambda item: (
                 int(item.get("closed_at_ms") or 0),
                 0 if str(item.get("kind") or "final") == "partial" else 1,
