@@ -1739,6 +1739,13 @@ class PassiveCloseExecutor:
             time_in_force=TimeInForce.GTC,
             client_order_id=maker_cid,
         )
+        self._claim_close_order_intent(
+            pending,
+            position,
+            request,
+            leg_label=maker_leg_label,
+            operation="submit_passive_order",
+        )
 
         try:
             ack = await adapter.submit_passive_order(request)
@@ -1906,7 +1913,7 @@ class PassiveCloseExecutor:
         pending.phase_state.maker_submit_consecutive_failures = 0
 
         pending.phase_state.maker_order_id = ack.order_id
-        pending.phase_state.maker_client_order_id = ack.client_order_id
+        pending.phase_state.maker_client_order_id = ack.client_order_id or maker_cid
         pending.phase_state.maker_resting_limit_price = aligned_price
         pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
 
@@ -1917,7 +1924,7 @@ class PassiveCloseExecutor:
                 "maker_venue": maker_venue.value,
                 "maker_leg": maker_leg_label,
                 "order_id": ack.order_id,
-                "client_order_id": ack.client_order_id,
+                "client_order_id": pending.phase_state.maker_client_order_id,
                 "price": pending.phase_state.maker_resting_limit_price,
                 "quantity": chunk_quantity,
                 "chunk_index": pending.active_chunk_index,
@@ -1961,6 +1968,85 @@ class PassiveCloseExecutor:
             }
             return None
 
+    def _claim_close_order_intent(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        request: OrderRequest,
+        *,
+        leg_label: str,
+        operation: str,
+    ) -> None:
+        """Persist a close-order lookup key before its first network await.
+
+        A client order ID is the recovery handle for the ambiguous interval
+        where an exchange may have accepted the close but this process has not
+        received an acknowledgement yet.  Store it in both durable journal
+        evidence and the pending-close snapshot before submitting so a restart
+        can query the venue instead of inferring accounting from flat position
+        truth alone.
+        """
+        client_order_id = str(request.client_order_id or "")
+        if not client_order_id:
+            raise ValueError("close order intent requires client_order_id")
+        if leg_label not in {"long", "short"}:
+            raise ValueError(f"unknown close leg: {leg_label}")
+
+        legs = pending.long_legs if leg_label == "long" else pending.short_legs
+        if not any(
+            leg.client_order_id == client_order_id
+            for leg in legs
+        ):
+            legs.append(
+                PersistedCloseExecutionLeg(
+                    fill=None,
+                    client_order_id=client_order_id,
+                    submit_started_at_ms=self._now_ms(),
+                )
+            )
+
+        self._journal.append_critical(
+            self._now_ms(),
+            "exit.close_order_intent_claimed",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "venue": request.venue.value,
+                "leg": leg_label,
+                "operation": operation,
+                "client_order_id": client_order_id,
+                "side": request.side.value,
+                "quantity": request.quantity,
+                "reduce_only": request.reduce_only,
+                "order_truth_required": True,
+            },
+        )
+
+    @staticmethod
+    def _record_close_execution_leg(
+        pending: PendingPassiveClose,
+        *,
+        leg_label: str,
+        fill: OrderFill,
+        client_order_id: str,
+        submitted_at_ms: int,
+    ) -> None:
+        """Attach execution truth to its pre-submit intent without duplicates."""
+        legs = pending.long_legs if leg_label == "long" else pending.short_legs
+        for leg in legs:
+            if leg.client_order_id == client_order_id and leg.fill is None:
+                leg.fill = fill
+                if not leg.submit_started_at_ms:
+                    leg.submit_started_at_ms = submitted_at_ms
+                return
+        legs.append(
+            PersistedCloseExecutionLeg(
+                fill=fill,
+                client_order_id=client_order_id,
+                submit_started_at_ms=submitted_at_ms,
+            )
+        )
+
     def _apply_maker_progress(
         self,
         pending: PendingPassiveClose,
@@ -1970,6 +2056,10 @@ class PassiveCloseExecutor:
         """Update pending state from maker progress poll result."""
         if progress.cumulative_quantity > pending.maker_fill.quantity + 1e-9:
             delta_qty = progress.cumulative_quantity - pending.maker_fill.quantity
+            progress_client_order_id = (
+                progress.client_order_id
+                or pending.phase_state.maker_client_order_id
+            )
             # Weighted average price update
             prev_total = pending.maker_fill.quantity * pending.maker_fill.average_price
             new_total = delta_qty * progress.average_price
@@ -1979,6 +2069,7 @@ class PassiveCloseExecutor:
             pending.maker_fill.fee_quote += progress.fee_quote
             pending.maker_fill.last_fill_time_ms = progress.last_fill_time_ms
             pending.maker_fill.order_id = progress.order_id
+            pending.maker_fill.client_order_id = progress_client_order_id
 
             # Persist maker delta fill as a close execution leg
             maker_leg = pending.phase_state.active_maker_leg
@@ -1989,19 +2080,17 @@ class PassiveCloseExecutor:
                 quantity=delta_qty,
                 price=progress.average_price,
                 order_id=progress.order_id,
-                client_order_id=progress.client_order_id,
+                client_order_id=progress_client_order_id,
                 fee_quote=progress.fee_quote,
                 filled_at_ms=progress.last_fill_time_ms or now_ms,
             )
-            leg = PersistedCloseExecutionLeg(
+            self._record_close_execution_leg(
+                pending,
+                leg_label=("long" if maker_leg == ActiveMakerLeg.LONG else "short"),
                 fill=maker_fill,
-                client_order_id=progress.client_order_id,
-                submit_started_at_ms=now_ms,
+                client_order_id=progress_client_order_id,
+                submitted_at_ms=now_ms,
             )
-            if maker_leg == ActiveMakerLeg.LONG:
-                pending.long_legs.append(leg)
-            else:
-                pending.short_legs.append(leg)
 
             self._journal.append(
                 "exit.passive_close_maker_progress",
@@ -2213,15 +2302,13 @@ class PassiveCloseExecutor:
             pending.hedge_fill.order_id = fill.order_id
             pending.hedge_fill.client_order_id = fill_client_order_id
 
-            leg = PersistedCloseExecutionLeg(
+            self._record_close_execution_leg(
+                pending,
+                leg_label=hedge_leg_label,
                 fill=fill,
                 client_order_id=fill_client_order_id,
-                submit_started_at_ms=self._now_ms(),
+                submitted_at_ms=self._now_ms(),
             )
-            if hedge_leg_label == "long":
-                pending.long_legs.append(leg)
-            else:
-                pending.short_legs.append(leg)
 
             self._journal.append(
                 "exit.passive_close_hedge_filled",
@@ -2392,6 +2479,13 @@ class PassiveCloseExecutor:
                 accepted_client_order_id=accepted_client_order_id,
             )
 
+        self._claim_close_order_intent(
+            pending,
+            position,
+            request,
+            leg_label=hedge_leg_label,
+            operation="place_order",
+        )
         try:
             fill = await adapter.place_order(request)
         except Exception as e:
@@ -2514,6 +2608,13 @@ class PassiveCloseExecutor:
                         reduce_only=True,
                         time_in_force=TimeInForce.IOC,
                         client_order_id=retry_cid,
+                    )
+                    self._claim_close_order_intent(
+                        pending,
+                        position,
+                        retry_request,
+                        leg_label=hedge_leg_label,
+                        operation="place_order_duplicate_retry",
                     )
                     try:
                         retry_fill = await adapter.place_order(retry_request)
@@ -4093,6 +4194,33 @@ class PassiveCloseExecutor:
             add_fill_state(short_records, pending.maker_fill, position.short_venue)
             add_fill_state(long_records, pending.hedge_fill, position.long_venue)
 
+        def add_intent_records(
+            target: list[dict[str, Any]],
+            legs: list[PersistedCloseExecutionLeg],
+            venue: Venue,
+        ) -> None:
+            # Confirmed fills/order IDs are authoritative.  Intents are only a
+            # recovery fallback for the crash window before any execution
+            # identity is known; adding rejected intents beside real fills
+            # would incorrectly make billing wait on non-executed orders.
+            if any(
+                record.get("order_id") or record.get("client_order_id")
+                for record in target
+            ):
+                return
+            for leg in legs:
+                if leg.fill is None and leg.client_order_id:
+                    add_record(
+                        target,
+                        self._close_reconciliation_record(
+                            venue=venue,
+                            client_order_id=leg.client_order_id,
+                        ),
+                    )
+
+        add_intent_records(long_records, pending.long_legs, position.long_venue)
+        add_intent_records(short_records, pending.short_legs, position.short_venue)
+
         if extra:
             flattened_venue = str(extra.get("flattened_venue") or "")
             flattened_quantity = float(extra.get("flattened_quantity") or 0.0)
@@ -5135,6 +5263,13 @@ class PassiveCloseExecutor:
             time_in_force=TimeInForce.IOC,
             client_order_id=client_order_id,
         )
+        self._claim_close_order_intent(
+            pending,
+            position,
+            request,
+            leg_label=leg_label,
+            operation="place_order_live_one_sided",
+        )
         try:
             fill = await adapter.place_order(request)
         except Exception as exc:
@@ -5278,15 +5413,13 @@ class PassiveCloseExecutor:
             },
         )
 
-        leg = PersistedCloseExecutionLeg(
+        self._record_close_execution_leg(
+            pending,
+            leg_label=leg_label,
             fill=fill,
             client_order_id=client_order_id,
-            submit_started_at_ms=self._now_ms(),
+            submitted_at_ms=self._now_ms(),
         )
-        if leg_label == "short":
-            pending.short_legs.append(leg)
-        else:
-            pending.long_legs.append(leg)
 
         if await self._clear_if_live_flat(
             state,
@@ -5524,6 +5657,13 @@ class PassiveCloseExecutor:
             time_in_force=TimeInForce.IOC,
             client_order_id=client_order_id,
         )
+        self._claim_close_order_intent(
+            pending,
+            position,
+            request,
+            leg_label=excess_leg,
+            operation="place_order_live_imbalanced_excess",
+        )
         try:
             fill = await adapter.place_order(request)
         except Exception as exc:
@@ -5552,15 +5692,13 @@ class PassiveCloseExecutor:
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
 
-        leg = PersistedCloseExecutionLeg(
+        self._record_close_execution_leg(
+            pending,
+            leg_label=excess_leg,
             fill=fill,
             client_order_id=client_order_id,
-            submit_started_at_ms=self._now_ms(),
+            submitted_at_ms=self._now_ms(),
         )
-        if excess_leg == "short":
-            pending.short_legs.append(leg)
-        else:
-            pending.long_legs.append(leg)
         self._journal.append(
             "exit.passive_close_live_imbalanced_excess_flattened",
             {

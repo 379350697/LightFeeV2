@@ -2162,6 +2162,12 @@ def build_recovery_dedup_index(state: EngineState) -> dict[str, str]:
             index[ppc.maker_fill.client_order_id] = pid
         if ppc.hedge_fill.client_order_id:
             index[ppc.hedge_fill.client_order_id] = pid
+        # Pre-submit close intents have no fill yet, but are the only durable
+        # lookup keys if the process stops after the exchange accepts an order
+        # and before the acknowledgement returns.
+        for leg in [*ppc.long_legs, *ppc.short_legs]:
+            if leg.client_order_id:
+                index[leg.client_order_id] = pid
 
     return index
 

@@ -26,7 +26,10 @@ from lightfee.venues.transport import LiveCredential, VenueTransport
 class BinanceAdapter(VenueAdapter):
     """Binance USDⓈ-M futures adapter."""
 
-    _ENTRY_TRADABILITY_CATALOG_TTL_MS = 1_000
+    # An entry admission decision must use a server response obtained for that
+    # decision.  Reusing even a one-second catalog would reintroduce the
+    # PRE_SETTLE transition window this guard exists to close.
+    _ENTRY_TRADABILITY_CATALOG_TTL_MS = 0
 
     def __init__(
         self,
@@ -84,10 +87,9 @@ class BinanceAdapter(VenueAdapter):
         """Fail closed if Binance no longer accepts opening orders for ``symbol``.
 
         Binance documents ``GET /fapi/v1/exchangeInfo`` as an all-symbol
-        catalog; it does not document a symbol filter. Keep a separate,
-        one-second cache for this execution-time view so concurrent candidates
-        do not repeatedly download the catalog, while never reusing the
-        long-lived discovery catalog.
+        catalog; it does not document a symbol filter.  This execution-time
+        view is refreshed for every admission decision, while remaining
+        independent from the long-lived discovery catalog.
         """
         venue_symbol = self._transport._venue_symbol(symbol)
         now_ms = int(time.time() * 1000)

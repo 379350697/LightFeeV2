@@ -38,7 +38,9 @@ from lightfee.venues.transport import (
 # permanently valid after a single load: delisted/unsupported contracts must be
 # re-discovered on refresh while remaining excluded via the negative cache.
 _ASTER_EXCHANGE_INFO_TTL_MS = 300_000
-_ASTER_ENTRY_TRADABILITY_CATALOG_TTL_MS = 1_000
+# Entry admission requires a fresh server response, not a short-lived view
+# reused from a prior candidate.
+_ASTER_ENTRY_TRADABILITY_CATALOG_TTL_MS = 0
 
 # How long an invalid-symbol (-1121) negative-cache entry stays effective before
 # the symbol may be re-admitted on a future refresh.
@@ -248,7 +250,8 @@ class AsterAdapter(VenueAdapter):
         """Check Aster's current FAPI contract state before opening a leg.
 
         Aster's endpoint is Binance-compatible and returns a full catalog. The
-        entry cache is intentionally short-lived and independent from discovery.
+        execution-time catalog is refreshed per admission and is independent
+        from discovery metadata.
         """
         venue_symbol = self._transport._venue_symbol(symbol)
         now_ms = int(time.time() * 1000)

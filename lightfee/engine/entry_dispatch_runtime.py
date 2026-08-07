@@ -368,6 +368,7 @@ class EntryDispatchRuntime:
         now_ms: int,
         long_venue: Venue,
         short_venue: Venue,
+        stage: str = "immediately_before_dispatch",
     ) -> bool:
         """Require every live entry venue to accept a new position right now.
 
@@ -456,6 +457,7 @@ class EntryDispatchRuntime:
                         "candidate_pair_id": pair_id,
                         "pair_id": pair_id,
                         "status": "ok",
+                        "stage": stage,
                         "check_latency_ms": elapsed_ms,
                         "contract_status": str((result or {}).get("contract_status", "")),
                         "instrument_state": str((result or {}).get("instrument_state", "")),
@@ -496,6 +498,7 @@ class EntryDispatchRuntime:
                     "candidate_pair_id": pair_id,
                     "pair_id": pair_id,
                     "reason": reason,
+                    "stage": stage,
                     "raw_error": error_text[:500],
                     "official_doc_url": metadata.get("official_doc_url", ""),
                     "evidence_gap": bool(metadata.get("evidence_gap", True)),
@@ -2197,14 +2200,6 @@ class EntryDispatchRuntime:
             )
             return False
 
-        if not await self._precheck_live_entry_venue_tradability(
-            candidate=candidate,
-            now_ms=now_ms,
-            long_venue=long_venue,
-            short_venue=short_venue,
-        ):
-            return False
-
         if not await self._precheck_bybit_entry_admission(
             candidate=candidate,
             now_ms=now_ms,
@@ -2297,6 +2292,19 @@ class EntryDispatchRuntime:
             route=route,
             now_ms=now_ms,
         )
+
+        # This must be the final network gate before the executor can submit
+        # the maker order.  Admission, leverage preparation and BBO repricing
+        # can each await; checking earlier leaves their combined latency as an
+        # avoidable status-transition window between exchanges.
+        if not await self._precheck_live_entry_venue_tradability(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            stage="immediately_before_dispatch",
+        ):
+            return False
 
         return await self._execute_entry_context(
             ctx=ctx,
