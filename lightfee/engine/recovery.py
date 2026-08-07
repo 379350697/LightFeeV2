@@ -850,6 +850,8 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
 def _restore_pending_passive_close_from_journal(
     state: EngineState,
     payload: dict[str, Any],
+    *,
+    replace_existing: bool = False,
 ) -> PendingPassiveClose | None:
     """Restore the durable passive-close owner carried by a journal event.
 
@@ -864,7 +866,7 @@ def _restore_pending_passive_close_from_journal(
         return state.pending_passive_closes.get(position_id)
 
     existing = state.pending_passive_closes.get(position_id)
-    if existing is not None:
+    if existing is not None and not replace_existing:
         return existing
 
     recovered = _restore_state_from_snapshot_dict(
@@ -989,12 +991,31 @@ def _apply_journal_replay_to_state(
             _restore_pending_passive_close_from_journal(state, payload)
 
         elif kind == "exit.close_order_intent_claimed":
-            pending = _restore_pending_passive_close_from_journal(state, payload)
-            if pending is None:
-                continue
             client_order_id = str(payload.get("client_order_id") or "")
             leg_label = str(payload.get("leg") or "")
             if not client_order_id or leg_label not in {"long", "short"}:
+                continue
+            position_id = str(payload.get("position_id") or "")
+            existing = state.pending_passive_closes.get(position_id)
+            existing_legs = (
+                existing.long_legs if leg_label == "long" and existing is not None
+                else existing.short_legs if existing is not None
+                else []
+            )
+            # The state serializer retains every close intent.  Therefore a
+            # missing CID proves this journal event happened after the loaded
+            # snapshot, so its complete owner payload is newer and may safely
+            # replace the stale pending state.  A known CID is an old replay
+            # record and must never overwrite the newer snapshot.
+            pending = _restore_pending_passive_close_from_journal(
+                state,
+                payload,
+                replace_existing=not any(
+                    leg.client_order_id == client_order_id
+                    for leg in existing_legs
+                ),
+            )
+            if pending is None:
                 continue
             legs = pending.long_legs if leg_label == "long" else pending.short_legs
             if not any(leg.client_order_id == client_order_id for leg in legs):

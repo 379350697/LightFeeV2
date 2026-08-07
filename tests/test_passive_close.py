@@ -7711,6 +7711,79 @@ class TestCloseOrderIntentDurability:
         adapter.query_passive_order_progress.assert_awaited_once()
         adapter.submit_passive_order.assert_not_awaited()
 
+    def test_later_intent_replaces_stale_pending_close_snapshot(self, tmp_path):
+        """A post-snapshot CID must not be paired with the old maker order ID."""
+        from lightfee.engine.recovery import (
+            build_persistent_state_view,
+            recover_from_snapshot,
+        )
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        position = _make_position(position_id="entry-close-stale-snapshot")
+        stale_state = EngineState()
+        stale_state.open_positions[position.position_id] = position
+        stale_state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-maker-order",
+                maker_client_order_id="old-maker-cid",
+            ),
+            long_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=None,
+                    client_order_id="old-maker-cid",
+                    submit_started_at_ms=1,
+                )
+            ],
+        )
+        snapshot = SnapshotStore(tmp_path / "stale-pending-close.json")
+        snapshot.write(build_persistent_state_view(stale_state))
+
+        journal = Journal(tmp_path / "later-intent.log")
+        journal.open()
+        latest = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        executor = PassiveCloseExecutor({}, journal)
+        new_cid = "new-maker-cid"
+        executor._claim_close_order_intent(
+            latest,
+            position,
+            OrderRequest(
+                venue=Venue.BINANCE,
+                symbol=position.symbol,
+                side=Side.SELL,
+                quantity=position.matched_quantity,
+                price=50_000.0,
+                reduce_only=True,
+                post_only=True,
+                time_in_force=TimeInForce.GTC,
+                client_order_id=new_cid,
+            ),
+            leg_label="long",
+            operation="submit_passive_order",
+        )
+
+        recovered = recover_from_snapshot(snapshot, journal)
+        pending = recovered.pending_passive_closes[position.position_id]
+        assert pending.phase_state.maker_order_id == ""
+        assert pending.phase_state.maker_client_order_id == new_cid
+        assert [leg.client_order_id for leg in pending.long_legs] == [new_cid]
+
     def test_unresolved_close_intents_are_not_hidden_by_confirmed_fills(self):
         """A later ACK-loss CID remains a required reconciliation target."""
         journal = _open_journal()
