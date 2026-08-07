@@ -241,6 +241,20 @@ def test_hyperliquid_official_margin_reject_statuses_classify_as_admission_block
     assert metadata["evidence_gap"] is False
 
 
+def test_binance_invalid_opening_position_status_is_an_admission_block():
+    metadata = LiveRuntime._entry_admission_reject_metadata(
+        Venue.BINANCE,
+        "binance status=400 code=-4140 msg=Invalid symbol status for opening position",
+    )
+
+    assert metadata is not None
+    assert metadata["reason"] == "new_position_not_allowed"
+    assert metadata["official_doc_url"] == (
+        "https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code"
+    )
+    assert metadata["evidence_gap"] is False
+
+
 class FlatAdapter:
     async def fetch_position(self, symbol: str):
         return None

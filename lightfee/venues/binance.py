@@ -13,6 +13,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.specs import binance_spec
 from lightfee.venues.transport import LiveCredential, VenueTransport
 
@@ -68,6 +69,58 @@ class BinanceAdapter(VenueAdapter):
                 continue
             metadata[symbol] = dict(row)
         self._transport.set_symbol_metadata(metadata)
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Fail closed if Binance no longer accepts opening orders for ``symbol``.
+
+        Catalog metadata is deliberately not used here: exchangeInfo status can
+        change between candidate selection and maker submission (for example
+        when a perpetual moves into PRE_SETTLE). This is a public,
+        non-mutating preflight executed immediately before either entry leg is
+        submitted.
+        """
+        venue_symbol = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "GET",
+            "/fapi/v1/exchangeInfo",
+            params={"symbol": venue_symbol},
+        )
+        rows = raw.get("symbols", []) if isinstance(raw, dict) else []
+        row = next(
+            (
+                item
+                for item in rows
+                if isinstance(item, dict)
+                and str(item.get("symbol", "")).upper() == venue_symbol.upper()
+            ),
+            None,
+        )
+        if row is None:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "binance code=-4140 Invalid symbol status for opening position: "
+                f"symbol={venue_symbol} missing from exchangeInfo",
+            )
+
+        status = str(row.get("status", "")).upper()
+        contract_type = str(row.get("contractType", "")).upper()
+        delivery_date = str(row.get("deliveryDate", "") or "")
+        if status != "TRADING" or contract_type != "PERPETUAL":
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "binance code=-4140 Invalid symbol status for opening position: "
+                f"symbol={venue_symbol} status={status or 'MISSING'} "
+                f"contractType={contract_type or 'MISSING'} "
+                f"deliveryDate={delivery_date or 'MISSING'}",
+            )
+        return {
+            "venue": Venue.BINANCE.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "contract_status": status,
+            "contract_type": contract_type,
+            "delivery_date": delivery_date,
+        }
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)

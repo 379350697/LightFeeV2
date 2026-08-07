@@ -12,6 +12,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.specs import bybit_spec
 from lightfee.venues.transport import LiveCredential, VenueTransport
 
@@ -84,6 +85,57 @@ class BybitAdapter(VenueAdapter):
                 break
             cursor = next_cursor
         self._transport.set_symbol_metadata(metadata)
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Fail closed if Bybit no longer accepts a new position for ``symbol``.
+
+        Contract status and delivery state are execution-time facts, so this
+        deliberately bypasses the long-lived discovery catalog cache.
+        """
+        venue_symbol = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "GET",
+            "/v5/market/instruments-info",
+            params={"category": "linear", "symbol": venue_symbol},
+            private=False,
+        )
+        result = raw.get("result", {}) if isinstance(raw, dict) else {}
+        rows = result.get("list", []) if isinstance(result, dict) else []
+        row = next(
+            (
+                item
+                for item in rows
+                if isinstance(item, dict)
+                and str(item.get("symbol", "")).upper() == venue_symbol.upper()
+            ),
+            None,
+        )
+        if row is None:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "bybit instrument not entry-tradable: "
+                f"symbol={venue_symbol} missing from instruments-info",
+            )
+
+        status = str(row.get("status", "")).upper()
+        contract_type = str(row.get("contractType", "")).upper()
+        delivery_time = str(row.get("deliveryTime", "") or "")
+        if status != "TRADING" or "PERPETUAL" not in contract_type:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "bybit instrument not entry-tradable: "
+                f"symbol={venue_symbol} status={status or 'MISSING'} "
+                f"contractType={contract_type or 'MISSING'} "
+                f"deliveryTime={delivery_time or 'MISSING'}",
+            )
+        return {
+            "venue": Venue.BYBIT.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "contract_status": status,
+            "contract_type": contract_type,
+            "delivery_time": delivery_time,
+        }
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)

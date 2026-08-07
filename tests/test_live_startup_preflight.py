@@ -377,6 +377,80 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_binance_pre_settle_precheck_blocks_before_maker_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class PrecheckRejectingBinance(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.precheck_symbols = []
+
+                async def precheck_entry_tradability(self, symbol: str):
+                    self.precheck_symbols.append(symbol)
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "binance code=-4140 Invalid symbol status for opening "
+                        "position: symbol=HFTUSDT status=PRE_SETTLE",
+                    )
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError(
+                        "maker dispatch must be blocked by Binance status precheck"
+                    )
+
+            binance = PrecheckRejectingBinance()
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BINANCE: binance},
+                ),
+            )
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="HFTUSDT",
+                long_venue="bybit",
+                short_venue="binance",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is False
+            assert executor.calls == 0
+            assert binance.precheck_symbols == ["HFTUSDT"]
+            key = "binance:HFTUSDT"
+            cooldown = runtime.state.venue_entry_cooldowns[key]
+            assert cooldown["reason"] == "new_position_not_allowed"
+            assert cooldown["source"] == "pre_entry_venue_tradability"
+            assert cooldown["evidence_gap"] is False
+            events = runtime.journal.read_all()
+            blocked = [
+                event["payload"]
+                for event in events
+                if event["kind"] == "runtime.entry_symbol_tradability_blocked"
+            ]
+            assert blocked
+            assert blocked[-1]["venue"] == "binance"
+            assert blocked[-1]["reason"] == "new_position_not_allowed"
+            assert not any(
+                event["kind"] == "execution.entry_selected"
+                for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_live_entry_prepares_leverage_before_dispatch(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)

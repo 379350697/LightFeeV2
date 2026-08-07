@@ -360,6 +360,97 @@ class EntryDispatchRuntime:
             )
             return False
 
+    async def _precheck_live_entry_venue_tradability(
+        self,
+        *,
+        candidate,
+        now_ms: int,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> bool:
+        """Require every live entry venue to accept a new position right now.
+
+        Discovery catalogs are intentionally long-lived, but a contract can
+        move to pre-settlement after selection and before the maker order is
+        submitted.  Adapters which expose this hook therefore fetch their
+        exchange's current instrument state immediately before dispatch.
+        """
+        mode = str(getattr(self.ctx.config.runtime, "mode", "") or "").lower()
+        if mode != "live":
+            return True
+
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        pair_id = self._candidate_pair_id(candidate)
+        checks: list[tuple[Venue, Any]] = []
+        for venue in (long_venue, short_venue):
+            adapter = self.ctx.venue_adapters.get(venue)
+            precheck = (
+                getattr(adapter, "precheck_entry_tradability", None)
+                if adapter is not None
+                else None
+            )
+            if callable(precheck):
+                checks.append((venue, precheck))
+        if not checks:
+            return True
+
+        async def call_precheck(
+            venue: Venue,
+            precheck: Any,
+        ) -> tuple[Venue, Exception | None]:
+            try:
+                await precheck(symbol)
+                return venue, None
+            except Exception as exc:
+                return venue, exc
+
+        results = await asyncio.gather(
+            *(call_precheck(venue, precheck) for venue, precheck in checks)
+        )
+        allowed = True
+        for venue, error in results:
+            if error is None:
+                continue
+            allowed = False
+            error_text = str(error)
+            metadata = self._entry_admission_reject_metadata(venue, error_text)
+            if metadata:
+                reason = str(metadata["reason"])
+            else:
+                reason = "entry_symbol_tradability_unavailable"
+                metadata = {
+                    "reason": reason,
+                    "official_doc_url": "",
+                    "evidence_gap": True,
+                }
+            self._record_symbol_admission_block(
+                venue=venue,
+                symbol=symbol,
+                reason=reason,
+                raw_error=error_text,
+                now_ms=now_ms,
+                evidence=metadata,
+                source="pre_entry_venue_tradability",
+                candidate_pair_id=pair_id,
+            )
+            self.ctx.journal.append(
+                "runtime.entry_symbol_tradability_blocked",
+                {
+                    "venue": venue.value,
+                    "symbol": symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "reason": reason,
+                    "raw_error": error_text[:500],
+                    "official_doc_url": metadata.get("official_doc_url", ""),
+                    "evidence_gap": bool(metadata.get("evidence_gap", True)),
+                    "ts_ms": now_ms,
+                },
+            )
+        return allowed
+
     async def _okx_entry_base_quantity_metadata(
         self, venue: Venue, symbol: str,
     ) -> tuple[float | None, float | None, list[str], str]:
@@ -2049,6 +2140,14 @@ class EntryDispatchRuntime:
                     "reason": "pending entry already exists for this symbol pair",
                 },
             )
+            return False
+
+        if not await self._precheck_live_entry_venue_tradability(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
+        ):
             return False
 
         if not await self._precheck_bybit_entry_admission(

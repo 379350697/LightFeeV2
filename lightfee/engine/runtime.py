@@ -416,6 +416,13 @@ class LiveRuntime:
             or "no new positions during delisting" in text
             or ("delivery" in text and "reduce" in text)
             or "only reduce-only" in text
+            or "instrument not entry-tradable" in text
+        ):
+            return LiveRuntime._entry_admission_evidence("new_position_not_allowed")
+        if venue == Venue.BINANCE and (
+            "-4140" in text
+            or "invalid opening position status" in text
+            or "invalid symbol status for opening position" in text
         ):
             return LiveRuntime._entry_admission_evidence("new_position_not_allowed")
         if venue == Venue.BINANCE and (
