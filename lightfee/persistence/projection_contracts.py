@@ -31,6 +31,7 @@ PROJECTED_ENTRY_EXIT_KINDS: frozenset[str] = frozenset({
     "exit.closed",
     "exit.close_chunk_submitted",
     "exit.close_order_intent_claimed",
+    "exit.passive_close_registered",
     "exit.close_residual_detected",
     "exit.partial_closed",
     "exit.passive_close_advance_blocked_maker_under_chunk",

@@ -1177,6 +1177,7 @@ _EVENT_KIND_PHASES = {
     "exit.accepted_order_truth_gap_superseded": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.pending_close_reconciliation_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.close_order_intent_claimed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.passive_close_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.retry_wait": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.close_chunk_submitted": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.close_residual_detected": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,

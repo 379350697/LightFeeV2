@@ -7522,12 +7522,44 @@ class TestPassiveManagerProfileAndConfig:
 
 
 class TestCloseOrderIntentDurability:
+    def test_pending_close_registration_replays_without_followup_snapshot(self, tmp_path):
+        """Starting a close is journal-durable before its first drive cycle."""
+        from lightfee.engine.recovery import recover_from_snapshot
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        journal = Journal(tmp_path / "close-registration.log")
+        journal.open()
+        state = EngineState()
+        position = _make_position(position_id="entry-close-registration")
+        state.open_positions[position.position_id] = position
+        snapshot = SnapshotStore(tmp_path / "before-close-registration.json")
+        snapshot.write(state.to_dict())
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: _mock_adapter_with_tick(Venue.BINANCE)},
+            journal,
+        )
+        pending = asyncio.run(
+            executor.start_pending_passive_close(
+                state,
+                position,
+                "funding_capture",
+                long_price_hint=50_000.0,
+                short_price_hint=50_000.0,
+            )
+        )
+
+        assert pending is not None
+        recovered = recover_from_snapshot(snapshot, journal)
+        recovered_pending = recovered.pending_passive_closes[position.position_id]
+        assert recovered_pending.target_quantity == position.matched_quantity
+        assert recovered_pending.position_snapshot is recovered.open_positions[position.position_id]
+
     def test_maker_intent_is_persisted_before_submit_and_survives_restart(self):
         """A crash after exchange acceptance must retain a client-ID lookup key."""
         from lightfee.engine.recovery import (
             _restore_state_from_snapshot_dict,
             build_persistent_state_view,
-            build_recovery_dedup_index,
         )
 
         journal = _open_journal()
@@ -7596,7 +7628,6 @@ class TestCloseOrderIntentDurability:
         restored_pending = restored.pending_passive_closes[position.position_id]
         assert restored_pending.long_legs[0].fill is None
         assert restored_pending.long_legs[0].client_order_id == client_order_id
-        assert build_recovery_dedup_index(restored)[client_order_id] == position.position_id
 
         long_records, short_records = executor._pending_close_reconciliation_records(
             restored_pending,
@@ -7613,8 +7644,75 @@ class TestCloseOrderIntentDurability:
             "fee_quote": 0.0,
         }]
 
-    def test_confirmed_close_identity_supersedes_non_executed_intents(self):
-        """A rejected prior CID must not keep a later filled close provisional."""
+    def test_intent_replays_after_ack_loss_without_followup_snapshot(self, tmp_path):
+        """Journal replay retains the CID and refuses a duplicate maker submit."""
+        from lightfee.engine.recovery import recover_from_snapshot
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        journal = Journal(tmp_path / "close-intent.log")
+        journal.open()
+        adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        state = EngineState()
+        position = _make_position(position_id="entry-close-intent-ack-loss")
+        state.open_positions[position.position_id] = position
+        snapshot = SnapshotStore(tmp_path / "before-close-intent.json")
+        snapshot.write(state.to_dict())
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        async def lose_ack_after_exchange_acceptance(request):
+            raise asyncio.CancelledError("simulated process loss after exchange accept")
+
+        adapter.submit_passive_order = AsyncMock(
+            side_effect=lose_ack_after_exchange_acceptance
+        )
+        executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        executor._get_passive_tick_size = AsyncMock(return_value=0.01)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                executor._submit_maker_order(
+                    state,
+                    pending,
+                    position,
+                    Venue.BINANCE,
+                    Side.SELL,
+                    "long",
+                    50_000.0,
+                    position.matched_quantity,
+                )
+            )
+
+        client_order_id = pending.phase_state.maker_client_order_id
+        assert client_order_id
+        recovered = recover_from_snapshot(snapshot, journal)
+        recovered_pending = recovered.pending_passive_closes[position.position_id]
+        assert recovered_pending.phase_state.maker_client_order_id == client_order_id
+        assert recovered_pending.long_legs[0].client_order_id == client_order_id
+
+        adapter.submit_passive_order = AsyncMock()
+        adapter.query_passive_order_progress = AsyncMock(return_value=None)
+        recovered_executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        asyncio.run(
+            recovered_executor.drive_pending_passive_close(
+                recovered,
+                position.position_id,
+            )
+        )
+        adapter.query_passive_order_progress.assert_awaited_once()
+        adapter.submit_passive_order.assert_not_awaited()
+
+    def test_unresolved_close_intents_are_not_hidden_by_confirmed_fills(self):
+        """A later ACK-loss CID remains a required reconciliation target."""
         journal = _open_journal()
         executor = PassiveCloseExecutor({}, journal)
         position = _make_position(position_id="entry-close-intent-supersede")
@@ -7628,7 +7726,7 @@ class TestCloseOrderIntentDurability:
             long_legs=[
                 PersistedCloseExecutionLeg(
                     fill=None,
-                    client_order_id="rejected-intent-cid",
+                    client_order_id="unresolved-intent-cid",
                 ),
                 PersistedCloseExecutionLeg(
                     fill=OrderFill(
@@ -7654,5 +7752,6 @@ class TestCloseOrderIntentDurability:
 
         assert short_records == []
         assert [record["client_order_id"] for record in long_records] == [
-            "confirmed-intent-cid"
+            "confirmed-intent-cid",
+            "unresolved-intent-cid",
         ]

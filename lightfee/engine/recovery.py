@@ -847,6 +847,39 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     return state
 
 
+def _restore_pending_passive_close_from_journal(
+    state: EngineState,
+    payload: dict[str, Any],
+) -> PendingPassiveClose | None:
+    """Restore the durable passive-close owner carried by a journal event.
+
+    The close registration and each pre-submit intent include the complete
+    pending-close owner.  Reconstructing it here makes the journal, rather
+    than a later periodic snapshot, the recovery boundary for an ambiguous
+    exchange submit.
+    """
+    position_id = str(payload.get("position_id") or "")
+    serialized = payload.get("pending_passive_close")
+    if not position_id or not isinstance(serialized, dict):
+        return state.pending_passive_closes.get(position_id)
+
+    existing = state.pending_passive_closes.get(position_id)
+    if existing is not None:
+        return existing
+
+    recovered = _restore_state_from_snapshot_dict(
+        {"pending_passive_closes": {position_id: serialized}}
+    )
+    pending = recovered.pending_passive_closes.get(position_id)
+    if pending is None:
+        return None
+    pending.position_snapshot = (
+        state.open_positions.get(position_id) or pending.position_snapshot
+    )
+    state.pending_passive_closes[position_id] = pending
+    return pending
+
+
 def _apply_journal_replay_to_state(
     state: EngineState,
     records: list[dict[str, Any]],
@@ -951,6 +984,31 @@ def _apply_journal_replay_to_state(
             pid = payload.get("position_id", "")
             if pid:
                 _clear_terminal_close_state(state, str(pid))
+
+        elif kind == "exit.passive_close_registered":
+            _restore_pending_passive_close_from_journal(state, payload)
+
+        elif kind == "exit.close_order_intent_claimed":
+            pending = _restore_pending_passive_close_from_journal(state, payload)
+            if pending is None:
+                continue
+            client_order_id = str(payload.get("client_order_id") or "")
+            leg_label = str(payload.get("leg") or "")
+            if not client_order_id or leg_label not in {"long", "short"}:
+                continue
+            legs = pending.long_legs if leg_label == "long" else pending.short_legs
+            if not any(leg.client_order_id == client_order_id for leg in legs):
+                legs.append(
+                    PersistedCloseExecutionLeg(
+                        fill=None,
+                        client_order_id=client_order_id,
+                        submit_started_at_ms=int(
+                            payload.get("submit_started_at_ms", 0) or 0
+                        ),
+                    )
+                )
+            if payload.get("operation") == "submit_passive_order":
+                pending.phase_state.maker_client_order_id = client_order_id
 
         # V1: exit.pending_close_registered — recreate pending close from journal
         elif kind == "exit.pending_close_registered":
@@ -2162,13 +2220,6 @@ def build_recovery_dedup_index(state: EngineState) -> dict[str, str]:
             index[ppc.maker_fill.client_order_id] = pid
         if ppc.hedge_fill.client_order_id:
             index[ppc.hedge_fill.client_order_id] = pid
-        # Pre-submit close intents have no fill yet, but are the only durable
-        # lookup keys if the process stops after the exchange accepts an order
-        # and before the acknowledgement returns.
-        for leg in [*ppc.long_legs, *ppc.short_legs]:
-            if leg.client_order_id:
-                index[leg.client_order_id] = pid
-
     return index
 
 
