@@ -12,7 +12,10 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
-from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.venues.entry_tradability import (
+    entry_tradability_blocked,
+    entry_tradability_unavailable,
+)
 from lightfee.venues.specs import bybit_spec
 from lightfee.venues.transport import LiveCredential, VenueTransport
 
@@ -99,8 +102,24 @@ class BybitAdapter(VenueAdapter):
             params={"category": "linear", "symbol": venue_symbol},
             private=False,
         )
-        result = raw.get("result", {}) if isinstance(raw, dict) else {}
-        rows = result.get("list", []) if isinstance(result, dict) else []
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("retCode", 0)) != "0"
+            or not isinstance(raw.get("result"), dict)
+        ):
+            raise entry_tradability_unavailable(
+                Venue.BYBIT.value,
+                venue_symbol,
+                "instruments_info_response_missing_or_unsuccessful",
+            )
+        result = raw["result"]
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            raise entry_tradability_unavailable(
+                Venue.BYBIT.value,
+                venue_symbol,
+                "instruments_info_list_missing_or_malformed",
+            )
         row = next(
             (
                 item
@@ -111,22 +130,23 @@ class BybitAdapter(VenueAdapter):
             None,
         )
         if row is None:
-            raise OrderSubmitError(
-                SubmitFailureClass.REJECTED,
-                "bybit instrument not entry-tradable: "
-                f"symbol={venue_symbol} missing from instruments-info",
+            raise entry_tradability_blocked(
+                Venue.BYBIT.value,
+                venue_symbol,
+                status="MISSING",
+                contract_type="MISSING",
             )
 
         status = str(row.get("status", "")).upper()
         contract_type = str(row.get("contractType", "")).upper()
         delivery_time = str(row.get("deliveryTime", "") or "")
         if status != "TRADING" or "PERPETUAL" not in contract_type:
-            raise OrderSubmitError(
-                SubmitFailureClass.REJECTED,
-                "bybit instrument not entry-tradable: "
-                f"symbol={venue_symbol} status={status or 'MISSING'} "
-                f"contractType={contract_type or 'MISSING'} "
-                f"deliveryTime={delivery_time or 'MISSING'}",
+            raise entry_tradability_blocked(
+                Venue.BYBIT.value,
+                venue_symbol,
+                status=status or "MISSING",
+                contract_type=contract_type or "MISSING",
+                delivery_time=delivery_time or "MISSING",
             )
         return {
             "venue": Venue.BYBIT.value,

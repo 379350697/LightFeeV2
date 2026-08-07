@@ -12,6 +12,10 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.entry_tradability import (
+    entry_tradability_blocked,
+    entry_tradability_unavailable,
+)
 from lightfee.venues.specs import gate_spec
 from lightfee.venues.transport import LiveCredential, VenueTransport
 
@@ -100,6 +104,47 @@ class GateAdapter(VenueAdapter):
                 continue
             metadata[venue_symbol] = dict(item)
         self._transport.set_symbol_metadata(metadata)
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Require Gate to report the exact USDT futures contract as trading."""
+        venue_symbol = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "GET",
+            f"/api/v4/futures/usdt/contracts/{venue_symbol}",
+            private=False,
+        )
+        row = raw.get("data", raw) if isinstance(raw, dict) else None
+        if not isinstance(row, dict):
+            raise entry_tradability_unavailable(
+                Venue.GATE.value,
+                venue_symbol,
+                "contract_response_missing_or_malformed",
+            )
+        returned_symbol = str(
+            row.get("name") or row.get("contract") or row.get("symbol") or ""
+        ).upper()
+        if returned_symbol != venue_symbol.upper():
+            raise entry_tradability_unavailable(
+                Venue.GATE.value,
+                venue_symbol,
+                "contract_response_symbol_mismatch",
+            )
+        status = str(row.get("status", "")).lower()
+        in_delisting = bool(row.get("in_delisting", False))
+        if status != "trading" or in_delisting:
+            raise entry_tradability_blocked(
+                Venue.GATE.value,
+                venue_symbol,
+                status=status or "MISSING",
+                in_delisting=in_delisting,
+            )
+        return {
+            "venue": Venue.GATE.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "contract_status": status,
+            "in_delisting": in_delisting,
+        }
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)

@@ -370,6 +370,9 @@ class LiveRuntime:
         "https://asterdex.github.io/aster-api-website/futures/account%26trades/"
         "#remaining-openable-notional-value-user_data"
     )
+    _OKX_INSTRUMENT_DOC_URL = "https://www.okx.com/docs-v5/en/#public-data-rest-api-get-instruments"
+    _BITGET_CONTRACT_DOC_URL = "https://www.bitget.com/api-doc/classic/contract/market/Get-All-Symbols-Contracts"
+    _GATE_CONTRACT_DOC_URL = "https://www.gate.com/docs/developers/apiv4/en/futures/"
 
     @staticmethod
     def _risk_snapshot_ttl_ms(venue: Venue) -> int:
@@ -383,8 +386,26 @@ class LiveRuntime:
         return str(metadata["reason"]) if metadata else None
 
     @staticmethod
+    def _entry_tradability_doc_url(venue: Venue) -> str:
+        return {
+            Venue.BINANCE: LiveRuntime._BINANCE_USDM_ERROR_DOC_URL,
+            Venue.BYBIT: LiveRuntime._BYBIT_ERROR_DOC_URL,
+            Venue.OKX: LiveRuntime._OKX_INSTRUMENT_DOC_URL,
+            Venue.BITGET: LiveRuntime._BITGET_CONTRACT_DOC_URL,
+            Venue.GATE: LiveRuntime._GATE_CONTRACT_DOC_URL,
+            Venue.ASTER: LiveRuntime._ASTER_API_DOC_URL,
+            Venue.HYPERLIQUID: LiveRuntime._HYPERLIQUID_INFO_DOC_URL,
+        }.get(venue, "")
+
+    @staticmethod
     def _entry_admission_reject_metadata(venue: Venue, reason: str) -> dict | None:
         text = str(reason or "").lower()
+        if "entry-tradability-blocked" in text:
+            return {
+                "reason": "new_position_not_allowed",
+                "official_doc_url": LiveRuntime._entry_tradability_doc_url(venue),
+                "evidence_gap": False,
+            }
         if venue == Venue.BYBIT and (
             "110007" in text
             or "available balance is insufficient" in text
@@ -424,7 +445,11 @@ class LiveRuntime:
             or "invalid opening position status" in text
             or "invalid symbol status for opening position" in text
         ):
-            return LiveRuntime._entry_admission_evidence("new_position_not_allowed")
+            return {
+                "reason": "new_position_not_allowed",
+                "official_doc_url": LiveRuntime._BINANCE_USDM_ERROR_DOC_URL,
+                "evidence_gap": False,
+            }
         if venue == Venue.BINANCE and (
             "-2019" in text
             or "margin is insufficient" in text
@@ -1620,6 +1645,12 @@ class LiveRuntime:
 
     async def _verify_live_trading_preflights(self) -> None:
         """Run read-only venue admission checks before selector can trade."""
+        def mask_address(value: object) -> str:
+            text = str(value or "").strip()
+            if len(text) <= 12:
+                return text
+            return f"{text[:6]}...{text[-4:]}"
+
         blocked = {
             "api_key",
             "api_secret",
@@ -1655,6 +1686,13 @@ class LiveRuntime:
             for key, value in dict(raw_payload or {}).items():
                 key_s = str(key)
                 key_l = key_s.lower()
+                if venue == Venue.HYPERLIQUID and key_l in {
+                    "configured_account_address",
+                    "signer_address",
+                }:
+                    payload[f"{key_s}_present"] = bool(str(value or "").strip())
+                    payload[f"{key_s}_masked"] = mask_address(value)
+                    continue
                 if (
                     key_l not in allowed_auth_diagnostics
                     and (

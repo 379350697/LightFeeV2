@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import time
 from enum import Enum
 from typing import Any, Optional
 
@@ -17,6 +18,10 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.exchange_truth import request_venue_operation
+from lightfee.venues.entry_tradability import (
+    entry_tradability_blocked,
+    entry_tradability_unavailable,
+)
 from lightfee.venues.specs import (
     BitgetContractFamily,
     VenueOperation,
@@ -382,6 +387,78 @@ class BitgetAdapter(VenueAdapter):
         """Populate Bitget contract metadata when startup recovery needs it."""
         if not self._transport._symbol_metadata:
             await self._load_symbol_metadata()
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Require Bitget to currently permit a USDT perpetual opening order."""
+        venue_symbol = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "GET",
+            "/api/v2/mix/market/contracts",
+            params={"productType": "USDT-FUTURES", "symbol": venue_symbol},
+            private=False,
+        )
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("code", "00000")) != "00000"
+            or not isinstance(raw.get("data"), list)
+        ):
+            raise entry_tradability_unavailable(
+                Venue.BITGET.value,
+                venue_symbol,
+                "contracts_response_missing_or_unsuccessful",
+            )
+        row = next(
+            (
+                item
+                for item in raw["data"]
+                if isinstance(item, dict)
+                and str(item.get("symbol", "")).upper() == venue_symbol.upper()
+            ),
+            None,
+        )
+        if row is None:
+            raise entry_tradability_blocked(
+                Venue.BITGET.value,
+                venue_symbol,
+                symbol_status="MISSING",
+                symbol_type="MISSING",
+            )
+        symbol_status = str(row.get("symbolStatus", "")).lower()
+        symbol_type = str(row.get("symbolType", "")).lower()
+        limit_open_time = str(row.get("limitOpenTime", "") or "")
+        if limit_open_time not in ("", "-1"):
+            try:
+                limit_open_at_ms = int(limit_open_time)
+            except ValueError:
+                raise entry_tradability_unavailable(
+                    Venue.BITGET.value,
+                    venue_symbol,
+                    "limitOpenTime_not_an_integer",
+                )
+            if limit_open_at_ms > 0 and limit_open_at_ms <= int(time.time() * 1000):
+                raise entry_tradability_blocked(
+                    Venue.BITGET.value,
+                    venue_symbol,
+                    symbol_status=symbol_status or "MISSING",
+                    symbol_type=symbol_type or "MISSING",
+                    limit_open_time=limit_open_time,
+                )
+        if symbol_status != "normal" or symbol_type != "perpetual":
+            raise entry_tradability_blocked(
+                Venue.BITGET.value,
+                venue_symbol,
+                symbol_status=symbol_status or "MISSING",
+                symbol_type=symbol_type or "MISSING",
+                limit_open_time=limit_open_time or "MISSING",
+            )
+        return {
+            "venue": Venue.BITGET.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "symbol_status": symbol_status,
+            "symbol_type": symbol_type,
+            "limit_open_time": limit_open_time,
+        }
 
     # ------------------------------------------------------------------
     # Profile detection

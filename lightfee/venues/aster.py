@@ -6,6 +6,7 @@ Aster Pro API V3 and do not share Binance HMAC signing.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Optional
 
@@ -20,6 +21,10 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.venues.aster_v3 import AsterV3Client
+from lightfee.venues.entry_tradability import (
+    entry_tradability_blocked,
+    entry_tradability_unavailable,
+)
 from lightfee.venues.specs import aster_spec
 from lightfee.venues.transport import (
     LiveCredential,
@@ -33,6 +38,7 @@ from lightfee.venues.transport import (
 # permanently valid after a single load: delisted/unsupported contracts must be
 # re-discovered on refresh while remaining excluded via the negative cache.
 _ASTER_EXCHANGE_INFO_TTL_MS = 300_000
+_ASTER_ENTRY_TRADABILITY_CATALOG_TTL_MS = 1_000
 
 # How long an invalid-symbol (-1121) negative-cache entry stays effective before
 # the symbol may be re-admitted on a future refresh.
@@ -89,6 +95,9 @@ class AsterAdapter(VenueAdapter):
         self._private_disabled_reason = ""
         self._private: AsterV3Client | None = None
         self._symbol_metadata_loaded_at_ms: int = 0
+        self._entry_tradability_catalog: dict[str, dict[str, Any]] = {}
+        self._entry_tradability_catalog_at_ms = 0
+        self._entry_tradability_catalog_lock = asyncio.Lock()
         # negative cache: symbol -> marked_at_ms for exchange -1121 evidence
         self._unsupported_symbols: dict[str, int] = {}
         if mode == "live" and credential is not None:
@@ -234,6 +243,56 @@ class AsterAdapter(VenueAdapter):
             metadata[symbol] = dict(row)
         self._transport.set_symbol_metadata(metadata)
         self._symbol_metadata_loaded_at_ms = int(time.time() * 1000)
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Check Aster's current FAPI contract state before opening a leg.
+
+        Aster's endpoint is Binance-compatible and returns a full catalog. The
+        entry cache is intentionally short-lived and independent from discovery.
+        """
+        venue_symbol = self._transport._venue_symbol(symbol)
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._entry_tradability_catalog_at_ms >= _ASTER_ENTRY_TRADABILITY_CATALOG_TTL_MS:
+            async with self._entry_tradability_catalog_lock:
+                now_ms = int(time.time() * 1000)
+                if now_ms - self._entry_tradability_catalog_at_ms >= _ASTER_ENTRY_TRADABILITY_CATALOG_TTL_MS:
+                    raw = await self._transport._request("GET", "/fapi/v1/exchangeInfo")
+                    if not isinstance(raw, dict) or not isinstance(raw.get("symbols"), list):
+                        raise entry_tradability_unavailable(
+                            Venue.ASTER.value,
+                            venue_symbol,
+                            "exchangeInfo_symbols_missing_or_malformed",
+                        )
+                    self._entry_tradability_catalog = {
+                        str(item.get("symbol", "")).upper(): dict(item)
+                        for item in raw["symbols"]
+                        if isinstance(item, dict) and str(item.get("symbol", ""))
+                    }
+                    self._entry_tradability_catalog_at_ms = now_ms
+        row = self._entry_tradability_catalog.get(venue_symbol.upper())
+        if row is None:
+            raise entry_tradability_blocked(
+                Venue.ASTER.value,
+                venue_symbol,
+                status="MISSING",
+                contract_type="MISSING",
+            )
+        status = str(row.get("status", row.get("contractStatus", ""))).upper()
+        contract_type = str(row.get("contractType", "")).upper()
+        if status != "TRADING" or contract_type != "PERPETUAL":
+            raise entry_tradability_blocked(
+                Venue.ASTER.value,
+                venue_symbol,
+                status=status or "MISSING",
+                contract_type=contract_type or "MISSING",
+            )
+        return {
+            "venue": Venue.ASTER.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "contract_status": status,
+            "contract_type": contract_type,
+        }
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)

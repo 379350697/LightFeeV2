@@ -548,6 +548,34 @@ class CloseRuntime:
                 }
             }
             terminal_payload["net_quote_status"] = "provisional"
+
+        def recovery_targets(raw_legs: Any) -> list[dict[str, str]]:
+            if not isinstance(raw_legs, list):
+                return []
+            return [
+                {
+                    "venue": str(leg.get("venue") or ""),
+                    "order_id": str(leg.get("order_id") or ""),
+                    "client_order_id": str(leg.get("client_order_id") or ""),
+                }
+                for leg in raw_legs
+                if isinstance(leg, dict)
+                and (leg.get("order_id") or leg.get("client_order_id"))
+            ]
+
+        long_targets = recovery_targets(terminal_payload.get("long_legs"))
+        short_targets = recovery_targets(terminal_payload.get("short_legs"))
+        terminal_payload["billing_reconciliation_required"] = True
+        terminal_payload["billing_reconciliation_targets"] = {
+            "long": long_targets,
+            "short": short_targets,
+        }
+        terminal_payload["close_order_identity_available"] = bool(
+            long_targets or short_targets
+        )
+        terminal_payload["close_order_identity_complete"] = bool(
+            long_targets and short_targets
+        )
         self.ctx.journal.append_critical(
             now_ms,
             "exit.billing_evidence_unavailable",

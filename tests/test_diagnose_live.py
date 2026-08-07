@@ -1674,6 +1674,8 @@ def test_run_diagnose_warns_on_persistent_billing_unreconciled(monkeypatch):
         gate = result["production_acceptance_gate"]
         assert gate["unresolved_billing_unreconciled_count"] == 0
         assert "billing_unreconciled_unresolved" not in gate["blocking_reasons"]
+        assert gate["provisional_billing_evidence_count"] == 1
+        assert "billing_evidence_provisional" in gate["blocking_reasons"]
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

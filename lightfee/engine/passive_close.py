@@ -4437,6 +4437,19 @@ class PassiveCloseExecutor:
             position,
             extra=None,
         )
+        def recovery_targets(records: list[dict[str, Any]]) -> list[dict[str, str]]:
+            return [
+                {
+                    "venue": str(record.get("venue") or ""),
+                    "order_id": str(record.get("order_id") or ""),
+                    "client_order_id": str(record.get("client_order_id") or ""),
+                }
+                for record in records
+                if record.get("order_id") or record.get("client_order_id")
+            ]
+
+        long_targets = recovery_targets(long_legs)
+        short_targets = recovery_targets(short_legs)
         now_ms = self._now_ms()
         self._journal.append_critical(
             now_ms,
@@ -4448,6 +4461,9 @@ class PassiveCloseExecutor:
                 "short_venue": position.short_venue.value,
                 "reason": pending.reason,
                 "resolution_source": source,
+                # Preserve the existing terminal reason/path for downstream
+                # consumers; the explicit completeness fields below carry the
+                # more precise distinction for new diagnostics.
                 "terminal_reason": "terminal_live_flat_without_close_order_identity",
                 "close_path": "passive_close_live_flat_no_reconciliation_identity",
                 "closed_at_ms": now_ms,
@@ -4463,7 +4479,13 @@ class PassiveCloseExecutor:
                     float(record.get("quantity") or 0.0) for record in short_legs
                 ),
                 "close_quantity_evidence_complete": False,
-                "close_order_identity_available": False,
+                "close_order_identity_available": bool(long_targets or short_targets),
+                "close_order_identity_complete": bool(long_targets and short_targets),
+                "billing_reconciliation_required": True,
+                "billing_reconciliation_targets": {
+                    "long": long_targets,
+                    "short": short_targets,
+                },
                 "entry_fee_evidence_complete": bool(
                     position.entry_fee_evidence_complete
                 ),

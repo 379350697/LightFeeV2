@@ -15,6 +15,10 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.entry_tradability import (
+    entry_tradability_blocked,
+    entry_tradability_unavailable,
+)
 from lightfee.venues.specs import hyperliquid_spec
 from lightfee.venues.transport import (
     LiveCredential,
@@ -75,6 +79,43 @@ class HyperliquidAdapter(VenueAdapter):
                 continue
             metadata[name] = dict(row)
         self._transport.set_symbol_metadata(metadata)
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Require the current Hyperliquid meta universe to retain the asset."""
+        venue_symbol = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "POST",
+            "/info",
+            body={"type": "meta"},
+            private=False,
+        )
+        if not isinstance(raw, dict) or not isinstance(raw.get("universe"), list):
+            raise entry_tradability_unavailable(
+                Venue.HYPERLIQUID.value,
+                venue_symbol,
+                "meta_universe_missing_or_malformed",
+            )
+        row = next(
+            (
+                item
+                for item in raw["universe"]
+                if isinstance(item, dict)
+                and str(item.get("name", "")).upper() == venue_symbol.upper()
+            ),
+            None,
+        )
+        if row is None or bool(row.get("isDelisted", False)):
+            raise entry_tradability_blocked(
+                Venue.HYPERLIQUID.value,
+                venue_symbol,
+                state="DELISTED" if row is not None else "MISSING",
+            )
+        return {
+            "venue": Venue.HYPERLIQUID.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "is_delisted": False,
+        }
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
