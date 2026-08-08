@@ -145,6 +145,18 @@ class VenueAdapter(ABC):
     ) -> None:
         pass
 
+    async def precheck_entry_tradability(self, symbol: str) -> dict:
+        """Prove this venue currently permits opening ``symbol``.
+
+        Discovery metadata may be stale, so live dispatch calls this immediately
+        before any maker or hedge order. Adapters must implement it using a
+        current, non-mutating exchange endpoint. The default intentionally
+        fails instead of silently treating a missing capability as permission.
+        """
+        raise NotImplementedError(
+            f"precheck_entry_tradability not implemented for {self.venue.value}"
+        )
+
     @property
     def supports_risk_health(self) -> bool:
         """Whether this venue adapter can provide account risk health snapshots.

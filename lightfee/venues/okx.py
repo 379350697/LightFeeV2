@@ -13,6 +13,10 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.entry_tradability import (
+    entry_tradability_blocked,
+    entry_tradability_unavailable,
+)
 from lightfee.venues.specs import okx_spec
 from lightfee.venues.transport import LiveCredential, VenueTransport
 
@@ -63,6 +67,58 @@ class OkxAdapter(VenueAdapter):
         if self._transport._symbol_metadata:
             return
         await self._transport._ensure_okx_swap_instrument_metadata_loaded()
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict[str, Any]:
+        """Require the exact OKX SWAP instrument to be currently ``live``."""
+        venue_symbol = self._transport._venue_symbol(symbol)
+        raw = await self._transport._request(
+            "GET",
+            "/api/v5/public/instruments",
+            params={"instType": "SWAP", "instId": venue_symbol},
+            private=False,
+        )
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("code", "0")) != "0"
+            or not isinstance(raw.get("data"), list)
+        ):
+            raise entry_tradability_unavailable(
+                Venue.OKX.value,
+                venue_symbol,
+                "instruments_response_missing_or_unsuccessful",
+            )
+        row = next(
+            (
+                item
+                for item in raw["data"]
+                if isinstance(item, dict)
+                and str(item.get("instId", "")).upper() == venue_symbol.upper()
+            ),
+            None,
+        )
+        if row is None:
+            raise entry_tradability_blocked(
+                Venue.OKX.value,
+                venue_symbol,
+                state="MISSING",
+                inst_type="MISSING",
+            )
+        state = str(row.get("state", "")).lower()
+        inst_type = str(row.get("instType", "")).upper()
+        if state != "live" or inst_type != "SWAP":
+            raise entry_tradability_blocked(
+                Venue.OKX.value,
+                venue_symbol,
+                state=state or "MISSING",
+                inst_type=inst_type or "MISSING",
+            )
+        return {
+            "venue": Venue.OKX.value,
+            "symbol": venue_symbol,
+            "status": "ok",
+            "instrument_state": state,
+            "instrument_type": inst_type,
+        }
 
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)

@@ -377,6 +377,298 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_binance_pre_settle_precheck_blocks_before_maker_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class PrecheckRejectingBinance(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.precheck_symbols = []
+
+                async def precheck_entry_tradability(self, symbol: str):
+                    self.precheck_symbols.append(symbol)
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "binance code=-4140 Invalid symbol status for opening "
+                        "position: symbol=HFTUSDT status=PRE_SETTLE",
+                    )
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError(
+                        "maker dispatch must be blocked by Binance status precheck"
+                    )
+
+            binance = PrecheckRejectingBinance()
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BINANCE: binance},
+                ),
+            )
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="HFTUSDT",
+                long_venue="bybit",
+                short_venue="binance",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is False
+            assert executor.calls == 0
+            assert binance.precheck_symbols == ["HFTUSDT"]
+            key = "binance:HFTUSDT"
+            cooldown = runtime.state.venue_entry_cooldowns[key]
+            assert cooldown["reason"] == "new_position_not_allowed"
+            assert cooldown["source"] == "pre_entry_venue_tradability"
+            assert cooldown["evidence_gap"] is False
+            events = runtime.journal.read_all()
+            blocked = [
+                event["payload"]
+                for event in events
+                if event["kind"] == "runtime.entry_symbol_tradability_blocked"
+            ]
+            assert blocked
+            assert blocked[-1]["venue"] == "binance"
+            assert blocked[-1]["reason"] == "new_position_not_allowed"
+            assert not any(
+                event["kind"] == "execution.entry_selected"
+                for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_entry_tradability_capability_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class MissingCapabilityBinance(FakeVenueAdapter):
+                precheck_entry_tradability = None
+
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError("entry must not dispatch without a venue precheck")
+
+            binance = MissingCapabilityBinance()
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BINANCE: binance},
+                ),
+            )
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+
+            dispatched = await runtime._dispatch_entry(
+                _admissible_dispatch_candidate(
+                    symbol="HFTUSDT", long_venue="bybit", short_venue="binance"
+                ),
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is False
+            assert executor.calls == 0
+            cooldown = runtime.state.venue_entry_cooldowns["binance:HFTUSDT"]
+            assert cooldown["reason"] == "entry_symbol_tradability_unavailable"
+            assert cooldown["evidence_gap"] is True
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_entry_tradability_timeout_fails_closed_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.entry_tradability_precheck_timeout_ms = 1
+
+            class HangingBinance(FakeVenueAdapter):
+                async def precheck_entry_tradability(self, symbol: str):
+                    await asyncio.Event().wait()
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError("entry must not dispatch after a timed-out precheck")
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BINANCE: HangingBinance(Venue.BINANCE)},
+                ),
+            )
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+
+            dispatched = await runtime._dispatch_entry(
+                _admissible_dispatch_candidate(
+                    symbol="HFTUSDT", long_venue="bybit", short_venue="binance"
+                ),
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is False
+            assert executor.calls == 0
+            event = [
+                record["payload"]
+                for record in runtime.journal.read_all()
+                if record["kind"] == "runtime.entry_symbol_tradability_blocked"
+                and record["payload"].get("venue") == "binance"
+            ][-1]
+            assert event["reason"] == "entry_symbol_tradability_unavailable"
+            assert event["precheck_timeout_ms"] == 1
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_binance_execution_catalog_is_unfiltered_and_fresh_per_admission(self):
+        from lightfee.venues.binance import BinanceAdapter
+
+        adapter = BinanceAdapter(mode="paper")
+        requests = []
+
+        async def fake_request(method, path, params=None, **kwargs):
+            requests.append((method, path, params))
+            return {
+                "symbols": [
+                    {"symbol": "HFTUSDT", "status": "TRADING", "contractType": "PERPETUAL"}
+                ]
+            }
+
+        adapter._transport._request = fake_request
+        await adapter.precheck_entry_tradability("HFTUSDT")
+        await adapter.precheck_entry_tradability("HFTUSDT")
+
+        assert requests == [
+            ("GET", "/fapi/v1/exchangeInfo", None),
+            ("GET", "/fapi/v1/exchangeInfo", None),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_venue_precheck_application_errors_are_evidence_gaps(self):
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.transport import TransportError
+
+        bybit = BybitAdapter(mode="paper")
+        bitget = BitgetAdapter(mode="paper")
+
+        async def bybit_error(*args, **kwargs):
+            return {"retCode": 10001, "retMsg": "bad request", "result": {}}
+
+        async def bitget_error(*args, **kwargs):
+            return {"code": "40010", "msg": "bad request", "data": []}
+
+        bybit._transport._request = bybit_error
+        bitget._transport._request = bitget_error
+
+        with pytest.raises(TransportError, match="entry-tradability-unavailable"):
+            await bybit.precheck_entry_tradability("HFTUSDT")
+        with pytest.raises(TransportError, match="entry-tradability-unavailable"):
+            await bitget.precheck_entry_tradability("HFTUSDT")
+
+    @pytest.mark.asyncio
+    async def test_all_live_adapter_prechecks_accept_current_perpetual_state(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.binance import BinanceAdapter
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.gate import GateAdapter
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+        from lightfee.venues.okx import OkxAdapter
+
+        cases = [
+            (
+                BinanceAdapter(mode="paper"),
+                "HFTUSDT",
+                {"symbols": [{"symbol": "HFTUSDT", "status": "TRADING", "contractType": "PERPETUAL"}]},
+            ),
+            (
+                BybitAdapter(mode="paper"),
+                "HFTUSDT",
+                {"retCode": 0, "result": {"list": [{"symbol": "HFTUSDT", "status": "Trading", "contractType": "LinearPerpetual"}]}},
+            ),
+            (
+                OkxAdapter(mode="paper"),
+                "HFTUSDT",
+                {"code": "0", "data": [{"instId": "HFT-USDT-SWAP", "instType": "SWAP", "state": "live"}]},
+            ),
+            (
+                BitgetAdapter(mode="paper"),
+                "HFTUSDT",
+                {"code": "00000", "data": [{"symbol": "HFTUSDT", "symbolStatus": "normal", "symbolType": "perpetual", "limitOpenTime": "-1"}]},
+            ),
+            (
+                GateAdapter(mode="paper"),
+                "HFTUSDT",
+                {"name": "HFT_USDT", "status": "trading", "in_delisting": False},
+            ),
+            (
+                AsterAdapter(mode="paper"),
+                "HFTUSDT",
+                {"symbols": [{"symbol": "HFTUSDT", "status": "TRADING", "contractType": "PERPETUAL"}]},
+            ),
+            (
+                HyperliquidAdapter(mode="paper"),
+                "HFTUSDT",
+                {"universe": [{"name": "HFT", "isDelisted": False}]},
+            ),
+        ]
+
+        for adapter, symbol, raw in cases:
+            async def fake_request(*args, _raw=raw, **kwargs):
+                return _raw
+
+            adapter._transport._request = fake_request
+            result = await adapter.precheck_entry_tradability(symbol)
+            assert result["status"] == "ok"
+
+    def test_every_live_adapter_implements_entry_tradability_precheck(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.binance import BinanceAdapter
+        from lightfee.venues.bitget import BitgetAdapter
+        from lightfee.venues.bybit import BybitAdapter
+        from lightfee.venues.gate import GateAdapter
+        from lightfee.venues.hyperliquid import HyperliquidAdapter
+        from lightfee.venues.okx import OkxAdapter
+
+        for adapter_type in (
+            BinanceAdapter,
+            OkxAdapter,
+            BybitAdapter,
+            BitgetAdapter,
+            GateAdapter,
+            AsterAdapter,
+            HyperliquidAdapter,
+        ):
+            assert "precheck_entry_tradability" in adapter_type.__dict__
+
+    @pytest.mark.asyncio
     async def test_live_entry_prepares_leverage_before_dispatch(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
@@ -868,8 +1160,12 @@ class TestRuntimePreflight:
                 if r["kind"] == "startup.trading_preflight"
             )
             assert preflight["authorization_mode"] == "api_wallet"
-            assert preflight["configured_account_address"].lower().endswith("beef")
-            assert preflight["signer_address"].startswith("0x1111")
+            assert preflight["configured_account_address_present"] is True
+            assert preflight["configured_account_address_masked"].lower().endswith("beef")
+            assert preflight["signer_address_present"] is True
+            assert preflight["signer_address_masked"].startswith("0x1111")
+            assert "configured_account_address" not in preflight
+            assert "signer_address" not in preflight
             assert preflight["authorization_error"] == "L1 error: signer mismatch"
             assert "auth_payload" not in preflight
             assert "auth_headers" not in preflight
@@ -3849,6 +4145,7 @@ class TestLiveMainStartupShutdownOrder:
         """SIGTERM path must cancel runtime-owned background tasks and flush state."""
         calls: list[str] = []
         task_cancelled = asyncio.Event()
+        stop_saw_task_pending = False
         shutdown_event = asyncio.Event()
         flush_path = tmp_path / "flushed.txt"
 
@@ -3878,7 +4175,9 @@ class TestLiveMainStartupShutdownOrder:
                 await shutdown_event.wait()
 
             async def stop(self) -> None:
+                nonlocal stop_saw_task_pending
                 calls.append("stop")
+                stop_saw_task_pending = not task_cancelled.is_set()
                 logger = __import__("logging").getLogger("lightfee.engine.runtime")
                 logger.info("shutdown stage=close_network")
                 logger.info("shutdown stage=flush_state")
@@ -3914,6 +4213,7 @@ class TestLiveMainStartupShutdownOrder:
         assert calls == ["start", "run_loop", "stop"]
         assert flush_path.read_text() == "flushed"
         assert task_cancelled.is_set()
+        assert stop_saw_task_pending is True
         messages = "\n".join(record.getMessage() for record in caplog.records)
         for stage in (
             "signal_received",
@@ -3925,6 +4225,9 @@ class TestLiveMainStartupShutdownOrder:
             assert f"shutdown stage={stage}" in messages
         assert messages.index("shutdown stage=close_network") < messages.index(
             "shutdown stage=flush_state"
+        )
+        assert messages.index("shutdown stage=close_network") < messages.index(
+            "shutdown stage=cancel_tasks"
         )
 
     @pytest.mark.asyncio
@@ -4030,3 +4333,68 @@ class TestLiveMainStartupShutdownOrder:
         messages = "\n".join(record.getMessage() for record in caplog.records)
         assert "shutdown stage=cancel_tasks" in messages
         assert "stuck-after-async-main" in messages
+
+
+@pytest.mark.asyncio
+async def test_final_tradability_check_blocks_status_flip_during_admission():
+    """A venue state change during a slower admission gate blocks dispatch."""
+    with tempfile.TemporaryDirectory() as td:
+        binance_state = {"blocked": False}
+        call_order: list[str] = []
+
+        class SwitchingBinance(FakeVenueAdapter):
+            async def precheck_entry_tradability(self, symbol: str):
+                call_order.append("binance_tradability")
+                if binance_state["blocked"]:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "binance code=-4140 Invalid symbol status for opening "
+                        "position: symbol=HFTUSDT status=PRE_SETTLE",
+                    )
+                return {"status": "ok"}
+
+        class MutatingBybit(FakeVenueAdapter):
+            async def precheck_order_admission(self, request):
+                call_order.append("bybit_admission")
+                binance_state["blocked"] = True
+                return {"status": "ok"}
+
+        class RecordingExecutor:
+            calls = 0
+
+            async def execute(self, ctx):
+                self.calls += 1
+                raise AssertionError("status flip must block before dispatch")
+
+        binance = SwitchingBinance(Venue.BINANCE)
+        bybit = MutatingBybit(Venue.BYBIT)
+        runtime = LiveRuntime(
+            make_test_config(td),
+            venue_adapters=_fake_adapters_for_venues(
+                "binance",
+                "bybit",
+                overrides={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            ),
+        )
+        runtime.entry_executor = RecordingExecutor()
+        runtime.journal.open()
+
+        dispatched = await runtime._dispatch_entry(
+            _admissible_dispatch_candidate(
+                symbol="HFTUSDT", long_venue="binance", short_venue="bybit"
+            ),
+            1778787000000,
+            price_hint=100.0,
+        )
+
+        assert dispatched is False
+        assert runtime.entry_executor.calls == 0
+        assert call_order == ["bybit_admission", "binance_tradability"]
+        blocked = [
+            event["payload"]
+            for event in runtime.journal.read_all()
+            if event["kind"] == "runtime.entry_symbol_tradability_blocked"
+            and event["payload"]["venue"] == "binance"
+        ]
+        assert blocked[-1]["stage"] == "immediately_before_dispatch"
+        runtime.journal.close()

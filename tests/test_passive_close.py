@@ -7519,3 +7519,312 @@ class TestPassiveManagerProfileAndConfig:
         assert executor._config.max_zero_fill_cycles == 5
         assert executor._config.default_tick_size == 0.5
         assert executor._config.close_chunk_max_notional_quote == 1000.0
+
+
+class TestCloseOrderIntentDurability:
+    def test_pending_close_registration_replays_without_followup_snapshot(self, tmp_path):
+        """Starting a close is journal-durable before its first drive cycle."""
+        from lightfee.engine.recovery import recover_from_snapshot
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        journal = Journal(tmp_path / "close-registration.log")
+        journal.open()
+        state = EngineState()
+        position = _make_position(position_id="entry-close-registration")
+        state.open_positions[position.position_id] = position
+        snapshot = SnapshotStore(tmp_path / "before-close-registration.json")
+        snapshot.write(state.to_dict())
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: _mock_adapter_with_tick(Venue.BINANCE)},
+            journal,
+        )
+        pending = asyncio.run(
+            executor.start_pending_passive_close(
+                state,
+                position,
+                "funding_capture",
+                long_price_hint=50_000.0,
+                short_price_hint=50_000.0,
+            )
+        )
+
+        assert pending is not None
+        recovered = recover_from_snapshot(snapshot, journal)
+        recovered_pending = recovered.pending_passive_closes[position.position_id]
+        assert recovered_pending.target_quantity == position.matched_quantity
+        assert recovered_pending.position_snapshot is recovered.open_positions[position.position_id]
+
+    def test_maker_intent_is_persisted_before_submit_and_survives_restart(self):
+        """A crash after exchange acceptance must retain a client-ID lookup key."""
+        from lightfee.engine.recovery import (
+            _restore_state_from_snapshot_dict,
+            build_persistent_state_view,
+        )
+
+        journal = _open_journal()
+        adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        state = EngineState()
+        position = _make_position(position_id="entry-close-intent")
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        observed_at_submit: dict[str, bool] = {}
+
+        async def accept_after_observing_intent(request):
+            observed_at_submit["intent_in_state"] = (
+                len(pending.long_legs) == 1
+                and pending.long_legs[0].fill is None
+                and pending.long_legs[0].client_order_id == request.client_order_id
+            )
+            observed_at_submit["intent_in_journal"] = any(
+                event["kind"] == "exit.close_order_intent_claimed"
+                and event["payload"]["client_order_id"] == request.client_order_id
+                for event in journal.read_all()
+            )
+            return _make_passive_ack(
+                venue=Venue.BINANCE,
+                side=Side.SELL,
+                order_id="maker-order-1",
+                client_order_id=request.client_order_id,
+                quantity=request.quantity,
+            )
+
+        adapter.submit_passive_order = AsyncMock(side_effect=accept_after_observing_intent)
+        executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        executor._get_passive_tick_size = AsyncMock(return_value=0.01)
+
+        submitted = asyncio.run(
+            executor._submit_maker_order(
+                state,
+                pending,
+                position,
+                Venue.BINANCE,
+                Side.SELL,
+                "long",
+                50_000.0,
+                position.matched_quantity,
+            )
+        )
+
+        assert submitted is True
+        assert observed_at_submit == {
+            "intent_in_state": True,
+            "intent_in_journal": True,
+        }
+        client_order_id = pending.phase_state.maker_client_order_id
+        restored = _restore_state_from_snapshot_dict(build_persistent_state_view(state))
+        restored_pending = restored.pending_passive_closes[position.position_id]
+        assert restored_pending.long_legs[0].fill is None
+        assert restored_pending.long_legs[0].client_order_id == client_order_id
+
+        long_records, short_records = executor._pending_close_reconciliation_records(
+            restored_pending,
+            restored.open_positions[position.position_id],
+            extra=None,
+        )
+        assert short_records == []
+        assert long_records == [{
+            "venue": Venue.BINANCE.value,
+            "order_id": "",
+            "client_order_id": client_order_id,
+            "quantity": 0.0,
+            "average_price": 0.0,
+            "fee_quote": 0.0,
+        }]
+
+    def test_intent_replays_after_ack_loss_without_followup_snapshot(self, tmp_path):
+        """Journal replay retains the CID and refuses a duplicate maker submit."""
+        from lightfee.engine.recovery import recover_from_snapshot
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        journal = Journal(tmp_path / "close-intent.log")
+        journal.open()
+        adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        state = EngineState()
+        position = _make_position(position_id="entry-close-intent-ack-loss")
+        state.open_positions[position.position_id] = position
+        snapshot = SnapshotStore(tmp_path / "before-close-intent.json")
+        snapshot.write(state.to_dict())
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+
+        async def lose_ack_after_exchange_acceptance(request):
+            raise asyncio.CancelledError("simulated process loss after exchange accept")
+
+        adapter.submit_passive_order = AsyncMock(
+            side_effect=lose_ack_after_exchange_acceptance
+        )
+        executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        executor._get_passive_tick_size = AsyncMock(return_value=0.01)
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                executor._submit_maker_order(
+                    state,
+                    pending,
+                    position,
+                    Venue.BINANCE,
+                    Side.SELL,
+                    "long",
+                    50_000.0,
+                    position.matched_quantity,
+                )
+            )
+
+        client_order_id = pending.phase_state.maker_client_order_id
+        assert client_order_id
+        recovered = recover_from_snapshot(snapshot, journal)
+        recovered_pending = recovered.pending_passive_closes[position.position_id]
+        assert recovered_pending.phase_state.maker_client_order_id == client_order_id
+        assert recovered_pending.long_legs[0].client_order_id == client_order_id
+
+        adapter.submit_passive_order = AsyncMock()
+        adapter.query_passive_order_progress = AsyncMock(return_value=None)
+        recovered_executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        asyncio.run(
+            recovered_executor.drive_pending_passive_close(
+                recovered,
+                position.position_id,
+            )
+        )
+        adapter.query_passive_order_progress.assert_awaited_once()
+        adapter.submit_passive_order.assert_not_awaited()
+
+    def test_later_intent_replaces_stale_pending_close_snapshot(self, tmp_path):
+        """A post-snapshot CID must not be paired with the old maker order ID."""
+        from lightfee.engine.recovery import (
+            build_persistent_state_view,
+            recover_from_snapshot,
+        )
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        position = _make_position(position_id="entry-close-stale-snapshot")
+        stale_state = EngineState()
+        stale_state.open_positions[position.position_id] = position
+        stale_state.pending_passive_closes[position.position_id] = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="old-maker-order",
+                maker_client_order_id="old-maker-cid",
+            ),
+            long_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=None,
+                    client_order_id="old-maker-cid",
+                    submit_started_at_ms=1,
+                )
+            ],
+        )
+        snapshot = SnapshotStore(tmp_path / "stale-pending-close.json")
+        snapshot.write(build_persistent_state_view(stale_state))
+
+        journal = Journal(tmp_path / "later-intent.log")
+        journal.open()
+        latest = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        executor = PassiveCloseExecutor({}, journal)
+        new_cid = "new-maker-cid"
+        executor._claim_close_order_intent(
+            latest,
+            position,
+            OrderRequest(
+                venue=Venue.BINANCE,
+                symbol=position.symbol,
+                side=Side.SELL,
+                quantity=position.matched_quantity,
+                price=50_000.0,
+                reduce_only=True,
+                post_only=True,
+                time_in_force=TimeInForce.GTC,
+                client_order_id=new_cid,
+            ),
+            leg_label="long",
+            operation="submit_passive_order",
+        )
+
+        recovered = recover_from_snapshot(snapshot, journal)
+        pending = recovered.pending_passive_closes[position.position_id]
+        assert pending.phase_state.maker_order_id == ""
+        assert pending.phase_state.maker_client_order_id == new_cid
+        assert [leg.client_order_id for leg in pending.long_legs] == [new_cid]
+
+    def test_unresolved_close_intents_are_not_hidden_by_confirmed_fills(self):
+        """A later ACK-loss CID remains a required reconciliation target."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        position = _make_position(position_id="entry-close-intent-supersede")
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(active_maker_leg=ActiveMakerLeg.LONG),
+            long_legs=[
+                PersistedCloseExecutionLeg(
+                    fill=None,
+                    client_order_id="unresolved-intent-cid",
+                ),
+                PersistedCloseExecutionLeg(
+                    fill=OrderFill(
+                        venue=Venue.BINANCE,
+                        symbol=position.symbol,
+                        side=Side.SELL,
+                        quantity=position.matched_quantity,
+                        price=50_000.0,
+                        order_id="confirmed-order-id",
+                        client_order_id="confirmed-intent-cid",
+                        filled_at_ms=1_000,
+                    ),
+                    client_order_id="confirmed-intent-cid",
+                ),
+            ],
+        )
+
+        long_records, short_records = executor._pending_close_reconciliation_records(
+            pending,
+            position,
+            extra=None,
+        )
+
+        assert short_records == []
+        assert [record["client_order_id"] for record in long_records] == [
+            "confirmed-intent-cid",
+            "unresolved-intent-cid",
+        ]

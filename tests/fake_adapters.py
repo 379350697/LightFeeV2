@@ -137,6 +137,10 @@ class FakeVenueAdapter(VenueAdapter):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
 
+    async def precheck_entry_tradability(self, symbol: str) -> dict:
+        """Test doubles are explicitly tradable unless a test overrides this."""
+        return {"venue": self._venue.value, "symbol": symbol, "status": "ok"}
+
     async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> "LocalL2Update":
         """Return a fake L2 snapshot for testing."""
         from lightfee.marketdata.l2 import LocalL2Update, LocalL2UpdateKind, PriceLevel

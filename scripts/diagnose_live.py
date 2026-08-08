@@ -3575,6 +3575,8 @@ def _build_production_acceptance_gate(
     terminal_close_position_ids: set[str] = set()
     terminal_close_ts_by_position: dict[str, int] = {}
     billing_unreconciled_events: list[dict[str, Any]] = []
+    billing_evidence_unavailable_events: list[dict[str, Any]] = []
+    billing_reconciled_ts_by_position: dict[str, int] = {}
     runtime_progress = _runtime_progress_from_state(local_state)
     runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
     ws_bbo_effective_mode = (
@@ -3781,6 +3783,14 @@ def _build_production_acceptance_gate(
                 ts = int(_event_timestamp_ms(rec))
                 if ts > terminal_close_ts_by_position.get(pid, 0):
                     terminal_close_ts_by_position[pid] = ts
+                if (
+                    kind == "exit.reconciled"
+                    and payload.get("venue_statement_reconciled") is True
+                    and ts > billing_reconciled_ts_by_position.get(pid, 0)
+                ):
+                    billing_reconciled_ts_by_position[pid] = ts
+                if kind == "exit.billing_evidence_unavailable":
+                    billing_evidence_unavailable_events.append(rec)
         elif kind == "exit.billing_unreconciled":
             billing_unreconciled_events.append(rec)
 
@@ -3805,6 +3815,20 @@ def _build_production_acceptance_gate(
     unresolved_billing_unreconciled_count = len(
         unresolved_billing_unreconciled_position_ids
     )
+    provisional_billing_position_ids: set[str] = set()
+    for rec in billing_evidence_unavailable_events:
+        payload = _payload_dict(rec)
+        pid = str(payload.get("position_id") or "")
+        if not pid:
+            continue
+        evidence_ts = int(_event_timestamp_ms(rec))
+        # Physical flatness closes lifecycle risk, but it is not accounting
+        # reconciliation. Only a later, explicitly reconciled venue statement
+        # may clear the financial-evidence warning.
+        reconciled_ts = billing_reconciled_ts_by_position.get(pid, 0)
+        if reconciled_ts <= 0 or reconciled_ts < evidence_ts:
+            provisional_billing_position_ids.add(pid)
+    provisional_billing_evidence_count = len(provisional_billing_position_ids)
 
     passive_maker_fill_rate = (
         sum(fill_ratios) / len(fill_ratios)
@@ -4034,6 +4058,9 @@ def _build_production_acceptance_gate(
     if unresolved_billing_unreconciled_count:
         blocking_reasons.append("billing_unreconciled_unresolved")
         fingerprints.append("unresolved_billing_unreconciled")
+    if provisional_billing_evidence_count:
+        blocking_reasons.append("billing_evidence_provisional")
+        fingerprints.append("billing_evidence_provisional")
     if pending_reconciliation_total > 0:
         blocking_reasons.append("pending_close_reconciliations_not_empty")
         fingerprints.append("pending_close_reconciliations_not_empty")
@@ -4131,6 +4158,8 @@ def _build_production_acceptance_gate(
         "resolved_order_truth_gap_count": resolved_order_truth_gap_count,
         "unresolved_order_truth_gap_count": unresolved_order_truth_gap_count,
         "unresolved_billing_unreconciled_count": unresolved_billing_unreconciled_count,
+        "provisional_billing_evidence_count": provisional_billing_evidence_count,
+        "provisional_billing_position_ids": sorted(provisional_billing_position_ids)[:20],
         "resolved_order_truth_gap_summary": resolved_order_truth_gap_summary,
         "required_position_truth_unavailable_count": (
             required_position_truth_unavailable_count

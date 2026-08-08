@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import Any
 
 from lightfee.core.domain import OrderRequest, Side, TimeInForce, Venue
@@ -359,6 +360,154 @@ class EntryDispatchRuntime:
                 },
             )
             return False
+
+    async def _precheck_live_entry_venue_tradability(
+        self,
+        *,
+        candidate,
+        now_ms: int,
+        long_venue: Venue,
+        short_venue: Venue,
+        stage: str = "immediately_before_dispatch",
+    ) -> bool:
+        """Require every live entry venue to accept a new position right now.
+
+        Discovery catalogs are intentionally long-lived, but a contract can
+        move to pre-settlement after selection and before the maker order is
+        submitted. Every live venue must therefore prove its current state;
+        an absent capability, timeout, malformed result, or transport failure
+        is an evidence gap and blocks entry rather than being silently skipped.
+        """
+        mode = str(getattr(self.ctx.config.runtime, "mode", "") or "").lower()
+        if mode != "live":
+            return True
+
+        symbol = str(getattr(candidate, "symbol", "") or "")
+        pair_id = self._candidate_pair_id(candidate)
+        checks: list[tuple[Venue, Any | None]] = []
+        seen_venues: set[Venue] = set()
+        for venue in (long_venue, short_venue):
+            if venue in seen_venues:
+                continue
+            seen_venues.add(venue)
+            adapter = self.ctx.venue_adapters.get(venue)
+            precheck = (
+                getattr(adapter, "precheck_entry_tradability", None)
+                if adapter is not None
+                else None
+            )
+            checks.append((venue, precheck if callable(precheck) else None))
+
+        timeout_ms = max(
+            int(
+                getattr(
+                    self.ctx.config.runtime,
+                    "entry_tradability_precheck_timeout_ms",
+                    1500,
+                )
+                or 1500
+            ),
+            1,
+        )
+
+        async def call_precheck(
+            venue: Venue,
+            precheck: Any | None,
+        ) -> tuple[Venue, dict[str, Any] | None, Exception | None, int]:
+            started_at = time.monotonic()
+            try:
+                if precheck is None:
+                    raise RuntimeError(
+                        "entry-tradability-unavailable: capability_missing"
+                    )
+                result = await asyncio.wait_for(
+                    precheck(symbol),
+                    timeout=timeout_ms / 1000.0,
+                )
+                if not isinstance(result, dict) or str(result.get("status", "")).lower() != "ok":
+                    raise RuntimeError(
+                        "entry-tradability-unavailable: malformed_or_non_ok_result"
+                    )
+                return venue, result, None, int((time.monotonic() - started_at) * 1000)
+            except asyncio.TimeoutError:
+                return (
+                    venue,
+                    None,
+                    RuntimeError(
+                        f"entry-tradability-unavailable: timeout_ms={timeout_ms}"
+                    ),
+                    int((time.monotonic() - started_at) * 1000),
+                )
+            except Exception as exc:
+                return venue, None, exc, int((time.monotonic() - started_at) * 1000)
+
+        results = await asyncio.gather(
+            *(call_precheck(venue, precheck) for venue, precheck in checks)
+        )
+        allowed = True
+        for venue, result, error, elapsed_ms in results:
+            if error is None:
+                self.ctx.journal.append(
+                    "runtime.entry_symbol_tradability_checked",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "status": "ok",
+                        "stage": stage,
+                        "check_latency_ms": elapsed_ms,
+                        "contract_status": str((result or {}).get("contract_status", "")),
+                        "instrument_state": str((result or {}).get("instrument_state", "")),
+                        "ts_ms": now_ms,
+                    },
+                )
+                continue
+            allowed = False
+            error_text = str(error)
+            metadata = self._entry_admission_reject_metadata(venue, error_text)
+            if metadata:
+                reason = str(metadata["reason"])
+            else:
+                reason = "entry_symbol_tradability_unavailable"
+                metadata = {
+                    "reason": reason,
+                    "official_doc_url": "",
+                    "evidence_gap": True,
+                }
+            metadata = {**metadata, "check_latency_ms": elapsed_ms}
+            self._record_symbol_admission_block(
+                venue=venue,
+                symbol=symbol,
+                reason=reason,
+                raw_error=error_text,
+                now_ms=now_ms,
+                evidence=metadata,
+                source="pre_entry_venue_tradability",
+                candidate_pair_id=pair_id,
+            )
+            self.ctx.journal.append(
+                "runtime.entry_symbol_tradability_blocked",
+                {
+                    "venue": venue.value,
+                    "symbol": symbol,
+                    "long_venue": long_venue.value,
+                    "short_venue": short_venue.value,
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "reason": reason,
+                    "stage": stage,
+                    "raw_error": error_text[:500],
+                    "official_doc_url": metadata.get("official_doc_url", ""),
+                    "evidence_gap": bool(metadata.get("evidence_gap", True)),
+                    "check_latency_ms": elapsed_ms,
+                    "precheck_timeout_ms": timeout_ms,
+                    "ts_ms": now_ms,
+                },
+            )
+        return allowed
 
     async def _okx_entry_base_quantity_metadata(
         self, venue: Venue, symbol: str,
@@ -2150,6 +2299,19 @@ class EntryDispatchRuntime:
             route=route,
             now_ms=now_ms,
         )
+
+        # This must be the final network gate before the executor can submit
+        # the maker order.  Admission, leverage preparation and BBO repricing
+        # can each await; checking earlier leaves their combined latency as an
+        # avoidable status-transition window between exchanges.
+        if not await self._precheck_live_entry_venue_tradability(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            stage="immediately_before_dispatch",
+        ):
+            return False
 
         return await self._execute_entry_context(
             ctx=ctx,
