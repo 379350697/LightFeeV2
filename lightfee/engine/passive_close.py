@@ -29,6 +29,7 @@ from lightfee.core.exchange_errors import (
 )
 from lightfee.core.domain import (
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PassiveOrderAck,
     PassiveOrderAmendRequest,
@@ -66,6 +67,7 @@ from lightfee.engine.state import (
     PendingPassiveClose,
     PendingPassiveLegFill,
     PersistedCloseExecutionLeg,
+    pending_close_reconciliation_missing_legs,
 )
 from lightfee.persistence.journal import Journal
 from lightfee.venues.common import (
@@ -533,6 +535,20 @@ class PassiveCloseExecutor:
             "hedge_notional_quote": decision.get("unhedged_gap", 0.0)
             * max(decision.get("price_hint", 0.0), 0.0),
             "reconciled": bool(decision.get("reconciled", False)),
+            "maker_order_id": str(
+                getattr(pending.phase_state, "maker_order_id", "")
+                or getattr(pending.maker_fill, "order_id", "")
+                or ""
+            ),
+            "maker_client_order_id": str(
+                getattr(pending.phase_state, "maker_client_order_id", "")
+                or getattr(pending.maker_fill, "client_order_id", "")
+                or ""
+            ),
+            "hedge_order_id": str(getattr(pending.hedge_fill, "order_id", "") or ""),
+            "hedge_client_order_id": str(
+                getattr(pending.hedge_fill, "client_order_id", "") or ""
+            ),
             "source": source,
         }
         self._journal.append("execution.hedge_deadline_breached", payload)
@@ -1026,11 +1042,13 @@ class PassiveCloseExecutor:
                     progress.state in (
                         PassiveOrderState.FILLED,
                         PassiveOrderState.CANCELED,
+                        PassiveOrderState.REJECTED,
                         PassiveOrderState.EXPIRED,
                     )
                     and progress.cumulative_quantity <= 1e-9
                     and pending.maker_fill.quantity <= 1e-9
                 ):
+                    terminal_state = progress.state.value
                     try:
                         terminal_truth = await adapter.fetch_order_fill_reconciliation(
                             position.symbol,
@@ -1063,6 +1081,28 @@ class PassiveCloseExecutor:
                                 "maker_order_id": progress.order_id or maker_order_id,
                                 "maker_client_order_id": progress.client_order_id or maker_client_id,
                                 "state": progress.state.value,
+                                "decision": "retain_pending",
+                            },
+                        )
+                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                        return False
+                    if not isinstance(terminal_truth, OrderFillReconciliation):
+                        # Adapter mocks and malformed implementations must not
+                        # be interpreted as a positive fill merely because a
+                        # dynamic object exposes a truthy ``quantity`` field.
+                        # Only the typed execution-truth contract can change a
+                        # terminal maker order into a filled close leg.
+                        self._journal.append(
+                            "exit.passive_close_terminal_zero_fill_truth_unavailable",
+                            {
+                                "position_id": position_id,
+                                "symbol": position.symbol,
+                                "maker_venue": maker_venue.value,
+                                "maker_order_id": progress.order_id or maker_order_id,
+                                "maker_client_order_id": progress.client_order_id or maker_client_id,
+                                "state": progress.state.value,
+                                "reason": "invalid_reconciliation_type",
+                                "truth_type": type(terminal_truth).__name__,
                                 "decision": "retain_pending",
                             },
                         )
@@ -1123,9 +1163,26 @@ class PassiveCloseExecutor:
                             "exit.passive_close_terminal_zero_fill_reconciled_fill",
                             {
                                 "position_id": position_id,
+                                "symbol": position.symbol,
+                                "maker_venue": maker_venue.value,
+                                "maker_leg": maker_leg_label,
+                                "terminal_state": terminal_state,
                                 "maker_order_id": progress.order_id,
                                 "maker_client_order_id": progress.client_order_id,
                                 "reconciled_quantity": terminal_quantity,
+                                "truth_order_id": str(
+                                    getattr(terminal_truth, "order_id", "") or ""
+                                ),
+                                "truth_client_order_id": str(
+                                    getattr(
+                                        terminal_truth, "client_order_id", ""
+                                    )
+                                    or ""
+                                ),
+                                "truth_filled_at_ms": int(
+                                    getattr(terminal_truth, "filled_at_ms", 0) or 0
+                                ),
+                                "decision": "treat_terminal_maker_as_filled",
                             },
                         )
                 self._apply_maker_progress(pending, progress, now_ms)
@@ -4429,9 +4486,26 @@ class PassiveCloseExecutor:
             position,
             extra=extra,
         )
-        if not long_legs and not short_legs:
-            return False
-
+        closed_at_ms = self._now_ms()
+        position_snapshot = self._position_snapshot_for_close_reconciliation(position)
+        reconciliation = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "kind": "final",
+            "reason": pending.reason,
+            "source": source,
+            "closed_at_ms": closed_at_ms,
+            "created_cycle": int(getattr(state, "tick_count", 0) or 0),
+            "position_snapshot": position_snapshot,
+            "original_payload": dict(payload),
+            "long_legs": long_legs,
+            "short_legs": short_legs,
+            "attempt_count": 0,
+            "next_attempt_ms": closed_at_ms,
+        }
+        missing_identity_legs = pending_close_reconciliation_missing_legs(
+            reconciliation
+        )
         order_key = tuple(
             sorted(
                 str(record.get("order_id") or record.get("client_order_id") or "")
@@ -4439,13 +4513,30 @@ class PassiveCloseExecutor:
                 if record.get("order_id") or record.get("client_order_id")
             )
         )
-        # A local fill quantity without either order identity cannot be
-        # reconciled against a venue statement.  Do not enqueue work that can
-        # never produce a financial terminal; the caller emits the standard
-        # provisional billing terminal after exchange truth proves both legs
-        # flat.
-        if not order_key:
-            return False
+        if not order_key and not missing_identity_legs:
+            # Even a zero-quantity legacy snapshot must retain an explicit
+            # execution-history task when no lookup identity exists.  The
+            # absence of an identity, rather than the local quantity alone,
+            # determines whether venue order truth is queryable.
+            missing_identity_legs = ("long", "short")
+        # A local fill quantity without either order identity cannot be queried
+        # through the order-status adapters.  It is still durable accounting
+        # work: dropping it would turn a proved-flat position into an
+        # untracked PnL gap.  Keep the same reconciliation queue and mark the
+        # task explicitly so CloseRuntime can retain it fail-closed and emit a
+        # diagnostic until venue execution-history evidence is supplied.
+        missing_close_order_identity = bool(missing_identity_legs)
+        reconciliation.update(
+            {
+                "reconciliation_mode": (
+                    "venue_execution_history_required"
+                    if missing_close_order_identity
+                    else "order_identity"
+                ),
+                "missing_close_order_identity": missing_close_order_identity,
+                "billing_reconciliation_required": True,
+            }
+        )
         for existing in state.pending_close_reconciliations:
             if not isinstance(existing, dict):
                 continue
@@ -4463,27 +4554,19 @@ class PassiveCloseExecutor:
             if (
                 existing.get("position_id") == pending.position_id
                 and existing_key == order_key
+                and not (
+                    missing_close_order_identity
+                    and existing.get("reconciliation_mode")
+                    != "venue_execution_history_required"
+                )
             ):
                 return True
-
-        closed_at_ms = self._now_ms()
-        reconciliation = {
-            "position_id": pending.position_id,
-            "symbol": position.symbol,
-            "kind": "final",
-            "reason": pending.reason,
-            "source": source,
-            "closed_at_ms": closed_at_ms,
-            "created_cycle": int(getattr(state, "tick_count", 0) or 0),
-            "position_snapshot": self._position_snapshot_for_close_reconciliation(position),
-            "original_payload": dict(payload),
-            "long_legs": long_legs,
-            "short_legs": short_legs,
-            "attempt_count": 0,
-            "next_attempt_ms": closed_at_ms,
-        }
-        state.enqueue_pending_close_reconciliation(reconciliation)
-        self._journal.append(
+        # Persist the complete reconciliation record before mutating the
+        # in-memory queue.  If the process exits between these operations,
+        # recovery can replay the critical event and rebuild the queue instead
+        # of losing the billing obligation.
+        self._journal.append_critical(
+            closed_at_ms,
             "exit.pending_close_reconciliation_registered",
             {
                 "position_id": pending.position_id,
@@ -4492,8 +4575,18 @@ class PassiveCloseExecutor:
                 "long_leg_count": len(long_legs),
                 "short_leg_count": len(short_legs),
                 "order_ids": order_key,
+                "reconciliation_mode": reconciliation["reconciliation_mode"],
+                "missing_close_order_identity": missing_close_order_identity,
+                "billing_reconciliation_required": True,
+                "missing_identity_legs": list(missing_identity_legs),
+                "live_flat_terminal": True,
+                # The complete record is the journal recovery boundary.  The
+                # scalar fields above remain convenient for diagnostics and
+                # backward-compatible event consumers.
+                "reconciliation": dict(reconciliation),
             },
         )
+        state.enqueue_pending_close_reconciliation(reconciliation)
         return True
 
     def _register_accepted_order_truth_gap(
@@ -4977,6 +5070,7 @@ class PassiveCloseExecutor:
                 "position_id": pending.position_id,
                 "symbol": position.symbol,
                 "source": source,
+                "billing_reconciliation_pending": bool(reconciliation_registered),
                 **closure_fields,
             },
         )

@@ -1844,14 +1844,25 @@ class VenueTransport(MarketDataClient):
         if not endpoints:
             endpoints = ["fetch_order_status"]
         classification = response_classification or uncertain_subtype or "uncertain"
+        identifier_kind = (
+            "order_id"
+            if order_id
+            else "client_order_id"
+            if client_order_id
+            else "missing"
+        )
         self._record_order_diagnostic(
             "order.reconcile_query",
             {
                 "venue": self._spec.venue_id.value,
                 "symbol": symbol,
+                "observed_at_ms": int(time.time() * 1000),
                 "client_order_id": client_order_id,
                 "order_id": order_id,
                 "exchange_order_id": order_id,
+                "identifier_kind": identifier_kind,
+                "has_order_id": bool(order_id),
+                "has_client_order_id": bool(client_order_id),
                 "queried_endpoints": endpoints,
                 "endpoint_responses": [
                     {"endpoint": endpoint, "classification": classification}

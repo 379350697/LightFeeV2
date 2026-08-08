@@ -5436,36 +5436,35 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         assert "recovery.flat" in kinds
         assert "runtime.position_drift_corrected" in kinds
 
-    def test_live_flat_without_order_identity_writes_provisional_billing_terminal(self):
-        """A proved-flat close without venue order IDs cannot silently lose its bill."""
+    def test_live_flat_without_order_identity_retains_billing_reconciliation(self):
+        """A proved-flat close without IDs remains durable accounting work."""
         state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
 
         remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
 
         assert remaining == set()
-        assert state.pending_close_reconciliations == []
-        terminals = [
-            event["payload"]
+        assert len(state.pending_close_reconciliations) == 1
+        reconciliation = state.pending_close_reconciliations[0]
+        assert reconciliation["position_id"] == position.position_id
+        assert reconciliation["reconciliation_mode"] == (
+            "venue_execution_history_required"
+        )
+        assert reconciliation["missing_close_order_identity"] is True
+        assert reconciliation["billing_reconciliation_required"] is True
+        assert not [
+            event
             for event in journal.read_all()
             if event.get("kind") == "exit.billing_evidence_unavailable"
         ]
-        assert len(terminals) == 1
-        terminal = terminals[0]
-        assert terminal["position_id"] == position.position_id
-        assert terminal["terminal_reason"] == (
-            "terminal_live_flat_without_close_order_identity"
-        )
-        assert terminal["close_quantity_evidence_complete"] is False
-        assert terminal["close_order_identity_available"] is False
-        assert terminal["actual_long_size"] == 0.0
-        assert terminal["actual_short_size"] == 0.0
-        assert terminal["net_quote_status"] == "provisional"
-        assert "net_quote" not in terminal
 
-        # Local state has already been cleared, so replaying the same journal
-        # cannot create a second terminal on a restart.
+        # Local position state is cleared, but the queue remains durable so
+        # same-symbol re-entry cannot outrun the missing accounting evidence.
         replayed = replay_journal_records(journal.read_all())
         assert position.position_id not in replayed["open_position_ids"]
+        assert replayed["pending_close_reconciliation_count"] == 1
+        assert replayed["pending_close_reconciliation_ids"] == [
+            position.position_id
+        ]
 
     def test_live_flat_cleanup_normalizes_dict_shaped_pending_close_reconciliation_queue(self):
         state, position, journal, executor, long_adapter, short_adapter = (
@@ -6949,6 +6948,16 @@ class TestReduceOnlyRejectedEscalation:
             average_price=0.0,
             state=PassiveOrderState.REJECTED,
         ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            average_price=0.0,
+            order_id="rejected-maker",
+            client_order_id="rejected-client",
+            filled_at_ms=0,
+        ))
         maker_adapter.submit_passive_order = AsyncMock()
 
         executor = PassiveCloseExecutor(
@@ -7049,6 +7058,75 @@ class TestReduceOnlyRejectedEscalation:
             event["kind"] == "exit.passive_close_terminal_zero_fill_truth_unavailable"
             for event in journal.read_all()
         )
+
+    def test_rejected_zero_progress_uses_late_execution_fill(self):
+        """A rejected terminal status cannot discard a late venue execution."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE,
+            side=Side.SELL,
+            order_id="rejected-maker",
+            client_order_id="rejected-client",
+            cumulative_quantity=0.0,
+            average_price=0.0,
+            state=PassiveOrderState.REJECTED,
+        ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.25,
+            average_price=49_999.5,
+            order_id="late-fill-maker",
+            client_order_id="rejected-client",
+            fee_quote=0.1,
+            filled_at_ms=2500,
+        ))
+        hedge_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="rejected-maker",
+                maker_client_order_id="rejected-client",
+                maker_resting_limit_price=50_000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(asyncio.wait_for(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            ),
+            timeout=0.1,
+        ))
+
+        assert result is False
+        assert pending.maker_fill.quantity == pytest.approx(0.25)
+        reconciled = [
+            event for event in journal.read_all()
+            if event.get("kind") == "exit.passive_close_terminal_zero_fill_reconciled_fill"
+        ]
+        assert len(reconciled) == 1
+        assert reconciled[0]["payload"]["terminal_state"] == "rejected"
+        assert reconciled[0]["payload"]["truth_order_id"] == "late-fill-maker"
 
     def test_filled_zero_progress_with_zero_execution_truth_is_retained(self):
         """Contradictory terminal status must not initiate a second close leg."""

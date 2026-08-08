@@ -65,6 +65,7 @@ _TERMINAL_CLOSE_EVENT_KINDS = frozenset(
         "exit.closed",
         "exit.reconciled",
         "exit.billing_evidence_unavailable",
+        "exit.reconciliation_abandoned",
         "recovery.flat",
     }
 )
@@ -892,8 +893,10 @@ def _apply_journal_replay_to_state(
     Processes events that happened AFTER the snapshot was written:
     - entry.opened / recovery.live_detected → add position
     - entry.pending_registered / entry.hedge_submitted → recreate pending entry
-    - terminal close events / recovery.flat → remove all close work for position
+    - terminal close events / recovery.flat → remove close owners; preserve a
+      pending billing reconciliation registered by live-flat cleanup
     - exit.partial_closed → reduce matched_quantity
+    - exit.pending_close_reconciliation_registered → restore billing queue
     - exit.pending_close_registered → recreate pending close
     - runtime.lifecycle_changed / risk_mode_changed → update modes
     """
@@ -985,7 +988,24 @@ def _apply_journal_replay_to_state(
         elif kind in _TERMINAL_CLOSE_EVENT_KINDS:
             pid = payload.get("position_id", "")
             if pid:
-                _clear_terminal_close_state(state, str(pid))
+                if (
+                    kind == "recovery.flat"
+                    and (
+                        payload.get("billing_reconciliation_pending") is True
+                        or any(
+                            str(item.get("position_id") or "") == str(pid)
+                            and str(item.get("kind") or "final")
+                            in {"final", "partial"}
+                            for item in normalize_pending_close_reconciliations(
+                                state.pending_close_reconciliations
+                            )
+                            if isinstance(item, dict)
+                        )
+                    )
+                ):
+                    _clear_terminal_close_owners(state, str(pid))
+                else:
+                    _clear_terminal_close_state(state, str(pid))
 
         elif kind == "exit.passive_close_registered":
             _restore_pending_passive_close_from_journal(state, payload)
@@ -1030,6 +1050,48 @@ def _apply_journal_replay_to_state(
                 )
             if payload.get("operation") == "submit_passive_order":
                 pending.phase_state.maker_client_order_id = client_order_id
+
+        elif kind == "exit.pending_close_reconciliation_registered":
+            # The full reconciliation record is carried by the critical
+            # registration event so a crash before the next snapshot cannot
+            # lose billing work.  Older events only contain a summary; restore
+            # a deliberately incomplete fail-closed task for those records.
+            reconciliation = payload.get("reconciliation")
+            if not isinstance(reconciliation, dict):
+                position_id = str(payload.get("position_id") or "")
+                if not position_id:
+                    continue
+                try:
+                    closed_at_ms = int(
+                        payload.get("closed_at_ms") or record.get("ts_ms") or 0
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    closed_at_ms = 0
+                reconciliation = {
+                    "position_id": position_id,
+                    "symbol": str(payload.get("symbol") or ""),
+                    "kind": "final",
+                    "source": str(payload.get("source") or "journal_replay"),
+                    "closed_at_ms": closed_at_ms,
+                    "position_snapshot": {},
+                    "long_legs": [],
+                    "short_legs": [],
+                    "reconciliation_mode": "venue_execution_history_required",
+                    "missing_close_order_identity": True,
+                    "billing_reconciliation_required": True,
+                }
+            else:
+                reconciliation = dict(reconciliation)
+            if reconciliation.get("position_id"):
+                state.enqueue_pending_close_reconciliation(reconciliation)
+                # This event is emitted only by the live-flat cleanup path.
+                # Restore the queue and remove local position/close owners
+                # without dropping the financial reconciliation task.  The
+                # unconditional behavior also migrates old summary-only
+                # registration events that predate ``live_flat_terminal``.
+                _clear_terminal_close_owners(
+                    state, str(reconciliation["position_id"])
+                )
 
         # V1: exit.pending_close_registered — recreate pending close from journal
         elif kind == "exit.pending_close_registered":
@@ -1401,8 +1463,8 @@ def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
         return None
 
 
-def _clear_terminal_close_state(state: EngineState, position_id: str) -> None:
-    """Remove every local close owner once exchange truth says it is terminal."""
+def _clear_terminal_close_owners(state: EngineState, position_id: str) -> None:
+    """Remove local position/close owners while retaining billing work."""
     state.open_positions.pop(position_id, None)
     state.pending_closes = {
         close_id: pending
@@ -1416,6 +1478,11 @@ def _clear_terminal_close_state(state: EngineState, position_id: str) -> None:
         if pending_id != position_id
         and str(getattr(pending, "position_id", "") or "") != position_id
     }
+
+
+def _clear_terminal_close_state(state: EngineState, position_id: str) -> None:
+    """Remove every local close owner once exchange truth says it is terminal."""
+    _clear_terminal_close_owners(state, position_id)
     state.set_pending_close_reconciliations(
         [
             item

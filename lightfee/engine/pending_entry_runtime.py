@@ -482,6 +482,20 @@ class PendingEntryRuntime:
             # --- V1: drive missing hedge on normal tick ---
             missing = pending.missing_hedge_quantity()
             if missing > 1e-9:
+                hedge_inflight = getattr(pending, "hedge_inflight", None)
+                phase_state = getattr(pending, "phase_state", None)
+                maker_order_id, maker_client_order_id = (
+                    self._pending_entry_maker_order_identifiers(pending)
+                )
+                hedge_order_id = str(getattr(pending, "hedge_order_id", "") or "")
+                hedge_client_order_id = str(
+                    getattr(pending, "hedge_client_order_id", "")
+                    or getattr(hedge_inflight, "client_order_id", "")
+                    or ""
+                )
+                hedge_submitted_at_ms = int(
+                    getattr(hedge_inflight, "submitted_at_ms", 0) or 0
+                )
                 self.ctx.journal.append(
                     "pending_entry.missing_hedge_detected",
                     {
@@ -491,6 +505,23 @@ class PendingEntryRuntime:
                         "hedge_leg_filled": pending.hedge_leg_filled,
                         "maker_venue": pending.maker_venue().value,
                         "hedge_venue": pending.hedge_venue().value,
+                        "observed_at_ms": now_ms,
+                        "maker_order_id": maker_order_id,
+                        "maker_client_order_id": maker_client_order_id,
+                        "hedge_order_id": hedge_order_id,
+                        "hedge_client_order_id": hedge_client_order_id,
+                        "hedge_attempt": int(
+                            getattr(hedge_inflight, "attempt", 0) or 0
+                        ),
+                        "hedge_submitted_at_ms": hedge_submitted_at_ms,
+                        "hedge_elapsed_ms": (
+                            max(now_ms - hedge_submitted_at_ms, 0)
+                            if hedge_submitted_at_ms > 0
+                            else 0
+                        ),
+                        "hedge_deadline_at_ms": int(
+                            getattr(phase_state, "hedge_deadline_at_ms", 0) or 0
+                        ),
                     },
                 )
                 if await self.ctx._maybe_finalize_pending_entry_terminal_hedge_dust(

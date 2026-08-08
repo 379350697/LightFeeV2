@@ -935,6 +935,90 @@ class RecoveryWorkSnapshot:
 MAX_PENDING_CLOSE_RECONCILIATIONS = 256
 
 
+def _reconciliation_identity_keys(item: Any) -> set[tuple[str, str]]:
+    """Return the durable order identities carried by a reconciliation item."""
+    if not isinstance(item, dict):
+        return set()
+    keys: set[tuple[str, str]] = set()
+    for leg_group in (item.get("long_legs"), item.get("short_legs")):
+        if not isinstance(leg_group, list):
+            continue
+        for leg in leg_group:
+            if not isinstance(leg, dict):
+                continue
+            order_id = str(leg.get("order_id") or "")
+            client_order_id = str(leg.get("client_order_id") or "")
+            if order_id or client_order_id:
+                keys.add((order_id, client_order_id))
+    return keys
+
+
+def _reconciliation_identity_coverage(item: Any) -> tuple[int, int]:
+    """Count durable identities independently for the long and short legs."""
+    if not isinstance(item, dict):
+        return (0, 0)
+    coverage: list[int] = []
+    for leg_group in (item.get("long_legs"), item.get("short_legs")):
+        if not isinstance(leg_group, list):
+            coverage.append(0)
+            continue
+        coverage.append(
+            sum(
+                isinstance(leg, dict)
+                and bool(leg.get("order_id") or leg.get("client_order_id"))
+                for leg in leg_group
+            )
+        )
+    return (coverage[0], coverage[1])
+
+
+def pending_close_reconciliation_missing_legs(
+    reconciliation: dict[str, Any],
+) -> tuple[str, ...]:
+    """Identify final/partial close legs that lack durable lookup identity.
+
+    An empty leg group is only complete when its persisted expected quantity is
+    explicitly zero.  Missing or malformed quantities remain unknown and must
+    fail closed.  ``accepted_order_truth_gap`` callers intentionally do not use
+    this helper because that task kind is allowed to contain one leg only.
+    """
+    snapshot = reconciliation.get("position_snapshot") or {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    missing: list[str] = []
+    for leg_label in ("long", "short"):
+        legs = reconciliation.get(f"{leg_label}_legs")
+        complete = isinstance(legs, list)
+        if complete:
+            complete = all(
+                isinstance(leg, dict)
+                and bool(leg.get("order_id") or leg.get("client_order_id"))
+                for leg in legs
+            )
+        if complete and legs:
+            continue
+
+        expected: float | None = None
+        for key in (f"{leg_label}_quantity", "matched_quantity"):
+            if key not in snapshot:
+                continue
+            try:
+                value = float(snapshot.get(key))
+            except (TypeError, ValueError):
+                expected = None
+                break
+            if math.isfinite(value) and value >= 0.0:
+                expected = value
+                break
+            expected = None
+            break
+        if complete and not legs and expected is not None and expected <= 1e-12:
+            continue
+        missing.append(leg_label)
+    return tuple(missing)
+
+
 def normalize_pending_close_reconciliations(raw: Any) -> list[dict[str, Any]]:
     if raw is None:
         return []
@@ -983,6 +1067,14 @@ def _invalid_pending_close_reconciliation(raw: Any, reason: str) -> dict[str, An
     }
 
 
+def _reconciliation_int(value: Any, default: int = 0) -> int:
+    """Read a persisted reconciliation integer without crashing diagnostics."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _build_reconciliation_summary(queue: list[dict[str, Any]]) -> dict[str, Any]:
     """Export a safe summary of the reconciliation queue for diagnostics.
 
@@ -1000,7 +1092,7 @@ def _build_reconciliation_summary(queue: list[dict[str, Any]]) -> dict[str, Any]
             continue
         kind = str(item.get("kind") or "unknown")
         by_kind[kind] = by_kind.get(kind, 0) + 1
-        if int(item.get("next_attempt_ms") or 0) > 0:
+        if _reconciliation_int(item.get("next_attempt_ms")) > 0:
             backed_off += 1
     return {
         "total_count": total,
@@ -1066,11 +1158,39 @@ class EngineState:
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)
         position_id = str(item.get("position_id") or "")
         kind = str(item.get("kind") or "final")
+        candidate_keys = _reconciliation_identity_keys(item)
+        candidate_coverage = _reconciliation_identity_coverage(item)
         for existing in self.pending_close_reconciliations:
             if (
                 str(existing.get("position_id") or "") == position_id
                 and str(existing.get("kind") or "final") == kind
             ):
+                existing_keys = _reconciliation_identity_keys(existing)
+                existing_coverage = _reconciliation_identity_coverage(existing)
+                identity_evidence_not_weaker = all(
+                    candidate >= previous
+                    for candidate, previous in zip(
+                        candidate_coverage, existing_coverage
+                    )
+                )
+                # A later close-truth observation may enrich an earlier task
+                # that was persisted without an exchange identity (or with
+                # only one leg's identity).  Keep the same position/kind
+                # owner, but replace it when the new record carries at least
+                # as much identity evidence or a stronger reconciliation mode.
+                stronger_mode = (
+                    item.get("reconciliation_mode")
+                    == "venue_execution_history_required"
+                    and existing.get("reconciliation_mode")
+                    != "venue_execution_history_required"
+                    and identity_evidence_not_weaker
+                )
+                if (
+                    candidate_keys != existing_keys
+                    and identity_evidence_not_weaker
+                ) or stronger_mode:
+                    index = self.pending_close_reconciliations.index(existing)
+                    self.pending_close_reconciliations[index] = dict(item)
                 return
         self.pending_close_reconciliations.append(dict(item))
         if len(self.pending_close_reconciliations) > MAX_PENDING_CLOSE_RECONCILIATIONS:
@@ -1084,7 +1204,7 @@ class EngineState:
         target = (
             str(task.get("position_id") or ""),
             str(task.get("kind") or "final"),
-            int(task.get("closed_at_ms") or 0),
+            _reconciliation_int(task.get("closed_at_ms")),
         )
         self.pending_close_reconciliations = [
             item
@@ -1092,7 +1212,7 @@ class EngineState:
             if (
                 str(item.get("position_id") or ""),
                 str(item.get("kind") or "final"),
-                int(item.get("closed_at_ms") or 0),
+                _reconciliation_int(item.get("closed_at_ms")),
             )
             != target
         ]

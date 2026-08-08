@@ -437,6 +437,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "exit.close_chunk_submitted",
         "exit.close_residual_detected",
         "exit.closed",
+        "exit.reconciliation_abandoned",
         "runtime.risk_mode_changed",
         "runtime.stale_fail_closed_cleared",
         "runtime.entry_quote_rewarm_scheduled_after_rest_stale",

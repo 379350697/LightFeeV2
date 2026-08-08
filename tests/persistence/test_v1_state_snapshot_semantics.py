@@ -23,6 +23,7 @@ from lightfee.engine.state import (
     PendingClose,
     OperatorControlState,
     normalize_pending_close_reconciliations,
+    pending_close_reconciliation_missing_legs,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -974,6 +975,82 @@ class TestEngineStateFieldCompleteness:
 
         assert state.pending_close_reconciliations == [item]
 
+    def test_pending_close_reconciliation_enqueue_upgrades_identity_evidence(self):
+        state = EngineState()
+        base = {
+            "position_id": "entry-1780771924982-ZILUSDT",
+            "symbol": "ZILUSDT",
+            "kind": "final",
+            "reconciliation_mode": "venue_execution_history_required",
+            "missing_close_order_identity": True,
+            "billing_reconciliation_required": True,
+            "long_legs": [],
+            "short_legs": [],
+        }
+        enriched = {
+            **base,
+            "reconciliation_mode": "order_identity",
+            "missing_close_order_identity": False,
+            "long_legs": [{
+                "venue": "binance",
+                "order_id": "long-order",
+                "client_order_id": "long-cid",
+            }],
+            "short_legs": [{
+                "venue": "bybit",
+                "order_id": "short-order",
+                "client_order_id": "short-cid",
+            }],
+        }
+
+        state.enqueue_pending_close_reconciliation(base)
+        state.enqueue_pending_close_reconciliation(enriched)
+
+        assert state.pending_close_reconciliations == [enriched]
+
+    def test_pending_close_reconciliation_does_not_replace_complete_legs_with_partial_legs(
+        self,
+    ):
+        state = EngineState()
+        complete = {
+            "position_id": "entry-1780771924982-ZILUSDT",
+            "symbol": "ZILUSDT",
+            "kind": "final",
+            "reconciliation_mode": "order_identity",
+            "long_legs": [{"order_id": "long-order"}],
+            "short_legs": [{"order_id": "short-order"}],
+        }
+        partial = {
+            **complete,
+            "reconciliation_mode": "venue_execution_history_required",
+            "long_legs": [
+                {"order_id": "long-order-new"},
+                {"order_id": "long-order-retry"},
+            ],
+            "short_legs": [],
+        }
+
+        state.enqueue_pending_close_reconciliation(complete)
+        state.enqueue_pending_close_reconciliation(partial)
+
+        assert state.pending_close_reconciliations == [complete]
+
+    def test_pending_close_reconciliation_negative_expected_quantity_fails_closed(self):
+        reconciliation = {
+            "position_id": "entry-negative-quantity",
+            "kind": "final",
+            "position_snapshot": {
+                "long_quantity": -1.0,
+                "short_quantity": 0.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }
+
+        assert pending_close_reconciliation_missing_legs(reconciliation) == (
+            "long",
+        )
+
     def test_pending_close_reconciliation_enqueue_caps_oldest_at_256(self):
         state = EngineState()
 
@@ -1005,6 +1082,24 @@ class TestEngineStateFieldCompleteness:
 
         assert removed is True
         assert state.pending_close_reconciliations == [second]
+
+    def test_pending_close_reconciliation_malformed_timestamps_do_not_crash_state_export_or_remove(
+        self,
+    ):
+        malformed = {
+            "position_id": "entry-malformed-reconciliation",
+            "kind": "final",
+            "closed_at_ms": "not-a-timestamp",
+            "next_attempt_ms": float("inf"),
+        }
+        state = EngineState()
+        state.pending_close_reconciliations = [malformed]
+
+        summary = state.to_dict()["pending_close_reconciliation_summary"]
+        assert summary["total_count"] == 1
+        assert summary["backed_off_count"] == 0
+        assert state.remove_pending_close_reconciliation(malformed) is True
+        assert state.pending_close_reconciliations == []
 
     def test_pending_close_reconciliation_enqueue_normalizes_existing_dict_shape(self):
         state = EngineState()

@@ -1183,6 +1183,8 @@ _EVENT_KIND_PHASES = {
     "exit.close_residual_detected": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "exit.closed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_evidence_unavailable": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.billing_evidence_pending": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.reconciliation_abandoned": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_unreconciled": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.compensated": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.reconciled": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

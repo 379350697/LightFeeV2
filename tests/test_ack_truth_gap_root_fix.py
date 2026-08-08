@@ -158,6 +158,212 @@ class TestAckTruthGapRouting:
             for c in ctx.journal.append.call_args_list
         )
 
+
+class TestBillingEvidenceIdentityGap:
+    """A flat close without order identity stays on the billing queue."""
+
+    @pytest.mark.asyncio
+    async def test_missing_identity_is_retained_fail_closed(self):
+        from lightfee.engine.close_runtime import CloseRuntime
+
+        ctx = _ctx()
+        ctx.state.pending_close_reconciliations = [{
+            "position_id": "entry-1-BTCUSDT",
+            "symbol": "BTCUSDT",
+            "kind": "final",
+            "reason": "funding_capture",
+            "closed_at_ms": 1000000,
+            "created_cycle": 0,
+            "attempt_count": 0,
+            "next_attempt_ms": 0,
+            "reconciliation_mode": "venue_execution_history_required",
+            "missing_close_order_identity": True,
+            "billing_reconciliation_required": True,
+            "position_snapshot": {
+                "position_id": "entry-1-BTCUSDT",
+                "symbol": "BTCUSDT",
+                "long_venue": "bybit",
+                "short_venue": "okx",
+                "matched_quantity": 100.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }]
+        cr = CloseRuntime(ctx)
+
+        await cr._process_pending_close_reconciliations(2000000)
+
+        assert len(ctx.state.pending_close_reconciliations) == 1
+        kinds = [
+            str(call.args[0])
+            for call in ctx.journal.append.call_args_list
+            if call.args
+        ]
+        assert "exit.billing_evidence_pending" in kinds
+        assert "reconciliation.pending_close_reconciliation_invalid" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_malformed_reconciliation_timestamps_are_retained_fail_closed(self):
+        from lightfee.engine.close_runtime import CloseRuntime
+
+        ctx = _ctx()
+        ctx.state.pending_close_reconciliations = [{
+            "position_id": "entry-malformed-timestamps",
+            "symbol": "BTCUSDT",
+            "kind": "final",
+            "closed_at_ms": "not-a-timestamp",
+            "created_cycle": "not-a-cycle",
+            "next_attempt_ms": float("inf"),
+            "position_snapshot": {
+                "long_venue": "bybit",
+                "short_venue": "okx",
+                "matched_quantity": 1.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }]
+        cr = CloseRuntime(ctx)
+
+        await cr._process_pending_close_reconciliations(2_000_000)
+
+        assert len(ctx.state.pending_close_reconciliations) == 1
+        assert any(
+            call.args and call.args[0] == "exit.billing_evidence_pending"
+            for call in ctx.journal.append.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_leg_identity_is_migrated_and_retained_fail_closed(self):
+        """One venue identity must not allow provisional billing terminalization."""
+        from lightfee.engine.close_runtime import CloseRuntime
+
+        ctx = _ctx()
+        ctx.state.pending_close_reconciliations = [{
+            "position_id": "entry-zil-partial-identity",
+            "symbol": "ZILUSDT",
+            "kind": "final",
+            "closed_at_ms": 1000000,
+            "position_snapshot": {
+                "position_id": "entry-zil-partial-identity",
+                "symbol": "ZILUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "matched_quantity": 100.0,
+            },
+            "long_legs": [{
+                "venue": "binance",
+                "order_id": "binance-close-1",
+                "client_order_id": "binance-cid-1",
+            }],
+            "short_legs": [],
+        }]
+        cr = CloseRuntime(ctx)
+
+        await cr._process_pending_close_reconciliations(2000000)
+
+        retained = ctx.state.pending_close_reconciliations[0]
+        assert retained["reconciliation_mode"] == (
+            "venue_execution_history_required"
+        )
+        assert retained["missing_close_order_identity"] is True
+        assert retained["billing_reconciliation_required"] is True
+        assert any(
+            call.args
+            and call.args[0] == "exit.billing_evidence_pending"
+            and call.args[1]["missing_identity_legs"] == ["short"]
+            and call.args[1]["decision"] == "migrated_legacy_queue_fail_closed"
+            for call in ctx.journal.append.call_args_list
+        )
+        assert not any(
+            call.args and call.args[0] == "exit.billing_evidence_unavailable"
+            for call in ctx.journal.append.call_args_list
+        )
+
+    def test_pending_close_reconciliation_registration_replays_full_queue(self):
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.persistence.journal import replay_journal_records
+        from lightfee.engine.state import EngineState
+
+        reconciliation = {
+            "position_id": "entry-replay-billing",
+            "symbol": "ZILUSDT",
+            "kind": "final",
+            "closed_at_ms": 1000,
+            "position_snapshot": {
+                "position_id": "entry-replay-billing",
+                "symbol": "ZILUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "matched_quantity": 1.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+            "reconciliation_mode": "venue_execution_history_required",
+            "missing_close_order_identity": True,
+            "billing_reconciliation_required": True,
+        }
+        records = [{
+            "kind": "entry.opened",
+            "ts_ms": 900,
+            "payload": {
+                "position_id": reconciliation["position_id"],
+                "symbol": reconciliation["symbol"],
+                "long_venue": "binance",
+                "short_venue": "bybit",
+            },
+        }, {
+            "kind": "exit.pending_close_reconciliation_registered",
+            "ts_ms": 1000,
+            "payload": {
+                "position_id": reconciliation["position_id"],
+                "symbol": reconciliation["symbol"],
+                "live_flat_terminal": True,
+                "reconciliation": reconciliation,
+            },
+        }]
+
+        restored = EngineState()
+        restored.open_positions[reconciliation["position_id"]] = object()
+        _apply_journal_replay_to_state(restored, records)
+        assert restored.pending_close_reconciliations == [reconciliation]
+        assert reconciliation["position_id"] not in restored.open_positions
+
+        replayed = replay_journal_records(records)
+        assert reconciliation["position_id"] not in replayed["open_position_ids"]
+        assert replayed["pending_close_reconciliation_count"] == 1
+        assert replayed["pending_close_reconciliation_ids"] == [
+            reconciliation["position_id"]
+        ]
+
+        legacy_records = [
+            {
+                "kind": "entry.opened",
+                "ts_ms": 900,
+                "payload": {
+                    "position_id": reconciliation["position_id"],
+                    "symbol": reconciliation["symbol"],
+                },
+            },
+            {
+                "kind": "exit.pending_close_reconciliation_registered",
+                "ts_ms": 1000,
+                "payload": {
+                    "position_id": reconciliation["position_id"],
+                    "symbol": reconciliation["symbol"],
+                },
+            },
+            {
+                "kind": "recovery.flat",
+                "ts_ms": 1001,
+                "payload": {"position_id": reconciliation["position_id"]},
+            },
+        ]
+        legacy_replayed = replay_journal_records(legacy_records)
+        assert legacy_replayed["open_position_ids"] == []
+        assert legacy_replayed["pending_close_reconciliation_ids"] == [
+            reconciliation["position_id"]
+        ]
+
     @pytest.mark.asyncio
     async def test_confirmed_execution_fill_resolves_no_billing(self):
         """Adapter returns fill from confirmed execution source →

@@ -7788,6 +7788,10 @@ class TestVenueSpecificOrderReconciliationEvidence:
         query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
         assert query_payload["queried_endpoints"] == ["/fapi/v1/order"]
         assert query_payload["client_order_id"] == "bn-timeout-cid"
+        assert query_payload["identifier_kind"] == "order_id"
+        assert query_payload["has_order_id"] is True
+        assert query_payload["has_client_order_id"] is True
+        assert isinstance(query_payload["observed_at_ms"], int)
 
     @pytest.mark.anyio
     async def test_binance_http_400_minus_2013_is_recoverable_order_truth_gap(self):

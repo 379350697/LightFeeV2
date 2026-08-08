@@ -16,6 +16,7 @@ from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
+from lightfee.engine.state import pending_close_reconciliation_missing_legs
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -293,6 +294,21 @@ class CloseRuntime:
             if order_id or client_order_id:
                 return True
         return False
+
+    @staticmethod
+    def _safe_reconciliation_int(raw: Any, default: int = 0) -> int:
+        try:
+            return int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    @staticmethod
+    def _safe_reconciliation_float(raw: Any, default: float = 0.0) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return value if math.isfinite(value) else default
     @staticmethod
     def _close_reconciliation_fill_qty(fill: Any) -> float:
         qty = getattr(fill, "quantity", 0.0) if fill is not None else 0.0
@@ -375,7 +391,9 @@ class CloseRuntime:
         ):
             return False
 
-        next_attempt_count = int(reconciliation.get("attempt_count") or 0) + 1
+        next_attempt_count = self._safe_reconciliation_int(
+            reconciliation.get("attempt_count")
+        ) + 1
         terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
             symbol=symbol,
             long_venue=long_venue,
@@ -395,13 +413,21 @@ class CloseRuntime:
                 "symbol": symbol,
                 "kind": "final",
                 "reason": reconciliation.get("reason", ""),
-                "closed_at_ms": int(reconciliation.get("closed_at_ms") or 0),
+                "closed_at_ms": self._safe_reconciliation_int(
+                    reconciliation.get("closed_at_ms")
+                ),
                 "attempt_count": next_attempt_count,
                 "terminal_reason": "fill_reconciliation_unavailable_after_terminal_budget",
                 "error": error,
                 "lifetime_ms": max(
                     0,
-                    now_ms - max(0, int(reconciliation.get("closed_at_ms") or 0)),
+                    now_ms
+                    - max(
+                        0,
+                        self._safe_reconciliation_int(
+                            reconciliation.get("closed_at_ms")
+                        ),
+                    ),
                 ),
                 "long_venue": long_venue.value,
                 "short_venue": short_venue.value,
@@ -723,7 +749,9 @@ class CloseRuntime:
         reconciliation: dict[str, Any],
         now_ms: int,
     ) -> None:
-        attempt = int(reconciliation.get("attempt_count") or 0) + 1
+        attempt = self._safe_reconciliation_int(
+            reconciliation.get("attempt_count")
+        ) + 1
         reconciliation["attempt_count"] = attempt
         delay = min(
             self._RECONCILE_RETRY_BASE_MS * (2 ** max(attempt - 1, 0)),
@@ -803,7 +831,9 @@ class CloseRuntime:
             "symbol": reconciliation.get("symbol", snapshot.get("symbol", "")),
             "kind": reconciliation.get("kind", "final"),
             "reason": reconciliation.get("reason", ""),
-            "closed_at_ms": int(reconciliation.get("closed_at_ms") or now_ms),
+            "closed_at_ms": self._safe_reconciliation_int(
+                reconciliation.get("closed_at_ms"), now_ms
+            ),
             "reconciled_at_ms": now_ms,
             "long_closed_qty": long_qty,
             "short_closed_qty": short_qty,
@@ -900,7 +930,9 @@ class CloseRuntime:
                     and abs(short_live_size) <= 1e-9
                     and open_order_evidence is None
                 ):
-                    next_attempt_count = int(reconciliation.get("attempt_count") or 0) + 1
+                    next_attempt_count = self._safe_reconciliation_int(
+                        reconciliation.get("attempt_count")
+                    ) + 1
                     self.ctx.journal.append(
                         "exit.accepted_order_truth_gap_superseded",
                         {
@@ -912,12 +944,20 @@ class CloseRuntime:
                             "long_live_size": long_live_size,
                             "short_live_size": short_live_size,
                             "attempt_count": next_attempt_count,
-                            "closed_at_ms": int(reconciliation.get("closed_at_ms") or 0),
+                            "closed_at_ms": self._safe_reconciliation_int(
+                                reconciliation.get("closed_at_ms")
+                            ),
                             "superseded_at_ms": now_ms,
                             "superseded_by": "terminal_live_flat_truth",
                             "lifetime_ms": max(
                                 0,
-                                now_ms - max(0, int(reconciliation.get("closed_at_ms") or 0)),
+                                now_ms
+                                - max(
+                                    0,
+                                    self._safe_reconciliation_int(
+                                        reconciliation.get("closed_at_ms")
+                                    ),
+                                ),
                             ),
                         },
                     )
@@ -961,7 +1001,9 @@ class CloseRuntime:
             snapshot = {}
         symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
         position_id = str(reconciliation.get("position_id") or "")
-        target_qty = float(reconciliation.get("requested_quantity") or 0.0)
+        target_qty = self._safe_reconciliation_float(
+            reconciliation.get("requested_quantity")
+        )
 
         long_venue = self._venue_from_close_reconciliation(
             reconciliation.get("long_venue") or snapshot.get("long_venue")
@@ -1057,7 +1099,9 @@ class CloseRuntime:
             return False
 
         # Every probed identity is a ledger-confirmed fill.
-        next_attempt_count = int(reconciliation.get("attempt_count") or 0) + 1
+        next_attempt_count = self._safe_reconciliation_int(
+            reconciliation.get("attempt_count")
+        ) + 1
         self.ctx.journal.append(
             "exit.accepted_order_truth_gap_resolved",
             {
@@ -1065,12 +1109,20 @@ class CloseRuntime:
                 "symbol": symbol,
                 "kind": "accepted_order_truth_gap",
                 "attempt_count": next_attempt_count,
-                "closed_at_ms": int(reconciliation.get("closed_at_ms") or 0),
+                "closed_at_ms": self._safe_reconciliation_int(
+                    reconciliation.get("closed_at_ms")
+                ),
                 "resolved_at_ms": now_ms,
                 "resolved_by": "order_fill_confirmed_by_ledger",
                 "lifetime_ms": max(
                     0,
-                    now_ms - max(0, int(reconciliation.get("closed_at_ms") or 0)),
+                    now_ms
+                    - max(
+                        0,
+                        self._safe_reconciliation_int(
+                            reconciliation.get("closed_at_ms")
+                        ),
+                    ),
                 ),
             },
         )
@@ -1088,16 +1140,22 @@ class CloseRuntime:
 
         retained: list[Any] = []
         eligible: list[dict[str, Any]] = []
-        current_cycle = int(getattr(self.ctx.state, "tick_count", 0) or 0)
+        current_cycle = self._safe_reconciliation_int(
+            getattr(self.ctx.state, "tick_count", 0)
+        )
         for reconciliation in list(pending_reconciliations):
             if not isinstance(reconciliation, dict):
                 retained.append(reconciliation)
                 continue
-            created_cycle = int(reconciliation.get("created_cycle") or 0)
+            created_cycle = self._safe_reconciliation_int(
+                reconciliation.get("created_cycle")
+            )
             if current_cycle != 0 and created_cycle >= current_cycle:
                 retained.append(reconciliation)
                 continue
-            if int(reconciliation.get("next_attempt_ms") or 0) > now_ms:
+            if self._safe_reconciliation_int(
+                reconciliation.get("next_attempt_ms")
+            ) > now_ms:
                 retained.append(reconciliation)
                 continue
             eligible.append(reconciliation)
@@ -1123,7 +1181,7 @@ class CloseRuntime:
         for reconciliation in sorted(
             order_truth_eligible,
             key=lambda item: (
-                int(item.get("closed_at_ms") or 0),
+                self._safe_reconciliation_int(item.get("closed_at_ms")),
                 str(item.get("position_id") or ""),
             ),
         ):
@@ -1142,7 +1200,7 @@ class CloseRuntime:
         for reconciliation in sorted(
             billing_eligible,
             key=lambda item: (
-                int(item.get("closed_at_ms") or 0),
+                self._safe_reconciliation_int(item.get("closed_at_ms")),
                 0 if str(item.get("kind") or "final") == "partial" else 1,
                 str(item.get("position_id") or ""),
             ),
@@ -1170,15 +1228,100 @@ class CloseRuntime:
                 changed = True
                 continue
 
-            if not (
-                self._has_close_reconciliation_leg_identity(reconciliation.get("long_legs"))
-                or self._has_close_reconciliation_leg_identity(reconciliation.get("short_legs"))
+            symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
+            has_leg_identity = (
+                self._has_close_reconciliation_leg_identity(
+                    reconciliation.get("long_legs")
+                )
+                or self._has_close_reconciliation_leg_identity(
+                    reconciliation.get("short_legs")
+                )
+            )
+            missing_identity_legs = pending_close_reconciliation_missing_legs(
+                reconciliation
+            )
+            if (
+                not missing_identity_legs
+                and not has_leg_identity
+                and reconciliation.get("reconciliation_mode")
+                == "venue_execution_history_required"
             ):
+                missing_identity_legs = ("long", "short")
+            if missing_identity_legs:
+                # A missing identity on either expected close leg is an
+                # accounting gap.  Do not let one venue's fill evidence make
+                # the other venue's unknown execution look terminal.
+                migrated = (
+                    reconciliation.get("reconciliation_mode")
+                    != "venue_execution_history_required"
+                )
+                reconciliation["reconciliation_mode"] = (
+                    "venue_execution_history_required"
+                )
+                reconciliation["missing_close_order_identity"] = True
+                reconciliation["billing_reconciliation_required"] = True
+                attempt = self._safe_reconciliation_int(
+                    reconciliation.get("attempt_count")
+                ) + 1
+                expected_long_quantity = self._safe_reconciliation_float(
+                    snapshot.get("long_quantity")
+                    if "long_quantity" in snapshot
+                    else snapshot.get("matched_quantity")
+                )
+                expected_short_quantity = self._safe_reconciliation_float(
+                    snapshot.get("short_quantity")
+                    if "short_quantity" in snapshot
+                    else snapshot.get("matched_quantity")
+                )
+                self.ctx.journal.append(
+                    "exit.billing_evidence_pending",
+                    {
+                        "position_id": reconciliation.get("position_id", ""),
+                        "symbol": symbol,
+                        "kind": reconciliation.get("kind", "final"),
+                        "source": reconciliation.get("source", ""),
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "long_leg_count": (
+                            len(reconciliation.get("long_legs"))
+                            if isinstance(reconciliation.get("long_legs"), list)
+                            else 0
+                        ),
+                        "short_leg_count": (
+                            len(reconciliation.get("short_legs"))
+                            if isinstance(reconciliation.get("short_legs"), list)
+                            else 0
+                        ),
+                        "missing_identity_legs": list(missing_identity_legs),
+                        "attempt_count": attempt,
+                        "closed_at_ms": self._safe_reconciliation_int(
+                            reconciliation.get("closed_at_ms")
+                        ),
+                        "expected_long_quantity": expected_long_quantity,
+                        "expected_short_quantity": expected_short_quantity,
+                        "missing_close_order_identity": True,
+                        "billing_reconciliation_required": True,
+                        "next_action": "venue_execution_history_required",
+                        "decision": (
+                            "migrated_legacy_queue_fail_closed"
+                            if migrated
+                            else "retain_pending_fail_closed"
+                        ),
+                    },
+                )
+                self._call_apply_pending_close_reconciliation_backoff(
+                    reconciliation, now_ms
+                )
+                retained.append(reconciliation)
+                changed = True
+                continue
+
+            if not has_leg_identity:
                 self.ctx.journal.append(
                     "reconciliation.pending_close_reconciliation_invalid",
                     {
                         "position_id": reconciliation.get("position_id", ""),
-                        "symbol": reconciliation.get("symbol", ""),
+                        "symbol": symbol,
                         "reason": "missing_order_identity",
                     },
                 )
@@ -1187,7 +1330,6 @@ class CloseRuntime:
                 changed = True
                 continue
 
-            symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
             long_fills = await self._call_fetch_close_leg_reconciliations(
                 symbol=symbol,
                 venue=long_venue,

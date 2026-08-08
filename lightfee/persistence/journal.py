@@ -308,7 +308,8 @@ def replay_journal_records(
     entries/closes, scan statistics, recovery and risk events, and full timeline.
 
     Returns a dict with open_position_count, open_position_ids,
-    pending_entry_count, pending_close_count, final_lifecycle, final_risk_mode,
+    pending_entry_count, pending_close_count, pending_close_reconciliation_count,
+    pending_close_reconciliation_ids, final_lifecycle, final_risk_mode,
     positions (fixed-schema dicts), scan_stats, recovery_events, risk_events,
     and timeline.
     """
@@ -318,6 +319,7 @@ def replay_journal_records(
     open_ids: set[str] = set()
     pending_entry_ids: set[str] = set()
     pending_close_ids: set[str] = set()
+    pending_close_reconciliation_ids: set[str] = set()
     # Map close_id -> position_id for correct cleanup on close
     _close_to_position: dict[str, str] = {}
 
@@ -330,7 +332,10 @@ def replay_journal_records(
         "entry.opened", "entry.pending_registered",
         "exit.closed", "exit.partial_closed", "exit.reconciled",
         "exit.billing_evidence_unavailable",
+        "exit.billing_evidence_pending",
+        "exit.reconciliation_abandoned",
         "exit.pending_close_registered",
+        "exit.pending_close_reconciliation_registered",
         "recovery.live_detected", "recovery.flat", "recovery.blocked",
         "recovery.mismatch_detected", "recovery.mismatch_flattened",
         "recovery.resumed",
@@ -382,6 +387,7 @@ def replay_journal_records(
             "exit.closed",
             "exit.reconciled",
             "exit.billing_evidence_unavailable",
+            "exit.reconciliation_abandoned",
             "recovery.flat",
         ):
             pid = payload.get("position_id", "")
@@ -389,6 +395,14 @@ def replay_journal_records(
                 del positions[pid]
                 open_ids.discard(pid)
             pending_close_ids.discard(pid)
+            if not (
+                kind == "recovery.flat"
+                and (
+                    payload.get("billing_reconciliation_pending") is True
+                    or str(pid) in pending_close_reconciliation_ids
+                )
+            ):
+                pending_close_reconciliation_ids.discard(pid)
             # Also remove any pending close registered for this position
             stale_closes = [cid for cid, cpid in _close_to_position.items() if cpid == pid]
             for cid in stale_closes:
@@ -423,6 +437,30 @@ def replay_journal_records(
                 pending_close_ids.add(cid)
                 if pid:
                     _close_to_position[cid] = pid
+
+        elif kind == "exit.pending_close_reconciliation_registered":
+            reconciliation = payload.get("reconciliation")
+            pid = (
+                reconciliation.get("position_id")
+                if isinstance(reconciliation, dict)
+                else payload.get("position_id", "")
+            )
+            if pid:
+                pending_close_reconciliation_ids.add(str(pid))
+                # Registration is emitted only after live-flat exchange
+                # truth; remove local position/close ownership even for old
+                # summary-only registration events.
+                positions.pop(str(pid), None)
+                open_ids.discard(str(pid))
+                pending_close_ids.discard(str(pid))
+                stale_closes = [
+                    cid
+                    for cid, cpid in _close_to_position.items()
+                    if cpid == str(pid)
+                ]
+                for cid in stale_closes:
+                    pending_close_ids.discard(cid)
+                    del _close_to_position[cid]
 
         elif kind == "runtime.lifecycle_changed":
             to_val = payload.get("to")
@@ -460,6 +498,12 @@ def replay_journal_records(
         "open_position_ids": sorted(open_ids),
         "pending_entry_count": len(pending_entry_ids),
         "pending_close_count": len(pending_close_ids),
+        "pending_close_reconciliation_count": len(
+            pending_close_reconciliation_ids
+        ),
+        "pending_close_reconciliation_ids": sorted(
+            pending_close_reconciliation_ids
+        ),
         "final_lifecycle": lifecycle,
         "final_risk_mode": risk_mode,
         "positions": positions,
