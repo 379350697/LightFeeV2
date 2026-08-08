@@ -49,6 +49,9 @@ class OkxMetadataAdapter:
             "quantity_step": 0.001,
         }
 
+    async def precheck_entry_tradability(self, symbol: str) -> dict:
+        return {"symbol": symbol, "status": "ok"}
+
 
 class BybitMetadataAdapter:
     trading_capability_trusted = True
@@ -59,6 +62,9 @@ class BybitMetadataAdapter:
             "min_quantity": 0.001,
             "quantity_step": 0.001,
         }
+
+    async def precheck_entry_tradability(self, symbol: str) -> dict:
+        return {"symbol": symbol, "status": "ok"}
 
 
 def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:

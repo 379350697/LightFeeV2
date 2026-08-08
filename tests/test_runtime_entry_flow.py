@@ -113,6 +113,9 @@ class FakeVenueAdapter(VenueAdapter):
             "quantity_step": 0.001,
         }
 
+    async def precheck_entry_tradability(self, symbol: str) -> dict:
+        return {"venue": self._venue.value, "symbol": symbol, "status": "ok"}
+
 
 def make_fake_fill(
     venue, symbol, side, quantity, price=50000.0,

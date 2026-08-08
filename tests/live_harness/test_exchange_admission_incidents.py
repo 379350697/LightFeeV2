@@ -31,6 +31,9 @@ class TrustedVenueAdapter:
             "min_notional": 0.0,
         }
 
+    async def precheck_entry_tradability(self, symbol: str) -> dict:
+        return {"symbol": symbol, "status": "ok"}
+
 
 def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
     adapter = TrustedVenueAdapter()
