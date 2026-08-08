@@ -7790,6 +7790,48 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert query_payload["client_order_id"] == "bn-timeout-cid"
 
     @pytest.mark.anyio
+    async def test_binance_http_400_minus_2013_is_recoverable_order_truth_gap(self):
+        """V1 treats Binance's missing-order response as no fill, not a crash."""
+        from lightfee.venues.binance import BinanceAdapter
+
+        seen_paths: list[str] = []
+
+        async def mock_handler(request):
+            seen_paths.append(request.url.path)
+            return httpx.Response(400, json={
+                "code": -2013,
+                "msg": "Order does not exist.",
+            })
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "ZILUSDT", order_id="812345", client_order_id="bn-close-cid",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is None
+        assert seen_paths == ["/fapi/v1/order"]
+        query_payload = [
+            event["payload"]
+            for event in events
+            if event["kind"] == "order.reconcile_query"
+        ][-1]
+        assert query_payload["response_classification"] == (
+            "binance_error_-2013:Order does not exist."
+        )
+        assert query_payload["uncertain_subtype"] == "open_order_not_found"
+        assert query_payload["next_action"] == "check_live_position"
+
+    @pytest.mark.anyio
     async def test_binance_recovery_placeholder_order_id_uses_orig_client_order_id(self):
         from lightfee.venues.binance import BinanceAdapter
 

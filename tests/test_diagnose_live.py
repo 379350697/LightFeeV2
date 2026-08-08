@@ -310,6 +310,36 @@ def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
     assert gate["runtime_progress"]["active_lane"] == "housekeeping"
 
 
+def test_acceptance_gate_remaining_slots_include_pending_entry_owners():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 1,
+            "max_concurrent_positions": 3,
+            "pending_entry_count": 1,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_scan": {"entry_capacity_reservation_count": 1},
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": True,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+        state_consistency={"state_mismatch": False},
+    )
+
+    assert gate["effective_entry_slot_count"] == 3
+    assert gate["entry_capacity_reservation_count"] == 1
+    assert gate["remaining_position_slots"] == 0
+
+
 def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
     from scripts.diagnose_live import _build_production_acceptance_gate
 

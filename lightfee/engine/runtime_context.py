@@ -362,6 +362,8 @@ class EntryGateRuntimeContext(RuntimeCommonContext, Protocol):
 
     def _ws_bbo_selection_blocker_family(self, *args: Any, **kwargs: Any) -> Any: ...
 
+    def _entry_capacity_snapshot(self) -> dict[str, int | bool]: ...
+
 
 class EntryDispatchRuntimeContext(RuntimeCommonContext, Protocol):
     @property
@@ -378,6 +380,10 @@ class EntryDispatchRuntimeContext(RuntimeCommonContext, Protocol):
 
     @property
     def _recovery_dedup_index(self) -> dict[str, str]: ...
+
+    def _reserve_entry_capacity_slot(self, entry_id: str) -> None: ...
+
+    def _release_entry_capacity_slot(self, entry_id: str) -> None: ...
 
     def get_venue_adapter(self, *args: Any, **kwargs: Any) -> Any: ...
 

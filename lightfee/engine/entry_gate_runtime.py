@@ -1404,6 +1404,9 @@ class EntryGateRuntime:
             "dispatched_candidate_count",
             "max_concurrent_positions",
             "open_position_count",
+            "pending_entry_count",
+            "entry_capacity_reservation_count",
+            "effective_entry_slot_count",
             "remaining_slots",
             "capacity_blocked",
             "blocked_reason_counts",
@@ -1592,12 +1595,13 @@ class EntryGateRuntime:
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
         }
-        max_concurrent_positions = max(
-            int(getattr(self.ctx.config.strategy, "max_concurrent_positions", 0) or 0),
-            1,
-        )
-        open_position_count = len(self.ctx.state.open_positions)
-        normalized_remaining_slots = max(int(remaining_slots), 0)
+        entry_capacity = self.ctx._entry_capacity_snapshot()
+        max_concurrent_positions = int(entry_capacity["max_concurrent_positions"])
+        open_position_count = int(entry_capacity["open_position_count"])
+        pending_entry_count = int(entry_capacity["pending_entry_count"])
+        reservation_count = int(entry_capacity["entry_capacity_reservation_count"])
+        effective_entry_slot_count = int(entry_capacity["effective_entry_slot_count"])
+        normalized_remaining_slots = int(entry_capacity["remaining_slots"])
         blocked_candidate_samples = [
             {
                 "pair_id": pair_id,
@@ -1614,9 +1618,11 @@ class EntryGateRuntime:
             "pipeline_counts": pipeline_counts,
             "max_concurrent_positions": max_concurrent_positions,
             "open_position_count": open_position_count,
+            "pending_entry_count": pending_entry_count,
+            "entry_capacity_reservation_count": reservation_count,
+            "effective_entry_slot_count": effective_entry_slot_count,
             "remaining_slots": normalized_remaining_slots,
-            "capacity_blocked": open_position_count >= max_concurrent_positions
-            and normalized_remaining_slots <= 0,
+            "capacity_blocked": bool(entry_capacity["capacity_blocked"]),
             "tradeable_selection_blocker_counts": dict(
                 sorted(
                     (str(k), int(v))
@@ -1859,12 +1865,13 @@ class EntryGateRuntime:
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
         }
-        max_concurrent_positions = max(
-            int(getattr(self.ctx.config.strategy, "max_concurrent_positions", 0) or 0),
-            1,
-        )
-        open_position_count = len(self.ctx.state.open_positions)
-        normalized_remaining_slots = max(int(remaining_slots), 0)
+        entry_capacity = self.ctx._entry_capacity_snapshot()
+        max_concurrent_positions = int(entry_capacity["max_concurrent_positions"])
+        open_position_count = int(entry_capacity["open_position_count"])
+        pending_entry_count = int(entry_capacity["pending_entry_count"])
+        reservation_count = int(entry_capacity["entry_capacity_reservation_count"])
+        effective_entry_slot_count = int(entry_capacity["effective_entry_slot_count"])
+        normalized_remaining_slots = int(entry_capacity["remaining_slots"])
         last_scan = self.ctx.state.last_scan if isinstance(self.ctx.state.last_scan, dict) else {}
         quote_truth_payload = {
             "quote_truth_must_resolve_count": int(
@@ -1948,9 +1955,11 @@ class EntryGateRuntime:
             "pipeline_counts": pipeline_counts,
             "max_concurrent_positions": max_concurrent_positions,
             "open_position_count": open_position_count,
+            "pending_entry_count": pending_entry_count,
+            "entry_capacity_reservation_count": reservation_count,
+            "effective_entry_slot_count": effective_entry_slot_count,
             "remaining_slots": normalized_remaining_slots,
-            "capacity_blocked": open_position_count >= max_concurrent_positions
-            and normalized_remaining_slots <= 0,
+            "capacity_blocked": bool(entry_capacity["capacity_blocked"]),
             "blocked_reason_counts": dict(sorted(blocked_reason_counts.items())),
             "entry_candidate_blocked_counts": dict(sorted(blocked_reason_counts.items())),
             "unsupported_symbol_blocked_counts": dict(
@@ -2016,6 +2025,11 @@ class EntryGateRuntime:
             "dispatched_candidate_count": payload["dispatched_candidate_count"],
             "max_concurrent_positions": payload["max_concurrent_positions"],
             "open_position_count": payload["open_position_count"],
+            "pending_entry_count": payload["pending_entry_count"],
+            "entry_capacity_reservation_count": payload[
+                "entry_capacity_reservation_count"
+            ],
+            "effective_entry_slot_count": payload["effective_entry_slot_count"],
             "remaining_slots": payload["remaining_slots"],
             "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
             "entry_local_l2_primary_not_ready_reason_totals": payload.get(
@@ -2040,6 +2054,11 @@ class EntryGateRuntime:
             "generic_reason": payload["generic_reason"],
             "max_concurrent_positions": payload["max_concurrent_positions"],
             "open_position_count": payload["open_position_count"],
+            "pending_entry_count": payload["pending_entry_count"],
+            "entry_capacity_reservation_count": payload[
+                "entry_capacity_reservation_count"
+            ],
+            "effective_entry_slot_count": payload["effective_entry_slot_count"],
             "remaining_slots": payload["remaining_slots"],
             "blocked_reason_keys": sorted(payload["blocked_reason_counts"].keys()),
             "unsupported_symbol_blocked_keys": sorted(
@@ -2109,6 +2128,11 @@ class EntryGateRuntime:
                 "no_entry_reason": payload["reason"],
                 "max_concurrent_positions": payload["max_concurrent_positions"],
                 "open_position_count": payload["open_position_count"],
+                "pending_entry_count": payload["pending_entry_count"],
+                "entry_capacity_reservation_count": payload[
+                    "entry_capacity_reservation_count"
+                ],
+                "effective_entry_slot_count": payload["effective_entry_slot_count"],
                 "remaining_slots": payload["remaining_slots"],
                 "capacity_blocked": payload["capacity_blocked"],
                 "selection_bucket_counts": payload["selection_bucket_counts"],

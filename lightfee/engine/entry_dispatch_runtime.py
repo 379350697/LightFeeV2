@@ -1566,6 +1566,10 @@ class EntryDispatchRuntime:
                     "owner_state": "submitting",
                 },
             )
+            # The durable claim is exposure-in-progress.  It must consume
+            # capacity before the first await that can submit an order, and is
+            # released only after a local successor or a proven rejection.
+            self.ctx._reserve_entry_capacity_slot(ctx.entry_id)
             result = await self.ctx.entry_executor.execute(ctx)
             self.ctx.journal.append(
                 "runtime.entry_dispatched",
@@ -1597,6 +1601,7 @@ class EntryDispatchRuntime:
                     entry_id=ctx.entry_id,
                     destination="rejected",
                 )
+                self.ctx._release_entry_capacity_slot(ctx.entry_id)
                 return True
             if result.open_position is not None:
                 self.ctx.state.open_positions[result.open_position.position_id] = result.open_position
@@ -1627,6 +1632,7 @@ class EntryDispatchRuntime:
                         entry_id=ctx.entry_id,
                         destination="rejected",
                     )
+                    self.ctx._release_entry_capacity_slot(ctx.entry_id)
                     return True
                 # Track pending entry for reconciliation
                 if getattr(result.pending_entry, "created_cycle", 0) == 0:
@@ -1717,6 +1723,7 @@ class EntryDispatchRuntime:
                 entry_id=ctx.entry_id,
                 destination=destination,
             )
+            self.ctx._release_entry_capacity_slot(ctx.entry_id)
         except Exception as e:
             error_text = str(e)
             if self._entry_reject_is_post_only_would_take(error_text):

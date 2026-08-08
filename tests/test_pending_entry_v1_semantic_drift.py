@@ -2043,6 +2043,7 @@ async def test_entry_dispatch_retains_pre_submit_owner_when_executor_has_no_loca
     )
 
     assert completed is True
+    assert runtime._entry_capacity_snapshot()["entry_capacity_reservation_count"] == 1
     records = tmp_journal.read_all()
     kinds = [record["kind"] for record in records]
     assert "runtime.entry_owner_handoff_complete" not in kinds

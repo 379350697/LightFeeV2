@@ -3819,8 +3819,26 @@ def _build_production_acceptance_gate(
         or (local_state.get("last_scan") or {}).get("max_concurrent_positions")
         or 8
     )
-    remaining_position_slots = max(max_concurrent_positions - open_position_count, 0)
     pending_entry_count = int(local_state.get("pending_entry_count", 0) or 0)
+    last_scan = local_state.get("last_scan") or {}
+    if not isinstance(last_scan, dict):
+        last_scan = {}
+    entry_capacity_reservation_count = int(
+        last_scan.get("entry_capacity_reservation_count", 0) or 0
+    )
+    observed_entry_slot_count = (
+        open_position_count
+        + pending_entry_count
+        + entry_capacity_reservation_count
+    )
+    effective_entry_slot_count = max(
+        int(last_scan.get("effective_entry_slot_count", 0) or 0),
+        observed_entry_slot_count,
+    )
+    remaining_position_slots = max(
+        max_concurrent_positions - effective_entry_slot_count,
+        0,
+    )
     pending_close_count = int(local_state.get("pending_close_count", 0) or 0)
     pending_reconciliation_summary = local_state.get("pending_close_reconciliation_summary") or {}
     pending_reconciliation_total = int(
@@ -4123,6 +4141,8 @@ def _build_production_acceptance_gate(
         "open_position_count": open_position_count,
         "max_concurrent_positions": max_concurrent_positions,
         "remaining_position_slots": remaining_position_slots,
+        "effective_entry_slot_count": effective_entry_slot_count,
+        "entry_capacity_reservation_count": entry_capacity_reservation_count,
         "active_positions_with_capacity": active_positions_with_capacity,
         "pending_entry_count": pending_entry_count,
         "pending_close_count": pending_close_count,

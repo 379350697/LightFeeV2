@@ -73,6 +73,7 @@ class TestConfigLoading:
         config = load_config("config/live.example.toml")
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
+        assert config.strategy.max_concurrent_positions == 3
 
     def test_live_missing_entry_provider_defaults_to_ws_bbo_even_with_legacy_local_l2_flag(
         self, tmp_path

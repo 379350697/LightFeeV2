@@ -226,6 +226,9 @@ class LiveRuntime:
 
         # V1 entry executor — set after construction or defaults to None
         self.entry_executor: Optional[object] = None
+        # A durable pre-submit owner is exposure-in-progress until it has a
+        # local successor (open position, pending entry) or a proven reject.
+        self._entry_capacity_reservations: set[str] = set()
         # V1 close executor — set after construction or defaults to None
         self.close_executor: Optional[object] = None
         # V1 passive close executor — set after construction or defaults to None
@@ -338,6 +341,42 @@ class LiveRuntime:
         # rate limiting. V1: try_consume_maker_venue_request_budget
         self._maker_venue_op_history: dict[str, list[int]] = {}
         self._maker_venue_request_budget_frozen_until_ms: dict[str, int] = {}
+
+    def _entry_capacity_snapshot(self) -> dict[str, int | bool]:
+        """Return the fail-closed entry capacity used by selection and dispatch.
+
+        An open position, a persisted pending entry, and a pre-submit owner
+        whose outcome is not locally resolved each consume one slot.  The
+        final category prevents a scan from submitting a second candidate
+        after an uncertain order handoff.
+        """
+        max_slots = max(
+            int(getattr(self.config.strategy, "max_concurrent_positions", 0) or 0),
+            1,
+        )
+        open_position_count = len(self.state.open_positions)
+        pending_entry_count = len(self.state.pending_entries)
+        reservation_count = len(self._entry_capacity_reservations)
+        effective_entry_slot_count = (
+            open_position_count + pending_entry_count + reservation_count
+        )
+        remaining_slots = max(max_slots - effective_entry_slot_count, 0)
+        return {
+            "max_concurrent_positions": max_slots,
+            "open_position_count": open_position_count,
+            "pending_entry_count": pending_entry_count,
+            "entry_capacity_reservation_count": reservation_count,
+            "effective_entry_slot_count": effective_entry_slot_count,
+            "remaining_slots": remaining_slots,
+            "capacity_blocked": effective_entry_slot_count >= max_slots,
+        }
+
+    def _reserve_entry_capacity_slot(self, entry_id: str) -> None:
+        if entry_id:
+            self._entry_capacity_reservations.add(str(entry_id))
+
+    def _release_entry_capacity_slot(self, entry_id: str) -> None:
+        self._entry_capacity_reservations.discard(str(entry_id))
 
     # V1 risk snapshot TTL constants (Rust: execution_core/engine.rs:127, risk.rs:12)
     _RISK_SNAPSHOT_TTL_MS_DEFAULT = 1_000
@@ -3811,6 +3850,7 @@ class LiveRuntime:
             self._live_scan_success_streak += 1
             self._last_good_snapshot = snapshot
 
+        entry_capacity = self._entry_capacity_snapshot()
         self.state.last_scan = {
             "ts_ms": now_ms,
             "snapshot_freshness": freshness.value if hasattr(freshness, "value") else str(freshness),
@@ -3818,13 +3858,7 @@ class LiveRuntime:
             "tradeable_count": 0,
             "selected_candidate_count": 0,
             "dispatched_candidate_count": 0,
-            "max_concurrent_positions": max(self.config.strategy.max_concurrent_positions, 1),
-            "open_position_count": len(self.state.open_positions),
-            "remaining_slots": max(
-                max(self.config.strategy.max_concurrent_positions, 1)
-                - len(self.state.open_positions),
-                0,
-            ),
+            **entry_capacity,
             "degraded_venues": list(getattr(snapshot, "degraded_venues", [])) if snapshot is not None else [],
             "no_entry_reason": None,
         }
@@ -4285,11 +4319,9 @@ class LiveRuntime:
                 # V1: selected_candidates is a final-entry list, not the raw
                 # shortlist. It excludes candidates still waiting on the final
                 # entry window, primary L2 tracking, or dual-ready books.
-                max_slots = max(self.config.strategy.max_concurrent_positions, 1)
-                remaining_slots = max(max_slots - len(self.state.open_positions), 0)
-                self.state.last_scan["max_concurrent_positions"] = max_slots
-                self.state.last_scan["open_position_count"] = len(self.state.open_positions)
-                self.state.last_scan["remaining_slots"] = remaining_slots
+                entry_capacity = self._entry_capacity_snapshot()
+                remaining_slots = int(entry_capacity["remaining_slots"])
+                self.state.last_scan.update(entry_capacity)
                 admission_blocker_counts: Counter[str] = Counter()
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
@@ -4306,17 +4338,13 @@ class LiveRuntime:
                     admission_blocker_counts=admission_blocker_counts,
                 )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
-                dispatched = 0
-                for candidate in finalists:
-                    if len(self.state.open_positions) >= max_slots:
-                        break
-                    mid_price = self._entry_quote_truth_price_hint(
-                        candidate,
-                        price_hints=price_hints,
-                        overlay=entry_quote_truth_overlay,
-                    )
-                    if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
-                        dispatched += 1
+                dispatched = await self._dispatch_selected_entry_candidates(
+                    finalists,
+                    now_ms=now_ms,
+                    price_hints=price_hints,
+                    entry_quote_truth_overlay=entry_quote_truth_overlay,
+                )
+                self.state.last_scan.update(self._entry_capacity_snapshot())
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
                 if dispatched > 0:
                     self._emit_entry_opportunity_funnel(
@@ -10995,6 +11023,31 @@ class LiveRuntime:
             ):
                 return True
         return False
+
+    async def _dispatch_selected_entry_candidates(
+        self,
+        finalists: list,
+        *,
+        now_ms: int,
+        price_hints: dict[str, float],
+        entry_quote_truth_overlay: dict[tuple[str, str], Any] | None,
+    ) -> int:
+        """Dispatch the V1 selection buffer without exceeding capacity."""
+        dispatched = 0
+        for candidate in finalists:
+            # Selection deliberately keeps fallback candidates.  Re-check
+            # capacity here because a prior dispatch can create a pending
+            # entry or retain an unresolved pre-submit owner.
+            if int(self._entry_capacity_snapshot()["remaining_slots"]) <= 0:
+                break
+            mid_price = self._entry_quote_truth_price_hint(
+                candidate,
+                price_hints=price_hints,
+                overlay=entry_quote_truth_overlay,
+            )
+            if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
+                dispatched += 1
+        return dispatched
 
     def _select_entry_candidates(
         self,

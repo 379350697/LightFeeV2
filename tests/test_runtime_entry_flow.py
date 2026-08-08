@@ -541,8 +541,51 @@ def test_scan_no_entry_diagnostics_exposes_capacity_context(config, tmp_journal)
     )
     assert payload["max_concurrent_positions"] == 8
     assert payload["open_position_count"] == 1
+    assert payload["pending_entry_count"] == 0
+    assert payload["entry_capacity_reservation_count"] == 0
+    assert payload["effective_entry_slot_count"] == 1
     assert payload["remaining_slots"] == 7
     assert payload["capacity_blocked"] is False
+
+
+@pytest.mark.asyncio
+async def test_scan_dispatch_capacity_counts_pending_entries_and_owner_claims(
+    config, tmp_journal,
+):
+    """The V1 fallback selection buffer cannot exceed the effective cap."""
+    config.strategy.max_concurrent_positions = 3
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.state.pending_entries["pending-existing"] = SimpleNamespace()
+    attempted: list[str] = []
+
+    async def claim_without_local_successor(candidate, _now_ms, *, price_hint=0.0):
+        attempted.append(candidate.symbol)
+        runtime._reserve_entry_capacity_slot(f"entry-{candidate.symbol}")
+        return True
+
+    runtime._dispatch_entry = claim_without_local_successor
+    runtime._entry_quote_truth_price_hint = lambda *args, **kwargs: 1.0
+    finalists = [SimpleNamespace(symbol=f"TOKEN{index}USDT") for index in range(4)]
+
+    dispatched = await runtime._dispatch_selected_entry_candidates(
+        finalists,
+        now_ms=1_000,
+        price_hints={},
+        entry_quote_truth_overlay=None,
+    )
+
+    assert dispatched == 2
+    assert attempted == ["TOKEN0USDT", "TOKEN1USDT"]
+    assert runtime._entry_capacity_snapshot() == {
+        "max_concurrent_positions": 3,
+        "open_position_count": 0,
+        "pending_entry_count": 1,
+        "entry_capacity_reservation_count": 2,
+        "effective_entry_slot_count": 3,
+        "remaining_slots": 0,
+        "capacity_blocked": True,
+    }
 
 
 def test_entry_opportunity_funnel_emitted_for_positive_dispatch_path(
@@ -3418,6 +3461,7 @@ class TestPlannerDispatchIntegration:
         await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0)
 
         assert runtime.state.pending_entries == {}
+        assert runtime._entry_capacity_snapshot()["entry_capacity_reservation_count"] == 0
         records = runtime.journal.read_all()
         kinds = [r["kind"] for r in records]
         assert "runtime.entry_dispatched" in kinds

@@ -4741,7 +4741,43 @@ class VenueTransport(MarketDataClient):
             return None
         else:
             params["origClientOrderId"] = order_id_text
-        raw = await self._request("GET", "/fapi/v1/order", params=params, private=True)
+        try:
+            raw = await self._request(
+                "GET",
+                "/fapi/v1/order",
+                params=params,
+                private=True,
+            )
+        except TransportError as error:
+            # Binance returns a normal missing historical order as HTTP 400.
+            # Keep the transport classification for all other rejected
+            # requests, but let reconciliation treat -2013/-2011 as no fill
+            # and establish live-position truth on the next step, as V1 does.
+            raw_error: dict[str, Any] = {}
+            try:
+                parsed_error = json.loads(error.body)
+                if isinstance(parsed_error, dict):
+                    raw_error = parsed_error
+            except (TypeError, ValueError):
+                pass
+            code = raw_error.get("code")
+            if (
+                error.category == TransportErrorCategory.REQUEST_REJECTED
+                and error.status_code == 400
+                and str(code) in ("-2011", "-2013")
+            ):
+                msg = str(raw_error.get("msg", ""))
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    queried_endpoints=["/fapi/v1/order"],
+                    response_classification=f"binance_error_{code}:{msg}",
+                    uncertain_subtype="open_order_not_found",
+                    next_action="check_live_position",
+                )
+                return None
+            raise
 
         code = raw.get("code") if isinstance(raw, dict) else None
         if code is not None and str(code).lstrip("-").isdigit() and int(code) < 0:
