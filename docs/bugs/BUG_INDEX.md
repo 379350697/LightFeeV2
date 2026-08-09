@@ -38,7 +38,13 @@ passed. Final review found no further P0/P1: real exchange exposure and active
 recovery work still take precedence over the background accounting debt. A
 full-suite probe reached `1211 passed, 7 skipped` before intentional
 interruption in external-wait slow tests, so it is not claimed as a full-suite
-pass. Deploy verification remains required. See
+pass. Cloud `main` was then fast-forwarded to `7fa873b`: remote HEAD and
+`.deploy_version` match, the 415-file manifest and 14 critical files passed,
+and sidecar/live restarted active with `NRestarts=0`. The compact state now
+shows all four reconciliation owners; each emitted exactly one durable
+evidence-debt event after deployment. Acceptance remains intentionally
+non-green (one warning; high-risk/unhealthy gate) until typed snapshot and
+close-leg evidence resolves those historical debts. See
 [daily/2026-08-09.md#cluster-cl-098-close-reconciliation-owner-contract-and-aster-v3-evidence](daily/2026-08-09.md#cluster-cl-098-close-reconciliation-owner-contract-and-aster-v3-evidence).
 
 Latest live-order/passive-close/owner-projection audit, 2026-08-09:
