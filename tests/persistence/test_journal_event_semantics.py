@@ -322,6 +322,23 @@ class TestJournalReplayBasics:
         result = replay_journal_records(records)
         assert len(result["timeline"]) >= 3  # entry.opened, lifecycle, exit.closed
 
+    def test_replay_timeline_tracks_billing_evidence_import(self):
+        records = [
+            {"seq": 1, "run_id": "r1", "ts_ms": 1,
+             "kind": "exit.billing_evidence_imported",
+             "payload": {"position_id": "historical-close-owner"}},
+        ]
+
+        result = replay_journal_records(records)
+
+        assert result["timeline"] == [
+            {
+                "seq": 1,
+                "ts_ms": 1,
+                "kind": "exit.billing_evidence_imported",
+            }
+        ]
+
     def test_replay_idempotent(self):
         """Replaying the same records twice produces same result."""
         records = [

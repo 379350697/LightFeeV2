@@ -923,6 +923,13 @@ class TestProjectionContractsClassification:
         assert is_journal_only_kind(kind) is True
         assert is_projected_kind(kind) is False
 
+    def test_billing_evidence_import_is_journal_only(self):
+        kind = "exit.billing_evidence_imported"
+        assert classify_kind(kind) == "journal_only"
+        assert is_journal_only_kind(kind) is True
+        assert is_projected_kind(kind) is False
+        assert fact_table_for_kind(kind) is None
+
     def test_no_overlap_between_projected_and_journal_only(self):
         overlap = ALL_PROJECTED_KINDS & ALL_JOURNAL_ONLY_KINDS
         assert overlap == set(), f"Overlap found: {overlap}"

@@ -333,6 +333,7 @@ def replay_journal_records(
         "exit.closed", "exit.partial_closed", "exit.reconciled",
         "exit.billing_evidence_unavailable",
         "exit.billing_evidence_debt_registered",
+        "exit.billing_evidence_imported",
         "exit.billing_evidence_pending",
         "exit.reconciliation_abandoned",
         "exit.pending_close_registered",

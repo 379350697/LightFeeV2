@@ -935,6 +935,10 @@ class RecoveryWorkSnapshot:
 MAX_PENDING_CLOSE_RECONCILIATIONS = 256
 
 
+class BillingEvidenceImportError(ValueError):
+    """Raised when operator billing evidence cannot safely replace a debt."""
+
+
 def _reconciliation_identity_keys(item: Any) -> set[tuple[str, str]]:
     """Return the durable order identities carried by a reconciliation item."""
     if not isinstance(item, dict):
@@ -1069,6 +1073,76 @@ def pending_close_reconciliation_evidence_debt_reason(
         return "missing_position_snapshot_venues"
     if pending_close_reconciliation_missing_legs(reconciliation):
         return "missing_close_order_identity"
+    return None
+
+
+def pending_close_reconciliation_import_reason(
+    reconciliation: Any,
+) -> str | None:
+    """Return the evidence gap that forbids an operator debt replacement.
+
+    The normal reconciliation validator deliberately accepts a minimal typed
+    task because live execution history remains the source of close-fill truth.
+    An operator import has a stricter boundary: it must also carry the entry
+    accounting facts needed to compute a non-provisional terminal result.  This
+    prevents an import from merely changing an evidence-debt label while still
+    allowing the runtime to eventually abandon it as accounting-unavailable.
+    """
+    reason = pending_close_reconciliation_evidence_debt_reason(reconciliation)
+    if reason is not None:
+        return reason
+    if not isinstance(reconciliation, dict):
+        return "invalid_reconciliation_item"
+    if _reconciliation_int(reconciliation.get("closed_at_ms")) <= 0:
+        return "missing_closed_at_ms"
+
+    snapshot = reconciliation.get("position_snapshot")
+    if not isinstance(snapshot, dict):
+        return "missing_position_snapshot"
+    position_id = str(reconciliation.get("position_id") or "")
+    symbol = str(reconciliation.get("symbol") or "")
+    if str(snapshot.get("position_id") or "") != position_id:
+        return "position_snapshot_position_id_mismatch"
+    if str(snapshot.get("symbol") or "") != symbol:
+        return "position_snapshot_symbol_mismatch"
+
+    for snapshot_field in (
+        "long_quantity",
+        "short_quantity",
+        "long_entry_price",
+        "short_entry_price",
+        "total_entry_fee_quote",
+        "captured_funding_quote",
+    ):
+        try:
+            value = float(snapshot[snapshot_field])
+        except (KeyError, TypeError, ValueError):
+            return f"missing_or_invalid_{snapshot_field}"
+        if not math.isfinite(value):
+            return f"missing_or_invalid_{snapshot_field}"
+        if snapshot_field in {
+            "long_quantity",
+            "short_quantity",
+            "long_entry_price",
+            "short_entry_price",
+        } and value < 0.0:
+            return f"missing_or_invalid_{snapshot_field}"
+    if snapshot.get("entry_fee_evidence_complete") is not True:
+        return "entry_fee_evidence_incomplete"
+
+    for leg_label, venue_field in (
+        ("long", "long_venue"),
+        ("short", "short_venue"),
+    ):
+        venue = str(snapshot.get(venue_field) or "")
+        legs = reconciliation.get(f"{leg_label}_legs")
+        if not isinstance(legs, list):
+            return f"missing_{leg_label}_legs"
+        for leg in legs:
+            if not isinstance(leg, dict):
+                return f"invalid_{leg_label}_leg"
+            if str(leg.get("venue") or "") != venue:
+                return f"{leg_label}_leg_venue_mismatch"
     return None
 
 
@@ -1279,6 +1353,138 @@ class EngineState:
             self.pending_close_reconciliations = self.pending_close_reconciliations[
                 -MAX_PENDING_CLOSE_RECONCILIATIONS:
             ]
+
+    def import_pending_close_reconciliation_evidence(
+        self,
+        item: Any,
+        *,
+        evidence_reference: str,
+        evidence_sha256: str,
+        imported_at_ms: int,
+        allow_idempotent: bool = False,
+    ) -> dict[str, Any]:
+        """Replace exactly one historical billing debt with stronger evidence.
+
+        This is the sole mutable entry point for operator-supplied close
+        accounting evidence.  It never creates a new owner, never changes the
+        physical-close identity, and does not mark a debt reconciled.  The live
+        reconciliation lane still queries exchange execution history by the
+        imported durable order identities before it can emit ``exit.reconciled``.
+        """
+        if not isinstance(item, dict):
+            raise BillingEvidenceImportError(
+                "evidence reconciliation must be an object"
+            )
+        reference = str(evidence_reference or "").strip()
+        digest = str(evidence_sha256 or "").strip().lower()
+        if not reference:
+            raise BillingEvidenceImportError("evidence_reference is required")
+        if len(digest) != 64 or any(
+            char not in "0123456789abcdef" for char in digest
+        ):
+            raise BillingEvidenceImportError(
+                "evidence_sha256 must be a SHA-256 hex digest"
+            )
+        if _reconciliation_int(imported_at_ms) <= 0:
+            raise BillingEvidenceImportError("imported_at_ms must be positive")
+
+        allowed_fields = {
+            "position_id",
+            "kind",
+            "closed_at_ms",
+            "position_snapshot",
+            "long_legs",
+            "short_legs",
+        }
+        unknown_fields = sorted(set(item) - allowed_fields)
+        if unknown_fields:
+            raise BillingEvidenceImportError(
+                "unsupported evidence fields: " + ", ".join(unknown_fields)
+            )
+        position_id = str(item.get("position_id") or "")
+        kind = str(item.get("kind") or "final")
+        closed_at_ms = _reconciliation_int(item.get("closed_at_ms"))
+        if not position_id:
+            raise BillingEvidenceImportError("position_id is required")
+        if kind not in {"final", "partial"}:
+            raise BillingEvidenceImportError("kind must be final or partial")
+        if closed_at_ms <= 0:
+            raise BillingEvidenceImportError("closed_at_ms must be positive")
+        if "position_snapshot" in item and not isinstance(
+            item["position_snapshot"], dict
+        ):
+            raise BillingEvidenceImportError(
+                "position_snapshot must be an object"
+            )
+        for leg_field in ("long_legs", "short_legs"):
+            if leg_field in item and not isinstance(item[leg_field], list):
+                raise BillingEvidenceImportError(f"{leg_field} must be a list")
+
+        self.set_pending_close_reconciliations(self.pending_close_reconciliations)
+        owner_matches = [
+            (index, existing)
+            for index, existing in enumerate(self.pending_close_reconciliations)
+            if isinstance(existing, dict)
+            and str(existing.get("position_id") or "") == position_id
+            and str(existing.get("kind") or "final") == kind
+            and _reconciliation_int(existing.get("closed_at_ms")) == closed_at_ms
+        ]
+        if len(owner_matches) != 1:
+            raise BillingEvidenceImportError(
+                "evidence must match exactly one pending reconciliation owner"
+            )
+        index, existing = owner_matches[0]
+
+        existing_import = existing.get("operator_evidence")
+        if (
+            allow_idempotent
+            and existing.get("reconciliation_status") == "operator_evidence_imported"
+            and isinstance(existing_import, dict)
+            and str(existing_import.get("sha256") or "").lower() == digest
+            and str(existing_import.get("reference") or "") == reference
+        ):
+            return dict(existing)
+        if existing.get("reconciliation_status") != "evidence_debt":
+            raise BillingEvidenceImportError("target owner is not an evidence debt")
+
+        candidate = dict(existing)
+        for evidence_field in ("position_snapshot", "long_legs", "short_legs"):
+            if evidence_field in item:
+                candidate[evidence_field] = item[evidence_field]
+
+        snapshot = candidate.get("position_snapshot")
+        if isinstance(snapshot, dict):
+            candidate["symbol"] = str(
+                candidate.get("symbol") or snapshot.get("symbol") or ""
+            )
+            candidate["long_venue"] = str(
+                candidate.get("long_venue") or snapshot.get("long_venue") or ""
+            )
+            candidate["short_venue"] = str(
+                candidate.get("short_venue") or snapshot.get("short_venue") or ""
+            )
+
+        import_reason = pending_close_reconciliation_import_reason(candidate)
+        if import_reason is not None:
+            raise BillingEvidenceImportError(
+                f"imported evidence is incomplete: {import_reason}"
+            )
+
+        candidate["reconciliation_status"] = "operator_evidence_imported"
+        candidate.pop("evidence_debt_reason", None)
+        candidate.pop("evidence_debt_at_ms", None)
+        candidate.pop("missing_close_order_identity", None)
+        candidate["billing_reconciliation_required"] = True
+        candidate["reconciliation_mode"] = "venue_execution_history_required"
+        candidate["next_attempt_ms"] = _reconciliation_int(imported_at_ms)
+        candidate["attempt_count"] = 0
+        candidate["operator_evidence"] = {
+            "reference": reference,
+            "sha256": digest,
+            "imported_at_ms": _reconciliation_int(imported_at_ms),
+        }
+        self.pending_close_reconciliations[index] = candidate
+        return dict(candidate)
 
     def remove_pending_close_reconciliation(self, task: dict[str, Any]) -> bool:
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)

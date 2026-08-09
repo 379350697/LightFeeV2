@@ -12,7 +12,6 @@ also receive rebuildable lifecycle-ledger rows for attribution.
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 from lightfee.persistence.metrics import PersistenceMetrics
@@ -87,6 +86,7 @@ _FAIL_CLOSED_PREFIX = "runtime.fail_closed"
 # These stay journal-first. Selected recovery kinds still get rebuildable
 # lifecycle-ledger rows, but never drive runtime recovery from the projection.
 _JOURNAL_ONLY_KINDS = frozenset({
+    "exit.billing_evidence_imported",
     "pending_entry.viability_blocked",
     "recovery.live_detected",
     "recovery.flat",

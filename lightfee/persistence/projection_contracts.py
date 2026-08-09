@@ -221,11 +221,18 @@ JOURNAL_ONLY_SIDECAR_KINDS: frozenset[str] = frozenset({
     "sidecar.candidate_published",
 })
 
+JOURNAL_ONLY_ACCOUNTING_KINDS: frozenset[str] = frozenset({
+    # The imported pack is operator-supplied evidence. Exact exchange lookup,
+    # not this audit event, remains the source of an accounting terminal.
+    "exit.billing_evidence_imported",
+})
+
 ALL_JOURNAL_ONLY_KINDS: frozenset[str] = (
     JOURNAL_ONLY_RECOVERY_KINDS
     | JOURNAL_ONLY_LIFECYCLE_KINDS
     | JOURNAL_ONLY_DIAGNOSTIC_KINDS
     | JOURNAL_ONLY_SIDECAR_KINDS
+    | JOURNAL_ONLY_ACCOUNTING_KINDS
 )
 
 # ---------------------------------------------------------------------------

@@ -148,12 +148,35 @@ async def async_main(
     shutdown_event: asyncio.Event | None = None,
     shutdown_signal_name=None,
 ) -> None:
-    """Async entry point for live trading (testable without event-loop side effects).
+    """Run the live process while holding its persistence writer lease."""
+    config = load_config(config_path)
+    from lightfee.persistence.writer_lease import PersistenceWriterLease
+
+    writer_lease = PersistenceWriterLease(config.persistence.event_log_path)
+    writer_lease.acquire()
+    try:
+        await _async_main_with_writer_lease(
+            config,
+            config_path=config_path,
+            shutdown_event=shutdown_event,
+            shutdown_signal_name=shutdown_signal_name,
+        )
+    finally:
+        writer_lease.release()
+
+
+async def _async_main_with_writer_lease(
+    config,
+    *,
+    config_path: str,
+    shutdown_event: asyncio.Event | None = None,
+    shutdown_signal_name=None,
+) -> None:
+    """Async entry point after the live persistence writer is exclusively owned.
 
     V1 parity: always calls runtime.start() before the loop, and runtime.stop()
     on every exit path (normal return, KeyboardInterrupt, or unexpected error).
     """
-    config = load_config(config_path)
     venue_adapters = build_adapter_map(config)
     logger.info(
         "built %d venue adapters: %s",

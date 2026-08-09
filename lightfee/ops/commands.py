@@ -6,6 +6,11 @@ Rust references:
 
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.risk.operator import OperatorCommand, apply_operator_command
 
@@ -64,3 +69,70 @@ def execute_operator_command(
     }
 
     return new_risk, new_lifecycle, messages.get(command, "Command executed")
+
+
+def load_billing_evidence_import(path: Path) -> dict[str, Any]:
+    """Load one auditable, operator-supplied close-accounting evidence pack."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read billing evidence file: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("billing evidence file must contain one JSON object")
+    if raw.get("schema_version") != 1:
+        raise ValueError("billing evidence schema_version must be 1")
+    if not isinstance(raw.get("reconciliation"), dict):
+        raise ValueError("billing evidence reconciliation must be an object")
+    if not str(raw.get("evidence_reference") or "").strip():
+        raise ValueError("billing evidence evidence_reference is required")
+    return raw
+
+
+def execute_billing_evidence_import(
+    evidence: dict[str, Any],
+    *,
+    journal: object,
+    state: object,
+    now_ms: int,
+) -> str:
+    """Durably import one debt replacement for normal exchange reconciliation.
+
+    The journal event is the durable authority.  The caller persists the
+    resulting state immediately afterwards; replay applies this same event
+    through the state-level import gate if a process stops in between.
+    """
+    if journal is None or state is None:
+        raise ValueError("journal and state are required for evidence import")
+    if not isinstance(evidence, dict):
+        raise ValueError("billing evidence must be an object")
+    reference = str(evidence.get("evidence_reference") or "").strip()
+    reconciliation = evidence.get("reconciliation")
+    if not isinstance(reconciliation, dict):
+        raise ValueError("billing evidence reconciliation must be an object")
+    canonical = json.dumps(
+        evidence,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    imported = state.import_pending_close_reconciliation_evidence(
+        reconciliation,
+        evidence_reference=reference,
+        evidence_sha256=digest,
+        imported_at_ms=now_ms,
+    )
+    journal.append_critical(
+        now_ms,
+        "exit.billing_evidence_imported",
+        {
+            "position_id": str(imported.get("position_id") or ""),
+            "symbol": str(imported.get("symbol") or ""),
+            "kind": str(imported.get("kind") or "final"),
+            "closed_at_ms": int(imported.get("closed_at_ms") or 0),
+            "evidence_reference": reference,
+            "evidence_sha256": digest,
+            "reconciliation": imported,
+        },
+    )
+    return "Billing evidence imported; awaiting exact exchange fill reconciliation"

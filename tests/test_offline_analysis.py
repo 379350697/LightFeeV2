@@ -985,6 +985,7 @@ class TestProjectionClassification:
         assert is_journal_only_kind("runtime.booting")
         assert is_journal_only_kind("runtime.running")
         assert is_journal_only_kind("runtime.stopped")
+        assert is_journal_only_kind("exit.billing_evidence_imported")
 
     def test_journal_only_is_not_projected(self):
         for kind in ["recovery.live_detected", "runtime.lifecycle_changed", "runtime.stopped"]:

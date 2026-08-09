@@ -1052,6 +1052,40 @@ def _apply_journal_replay_to_state(
             if payload.get("operation") == "submit_passive_order":
                 pending.phase_state.maker_client_order_id = client_order_id
 
+        elif kind == "exit.billing_evidence_imported":
+            # Operator evidence is durable only through the same strict
+            # state-level replacement gate used by the control plane.  Replay
+            # must not treat the audit event as a terminal close, and an
+            # invalid/obsolete event must leave the original debt fail-closed.
+            reconciliation = payload.get("reconciliation")
+            if not isinstance(reconciliation, dict):
+                continue
+            import_item = {
+                field: reconciliation[field]
+                for field in (
+                    "position_id",
+                    "kind",
+                    "closed_at_ms",
+                    "position_snapshot",
+                    "long_legs",
+                    "short_legs",
+                )
+                if field in reconciliation
+            }
+            try:
+                state.import_pending_close_reconciliation_evidence(
+                    import_item,
+                    evidence_reference=str(payload.get("evidence_reference") or ""),
+                    evidence_sha256=str(payload.get("evidence_sha256") or ""),
+                    imported_at_ms=int(record.get("ts_ms") or 0),
+                    allow_idempotent=True,
+                )
+            except (TypeError, ValueError, OverflowError):
+                # A malformed import must never manufacture a reconciliation
+                # owner.  If its old debt is present it remains visible; if it
+                # is absent there is no safe replacement to infer.
+                continue
+
         elif kind in (
             "exit.pending_close_reconciliation_registered",
             "exit.billing_evidence_debt_registered",
