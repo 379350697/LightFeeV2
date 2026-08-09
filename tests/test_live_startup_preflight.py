@@ -302,7 +302,7 @@ class TestRuntimePreflight:
             key = "bybit:CLUSDT"
             cooldown = runtime.state.venue_entry_cooldowns[key]
             assert cooldown["reason"] == "bybit_trading_terms_required"
-            assert cooldown["source"] == "pre_entry_bybit_precheck"
+            assert cooldown["source"] == "pre_entry_venue_precheck"
             assert cooldown["block_scope"] == "symbol"
             assert cooldown["evidence_gap"] is False
             events = runtime.journal.read_all()
@@ -312,7 +312,7 @@ class TestRuntimePreflight:
                 if event["kind"] == "runtime.entry_admission_blocked"
             ]
             assert blocked
-            assert blocked[-1]["source"] == "pre_entry_bybit_precheck"
+            assert blocked[-1]["source"] == "pre_entry_venue_precheck"
             assert blocked[-1]["candidate_pair_id"] == "clusdt:binance->bybit"
             assert not any(
                 event["kind"] == "execution.entry_selected"
@@ -374,6 +374,67 @@ class TestRuntimePreflight:
             assert len(bybit.precheck_requests) == 1
             assert bybit.precheck_requests[0].side == Side.SELL
             assert "bybit:CLUSDT" not in runtime.state.venue_entry_cooldowns
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_aster_capacity_precheck_blocks_before_any_maker_dispatch(self):
+        """A hedge venue must prove capacity before another venue can be made live."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class CapacityRejectingAster(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.ASTER)
+                    self.precheck_requests = []
+
+                async def precheck_order_admission(self, request):
+                    self.precheck_requests.append(request)
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "aster v3 capacity precheck rejected: maximum notional value limit",
+                    )
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError("maker dispatch must be blocked by Aster capacity")
+
+            aster = CapacityRejectingAster()
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "aster",
+                    overrides={Venue.ASTER: aster},
+                ),
+            )
+            runtime.entry_executor = RecordingExecutor()
+            runtime.journal.open()
+
+            dispatched = await runtime._dispatch_entry(
+                _admissible_dispatch_candidate(
+                    symbol="KAITOUSDT",
+                    long_venue="binance",
+                    short_venue="aster",
+                ),
+                1778787000000,
+                price_hint=100.0,
+            )
+
+            assert dispatched is False
+            assert runtime.entry_executor.calls == 0
+            assert len(aster.precheck_requests) == 1
+            assert aster.precheck_requests[0].venue == Venue.ASTER
+            assert aster.precheck_requests[0].side == Side.SELL
+            cooldown = runtime.state.venue_entry_cooldowns["aster:KAITOUSDT"]
+            assert cooldown["reason"] == "max_notional_admission_blocked"
+            assert cooldown["source"] == "pre_entry_venue_precheck"
+            assert not any(
+                event["kind"] == "execution.entry_selected"
+                for event in runtime.journal.read_all()
+            )
             runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -877,7 +938,7 @@ class TestRuntimePreflight:
                 "MAXUSDT",
                 'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
                 "max_notional_admission_blocked",
-                "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
+                "https://github.com/asterdex/api-docs/blob/master/V3%28Recommended%29/EN/aster-finance-futures-api-v3.md#position-information-v3-user_data",
                 False,
             ),
         ],
@@ -2464,6 +2525,51 @@ class TestRuntimePreflight:
             assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_flat_truth_releases_live_conflict_with_background_close_debt(self):
+        """Accounting debt stays visible without retaining a stale live-risk latch."""
+
+        class FlatBulkPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
+            runtime.state.recovery_blocked_at_ms = 1234
+            runtime.state.last_scan = {"recent_touched_symbols": ["HOMEUSDT"]}
+            runtime.state.set_pending_close_reconciliations([
+                {
+                    "position_id": "entry-coti-billing-debt",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "binance",
+                    "reason": "billing_evidence_missing",
+                }
+            ])
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == (
+                RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            )
+            assert runtime.recovery_decision.entry_allowed is True
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert runtime.state.recovery_blocked_at_ms == 0
+            assert len(runtime.state.pending_close_reconciliations) == 1
             runtime.journal.close()
 
     @pytest.mark.asyncio

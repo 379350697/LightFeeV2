@@ -404,10 +404,14 @@ class LiveRuntime:
     _HYPERLIQUID_INFO_DOC_URL = (
         "https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint"
     )
-    _ASTER_API_DOC_URL = "https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation"
+    _ASTER_API_DOC_URL = (
+        "https://github.com/asterdex/api-docs/blob/master/"
+        "V3%28Recommended%29/EN/aster-finance-futures-api-v3.md"
+    )
     _ASTER_OPENABLE_NOTIONAL_DOC_URL = (
-        "https://asterdex.github.io/aster-api-website/futures/account%26trades/"
-        "#remaining-openable-notional-value-user_data"
+        "https://github.com/asterdex/api-docs/blob/master/"
+        "V3%28Recommended%29/EN/aster-finance-futures-api-v3.md"
+        "#position-information-v3-user_data"
     )
     _OKX_INSTRUMENT_DOC_URL = "https://www.okx.com/docs-v5/en/#public-data-rest-api-get-instruments"
     _BITGET_CONTRACT_DOC_URL = "https://www.bitget.com/api-doc/classic/contract/market/Get-All-Symbols-Contracts"
@@ -911,7 +915,7 @@ class LiveRuntime:
             now_ms,
         )
 
-    async def _precheck_bybit_entry_admission(
+    async def _precheck_live_entry_admission(
         self,
         *,
         candidate,
@@ -926,7 +930,7 @@ class LiveRuntime:
         maker_client_order_id: str,
         hedge_client_order_id: str,
     ) -> bool:
-        return await self.entry_dispatch_runtime._precheck_bybit_entry_admission(
+        return await self.entry_dispatch_runtime._precheck_live_entry_admission(
             candidate=candidate,
             now_ms=now_ms,
             long_venue=long_venue,

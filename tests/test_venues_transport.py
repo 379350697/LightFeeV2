@@ -5239,6 +5239,15 @@ class TestV1PassiveBusinessFlowParity:
 
         async def fake_request(method, path, *, params=None):
             calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v3/positionRisk":
+                return [{
+                    "symbol": "GUAUSDT",
+                    "positionAmt": "0",
+                    "markPrice": "2",
+                    "maxNotionalValue": "100",
+                }]
+            if path == "/fapi/v3/openOrders":
+                return []
             return {
                 "orderId": "aster-oid-1",
                 "clientOrderId": (params or {}).get("newClientOrderId", ""),
@@ -5266,6 +5275,189 @@ class TestV1PassiveBusinessFlowParity:
         assert order_call[2]["timeInForce"] == "GTX"
         assert ack.quantity == 15.0
         assert not any(call[1] == "/fapi/v1/remainingOpenableNotionalValue" for call in calls)
+        await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_capacity_precheck_rejects_before_private_order_submit(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        get_symbol_rules_cache().clear()
+
+        async def fake_public_get(path, params=None):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [{
+                    "symbol": "KAITOUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                    ],
+                }],
+            }
+
+        calls = []
+
+        async def fake_request(method, path, *, params=None):
+            calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v3/positionRisk":
+                return [{
+                    "symbol": "KAITOUSDT",
+                    "positionAmt": "0",
+                    "markPrice": "2",
+                    "maxNotionalValue": "100",
+                }]
+            if path == "/fapi/v3/openOrders":
+                return []
+            raise AssertionError("capacity rejection must prevent private order submit")
+
+        adapter._transport._public_get = fake_public_get
+        adapter._private._request = fake_request
+        request = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="KAITOUSDT",
+            side=Side.BUY,
+            quantity=60.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-capacity-reject",
+        )
+
+        with pytest.raises(OrderSubmitError, match="maximum notional value limit"):
+            await adapter.submit_passive_order(request)
+
+        assert [call[1] for call in calls] == [
+            "/fapi/v3/positionRisk",
+            "/fapi/v3/openOrders",
+        ]
+        precheck_events = [
+            event["payload"]
+            for event in adapter._transport.drain_order_diagnostics()
+            if event["kind"] == "order.precheck_result"
+        ]
+        assert precheck_events
+        assert precheck_events[-1]["response_classification"] == "rejected"
+        assert precheck_events[-1]["endpoint"] == (
+            "/fapi/v3/positionRisk,/fapi/v3/openOrders"
+        )
+        assert not any(call[1] == "/fapi/v1/remainingOpenableNotionalValue" for call in calls)
+        await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_capacity_precheck_counts_existing_open_orders(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        get_symbol_rules_cache().clear()
+
+        async def fake_public_get(path, params=None):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [{
+                    "symbol": "KAITOUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                    ],
+                }],
+            }
+
+        async def fake_request(method, path, *, params=None):
+            if path == "/fapi/v3/positionRisk":
+                return [{
+                    "symbol": "KAITOUSDT",
+                    "positionAmt": "10",
+                    "markPrice": "2",
+                    "maxNotionalValue": "100",
+                }]
+            if path == "/fapi/v3/openOrders":
+                return [{
+                    "symbol": "KAITOUSDT",
+                    "origQty": "30",
+                    "price": "2",
+                    "reduceOnly": "false",
+                }]
+            raise AssertionError("existing capacity use must prevent private order submit")
+
+        adapter._transport._public_get = fake_public_get
+        adapter._private._request = fake_request
+        request = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="KAITOUSDT",
+            side=Side.BUY,
+            quantity=11.0,
+            price=2.0,
+            post_only=True,
+            client_order_id="aster-open-order-capacity-reject",
+        )
+
+        with pytest.raises(OrderSubmitError, match="maximum notional value limit"):
+            await adapter.submit_passive_order(request)
+
+        await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_capacity_precheck_records_rejected_http_evidence(self):
+        from lightfee.venues.aster import AsterAdapter
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+
+        async def fake_request(method, path, *, params=None):
+            assert method == "GET"
+            assert path == "/fapi/v3/positionRisk"
+            raise TransportError(
+                TransportErrorCategory.REQUEST_REJECTED,
+                'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
+                status_code=400,
+                body='{"code":-5018,"msg":"maximum notional value limit"}',
+            )
+
+        adapter._private._request = fake_request
+        request = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="KAITOUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=2.0,
+            client_order_id="aster-capacity-http-reject",
+        )
+
+        with pytest.raises(OrderSubmitError, match="capacity precheck rejected"):
+            await adapter.precheck_order_admission(request)
+
+        events = [
+            event["payload"]
+            for event in adapter._transport.drain_order_diagnostics()
+            if event["kind"] == "order.precheck_result"
+        ]
+        assert events[-1]["response_classification"] == "rejected"
+        assert events[-1]["status_code"] == 400
+        assert '"code":-5018' in events[-1]["response_body"]
         await adapter.shutdown()
 
     @pytest.mark.asyncio
@@ -5301,6 +5493,15 @@ class TestV1PassiveBusinessFlowParity:
 
         async def fake_request(method, path, *, params=None):
             order_attempts.append((method, path, dict(params or {})))
+            if path == "/fapi/v3/positionRisk":
+                return [{
+                    "symbol": "GUAUSDT",
+                    "positionAmt": "0",
+                    "markPrice": "2",
+                    "maxNotionalValue": "100",
+                }]
+            if path == "/fapi/v3/openOrders":
+                return []
             raise TransportError(
                 TransportErrorCategory.REQUEST_REJECTED,
                 "HTTP 400: max notional",
@@ -5324,6 +5525,16 @@ class TestV1PassiveBusinessFlowParity:
 
         assert exc.value.class_ == SubmitFailureClass.REJECTED
         assert order_attempts == [
+            (
+                "GET",
+                "/fapi/v3/positionRisk",
+                {"symbol": "GUAUSDT"},
+            ),
+            (
+                "GET",
+                "/fapi/v3/openOrders",
+                {"symbol": "GUAUSDT"},
+            ),
             (
                 "POST",
                 "/fapi/v3/order",
@@ -7160,6 +7371,15 @@ class TestAsterAdapterSymbolCatalog:
                         ],
                     }],
                 })
+            if request.url.path == "/fapi/v3/positionRisk":
+                return httpx.Response(200, json=[{
+                    "symbol": "COTIUSDT",
+                    "positionAmt": "0",
+                    "markPrice": "1",
+                    "maxNotionalValue": "1000000",
+                }])
+            if request.url.path == "/fapi/v3/openOrders":
+                return httpx.Response(200, json=[])
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 
@@ -7214,6 +7434,15 @@ class TestAsterAdapterSymbolCatalog:
                         ],
                     }],
                 })
+            if request.url.path == "/fapi/v3/positionRisk":
+                return httpx.Response(200, json=[{
+                    "symbol": "COTIUSDT",
+                    "positionAmt": "0",
+                    "markPrice": "1",
+                    "maxNotionalValue": "1000000",
+                }])
+            if request.url.path == "/fapi/v3/openOrders":
+                return httpx.Response(200, json=[])
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 

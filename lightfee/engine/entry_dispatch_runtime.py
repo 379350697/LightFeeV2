@@ -264,7 +264,7 @@ class EntryDispatchRuntime:
             )
         return ok
 
-    async def _precheck_bybit_entry_admission(
+    async def _precheck_live_entry_admission(
         self,
         *,
         candidate,
@@ -279,87 +279,89 @@ class EntryDispatchRuntime:
         maker_client_order_id: str,
         hedge_client_order_id: str,
     ) -> bool:
-        if Venue.BYBIT not in (long_venue, short_venue):
-            return True
-        adapter = self.ctx.venue_adapters.get(Venue.BYBIT)
-        precheck = getattr(adapter, "precheck_order_admission", None)
-        if adapter is None or not callable(precheck):
-            return True
-
         symbol = str(getattr(candidate, "symbol", "") or "")
         pair_id = self._candidate_pair_id(candidate)
         entry_type_value = str(getattr(entry_type, "value", entry_type) or "")
-        bybit_is_maker = maker_venue == Venue.BYBIT
-        passive = bybit_is_maker and "passive" in entry_type_value
-        side = Side.BUY if long_venue == Venue.BYBIT else Side.SELL
-        price_hint = (
-            long_order_price_hint if long_venue == Venue.BYBIT else short_order_price_hint
-        )
-        client_order_id = (
-            maker_client_order_id if bybit_is_maker else hedge_client_order_id
-        )
-        request = OrderRequest(
-            venue=Venue.BYBIT,
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            price=price_hint if passive and price_hint > 0 else None,
-            reduce_only=False,
-            client_order_id=client_order_id,
-            post_only=passive,
-            time_in_force=TimeInForce.POST_ONLY if passive else TimeInForce.IOC,
-            price_hint=price_hint if price_hint > 0 else None,
-            observed_at_ms=now_ms,
-        )
+        seen_venues: set[Venue] = set()
+        for venue in (long_venue, short_venue):
+            if venue in seen_venues:
+                continue
+            seen_venues.add(venue)
+            adapter = self.ctx.venue_adapters.get(venue)
+            precheck = getattr(adapter, "precheck_order_admission", None)
+            if adapter is None or not callable(precheck):
+                continue
 
-        try:
-            await precheck(request)
-            return True
-        except OrderSubmitError as exc:
-            error_text = str(exc)
-            metadata = self._entry_admission_reject_metadata(Venue.BYBIT, error_text)
-            if metadata:
-                reason = str(metadata["reason"])
-                self._record_symbol_admission_block(
-                    venue=Venue.BYBIT,
-                    symbol=symbol,
-                    reason=reason,
-                    raw_error=error_text,
-                    now_ms=now_ms,
-                    evidence=metadata,
-                    source="pre_entry_bybit_precheck",
-                    candidate_pair_id=pair_id,
+            is_maker = maker_venue == venue
+            passive = is_maker and "passive" in entry_type_value
+            side = Side.BUY if long_venue == venue else Side.SELL
+            price_hint = (
+                long_order_price_hint if long_venue == venue else short_order_price_hint
+            )
+            client_order_id = (
+                maker_client_order_id if is_maker else hedge_client_order_id
+            )
+            request = OrderRequest(
+                venue=venue,
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                price=price_hint if passive and price_hint > 0 else None,
+                reduce_only=False,
+                client_order_id=client_order_id,
+                post_only=passive,
+                time_in_force=TimeInForce.POST_ONLY if passive else TimeInForce.IOC,
+                price_hint=price_hint if price_hint > 0 else None,
+                observed_at_ms=now_ms,
+            )
+            try:
+                await precheck(request)
+            except OrderSubmitError as exc:
+                error_text = str(exc)
+                metadata = self._entry_admission_reject_metadata(venue, error_text)
+                if metadata:
+                    reason = str(metadata["reason"])
+                    self._record_symbol_admission_block(
+                        venue=venue,
+                        symbol=symbol,
+                        reason=reason,
+                        raw_error=error_text,
+                        now_ms=now_ms,
+                        evidence=metadata,
+                        source="pre_entry_venue_precheck",
+                        candidate_pair_id=pair_id,
+                    )
+                    return False
+                self.ctx.journal.append(
+                    "runtime.entry_admission_precheck_rejected",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "raw_error": error_text[:500],
+                        "ts_ms": now_ms,
+                    },
                 )
                 return False
-            self.ctx.journal.append(
-                "runtime.entry_admission_precheck_rejected",
-                {
-                    "venue": Venue.BYBIT.value,
-                    "symbol": symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "raw_error": error_text[:500],
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
-        except Exception as exc:
-            self.ctx.journal.append(
-                "runtime.entry_admission_precheck_uncertain",
-                {
-                    "venue": Venue.BYBIT.value,
-                    "symbol": symbol,
-                    "long_venue": long_venue.value,
-                    "short_venue": short_venue.value,
-                    "candidate_pair_id": pair_id,
-                    "pair_id": pair_id,
-                    "raw_error": str(exc)[:500],
-                    "ts_ms": now_ms,
-                },
-            )
-            return False
+            except Exception as exc:
+                self.ctx.journal.append(
+                    "runtime.entry_admission_precheck_uncertain",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "raw_error": str(exc)[:500],
+                        "ts_ms": now_ms,
+                    },
+                )
+                return False
+        return True
 
     async def _precheck_live_entry_venue_tradability(
         self,
@@ -2207,21 +2209,6 @@ class EntryDispatchRuntime:
             )
             return False
 
-        if not await self._precheck_bybit_entry_admission(
-            candidate=candidate,
-            now_ms=now_ms,
-            long_venue=long_venue,
-            short_venue=short_venue,
-            quantity=effective_quantity,
-            long_order_price_hint=long_order_price_hint,
-            short_order_price_hint=short_order_price_hint,
-            maker_venue=maker_venue,
-            entry_type=entry_type,
-            maker_client_order_id=maker_cid,
-            hedge_client_order_id=hedge_cid,
-        ):
-            return False
-
         if not await self._prepare_live_entry_leverage_for_candidate(
             candidate=candidate,
             now_ms=now_ms,
@@ -2285,6 +2272,21 @@ class EntryDispatchRuntime:
                         "ts_ms": now_ms,
                     },
                 )
+
+        if not await self._precheck_live_entry_admission(
+            candidate=candidate,
+            now_ms=now_ms,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            quantity=effective_quantity,
+            long_order_price_hint=long_order_price_hint,
+            short_order_price_hint=short_order_price_hint,
+            maker_venue=maker_venue,
+            entry_type=entry_type,
+            maker_client_order_id=maker_cid,
+            hedge_client_order_id=hedge_cid,
+        ):
+            return False
 
         ctx = self._build_entry_context(
             candidate=candidate,

@@ -8,6 +8,7 @@ an EIP-712 signature payload.
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.parse
 from typing import Any, Optional
@@ -439,6 +440,166 @@ class AsterV3Client:
         if not isinstance(data, dict):
             data = {}
         return _parse_binance_like_position(data, symbol, now_ms, venue=Venue.ASTER)
+
+    async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
+        """Prove an Aster V3 opening order fits current documented capacity.
+
+        Aster V3 does not expose the legacy
+        ``remainingOpenableNotionalValue`` endpoint.  Its documented V3
+        ``positionRisk`` response supplies ``maxNotionalValue`` instead, so
+        opening capacity is derived only from V3 position and open-order truth.
+        Missing or malformed evidence is fail-closed: a paired entry must not
+        make its other leg live when the Aster hedge cannot be proven admissible.
+        """
+        if request.reduce_only:
+            return {
+                "venue": Venue.ASTER.value,
+                "symbol": request.symbol,
+                "status": "skipped",
+                "reason": "reduce_only_exempt",
+            }
+
+        price = next(
+            (
+                float(value)
+                for value in (
+                    request.price,
+                    request.price_hint,
+                    request.mark_price_hint,
+                )
+                if value is not None and math.isfinite(float(value)) and float(value) > 0.0
+            ),
+            0.0,
+        )
+        quantity = float(request.quantity)
+        if not math.isfinite(quantity) or quantity <= 0.0:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster v3 capacity precheck rejected: order notional evidence unavailable",
+            )
+
+        position_raw = await self._request(
+            "GET",
+            ASTER_V3_POSITION_PATH,
+            params={"symbol": request.symbol},
+        )
+        rows = [
+            row
+            for row in _extract_rows(position_raw)
+            if str(row.get("symbol", request.symbol) or request.symbol) == request.symbol
+        ]
+        if not rows:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster v3 capacity precheck rejected: positionRisk evidence unavailable",
+            )
+
+        capacity_limits: list[float] = []
+        observed_mark_prices: list[float] = []
+        current_position_notional = 0.0
+        for row in rows:
+            max_notional = _parse_optional_float(row.get("maxNotionalValue"))
+            if max_notional is None or not math.isfinite(max_notional) or max_notional <= 0.0:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "aster v3 capacity precheck rejected: maxNotionalValue unavailable",
+                )
+            capacity_limits.append(max_notional)
+
+            mark_price = _parse_optional_float(row.get("markPrice"))
+            if (
+                mark_price is not None
+                and math.isfinite(mark_price)
+                and mark_price > 0.0
+            ):
+                observed_mark_prices.append(mark_price)
+
+            position_notional = _parse_optional_float(row.get("notional"))
+            if position_notional is None:
+                position_amount = _safe_float(row.get("positionAmt"), default=0.0)
+                if not math.isfinite(position_amount):
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "aster v3 capacity precheck rejected: position amount unavailable",
+                    )
+                if abs(position_amount) > 1e-9:
+                    if (
+                        mark_price is None
+                        or not math.isfinite(mark_price)
+                        or mark_price <= 0.0
+                    ):
+                        raise OrderSubmitError(
+                            SubmitFailureClass.REJECTED,
+                            "aster v3 capacity precheck rejected: position mark price unavailable",
+                        )
+                    position_notional = position_amount * mark_price
+                else:
+                    position_notional = 0.0
+            if not math.isfinite(position_notional):
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "aster v3 capacity precheck rejected: position notional unavailable",
+                )
+            current_position_notional += abs(position_notional)
+
+        if price <= 0.0 and observed_mark_prices:
+            price = observed_mark_prices[0]
+        if price <= 0.0:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster v3 capacity precheck rejected: order notional evidence unavailable",
+            )
+        requested_notional = abs(quantity * price)
+
+        open_orders_raw = await self._request(
+            "GET",
+            ASTER_V3_OPEN_ORDERS_PATH,
+            params={"symbol": request.symbol},
+        )
+        open_order_notional = 0.0
+        for order in _extract_rows(open_orders_raw):
+            if str(order.get("symbol", request.symbol) or request.symbol) != request.symbol:
+                continue
+            if str(order.get("reduceOnly", "false")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }:
+                continue
+            open_quantity = _safe_float(
+                order.get("origQty", order.get("quantity", order.get("qty"))),
+                default=0.0,
+            )
+            if not math.isfinite(open_quantity) or open_quantity <= 1e-9:
+                continue
+            open_price = _parse_optional_float(order.get("price"))
+            if open_price is None or not math.isfinite(open_price) or open_price <= 0.0:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "aster v3 capacity precheck rejected: open-order notional unavailable",
+                )
+            open_order_notional += abs(open_quantity * open_price)
+
+        max_notional = min(capacity_limits)
+        consumed_notional = current_position_notional + open_order_notional
+        remaining_notional = max_notional - consumed_notional
+        if requested_notional > remaining_notional + 1e-9:
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "aster v3 capacity precheck rejected: maximum notional value limit "
+                f"(requested={requested_notional:.8f}, remaining={max(remaining_notional, 0.0):.8f})",
+            )
+        return {
+            "venue": Venue.ASTER.value,
+            "symbol": request.symbol,
+            "status": "ok",
+            "requested_notional": requested_notional,
+            "current_position_notional": current_position_notional,
+            "open_order_notional": open_order_notional,
+            "max_notional_value": max_notional,
+            "remaining_notional": remaining_notional,
+            "source": "aster_v3_position_risk_and_open_orders",
+        }
 
     async def fetch_account_risk_snapshot(self) -> AccountRiskSnapshot | None:
         raw = await self._request("GET", ASTER_V3_ACCOUNT_PATH)

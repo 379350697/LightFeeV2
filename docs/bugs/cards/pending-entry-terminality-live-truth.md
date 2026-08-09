@@ -148,6 +148,14 @@ artifact: it becomes `owned_pending_entry_live_conflict`, blocks all new entry
 risk, and must be managed through cleanup/flatten-or-block until fresh account
 position and open-order truth prove flat.
 
+When only non-blocking close-accounting reconciliation remains, a historical
+`orphan_maker_order`, `unpaired_live_position`, or
+`owned_pending_entry_live_conflict` latch may release only from fresh,
+unfiltered **account-level** truth: every position and every open order
+(including reduce-only) must be zero/empty and no probe may be partial or
+missing. This preserves the V1 background-accounting rule without allowing a
+symbol-scoped or position-only flat probe to erase a live-artifact blocker.
+
 Venue order truth is layered. ACK/order accepted, order detail/status, actual
 fills/executions, and live position truth are different evidence classes. OKX
 order detail `accFillSz/fillSz` cannot by itself terminalize a pending entry;
@@ -259,12 +267,14 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-06-10 | PE-14 supervision stale-backlog terminality closure | fixed, deployed, cloud verified | Follow-up root closure for the same CL-064 risk window. The pending-entry terminalizer now owns the V1 supervision stale-clear decision: only zero-fill, no inflight hedge, no cancel requested, resting passive order, progress fetch absent, and live truth proving no open order/position may remove pending. Matching live open order, live position, unavailable truth, any fill, inflight hedge, cancel request, non-resting progress, or existing progress retains pending. RED/GREEN coverage is in `tests/engine/test_pending_entry_terminalizer.py -k supervision_stale_clear` (`4 passed`), the full terminalizer suite reports `11 passed`, final full pytest reports `3782 passed`, `9 skipped`, `1 warning`, and production acceptance for deployed runtime `66a3688` passed with all-account flat/no-open-orders truth. |
 | 2026-06-10 | Hyperliquid exchange-truth account identity false-green | fixed locally, deploy pending | CL-065 closes the root cause where diagnose queried the signer/API-wallet address instead of the configured Hyperliquid account and therefore reported empty `assetPositions` while the configured account had 18 nonzero positions. V2 now preserves explicit account addresses, loads wallet mode in diagnose, treats API/agent wallets as signers for the configured account, fails closed on account-wallet signer/account mismatch, and emits sanitized credential identity so future account/signer drift is visible. Local related diagnose/health gates report `104 passed`, full venue transport reports `401 passed`, and GitNexus detect-changes is low risk with no affected processes. |
 | 2026-06-14 | HOME positive-fill/live-truth conflict and owned single-leg cleanup | fixed, deployed; current cloud watch | CL-078/CL-080 close the recurrence where OKX order detail/local fill evidence and Bybit IOC/hedge ACK could disagree with live account truth, and where an owned pending live-conflict still needed an execution path before pending release. OKX now requires `/api/v5/trade/fills` aggregation and `ctVal` conversion before fill truth; empty fills remain `execution_not_found`. Bybit ACK/order ids are reconciled through execution list before counting hedge filled. Bitget positive fill without valid side fails closed. Pending positive-fill live single legs are owned as `owned_pending_entry_live_conflict`, block as live artifacts, project through lifecycle closure, run owner-scoped reduce-only cleanup when open-order truth is empty and exactly one direction-correct live leg remains, and clear only after fresh account flat plus open-order truth. Cloud `793d28d` verified the old positive-fill cleanup chain through `owned_live_conflict_cleanup_succeeded` and `removed_by_v1_lifecycle_closure`. Zero-fill direct cleanup is code/test closed on the same deployed line, but the post-deploy window has no fresh zero-fill sample that exercised the specialized direct-cleanup event path. A later docs-backfill recheck saw a new HOME matched open position, not a pending live-conflict recurrence, so current cloud acceptance is watch until that active exposure closes; the same recheck exposed and locally fixed an unmapped `reconciliation.entry_flat_not_found_terminal_cleared` lifecycle event. |
+| 2026-08-09 | KAITO cleanup followed by stale `owned_pending_entry_live_conflict` with COTI background evidence debt | fixed locally, deploy pending | Complete all-account flat/no-open-order truth was already sufficient for the core to allow `RUNNING_WITH_EVIDENCE_GAP`, but the old live-artifact latch was excluded from evidence-gap release. Core now has one strict release predicate: complete non-partial account truth must show all positions and orders empty; non-blocking accounting debt remains a warning rather than global `risk_only`. |
 
 ## Recurrences
 
 | Date | Symbols / Venues | Commit / Fix | Result | Detail |
 |---|---|---|---|---|
 | 2026-08-04 | synthetic `HOMEUSDT` OKX/Bybit confirmed replay fill | `3c42aea` | deployed; cloud health green; behavior watch | [CL-093 confirmed replay fill ownership](../daily/2026-08-04.md#cluster-cl-093-confirmed-replay-fill-owner-terminalization) |
+| 2026-08-09 | KAITO cleanup + historical COTI background close reconciliation | working tree | local regression green; deploy pending | [CL-099 complete-flat live-artifact latch release](../daily/2026-08-09.md#cluster-cl-099-kaito-v3-capacity-admission-and-live-artifact-release) |
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-06-01 | `ARIAUSDT` Bybit/Binance | `f1727c1`; cloud verified | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable; second deploy converted pending to open and flattened excess, then exposed drift-correction false-negative latching; final deploy reached running/flat/no-open-orders | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
@@ -296,6 +306,8 @@ side is an evidence gap/fail-closed condition, not default buy.
 - `tests/engine/test_recovery_owner_index.py`
 - `tests/engine/test_exchange_truth_runtime.py`
 - `tests/engine/test_pending_entry_terminalizer.py`
+- `tests/engine/test_recovery_decision_core.py`
+- `tests/test_live_startup_preflight.py`
 - `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py`
 - `tests/live_harness`
 - `scripts/diagnose_live.py --venues ...`
@@ -367,3 +379,7 @@ side is an evidence gap/fail-closed condition, not default buy.
     and the normal tick construct exactly one managed open position (or retain
     residual/fail-closed work) before removing the pending owner. Do not use
     `uncertain_outcome=false` as a deletion authority.
+26. Before releasing an old live-artifact `risk_only` latch in the presence of
+    background close debt, require complete all-account position **and**
+    open-order truth. Do not infer orders from a position-only or dirty-symbol
+    scan; any partial probe remains blocked.

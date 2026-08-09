@@ -20,6 +20,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.aster_v3 import AsterV3Client
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
@@ -365,6 +366,51 @@ class AsterAdapter(VenueAdapter):
             payload["transport_category"] = transport_error.category.value
         record("order.private_submit_result", payload)
 
+    def _record_private_admission_precheck_result(
+        self,
+        *,
+        request: OrderRequest,
+        result: dict[str, Any] | None = None,
+        exc: BaseException | None = None,
+        response_classification: str | None = None,
+    ) -> None:
+        """Persist Aster V3 capacity proof on the shared precheck contract."""
+        record = getattr(self._transport, "_record_order_diagnostic", None)
+        if not callable(record):
+            return
+        payload = {
+            "venue": self.venue.value,
+            "symbol": request.symbol,
+            "endpoint": "/fapi/v3/positionRisk,/fapi/v3/openOrders",
+            "private_api": "aster_v3",
+        }
+        if exc is not None:
+            classification = getattr(getattr(exc, "class_", None), "value", "")
+            payload["response_classification"] = str(
+                response_classification or classification or "uncertain"
+            )
+            payload["response_msg"] = str(exc)[:500]
+            transport_error = _aster_transport_error_in_chain(exc)
+            if transport_error is not None:
+                payload["status_code"] = int(transport_error.status_code or 0)
+                payload["response_body"] = str(transport_error.body or "")[:500]
+                payload["transport_category"] = transport_error.category.value
+            record("order.precheck_result", payload)
+            return
+
+        for key in (
+            "source",
+            "requested_notional",
+            "current_position_notional",
+            "open_order_notional",
+            "max_notional_value",
+            "remaining_notional",
+        ):
+            if result is not None and key in result:
+                payload[key] = result[key]
+        payload["response_classification"] = "accepted"
+        record("order.precheck_result", payload)
+
     async def _submit_private_order(
         self,
         request: OrderRequest,
@@ -378,6 +424,7 @@ class AsterAdapter(VenueAdapter):
             require_exchange_rules=self._mode == "live",
         )
         try:
+            await self.precheck_order_admission(prepared_request)
             result = (
                 await self._private.submit_passive_order(prepared_request)
                 if passive
@@ -401,6 +448,51 @@ class AsterAdapter(VenueAdapter):
             result=result,
         )
         return result
+
+    async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
+        """Check V3 opening capacity without submitting an order."""
+        if self._private is not None:
+            try:
+                result = await self._private.precheck_order_admission(request)
+            except TransportError as exc:
+                self._handle_private_invalid_symbol(
+                    exc,
+                    request.symbol,
+                    endpoint="/fapi/v3/positionRisk",
+                )
+                if exc.category in (
+                    TransportErrorCategory.AUTH_FAILURE,
+                    TransportErrorCategory.AUTHORIZATION_FAILURE,
+                    TransportErrorCategory.REQUEST_REJECTED,
+                ):
+                    mapped_error = OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        f"aster_v3 capacity precheck rejected: {exc}",
+                    )
+                    self._record_private_admission_precheck_result(
+                        request=request,
+                        exc=exc,
+                        response_classification=SubmitFailureClass.REJECTED.value,
+                    )
+                    raise mapped_error from exc
+                self._record_private_admission_precheck_result(request=request, exc=exc)
+                raise
+            except Exception as exc:
+                self._record_private_admission_precheck_result(request=request, exc=exc)
+                raise
+            self._record_private_admission_precheck_result(
+                request=request,
+                result=result,
+            )
+            return result
+        if self._mode == "live":
+            raise self._private_unavailable()
+        return {
+            "venue": Venue.ASTER.value,
+            "symbol": request.symbol,
+            "status": "skipped",
+            "reason": "paper_mode",
+        }
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._private is not None:

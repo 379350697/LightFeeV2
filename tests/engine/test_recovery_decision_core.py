@@ -38,6 +38,37 @@ def test_flat_no_local_work_truth_gap_runs_with_evidence_gap_and_allows_entry():
     assert decision.evidence_quality == "partial_evidence_gap"
 
 
+def test_full_flat_truth_releases_prior_live_conflict_with_background_close_debt():
+    """V1 accounting debt cannot preserve a disproven live-artifact blocker."""
+    snapshot = RecoveryEvidenceSnapshot(
+        local_open_positions=(),
+        pending_entries=(),
+        residual_repairs=(),
+        passive_closes=(),
+        exchange_truth=ExchangeTruthSnapshot(
+            available=True,
+            confidence="high",
+            positions=(),
+            open_orders=(),
+        ),
+        prior_recovery_block_reason="owned_pending_entry_live_conflict",
+        recovery_work_items=(
+            {
+                "kind": "pending_close_reconciliation",
+                "blocking": False,
+                "position_id": "entry-coti-billing-debt",
+            },
+        ),
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+    assert decision.entry_allowed is True
+    assert decision.clear_previous_block is True
+    assert decision.clear_reason == "core_background_close_reconciliation"
+
+
 def test_local_recovery_work_plus_unavailable_truth_blocks_new_entry():
     snapshot = RecoveryEvidenceSnapshot(
         local_open_positions=(),

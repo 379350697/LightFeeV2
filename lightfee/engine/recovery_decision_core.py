@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Mapping
 
@@ -468,7 +468,28 @@ class V1RecoveryDecisionCore:
         self, snapshot: RecoveryEvidenceSnapshot
     ) -> bool:
         reason = snapshot.prior_recovery_block_reason
+        if reason in LIVE_ARTIFACT_BLOCK_REASONS:
+            # A background accounting debt is not an execution owner, but it
+            # must not erase a live-artifact latch on partial or symbol-scoped
+            # evidence.  Only fresh account-wide position and order truth that
+            # is physically flat can release that old live-risk classification.
+            return self._exchange_truth_is_complete_flat(snapshot.exchange_truth)
         return reason is None or reason in EVIDENCE_GAP_CLEARABLE_BLOCK_REASONS
+
+    def _exchange_truth_is_complete_flat(self, exchange_truth: Any | None) -> bool:
+        if not self._truth_available(exchange_truth) or self._has_partial_evidence_gap(
+            exchange_truth
+        ):
+            return False
+        if any(
+            _quantity(position) > EPSILON
+            for position in _exchange_positions(exchange_truth)
+        ):
+            return False
+        return not any(
+            _quantity(order) > EPSILON
+            for order in _exchange_open_orders(exchange_truth)
+        )
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:

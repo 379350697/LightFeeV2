@@ -18,9 +18,11 @@ decision path short.
 
 Deterministic hedge admission reject must:
 
-1. For Bybit non-reduce-only entry exposure, run the official
-   `/v5/order/pre-check-order` before maker dispatch when the live adapter
-   supports it.
+1. Before the first entry leg is submitted, run the common
+   `precheck_order_admission` contract for every non-reduce-only entry leg
+   whose live adapter exposes exchange-backed admission evidence. This occurs
+   after leverage and final BBO repricing, so the check sees the submitted
+   notional rather than a sizing estimate.
 2. Reuse the same admission classifier as initial entry dispatch.
 3. Record `runtime.entry_admission_blocked`.
 4. Emit `pending_entry.hedge_admission_blocked` when the reject is discovered
@@ -28,7 +30,7 @@ Deterministic hedge admission reject must:
 5. Clear `hedge_inflight` on pending-hedge discovery.
 6. Abort through the existing pending-entry cleanup path so maker exposure is flattened or retained fail-closed if cleanup cannot prove flat.
 7. Prevent repeated same-pending hedge attempts for the same deterministic admission blocker.
-8. Carry the same evidence shape on pre-entry, initial-entry, shortlist/cooldown, and pending-hedge paths: `venue`, `symbol`, `block_scope`, `blocked_until_ms`, `source=pre_entry_bybit_precheck|initial_entry|pending_hedge`, `candidate_pair_id`/`pair_id`, `official_doc_url`, and `evidence_gap=false` when the reject family is exchange-documented.
+8. Carry the same evidence shape on pre-entry, initial-entry, shortlist/cooldown, and pending-hedge paths: `venue`, `symbol`, `block_scope`, `blocked_until_ms`, `source=pre_entry_venue_precheck|initial_entry|pending_hedge`, `candidate_pair_id`/`pair_id`, `official_doc_url`, and `evidence_gap=false` when the reject family is exchange-documented.
 9. Venue-scope admission cooldowns must prune new-entry candidates before
    shortlist tracking or maker submit. This is a new-entry admission downgrade
    only; exchange truth, close, cancel, and residual repair must remain usable.
@@ -46,6 +48,13 @@ Deterministic hedge admission reject must:
   `GET /fapi/v3/accountWithJoinMargin`. Capability metadata must not advertise
   Binance-style private WS/listen-key health for Aster V3; passive progress and
   accepted-order uncertainty truth rely on REST V3 polling/probes.
+- Aster V3 opening capacity uses only the documented V3
+  `GET /fapi/v3/positionRisk` `maxNotionalValue` plus current position and
+  non-reduce-only `GET /fapi/v3/openOrders` notional. Missing/malformed
+  capacity evidence fails closed before the other entry leg can become live.
+  The private Aster submit boundary repeats this check so pending-hedge retry
+  cannot bypass dispatch admission. Do not restore the legacy
+  `remainingOpenableNotionalValue` endpoint: it is not a V3 contract.
 - Bybit trading-terms rejects: no matching V1 definition found. Treat as exchange-documented admission/permission block, not as V1 copy work. Use Bybit's official non-mutating order pre-check endpoint as the maker-before-hedge protection; keep the pending-hedge branch as defense-in-depth.
 - Hyperliquid insufficient-margin rejects: no matching V1 exchange family found. Hyperliquid's official error response documents `Insufficient margin to place order.` under the perp margin family; V2 treats it as deterministic admission evidence with symbol cooldown, venue cooldown, shortlist/dispatch admission blocking, and pending hedge abort. Official doc: <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses>.
 - Transport-level classification alone is insufficient unless runtime consumes it in the pending hedge branch.
@@ -62,7 +71,8 @@ Deterministic hedge admission reject must:
 | 2026-06-07 | Hyperliquid venue-scope pre-shortlist admission downgrade | local implementation pending deploy | Active `venue_entry_cooldowns["hyperliquid:*"]` now prune Hyperliquid new-entry candidates before Local-L2/quote tracking. Selection and dispatch keep their existing admission blocks as bypass safety. |
 | 2026-06-08 | Aster Pro API V3 private transport isolation | fixed, deployed through main | Aster private account/order/open-order probes are no longer routed through shared Binance HMAC transport. V2 now keeps public Aster FAPI market data separate from a dedicated V3 Web3 signer client, so V3 API-wallet credentials do not produce false `Signature for this request is not valid` private-truth failures. Review closure also pins `accountWithJoinMargin`, Aster V3 capability truth, and REST V3 order-truth probe paths. Follow-up startup safety and host fixes are in main (`9d037f5`, `6054c47`) and the deployed manifest line. |
 | 2026-06-08 | Production issues 3-7 admission evidence audit | fixed, deployed/cloud verified | Existing admission classifier and venue-scope downgrade coverage stayed authoritative. CL-052 did not add another admission branch; it records that deployment review should verify the already-covered `runtime.entry_admission_blocked`, `runtime.entry_admission_venue_degraded`, `pending_entry.hedge_admission_blocked`, and `entry.aborted` payload fields across the same source/scope/venue/symbol/pair/action/cooldown contract. |
-| 2026-06-09 | Bybit trading-terms maker-before-hedge precheck | local green, deploy pending | Bybit non-reduce-only entry exposure now uses `/v5/order/pre-check-order` before maker dispatch when the adapter supports it. `110125/110126/110123` records `runtime.entry_admission_blocked` with `source=pre_entry_bybit_precheck` and prevents maker submit; pending hedge admission handling remains the fallback. |
+| 2026-06-09 | Bybit trading-terms maker-before-hedge precheck | local green, deploy pending | Bybit non-reduce-only entry exposure uses `/v5/order/pre-check-order` before maker dispatch. The later shared capable-venue contract preserves the same behavior with `source=pre_entry_venue_precheck`; pending hedge admission handling remains the fallback. |
+| 2026-08-09 | KAITO Binance maker / Aster hedge `-5018` V3 capacity recurrence | fixed locally, deploy pending | Aster V3 capacity was discovered only after a Binance maker fill. One shared pre-entry contract now calls every capable venue after leverage/BBO preparation; Aster derives capacity from V3 `positionRisk.maxNotionalValue`, position and non-reduce-only open-order occupancy, and the actual Aster submit boundary repeats the check. Missing evidence rejects before maker dispatch; existing `-5018` cooldown/cleanup remains the submission-race fallback. |
 
 ## Recurrences
 
@@ -74,6 +84,7 @@ Deterministic hedge admission reject must:
 | 2026-06-04 | `SEIUSDT` Bybit maker / Hyperliquid hedge | `1e082d9` | local RED/GREEN and cloud focused tests verify Hyperliquid insufficient margin now blocks initial entry and pending hedge retry; final cloud diagnose is flat/no-open-orders | [daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality](../daily/2026-06-04.md#cluster-cl-049-post-cl048-seiusdt-open-maker-order-terminality) |
 | 2026-06-08 | issue 3-7 admission / pending hedge closure review | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-09 | `CLUSDT` OKX maker / Bybit hedge, Bybit `110125` crude-oil terms | working tree | local precheck regression added; deploy pending | Bybit endpoint/signature was healthy in the same window; failure is symbol trading-terms admission, now blocked before maker dispatch. |
+| 2026-08-09 | `KAITOUSDT` Binance maker / Aster hedge, Aster `-5018` | working tree | local regression green; deploy pending | [CL-099 Aster V3 capacity admission](../daily/2026-08-09.md#cluster-cl-099-kaito-v3-capacity-admission-and-live-artifact-release) |
 
 ## Regression Harness
 
@@ -85,12 +96,15 @@ Deterministic hedge admission reject must:
 ## Next Recurrence Checklist
 
 1. Count `order.submit_result` rejected events by venue, symbol, and `response_classification`.
-2. For Bybit terms, check whether `order.precheck_result` and
-   `runtime.entry_admission_blocked source=pre_entry_bybit_precheck` appear
+2. For any capable venue, check whether admission evidence and
+   `runtime.entry_admission_blocked source=pre_entry_venue_precheck` appear
    before any maker `order.submit_attempt`.
 3. If the reject was only discovered after maker fill, check whether `pending_entry.hedge_admission_blocked` appears after the hedge reject.
 4. Check `runtime.entry_admission_blocked` and `state.venue_entry_cooldowns`.
-5. For Aster `-5018`, check `runtime.venue_cooldown_started` reason `aster_max_notional_limit`.
+5. For Aster `-5018`, verify preceding V3 `positionRisk`/`openOrders` capacity
+   evidence, no legacy remaining-openable endpoint, and
+   `runtime.venue_cooldown_started` reason `aster_max_notional_limit` if a
+   submission-time race still occurs.
 6. For Hyperliquid insufficient margin, check the symbol and venue cooldown events carry `source`, `block_scope`, `blocked_until_ms`, pair id, official doc URL, and `evidence_gap=false`.
 7. If `hyperliquid:*` venue cooldown is active, confirm
    `runtime.entry_admission_venue_degraded` prunes Hyperliquid candidates before

@@ -149,7 +149,7 @@ class RejectingExecutor:
             "ESPORTSUSDT",
             'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}',
             "leverage_admission_blocked",
-            "https://docs.asterdex.com/product/aster-perpetuals/api/api-documentation",
+            "https://github.com/asterdex/api-docs/blob/master/V3%28Recommended%29/EN/aster-finance-futures-api-v3.md",
             False,
         ),
         (
@@ -157,7 +157,7 @@ class RejectingExecutor:
             "MAXUSDT",
             'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
             "max_notional_admission_blocked",
-            "https://asterdex.github.io/aster-api-website/futures/account%26trades/#remaining-openable-notional-value-user_data",
+            "https://github.com/asterdex/api-docs/blob/master/V3%28Recommended%29/EN/aster-finance-futures-api-v3.md#position-information-v3-user_data",
             False,
         ),
     ],
