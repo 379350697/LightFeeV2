@@ -340,6 +340,49 @@ def test_acceptance_gate_remaining_slots_include_pending_entry_owners():
     assert gate["remaining_position_slots"] == 0
 
 
+def test_acceptance_gate_counts_compact_pending_passive_close_state():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 1,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+        state_consistency={"state_mismatch": False},
+    )
+
+    assert gate["pending_passive_close_count"] == 1
+    assert gate["pending_close_owner_count"] == 1
+    assert gate["gate_passed"] is False
+    assert "local_pending_entries_or_closes_present" in gate["blocking_reasons"]
+
+
+def test_recovery_decision_counts_compact_pending_passive_close_state():
+    from scripts.diagnose_live import _recovery_decision_payload
+
+    decision = _recovery_decision_payload(
+        {"pending_passive_close_count": 1},
+        {"available": False, "positions": {}, "open_orders": {}},
+    )
+
+    assert decision["kind"] == "RISK_ONLY_WAIT_FOR_TRUTH"
+    assert decision["entry_allowed"] is False
+    assert decision["block_reason"] == "truth_unavailable_for_required_recovery"
+
+
 def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
     from scripts.diagnose_live import _build_production_acceptance_gate
 

@@ -318,6 +318,35 @@ class TestExplainCLI:
         from lightfee.apps.explain import load_runtime_posture_report
         assert load_runtime_posture_report("/nonexistent/path.json") is None
 
+    def test_render_includes_all_pending_close_owners(self):
+        from lightfee.apps.explain import RuntimePostureReport, render_runtime_posture_text
+
+        report = RuntimePostureReport(
+            pending_closes=1,
+            pending_passive_closes=2,
+            pending_close_owners=3,
+        )
+
+        text = render_runtime_posture_text(report)
+        assert "pending closes : 1" in text
+        assert "pending passive closes: 2" in text
+        assert "pending close owners : 3" in text
+
+    def test_load_projects_compact_pending_close_owner_counts(self, tmp_path):
+        from lightfee.apps.explain import load_runtime_posture_report
+
+        snapshot = tmp_path / "state.json"
+        snapshot.write_text(json.dumps({
+            "pending_close_count": 1,
+            "pending_passive_close_count": 2,
+        }))
+
+        report = load_runtime_posture_report(str(snapshot))
+        assert report is not None
+        assert report.pending_closes == 1
+        assert report.pending_passive_closes == 2
+        assert report.pending_close_owners == 3
+
 
 class TestDailyDBSnapshot:
     def test_ensure_schema_creates_table(self):

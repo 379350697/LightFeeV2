@@ -5122,8 +5122,9 @@ class TestAckOnlyResponses:
 
 class TestV1PassiveBusinessFlowParity:
     @pytest.mark.asyncio
-    async def test_aster_passive_submit_uses_v3_order_without_legacy_headroom(self):
+    async def test_aster_live_private_passive_submit_fails_closed_without_exchange_rules(self):
         from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
         adapter = AsterAdapter(
             mode="live",
@@ -5133,6 +5134,107 @@ class TestV1PassiveBusinessFlowParity:
             ),
         )
         assert adapter._private is not None
+        get_symbol_rules_cache().clear()
+
+        async def unavailable_public_get(path, params=None):
+            raise RuntimeError("exchangeInfo unavailable")
+
+        adapter._transport._public_get = unavailable_public_get
+        adapter._private.submit_passive_order = AsyncMock(
+            side_effect=AssertionError("private order must not be sent")
+        )
+        request = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="GUAUSDT",
+            side=Side.BUY,
+            quantity=15.07,
+            price=2.009,
+            post_only=True,
+            client_order_id="aster-maker-unavailable-rules",
+        )
+
+        with pytest.raises(OrderSubmitError, match="dynamic symbol rules unavailable"):
+            await adapter.submit_passive_order(request)
+
+        adapter._private.submit_passive_order.assert_not_awaited()
+        await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_live_private_passive_submit_fails_closed_for_incomplete_exchange_rules(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        get_symbol_rules_cache().clear()
+
+        async def incomplete_public_get(path, params=None):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [{
+                    "symbol": "GUAUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                    ],
+                }],
+            }
+
+        adapter._transport._public_get = incomplete_public_get
+        adapter._private.submit_passive_order = AsyncMock(
+            side_effect=AssertionError("private order must not be sent")
+        )
+        request = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="GUAUSDT",
+            side=Side.BUY,
+            quantity=15.07,
+            price=2.009,
+            post_only=True,
+            client_order_id="aster-maker-incomplete-rules",
+        )
+
+        with pytest.raises(OrderSubmitError, match="dynamic symbol rules unavailable"):
+            await adapter.submit_passive_order(request)
+
+        adapter._private.submit_passive_order.assert_not_awaited()
+        await adapter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aster_passive_submit_uses_v3_order_without_legacy_headroom(self):
+        from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        adapter = AsterAdapter(
+            mode="live",
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1",
+                account_address="0x63DD5aCC6b1aa0f563956C0e534DD30B6dcF7C4e",
+            ),
+        )
+        assert adapter._private is not None
+        get_symbol_rules_cache().clear()
+
+        async def fake_public_get(path, params=None):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [{
+                    "symbol": "GUAUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                    ],
+                }],
+            }
+
+        adapter._transport._public_get = fake_public_get
         calls = []
 
         async def fake_request(method, path, *, params=None):
@@ -5150,8 +5252,8 @@ class TestV1PassiveBusinessFlowParity:
             venue=Venue.ASTER,
             symbol="GUAUSDT",
             side=Side.BUY,
-            quantity=15.0,
-            price=2.0,
+            quantity=15.07,
+            price=2.009,
             post_only=True,
             client_order_id="aster-maker-1",
         )
@@ -5160,6 +5262,7 @@ class TestV1PassiveBusinessFlowParity:
 
         order_call = [call for call in calls if call[1] == "/fapi/v3/order"][0]
         assert order_call[2]["quantity"] == "15"
+        assert order_call[2]["price"] == "2"
         assert order_call[2]["timeInForce"] == "GTX"
         assert ack.quantity == 15.0
         assert not any(call[1] == "/fapi/v1/remainingOpenableNotionalValue" for call in calls)
@@ -5168,6 +5271,7 @@ class TestV1PassiveBusinessFlowParity:
     @pytest.mark.asyncio
     async def test_aster_v3_passive_submit_reject_raises_order_submit_error(self):
         from lightfee.venues.aster import AsterAdapter
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
 
         adapter = AsterAdapter(
             mode="live",
@@ -5177,6 +5281,22 @@ class TestV1PassiveBusinessFlowParity:
             ),
         )
         assert adapter._private is not None
+        get_symbol_rules_cache().clear()
+
+        async def fake_public_get(path, params=None):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [{
+                    "symbol": "GUAUSDT",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                    ],
+                }],
+            }
+
+        adapter._transport._public_get = fake_public_get
         order_attempts = []
 
         async def fake_request(method, path, *, params=None):
@@ -7017,6 +7137,17 @@ class TestAsterAdapterSymbolCatalog:
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
         async def handler(request):
+            if request.url.path == "/fapi/v1/exchangeInfo":
+                return httpx.Response(200, json={
+                    "symbols": [{
+                        "symbol": "COTIUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }],
+                })
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 
@@ -7027,6 +7158,9 @@ class TestAsterAdapterSymbolCatalog:
         try:
             adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
             adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            adapter._transport._client = httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
             )
             with pytest.raises(OrderSubmitError) as exc:
@@ -7057,6 +7191,17 @@ class TestAsterAdapterSymbolCatalog:
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
         async def handler(request):
+            if request.url.path == "/fapi/v1/exchangeInfo":
+                return httpx.Response(200, json={
+                    "symbols": [{
+                        "symbol": "COTIUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }],
+                })
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 
@@ -7067,6 +7212,9 @@ class TestAsterAdapterSymbolCatalog:
         try:
             adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
             adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            adapter._transport._client = httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
             )
             with pytest.raises(OrderSubmitError):
@@ -7127,6 +7275,17 @@ class TestAsterAdapterSymbolCatalog:
         private_key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
 
         async def handler(request):
+            if request.url.path == "/fapi/v1/exchangeInfo":
+                return httpx.Response(200, json={
+                    "symbols": [{
+                        "symbol": "COTIUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }],
+                })
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 
         adapter = AsterAdapter(
@@ -7136,6 +7295,9 @@ class TestAsterAdapterSymbolCatalog:
         try:
             adapter._transport.set_symbol_metadata({"COTIUSDT": {"symbol": "COTIUSDT"}})
             adapter._private._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            adapter._transport._client = httpx.AsyncClient(
                 transport=httpx.MockTransport(handler)
             )
             for _ in range(3):
@@ -11191,4 +11353,78 @@ class TestBinanceAsterPrecisionFix:
         normalized = await transport.normalize_quantity("HIGHUSDT", 357.8)
         assert normalized == pytest.approx(357.0)
 
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_symbol_rules_cache_retries_after_spec_fallback(self):
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        transport = VenueTransport(
+            spec=aster_spec(),
+            mode="paper",
+        )
+        calls = 0
+
+        async def public_get(path, *, params=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary exchangeInfo outage")
+            return {
+                "symbols": [
+                    {
+                        "symbol": "HIGHUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.001"},
+                            {
+                                "filterType": "LOT_SIZE",
+                                "stepSize": "1",
+                                "minQty": "1",
+                            },
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }
+                ]
+            }
+
+        transport._public_get = public_get
+        cache = SymbolRulesCache()
+
+        first = await cache.get(transport, Venue.ASTER, "HIGHUSDT")
+        second = await cache.get(transport, Venue.ASTER, "HIGHUSDT")
+
+        assert first.rule_source == "spec_fallback"
+        assert second.rule_source == "exchangeInfo"
+        assert second.qty_step == 1.0
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_symbol_rules_cache_rejects_nonfinite_exchange_info_rules(self):
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        transport = VenueTransport(spec=aster_spec(), mode="paper")
+
+        async def public_get(path, *, params=None):
+            assert path == "/fapi/v1/exchangeInfo"
+            return {
+                "symbols": [
+                    {
+                        "symbol": "GUAUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "NaN"},
+                            {
+                                "filterType": "LOT_SIZE",
+                                "stepSize": "1",
+                                "minQty": "1",
+                            },
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }
+                ]
+            }
+
+        transport._public_get = public_get
+        rule = await SymbolRulesCache().get(transport, Venue.ASTER, "GUAUSDT")
+
+        assert rule.rule_source == "spec_fallback"
         await transport.close()

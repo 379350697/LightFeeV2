@@ -371,6 +371,21 @@ class TestFixtureDrivenOrderSuccess:
                 "lightfee.venues.transport.get_symbol_rules_cache",
                 lambda: FakeRulesCache(),
             )
+        if venue_id == Venue.ASTER:
+            async def fake_aster_public_get(path, params=None):
+                assert path == "/fapi/v1/exchangeInfo"
+                return {
+                    "symbols": [{
+                        "symbol": symbol,
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }],
+                }
+
+            monkeypatch.setattr(transport, "_public_get", fake_aster_public_get)
 
         try:
             req = OrderRequest(
@@ -474,11 +489,24 @@ class TestAsterOrderRequestShape:
 
     @pytest.mark.asyncio
     async def test_post_order_has_signer_nonce_and_signature_in_url(self):
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
         fixture = _load_fixture("aster", "place_order_success")
         captured_url = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured_url.append(str(request.url))
+            if request.url.path == "/fapi/v1/exchangeInfo":
+                return httpx.Response(200, json={
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }],
+                })
             return httpx.Response(200, json=fixture)
 
         mock = httpx.MockTransport(handler)
@@ -488,15 +516,18 @@ class TestAsterOrderRequestShape:
         )
         adapter = AsterAdapter(mode="live", credential=cred)
         assert adapter._private is not None
+        adapter._transport._client = httpx.AsyncClient(transport=mock)
         adapter._private._client = httpx.AsyncClient(transport=mock)
         adapter._private._owns_client = True
+        get_symbol_rules_cache().clear()
 
         try:
             req = OrderRequest(venue=Venue.ASTER, symbol="BTCUSDT",
                               side=Side.SELL, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 1
-            url = captured_url[0]
+            assert len(captured_url) == 2
+            assert "/fapi/v1/exchangeInfo?symbol=BTCUSDT" in captured_url[0]
+            url = [item for item in captured_url if "/fapi/v3/order" in item][0]
             assert "https://fapi.asterdex.com/fapi/v3/order" in url
             assert "signer=" in url, f"Missing signer in URL: {url}"
             assert "nonce=" in url, f"Missing nonce in URL: {url}"

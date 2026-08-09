@@ -89,6 +89,69 @@ class RecoveryEvidenceSnapshot:
     owner_evidence: tuple[Any, ...] = ()
 
 
+def _state_collection_or_count(
+    state: Mapping[str, Any] | Any,
+    collection_key: str,
+    count_key: str,
+) -> tuple[Any, ...]:
+    """Read an owner collection, or its compact-state count when omitted."""
+    if isinstance(state, Mapping):
+        collection = state.get(collection_key)
+        count_value = state.get(count_key)
+    else:
+        collection = getattr(state, collection_key, None)
+        count_value = getattr(state, count_key, None)
+    if isinstance(collection, Mapping):
+        return tuple(collection.values())
+    if isinstance(collection, (list, tuple, set)):
+        return tuple(collection)
+    try:
+        count = int(count_value or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return tuple({"source": count_key} for _ in range(max(count, 0)))
+
+
+@dataclass(frozen=True)
+class PendingCloseOwnerCounts:
+    """Canonical ordinary/passive close-owner projection for all surfaces."""
+
+    pending_close_count: int = 0
+    pending_passive_close_count: int = 0
+
+    @property
+    def pending_close_owner_count(self) -> int:
+        return self.pending_close_count + self.pending_passive_close_count
+
+
+def pending_passive_close_evidence(
+    state: Mapping[str, Any] | Any,
+) -> tuple[Any, ...]:
+    """Return passive-close owners from one canonical state contract.
+
+    ``pending_close_count`` belongs to the legacy close owner.  Passive closes
+    have their own state collection and count, so diagnostics must never infer
+    one from the other when the collection is omitted from a compact snapshot.
+    """
+    return _state_collection_or_count(
+        state,
+        "pending_passive_closes",
+        "pending_passive_close_count",
+    )
+
+
+def pending_close_owner_counts(
+    state: Mapping[str, Any] | Any,
+) -> PendingCloseOwnerCounts:
+    """Return the only valid ordinary + passive close-owner projection."""
+    return PendingCloseOwnerCounts(
+        pending_close_count=len(
+            _state_collection_or_count(state, "pending_closes", "pending_close_count")
+        ),
+        pending_passive_close_count=len(pending_passive_close_evidence(state)),
+    )
+
+
 @dataclass(frozen=True)
 class RecoveryDecision:
     kind: RecoveryDecisionKind

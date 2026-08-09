@@ -13,6 +13,7 @@ Venue endpoints:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Optional
 
 from lightfee.core.domain import Venue
@@ -51,7 +52,12 @@ class SymbolRulesCache:
             return self._rules[key]
 
         rule = await self._fetch(transport, venue, venue_symbol)
-        self._rules[key] = rule
+        # A spec fallback is an admission-time failure signal for live order
+        # preparation, not a durable exchange rule.  Keep only authoritative
+        # venue metadata so a transient public-endpoint failure can recover on
+        # the next attempt instead of pinning the process to stale defaults.
+        if rule.rule_source != "spec_fallback":
+            self._rules[key] = rule
         return rule
 
     async def _fetch(
@@ -93,26 +99,26 @@ class SymbolRulesCache:
         min_qty = 0.0
         min_notional = 0.0
 
-        for f in s.get("filters", []):
-            ft = f.get("filterType", "")
-            if ft == "PRICE_FILTER":
-                tick_size = float(f.get("tickSize", 0))
-            elif ft == "LOT_SIZE":
-                qty_step = float(f.get("stepSize", 0))
-                min_qty = float(f.get("minQty", 0))
-            elif ft == "MIN_NOTIONAL":
-                min_notional = float(f.get("notional", 0))
+        try:
+            for f in s.get("filters", []):
+                ft = f.get("filterType", "")
+                if ft == "PRICE_FILTER":
+                    tick_size = float(f.get("tickSize", 0))
+                elif ft == "LOT_SIZE":
+                    qty_step = float(f.get("stepSize", 0))
+                    min_qty = float(f.get("minQty", 0))
+                elif ft == "MIN_NOTIONAL":
+                    min_notional = float(f.get("notional", 0))
+        except (TypeError, ValueError):
+            return self._spec_fallback(transport, venue_symbol)
 
-        # Fill gaps with spec defaults
-        spec = transport._spec
-        if tick_size <= 0:
-            tick_size = float(spec.price_tick or 0.0)
-        if qty_step <= 0:
-            qty_step = float(spec.quantity_step or 0.0)
-        if min_qty <= 0:
-            min_qty = float(spec.min_quantity or 0.0)
-        if min_notional <= 0:
-            min_notional = float(spec.min_notional or 0.0)
+        # A partial exchangeInfo response cannot be labelled as an
+        # exchange-backed rule and supplemented with static VenueSpec values.
+        # Live preparation sees this fallback and rejects the order without
+        # sending a precision guess to the private endpoint.
+        required_values = (tick_size, qty_step, min_qty, min_notional)
+        if not all(math.isfinite(value) and value > 0.0 for value in required_values):
+            return self._spec_fallback(transport, venue_symbol)
 
         return SymbolRule(
             tick_size=tick_size,

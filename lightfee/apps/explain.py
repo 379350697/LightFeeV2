@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from lightfee.engine.recovery_decision_core import pending_close_owner_counts
+
 
 @dataclass
 class RuntimePostureReport:
@@ -20,6 +22,8 @@ class RuntimePostureReport:
     open_positions: int = 0
     pending_entries: int = 0
     pending_closes: int = 0
+    pending_passive_closes: int = 0
+    pending_close_owners: int = 0
     recent_errors: list[str] = field(default_factory=list)
 
 
@@ -31,6 +35,7 @@ def load_runtime_posture_report(snapshot_path: str) -> Optional[RuntimePostureRe
     with open(snapshot_path) as f:
         data = json.load(f)
 
+    pending_close_owners = pending_close_owner_counts(data)
     return RuntimePostureReport(
         lifecycle=data.get("lifecycle", "unknown"),
         risk_mode=data.get("risk_mode", "unknown"),
@@ -38,7 +43,11 @@ def load_runtime_posture_report(snapshot_path: str) -> Optional[RuntimePostureRe
         tick_count=data.get("tick_count", 0),
         open_positions=data.get("open_position_count", 0),
         pending_entries=data.get("pending_entry_count", 0),
-        pending_closes=data.get("pending_close_count", 0),
+        pending_closes=pending_close_owners.pending_close_count,
+        pending_passive_closes=(
+            pending_close_owners.pending_passive_close_count
+        ),
+        pending_close_owners=pending_close_owners.pending_close_owner_count,
     )
 
 
@@ -55,6 +64,8 @@ def render_runtime_posture_text(report: RuntimePostureReport) -> str:
         f"  open positions: {report.open_positions}",
         f"  pending entries: {report.pending_entries}",
         f"  pending closes : {report.pending_closes}",
+        f"  pending passive closes: {report.pending_passive_closes}",
+        f"  pending close owners : {report.pending_close_owners}",
         "=" * 54,
     ]
     if report.recent_errors:

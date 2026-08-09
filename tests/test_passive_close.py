@@ -6948,16 +6948,7 @@ class TestReduceOnlyRejectedEscalation:
             average_price=0.0,
             state=PassiveOrderState.REJECTED,
         ))
-        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=OrderFillReconciliation(
-            venue=Venue.BINANCE,
-            symbol="BTCUSDT",
-            side=Side.SELL,
-            quantity=0.0,
-            average_price=0.0,
-            order_id="rejected-maker",
-            client_order_id="rejected-client",
-            filled_at_ms=0,
-        ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
         maker_adapter.submit_passive_order = AsyncMock()
 
         executor = PassiveCloseExecutor(
@@ -7004,6 +6995,15 @@ class TestReduceOnlyRejectedEscalation:
             if e.get("kind") == "exit.passive_close_maker_terminal_no_fill"
         ]
         assert len(terminal_events) == 1
+        authoritative_events = [
+            e for e in events
+            if e.get("kind") == "exit.passive_close_terminal_zero_fill_status_authoritative"
+        ]
+        assert len(authoritative_events) == 1
+        assert not any(
+            e.get("kind") == "exit.passive_close_terminal_zero_fill_truth_unavailable"
+            for e in events
+        )
 
     def test_canceled_zero_fill_retains_maker_until_execution_truth_is_available(self):
         """A single canceled/zero progress response cannot arm a new close leg."""

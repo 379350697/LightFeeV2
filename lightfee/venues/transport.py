@@ -2008,6 +2008,76 @@ class VenueTransport(MarketDataClient):
         payload["response_classification"] = "attempt"
         return payload
 
+    async def prepare_order_request(
+        self,
+        request: OrderRequest,
+        *,
+        require_exchange_rules: bool = False,
+    ) -> tuple[OrderRequest, dict[str, Any], Any]:
+        """Apply one dynamic symbol-rule contract before an order is sent.
+
+        Private venue clients do not pass through ``VenueTransport``'s wire
+        builders, so they must use the same exchange-rule normalization as the
+        generic transport path.  A live caller may require an exchange-backed
+        rule source; falling back to static venue defaults is unsafe for
+        precision-sensitive symbols.
+        """
+        venue_sym = self._venue_symbol(request.symbol)
+        symbol_rule = None
+        try:
+            symbol_rule = await get_symbol_rules_cache().get(
+                self,
+                self._spec.venue_id,
+                venue_sym,
+            )
+        except Exception as exc:
+            if require_exchange_rules:
+                payload = {
+                    "venue": self._spec.venue_id.value,
+                    "symbol": venue_sym,
+                    "response_classification": "precision_rejected",
+                    "reason": "dynamic_symbol_rules_unavailable",
+                    "rule_source": "unavailable",
+                    "error": str(exc)[:200],
+                }
+                self._record_order_diagnostic("order.submit_result", payload)
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    f"dynamic symbol rules unavailable for {venue_sym}",
+                ) from exc
+
+        rule_source = str(getattr(symbol_rule, "rule_source", "") or "")
+        if require_exchange_rules and (
+            symbol_rule is None or rule_source == "spec_fallback"
+        ):
+            payload = {
+                "venue": self._spec.venue_id.value,
+                "symbol": venue_sym,
+                "response_classification": "precision_rejected",
+                "reason": "dynamic_symbol_rules_unavailable",
+                "rule_source": rule_source or "unavailable",
+            }
+            self._record_order_diagnostic("order.submit_result", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"dynamic symbol rules unavailable for {venue_sym}",
+            )
+
+        preflight = self.preflight_order_request(
+            request,
+            symbol_rule=symbol_rule,
+        )
+        prepared = replace(
+            request,
+            quantity=float(preflight["quantized_qty"]),
+            price=(
+                None
+                if preflight["quantized_price"] is None
+                else float(preflight["quantized_price"])
+            ),
+        )
+        return prepared, preflight, symbol_rule
+
     async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
         """Validate a Bybit order through the official non-mutating pre-check API."""
         spec = self._spec
@@ -4013,24 +4083,30 @@ class VenueTransport(MarketDataClient):
                     )
                 request = replace(request, quantity=wire_qty, price=limit_px)
             else:
-                symbol_rule = None
-                if spec.venue_id == Venue.BYBIT:
-                    try:
-                        symbol_rule = await get_symbol_rules_cache().get(
-                            self, spec.venue_id, venue_sym,
-                        )
-                    except Exception:
-                        symbol_rule = None
-                preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
-                request = replace(
-                    request,
-                    quantity=float(preflight["quantized_qty"]),
-                    price=(
-                        None
-                        if preflight["quantized_price"] is None
-                        else float(preflight["quantized_price"])
-                    ),
-                )
+                if spec.venue_id == Venue.ASTER:
+                    request, preflight, symbol_rule = await self.prepare_order_request(
+                        request,
+                        require_exchange_rules=self.mode == "live",
+                    )
+                else:
+                    symbol_rule = None
+                    if spec.venue_id == Venue.BYBIT:
+                        try:
+                            symbol_rule = await get_symbol_rules_cache().get(
+                                self, spec.venue_id, venue_sym,
+                            )
+                        except Exception:
+                            symbol_rule = None
+                    preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
+                    request = replace(
+                        request,
+                        quantity=float(preflight["quantized_qty"]),
+                        price=(
+                            None
+                            if preflight["quantized_price"] is None
+                            else float(preflight["quantized_price"])
+                        ),
+                    )
             body: dict[str, Any] = {
                 "symbol": venue_sym,
                 "side": request.side.value.upper(),
@@ -5755,15 +5831,21 @@ class VenueTransport(MarketDataClient):
                     "price_decimals": hl_meta["price_decimals"],
                 }
             else:
-                rules_cache = get_symbol_rules_cache()
-                symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
+                if spec.venue_id == Venue.ASTER:
+                    request, preflight, symbol_rule = await self.prepare_order_request(
+                        request,
+                        require_exchange_rules=self.mode == "live",
+                    )
+                else:
+                    rules_cache = get_symbol_rules_cache()
+                    symbol_rule = await rules_cache.get(self, spec.venue_id, venue_sym)
 
-                try:
-                    preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
-                except OrderSubmitError:
-                    raise
-                except Exception:
-                    preflight = self.preflight_order_request(request)
+                    try:
+                        preflight = self.preflight_order_request(request, symbol_rule=symbol_rule)
+                    except OrderSubmitError:
+                        raise
+                    except Exception:
+                        preflight = self.preflight_order_request(request)
 
             quantized_qty = float(preflight["quantized_qty"])
             quantized_price = preflight["quantized_price"]

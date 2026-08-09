@@ -38,6 +38,8 @@ from lightfee.engine.exchange_truth import (
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
+    pending_close_owner_counts,
+    pending_passive_close_evidence,
 )
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
@@ -527,12 +529,19 @@ def _build_local_state(
                 "opened_at_ms": pos.get("opened_at_ms", 0),
             })
 
+    pending_close_owners = pending_close_owner_counts(state)
     return {
         "lifecycle": str(state.get("lifecycle", "unknown")),
         "risk_mode": str(state.get("risk_mode", "unknown")),
         "open_position_count": int(state.get("open_position_count", 0) or 0),
         "pending_entry_count": int(state.get("pending_entry_count", 0) or 0),
-        "pending_close_count": int(state.get("pending_close_count", 0) or 0),
+        "pending_close_count": pending_close_owners.pending_close_count,
+        "pending_passive_close_count": (
+            pending_close_owners.pending_passive_close_count
+        ),
+        "pending_close_owner_count": (
+            pending_close_owners.pending_close_owner_count
+        ),
         "positions": positions,
         "last_tick_ms": int(state.get("last_tick_ms", 0) or 0),
         "runtime_progress": dict(state.get("runtime_progress") or {}),
@@ -3863,7 +3872,12 @@ def _build_production_acceptance_gate(
         max_concurrent_positions - effective_entry_slot_count,
         0,
     )
-    pending_close_count = int(local_state.get("pending_close_count", 0) or 0)
+    pending_close_owners = pending_close_owner_counts(local_state)
+    pending_close_count = pending_close_owners.pending_close_count
+    pending_passive_close_count = (
+        pending_close_owners.pending_passive_close_count
+    )
+    pending_close_owner_count = pending_close_owners.pending_close_owner_count
     pending_reconciliation_summary = local_state.get("pending_close_reconciliation_summary") or {}
     pending_reconciliation_total = int(
         pending_reconciliation_summary.get("total_count", 0) or 0
@@ -3899,7 +3913,7 @@ def _build_production_acceptance_gate(
     local_recovery_clean = (
         open_position_count == 0
         and pending_entry_count == 0
-        and pending_close_count == 0
+        and pending_close_owner_count == 0
         and pending_residual_repair_count == 0
     )
     exchange_recovery_clean = exchange_truth_flat and exchange_truth_no_open_orders
@@ -4004,7 +4018,7 @@ def _build_production_acceptance_gate(
         open_position_count > 0
         and open_position_count <= max_concurrent_positions
         and pending_entry_count == 0
-        and pending_close_count == 0
+        and pending_close_owner_count == 0
         and pending_residual_repair_count == 0
         and exchange_truth.get("available")
         and not exchange_truth_flat
@@ -4026,7 +4040,7 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("open_positions_exceed_configured_max")
     elif open_position_count and not active_positions_with_capacity:
         blocking_reasons.append("local_open_positions_present")
-    if pending_entry_count or pending_close_count:
+    if pending_entry_count or pending_close_owner_count:
         blocking_reasons.append("local_pending_entries_or_closes_present")
     if pending_residual_repair_count:
         blocking_reasons.append("local_pending_residual_repairs_present")
@@ -4175,6 +4189,8 @@ def _build_production_acceptance_gate(
         "active_positions_with_capacity": active_positions_with_capacity,
         "pending_entry_count": pending_entry_count,
         "pending_close_count": pending_close_count,
+        "pending_passive_close_count": pending_passive_close_count,
+        "pending_close_owner_count": pending_close_owner_count,
         "pending_close_reconciliation_total": pending_reconciliation_total,
         "pending_close_reconciliation_ack_truth_gap": pending_reconciliation_ack_truth_gap_count,
         "pending_close_reconciliation_summary": pending_reconciliation_summary,
@@ -4414,9 +4430,7 @@ def _recovery_decision_payload(
             residual_repairs=_state_collection_or_count(
                 local_state, "pending_residual_repairs", "pending_residual_repair_count"
             ),
-            passive_closes=_state_collection_or_count(
-                local_state, "pending_passive_closes", "pending_close_count"
-            ),
+            passive_closes=pending_passive_close_evidence(local_state),
             exchange_truth=exchange_truth,
             prior_recovery_block_reason=local_state.get("recovery_blocked_reason"),
         )
@@ -5392,9 +5406,10 @@ def _print_summary(result: dict[str, Any]) -> None:
 
     print("Status: {}  Risk: {}  Confidence: {}".format(c["status"], c["risk"], eq["confidence"]))
     print("Health: {}".format("OK" if h["ok"] else "CRITICAL={} WARN={}".format(h["critical_count"], h["warning_count"])))
-    print("Local: {}/{} open={} pending_entry={} pending_close={}".format(
+    print("Local: {}/{} open={} pending_entry={} pending_close={} pending_passive_close={}".format(
         ls["lifecycle"], ls["risk_mode"],
-        ls["open_position_count"], ls["pending_entry_count"], ls["pending_close_count"],
+        ls["open_position_count"], ls["pending_entry_count"],
+        ls["pending_close_count"], ls.get("pending_passive_close_count", 0),
     ))
     print("State path: {} ({})".format(ls.get("state_path", "?"), ls.get("state_path_source", "?")))
     print("Window: mode={} since_ms={} until_ms={} confidence={}".format(

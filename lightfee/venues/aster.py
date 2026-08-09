@@ -303,7 +303,11 @@ class AsterAdapter(VenueAdapter):
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._private is not None:
             try:
-                return await self._private.place_order(request)
+                prepared_request, _, _ = await self._transport.prepare_order_request(
+                    request,
+                    require_exchange_rules=self._mode == "live",
+                )
+                return await self._private.place_order(prepared_request)
             except Exception as exc:
                 self._handle_private_invalid_symbol(
                     exc, request.symbol, endpoint="/fapi/v3/order"
@@ -385,7 +389,11 @@ class AsterAdapter(VenueAdapter):
     async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
         if self._private is not None:
             try:
-                return await self._private.submit_passive_order(request)
+                prepared_request, _, _ = await self._transport.prepare_order_request(
+                    request,
+                    require_exchange_rules=self._mode == "live",
+                )
+                return await self._private.submit_passive_order(prepared_request)
             except Exception as exc:
                 self._handle_private_invalid_symbol(
                     exc, request.symbol, endpoint="/fapi/v3/order"

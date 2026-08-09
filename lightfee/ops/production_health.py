@@ -6,6 +6,8 @@ from typing import Any, Iterable
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
+    pending_close_owner_counts,
+    pending_passive_close_evidence,
 )
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
@@ -523,12 +525,15 @@ def analyze_current_state(
     current_state_age_ms = now_ms - generated_at_ms if generated_at_ms > 0 else None
     open_count = int(state.get("open_position_count") or 0)
     pending_entries = int(state.get("pending_entry_count") or 0)
-    pending_closes = int(state.get("pending_close_count") or 0)
+    pending_close_owners = pending_close_owner_counts(state)
+    pending_closes = pending_close_owners.pending_close_count
+    pending_passive_closes = pending_close_owners.pending_passive_close_count
+    pending_close_owner_count = pending_close_owners.pending_close_owner_count
     pending_residual_repairs = int(state.get("pending_residual_repair_count") or 0)
     clean = (
         open_count == 0
         and pending_entries == 0
-        and pending_closes == 0
+        and pending_close_owner_count == 0
         and pending_residual_repairs == 0
     )
     last_scan = state.get("last_scan")
@@ -544,6 +549,8 @@ def analyze_current_state(
         fingerprints.append("live_lifecycle_not_running")
     if state.get("risk_mode") == "fail_closed" and clean and not state.get("recovery_blocked_reason"):
         fingerprints.append("stale_fail_closed_clean_state")
+    if pending_close_owner_count:
+        fingerprints.append("pending_close_owner_present")
     if state.get("last_scan") is None:
         fingerprints.append("last_scan_missing")
     exchange_truth = state.get("exchange_truth")
@@ -656,7 +663,15 @@ def analyze_current_state(
     if weak_order_truth_events:
         fingerprints.append("order_truth_gap_unresolved")
 
-    severity = "critical" if any(fp != "last_scan_missing" for fp in fingerprints) else "warning"
+    warning_only_fingerprints = {
+        "last_scan_missing",
+        "pending_close_owner_present",
+    }
+    severity = (
+        "critical"
+        if any(fp not in warning_only_fingerprints for fp in fingerprints)
+        else "warning"
+    )
     return HealthReport(
         name="current_state",
         ok=not fingerprints,
@@ -669,6 +684,8 @@ def analyze_current_state(
             "open_position_count": open_count,
             "pending_entry_count": pending_entries,
             "pending_close_count": pending_closes,
+            "pending_passive_close_count": pending_passive_closes,
+            "pending_close_owner_count": pending_close_owner_count,
             "pending_residual_repair_count": pending_residual_repairs,
             "last_scan_age_ms": last_scan_age_ms,
             "current_state_age_ms": current_state_age_ms,
@@ -730,9 +747,7 @@ def _recovery_decision_payload(
             residual_repairs=_state_collection_or_count(
                 state, "pending_residual_repairs", "pending_residual_repair_count"
             ),
-            passive_closes=_state_collection_or_count(
-                state, "pending_passive_closes", "pending_close_count"
-            ),
+            passive_closes=pending_passive_close_evidence(state),
             exchange_truth=exchange_truth if isinstance(exchange_truth, dict) else None,
             prior_recovery_block_reason=state.get("recovery_blocked_reason"),
         )

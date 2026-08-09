@@ -345,6 +345,22 @@ class PassiveCloseExecutor:
     def _adapter(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._adapters.get(venue)
 
+    @staticmethod
+    def _terminal_zero_fill_status_is_authoritative(
+        progress: PassiveOrderProgress,
+    ) -> bool:
+        """Return whether a terminal status itself proves zero execution.
+
+        ``REJECTED`` and ``EXPIRED`` are immutable no-fill outcomes.  A
+        ``CANCELED`` order may still have executions that need a separate
+        execution-history query, while ``FILLED`` with zero executions is an
+        explicit contradiction and remains fail-closed.
+        """
+        return progress.state in (
+            PassiveOrderState.REJECTED,
+            PassiveOrderState.EXPIRED,
+        )
+
     def set_l2_mid_resolver(self, resolver: callable) -> None:
         self._l2_mid_resolver = resolver
 
@@ -1049,6 +1065,8 @@ class PassiveCloseExecutor:
                     and pending.maker_fill.quantity <= 1e-9
                 ):
                     terminal_state = progress.state.value
+                    terminal_truth = None
+                    terminal_truth_error = ""
                     try:
                         terminal_truth = await adapter.fetch_order_fill_reconciliation(
                             position.symbol,
@@ -1056,25 +1074,10 @@ class PassiveCloseExecutor:
                             progress.client_order_id or maker_client_id,
                         )
                     except Exception as exc:
-                        self._journal.append(
-                            "exit.passive_close_terminal_zero_fill_truth_unavailable",
-                            {
-                                "position_id": position_id,
-                                "symbol": position.symbol,
-                                "maker_venue": maker_venue.value,
-                                "maker_order_id": progress.order_id or maker_order_id,
-                                "maker_client_order_id": progress.client_order_id or maker_client_id,
-                                "state": progress.state.value,
-                                "error": str(exc),
-                                "decision": "retain_pending",
-                            },
-                        )
-                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
-                        return False
+                        terminal_truth_error = str(exc)
                     if terminal_truth is None:
-                        self._journal.append(
-                            "exit.passive_close_terminal_zero_fill_truth_unavailable",
-                            {
+                        if not self._terminal_zero_fill_status_is_authoritative(progress):
+                            payload = {
                                 "position_id": position_id,
                                 "symbol": position.symbol,
                                 "maker_venue": maker_venue.value,
@@ -1082,10 +1085,43 @@ class PassiveCloseExecutor:
                                 "maker_client_order_id": progress.client_order_id or maker_client_id,
                                 "state": progress.state.value,
                                 "decision": "retain_pending",
-                            },
+                            }
+                            if terminal_truth_error:
+                                payload["error"] = terminal_truth_error
+                            else:
+                                payload["reason"] = "no_execution_truth"
+                            self._journal.append(
+                                "exit.passive_close_terminal_zero_fill_truth_unavailable",
+                                payload,
+                            )
+                            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                            return False
+                        authoritative_payload = {
+                            "position_id": position_id,
+                            "symbol": position.symbol,
+                            "maker_venue": maker_venue.value,
+                            "maker_order_id": progress.order_id or maker_order_id,
+                            "maker_client_order_id": progress.client_order_id or maker_client_id,
+                            "state": progress.state.value,
+                            "source": "terminal_order_status",
+                            "decision": "advance_terminal_no_fill",
+                        }
+                        if terminal_truth_error:
+                            authoritative_payload["execution_truth_error"] = terminal_truth_error
+                        self._journal.append(
+                            "exit.passive_close_terminal_zero_fill_status_authoritative",
+                            authoritative_payload,
                         )
-                        pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
-                        return False
+                        terminal_truth = OrderFillReconciliation(
+                            venue=maker_venue,
+                            symbol=position.symbol,
+                            side=maker_side,
+                            quantity=0.0,
+                            average_price=0.0,
+                            order_id=progress.order_id or maker_order_id,
+                            client_order_id=progress.client_order_id or maker_client_id,
+                            metadata={"source": "terminal_order_status"},
+                        )
                     if not isinstance(terminal_truth, OrderFillReconciliation):
                         # Adapter mocks and malformed implementations must not
                         # be interpreted as a positive fill merely because a

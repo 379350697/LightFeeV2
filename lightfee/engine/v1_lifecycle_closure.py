@@ -22,6 +22,7 @@ from lightfee.engine.pending_entry_terminalizer import (
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
+    pending_passive_close_evidence,
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
 
@@ -124,9 +125,7 @@ def build_v1_lifecycle_closure_table(
             residual_repairs=_state_collection_or_count(
                 state, "pending_residual_repairs", "pending_residual_repair_count"
             ),
-            passive_closes=_state_collection_or_count(
-                state, "pending_passive_closes", "pending_close_count"
-            ),
+            passive_closes=pending_passive_close_evidence(state),
             exchange_truth=truth,
             prior_recovery_block_reason=_get(state, "recovery_blocked_reason"),
             recovery_work_items=tuple(ledger.work_items),
