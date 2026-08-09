@@ -332,6 +332,7 @@ def replay_journal_records(
         "entry.opened", "entry.pending_registered",
         "exit.closed", "exit.partial_closed", "exit.reconciled",
         "exit.billing_evidence_unavailable",
+        "exit.billing_evidence_debt_registered",
         "exit.billing_evidence_pending",
         "exit.reconciliation_abandoned",
         "exit.pending_close_registered",
@@ -438,7 +439,10 @@ def replay_journal_records(
                 if pid:
                     _close_to_position[cid] = pid
 
-        elif kind == "exit.pending_close_reconciliation_registered":
+        elif kind in (
+            "exit.pending_close_reconciliation_registered",
+            "exit.billing_evidence_debt_registered",
+        ):
             reconciliation = payload.get("reconciliation")
             pid = (
                 reconciliation.get("position_id")

@@ -226,6 +226,30 @@ class TestQuickFlatObservability:
         assert summary["quick_flat_count"] == 0
         assert summary["quick_flat_unreconciled_billing_count"] == 1
 
+    def test_billing_evidence_debt_is_counted_without_becoming_a_terminal_close(self):
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "entry.opened",
+                "payload": {"position_id": "p1", "symbol": "BTCUSDT"},
+            },
+            {
+                "ts_ms": 1500,
+                "kind": "exit.billing_evidence_debt_registered",
+                "payload": {"position_id": "p1"},
+            },
+            {
+                "ts_ms": 2500,
+                "kind": "exit.billing_evidence_debt_registered",
+                "payload": {"position_id": "p1"},
+            },
+        ]
+
+        summary = summarize_quick_flat_events(records, quick_flat_window_ms=60_000)
+
+        assert summary["quick_flat_count"] == 0
+        assert summary["quick_flat_unreconciled_billing_count"] == 1
+
     def test_terminal_billing_evidence_gap_is_physical_terminal_but_not_financially_reconciled(self):
         records = [
             {

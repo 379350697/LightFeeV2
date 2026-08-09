@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from lightfee.engine.recovery_decision_core import (
+    RecoveryEvidenceSnapshot,
+    V1RecoveryDecisionCore,
+)
 from lightfee.engine.recovery_ledger import RecoveryLedger, RecoveryWorkItem
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 
@@ -317,6 +321,103 @@ def test_flat_no_local_work_unavailable_truth_is_nonblocking_evidence_gap():
     assert [item.kind for item in ledger.work_items] == ["ambiguous_exchange_truth"]
     assert ledger.work_items[0].blocking is False
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
+
+
+def test_close_reconciliation_is_visible_background_work_without_global_entry_block():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-billing-debt",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "reconciliation_status": "evidence_debt",
+                    "evidence_debt_reason": "missing_close_order_identity",
+                }
+            ]
+        },
+        exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+    )
+
+    assert [item.kind for item in ledger.work_items] == [
+        "pending_close_reconciliation"
+    ]
+    item = ledger.work_items[0]
+    assert item.owner is not None
+    assert item.owner.owner_type == "close_reconciliation"
+    assert item.owner.owner_id == "pos-billing-debt"
+    assert item.decision.outcome == "background_accounting_reconciliation"
+    assert item.blocking is False
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="HOMEUSDT")) is True
+
+
+def test_live_artifact_overrides_background_close_reconciliation():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-billing-debt",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                }
+            ]
+        },
+        exchange_truth={
+            "truth_available": True,
+            "positions": [
+                {
+                    "venue": "okx",
+                    "symbol": "HOME-USDT-SWAP",
+                    "side": "buy",
+                    "quantity": 3.0,
+                }
+            ],
+            "open_orders": [],
+        },
+    )
+
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_available": True,
+                "positions": [
+                    {
+                        "venue": "okx",
+                        "symbol": "HOME-USDT-SWAP",
+                        "side": "buy",
+                        "quantity": 3.0,
+                    }
+                ],
+                "open_orders": [],
+            },
+            recovery_work_items=tuple(ledger.work_items),
+        )
+    )
+
+    assert any(item.kind == "pending_close_reconciliation" for item in ledger.work_items)
+    assert any(item.kind == "unpaired_live_position" for item in ledger.work_items)
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "unpaired_live_position"
+
+
+def test_compact_close_reconciliation_count_keeps_distinct_background_owners():
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"pending_close_reconciliation_count": 2},
+        exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+    )
+
+    items = [
+        item
+        for item in ledger.work_items
+        if item.kind == "pending_close_reconciliation"
+    ]
+    assert [item.owner.owner_id for item in items if item.owner is not None] == [
+        "compact-0",
+        "compact-1",
+    ]
+    assert all(item.blocking is False for item in items)
 
 
 def test_local_work_unavailable_truth_remains_blocking():

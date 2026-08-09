@@ -160,10 +160,10 @@ class TestAckTruthGapRouting:
 
 
 class TestBillingEvidenceIdentityGap:
-    """A flat close without order identity stays on the billing queue."""
+    """A close without durable identity becomes a persistent evidence debt."""
 
     @pytest.mark.asyncio
-    async def test_missing_identity_is_retained_fail_closed(self):
+    async def test_missing_identity_is_classified_once_and_retained_fail_closed(self):
         from lightfee.engine.close_runtime import CloseRuntime
 
         ctx = _ctx()
@@ -194,13 +194,24 @@ class TestBillingEvidenceIdentityGap:
         await cr._process_pending_close_reconciliations(2000000)
 
         assert len(ctx.state.pending_close_reconciliations) == 1
-        kinds = [
-            str(call.args[0])
-            for call in ctx.journal.append.call_args_list
-            if call.args
+        retained = ctx.state.pending_close_reconciliations[0]
+        assert retained["reconciliation_status"] == "evidence_debt"
+        assert retained["evidence_debt_reason"] == "missing_close_order_identity"
+        assert retained["next_attempt_ms"] == 0
+        debt_events = [
+            call for call in ctx.journal.append_critical.call_args_list
+            if call.args and call.args[1] == "exit.billing_evidence_debt_registered"
         ]
-        assert "exit.billing_evidence_pending" in kinds
-        assert "reconciliation.pending_close_reconciliation_invalid" not in kinds
+        assert len(debt_events) == 1
+        assert debt_events[0].args[2]["operator_action"] == (
+            "supply_typed_snapshot_and_close_leg_identity"
+        )
+
+        await cr._process_pending_close_reconciliations(2000001)
+        assert len([
+            call for call in ctx.journal.append_critical.call_args_list
+            if call.args and call.args[1] == "exit.billing_evidence_debt_registered"
+        ]) == 1
 
     @pytest.mark.asyncio
     async def test_malformed_reconciliation_timestamps_are_retained_fail_closed(self):
@@ -228,8 +239,8 @@ class TestBillingEvidenceIdentityGap:
 
         assert len(ctx.state.pending_close_reconciliations) == 1
         assert any(
-            call.args and call.args[0] == "exit.billing_evidence_pending"
-            for call in ctx.journal.append.call_args_list
+            call.args and call.args[1] == "exit.billing_evidence_debt_registered"
+            for call in ctx.journal.append_critical.call_args_list
         )
 
     @pytest.mark.asyncio
@@ -262,22 +273,49 @@ class TestBillingEvidenceIdentityGap:
         await cr._process_pending_close_reconciliations(2000000)
 
         retained = ctx.state.pending_close_reconciliations[0]
-        assert retained["reconciliation_mode"] == (
-            "venue_execution_history_required"
-        )
+        assert retained["reconciliation_status"] == "evidence_debt"
+        assert retained["evidence_debt_reason"] == "missing_close_order_identity"
         assert retained["missing_close_order_identity"] is True
         assert retained["billing_reconciliation_required"] is True
         assert any(
             call.args
-            and call.args[0] == "exit.billing_evidence_pending"
-            and call.args[1]["missing_identity_legs"] == ["short"]
-            and call.args[1]["decision"] == "migrated_legacy_queue_fail_closed"
-            for call in ctx.journal.append.call_args_list
+            and call.args[1] == "exit.billing_evidence_debt_registered"
+            and call.args[2]["terminal_reason"] == "missing_close_order_identity"
+            and call.args[2]["short_leg_count"] == 0
+            for call in ctx.journal.append_critical.call_args_list
         )
         assert not any(
             call.args and call.args[0] == "exit.billing_evidence_unavailable"
             for call in ctx.journal.append.call_args_list
         )
+
+    @pytest.mark.asyncio
+    async def test_missing_venue_is_evidence_debt_without_exchange_retry(self):
+        from lightfee.engine.close_runtime import CloseRuntime
+
+        ctx = _ctx()
+        ctx.state.pending_close_reconciliations = [{
+            "position_id": "entry-missing-venue",
+            "symbol": "BTCUSDT",
+            "kind": "final",
+            "closed_at_ms": 1000000,
+            "position_snapshot": {
+                "position_id": "entry-missing-venue",
+                "symbol": "BTCUSDT",
+                "long_venue": "bybit",
+                "matched_quantity": 1.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+        }]
+        cr = CloseRuntime(ctx)
+
+        await cr._process_pending_close_reconciliations(2_000_000)
+
+        retained = ctx.state.pending_close_reconciliations[0]
+        assert retained["reconciliation_status"] == "evidence_debt"
+        assert retained["evidence_debt_reason"] == "missing_position_snapshot_venues"
+        assert ctx._fetch_close_leg_reconciliations is None
 
     def test_pending_close_reconciliation_registration_replays_full_queue(self):
         from lightfee.engine.recovery import _apply_journal_replay_to_state
@@ -363,6 +401,55 @@ class TestBillingEvidenceIdentityGap:
         assert legacy_replayed["pending_close_reconciliation_ids"] == [
             reconciliation["position_id"]
         ]
+
+    def test_evidence_debt_replay_overrides_old_registration_and_accepts_stronger_task(self):
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.engine.state import EngineState
+
+        raw = {
+            "position_id": "entry-evidence-debt-replay",
+            "symbol": "BTCUSDT",
+            "long_venue": "bybit",
+            "short_venue": "okx",
+            "kind": "final",
+            "long_legs": [{"order_id": "long-close"}],
+            "short_legs": [{"order_id": "short-close"}],
+        }
+        debt = {
+            **raw,
+            "reconciliation_status": "evidence_debt",
+            "evidence_debt_reason": "missing_position_snapshot",
+            "evidence_debt_at_ms": 1000,
+        }
+        records = [
+            {
+                "kind": "exit.pending_close_reconciliation_registered",
+                "ts_ms": 900,
+                "payload": {"reconciliation": raw},
+            },
+            {
+                "kind": "exit.billing_evidence_debt_registered",
+                "ts_ms": 1000,
+                "payload": {"reconciliation": debt},
+            },
+        ]
+        restored = EngineState()
+        _apply_journal_replay_to_state(restored, records)
+        assert restored.pending_close_reconciliations == [debt]
+
+        restored.enqueue_pending_close_reconciliation({
+            **raw,
+            "position_snapshot": {
+                "position_id": raw["position_id"],
+                "symbol": raw["symbol"],
+                "long_venue": raw["long_venue"],
+                "short_venue": raw["short_venue"],
+                "matched_quantity": 1.0,
+            },
+        })
+        assert restored.pending_close_reconciliations[0].get(
+            "reconciliation_status"
+        ) is None
 
     @pytest.mark.asyncio
     async def test_confirmed_execution_fill_resolves_no_billing(self):
@@ -594,6 +681,28 @@ class TestDiagnoseReconciliationGate:
         assert "pending_close_reconciliations_not_empty" in r["blocking_reasons"]
         assert r["pending_close_reconciliation_total"] == 2
         assert r["pending_close_reconciliation_ack_truth_gap"] == 2
+
+    def test_compact_reconciliation_count_blocks_when_summary_is_absent(self):
+        from scripts import diagnose_live as dl
+
+        s = _dg_state(pending_close_reconciliation_count=1)
+        r = dl._build_production_acceptance_gate([], s, {"available": True, "venues": {}})
+        assert "local_pending_entries_or_closes_present" in r["blocking_reasons"]
+        assert "pending_close_reconciliations_not_empty" in r["blocking_reasons"]
+        assert r["pending_close_reconciliation_total"] == 1
+
+    def test_mixed_snapshot_sources_fail_closed(self):
+        """An empty queue must not erase a nonzero durable summary."""
+        from lightfee.engine.recovery_decision_core import pending_close_owner_counts
+
+        counts = pending_close_owner_counts({
+            "pending_close_reconciliations": [],
+            "pending_close_reconciliation_count": 0,
+            "pending_close_reconciliation_summary": {"total_count": 4},
+        })
+
+        assert counts.pending_close_reconciliation_count == 4
+        assert counts.pending_close_owner_count == 4
 
     def test_queue_empty_passes(self):
         from scripts import diagnose_live as dl

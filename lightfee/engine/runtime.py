@@ -2541,7 +2541,19 @@ class LiveRuntime:
                         self.state.operator.requested_mode
                         == GlobalRiskMode.FAIL_CLOSED
                     ),
-                    recovery_work_items=synthetic_work_items,
+                    recovery_work_items=(
+                        synthetic_work_items
+                        + tuple(
+                            RecoveryLedger.from_local_and_exchange_truth(
+                                local=self.state,
+                                exchange_truth={
+                                    "available": False,
+                                    "missing_evidence": ("bulk_position_probe",),
+                                    "venue": venue.value,
+                                },
+                            ).work_items
+                        )
+                    ),
                 )
             )
 
@@ -9556,6 +9568,12 @@ class LiveRuntime:
                 operator_fail_closed=(
                     self.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
                 ),
+                recovery_work_items=tuple(
+                    RecoveryLedger.from_local_and_exchange_truth(
+                        local=self.state,
+                        exchange_truth=None,
+                    ).work_items
+                ),
             )
         )
         self.recovery_decision = core_decision
@@ -11367,6 +11385,12 @@ class LiveRuntime:
                         operator_fail_closed=(
                             self.state.operator.requested_mode
                             == GlobalRiskMode.FAIL_CLOSED
+                        ),
+                        recovery_work_items=tuple(
+                            RecoveryLedger.from_local_and_exchange_truth(
+                                local=self.state,
+                                exchange_truth=None,
+                            ).work_items
                         ),
                     )
                 )

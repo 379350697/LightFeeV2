@@ -52,6 +52,7 @@ class RecoveryEvidenceClass(StrEnum):
     OWNED_RECOVERY_WORK = "owned_recovery_work"
     ORPHAN_LIVE_ARTIFACT = "orphan_live_artifact"
     PARTIAL_EVIDENCE_GAP = "partial_evidence_gap"
+    BACKGROUND_CLOSE_RECONCILIATION = "background_close_reconciliation"
     TRUTH_UNAVAILABLE_FOR_REQUIRED_RECOVERY = (
         "truth_unavailable_for_required_recovery"
     )
@@ -114,14 +115,25 @@ def _state_collection_or_count(
 
 @dataclass(frozen=True)
 class PendingCloseOwnerCounts:
-    """Canonical ordinary/passive close-owner projection for all surfaces."""
+    """Canonical projection of every unresolved close-work owner.
+
+    A close remains owned until either its execution is complete or its
+    accounting reconciliation is complete.  Runtime snapshots may omit the
+    full collections, so every consumer must use these counts rather than
+    reconstructing a partial view from whichever fields happen to be present.
+    """
 
     pending_close_count: int = 0
     pending_passive_close_count: int = 0
+    pending_close_reconciliation_count: int = 0
 
     @property
     def pending_close_owner_count(self) -> int:
-        return self.pending_close_count + self.pending_passive_close_count
+        return (
+            self.pending_close_count
+            + self.pending_passive_close_count
+            + self.pending_close_reconciliation_count
+        )
 
 
 def pending_passive_close_evidence(
@@ -140,15 +152,64 @@ def pending_passive_close_evidence(
     )
 
 
+def pending_close_reconciliation_evidence(
+    state: Mapping[str, Any] | Any,
+) -> tuple[Any, ...]:
+    """Return accounting-close owners from the canonical state contract.
+
+    Older compact snapshots exported only a reconciliation summary.  Treat its
+    total as the owner count when the queue and explicit count are absent, so a
+    mixed-version fleet cannot report an unresolved reconciliation as clean.
+    """
+    if isinstance(state, Mapping):
+        collection = state.get("pending_close_reconciliations")
+        count_value = state.get("pending_close_reconciliation_count")
+        summary = state.get("pending_close_reconciliation_summary")
+    else:
+        collection = getattr(state, "pending_close_reconciliations", None)
+        count_value = getattr(state, "pending_close_reconciliation_count", None)
+        summary = getattr(state, "pending_close_reconciliation_summary", None)
+
+    if isinstance(collection, Mapping):
+        materialized = tuple(collection.values())
+    elif isinstance(collection, (list, tuple, set)):
+        materialized = tuple(collection)
+    else:
+        materialized = ()
+
+    candidate_counts = [len(materialized)]
+    for value in (
+        count_value,
+        summary.get("total_count") if isinstance(summary, Mapping) else None,
+    ):
+        try:
+            candidate_counts.append(max(int(value or 0), 0))
+        except (TypeError, ValueError):
+            continue
+    count = max(candidate_counts)
+    return materialized + tuple(
+        {"source": "pending_close_reconciliation_count"}
+        for _ in range(count - len(materialized))
+    )
+
+
 def pending_close_owner_counts(
     state: Mapping[str, Any] | Any,
 ) -> PendingCloseOwnerCounts:
-    """Return the only valid ordinary + passive close-owner projection."""
+    """Return the only valid close-work owner projection.
+
+    This intentionally includes background close reconciliation.  V1 keeps
+    that work in ``recovery_work_snapshot`` even while the runtime is allowed
+    to continue operating, so reporting it as zero is a false clean state.
+    """
     return PendingCloseOwnerCounts(
         pending_close_count=len(
             _state_collection_or_count(state, "pending_closes", "pending_close_count")
         ),
         pending_passive_close_count=len(pending_passive_close_evidence(state)),
+        pending_close_reconciliation_count=len(
+            pending_close_reconciliation_evidence(state)
+        ),
     )
 
 
@@ -254,6 +315,30 @@ class V1RecoveryDecisionCore:
                 management_action=RecoveryManagementAction.MANAGE_OWNED_RECOVERY_WORK,
             )
 
+        if self._has_background_close_reconciliation(snapshot.recovery_work_items):
+            # V1 keeps close-accounting reconciliation visible in recovery work,
+            # but a physically flat position must not be treated as open-risk
+            # work.  Preserve that split centrally: diagnostics are non-clean,
+            # while entry admission remains available.
+            return RecoveryDecision(
+                kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+                evidence_class=RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION,
+                entry_allowed=True,
+                clear_previous_block=self._should_clear_evidence_gap_block(snapshot),
+                clear_reason="core_background_close_reconciliation",
+                recovery_work_items=snapshot.recovery_work_items,
+                diagnostic_severity="warning",
+                evidence_quality=(
+                    RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION.value
+                ),
+                journal_event_name="recovery.core.background_close_reconciliation",
+                maintenance_note=(
+                    "Close-accounting reconciliation remains visible as "
+                    "background work; no live execution owner requires an "
+                    "entry block."
+                ),
+            )
+
         if not truth_available or self._has_partial_evidence_gap(snapshot.exchange_truth):
             # A probe gap is not recovery work by itself. It becomes blocking only
             # when existing local work or a concrete live artifact requires truth
@@ -340,6 +425,14 @@ class V1RecoveryDecisionCore:
             if bool(_get(item, "blocking", True)):
                 return True
         return False
+
+    def _has_background_close_reconciliation(self, work_items: Any) -> bool:
+        return any(
+            str(_get(item, "kind", "") or "")
+            == "pending_close_reconciliation"
+            and not _bool(_get(item, "blocking", True))
+            for item in _as_items(work_items)
+        )
 
     def _has_truth_required_recovery_work_item(self, work_items: Any) -> bool:
         for item in _as_items(work_items):

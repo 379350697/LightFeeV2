@@ -256,6 +256,26 @@ class TestLifecycle:
         assert decision.entry_allowed is True
         assert decision.clear_previous_block is True
 
+    def test_core_keeps_close_reconciliation_visible_without_global_entry_block(self):
+        decision = V1RecoveryDecisionCore().decide(
+            RecoveryEvidenceSnapshot(
+                exchange_truth={"available": True, "positions": [], "open_orders": []},
+                recovery_work_items=(
+                    {
+                        "kind": "pending_close_reconciliation",
+                        "blocking": False,
+                    },
+                ),
+            )
+        )
+
+        assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+        assert decision.evidence_class == RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION
+        assert decision.evidence_quality == "background_close_reconciliation"
+        assert decision.entry_allowed is True
+        assert decision.block_reason is None
+        assert decision.clear_reason == "core_background_close_reconciliation"
+
 
 class TestRecovery:
     def test_empty_snapshot_starts_running(self):

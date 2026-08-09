@@ -9,6 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from lightfee.engine.recovery_decision_core import (
+    pending_close_reconciliation_evidence,
+)
 from lightfee.venues.specs import canonical_symbol_from_venue
 
 EPSILON = 1e-9
@@ -114,6 +117,9 @@ class RecoveryLedger:
         local_pending_entries = list(_local_collection(local, "pending_entries"))
         local_residuals = list(_local_collection(local, "pending_residual_repairs"))
         local_passive_closes = list(_local_collection(local, "pending_passive_closes"))
+        local_close_reconciliations = list(
+            pending_close_reconciliation_evidence(local)
+        )
         local_fill_evidence = list(_local_collection(local, "fill_evidence"))
 
         if not truth_available:
@@ -436,6 +442,48 @@ class RecoveryLedger:
                         reason="passive_close_requires_recovery",
                     ),
                     blocking=True,
+                )
+            )
+
+        for index, reconciliation in enumerate(local_close_reconciliations):
+            position_id = str(
+                _get(
+                    reconciliation,
+                    "position_id",
+                    _get(reconciliation, "close_id", ""),
+                )
+                or ""
+            )
+            owner_id = position_id or f"compact-{index}"
+            add_work(
+                RecoveryWorkItem(
+                    kind="pending_close_reconciliation",
+                    symbol=_symbol(reconciliation),
+                    venues=frozenset(
+                        filter(None, _venues_from_close(reconciliation))
+                    ),
+                    owner=RecoveryOwner(
+                        owner_type="close_reconciliation",
+                        owner_id=owner_id,
+                        confidence="proven" if position_id else "inferred",
+                        evidence={
+                            "source": "local_pending_close_reconciliation",
+                            "reconciliation_status": str(
+                                _get(reconciliation, "reconciliation_status", "")
+                                or ""
+                            ),
+                            "evidence_debt_reason": str(
+                                _get(reconciliation, "evidence_debt_reason", "")
+                                or ""
+                            ),
+                        },
+                    ),
+                    decision=RecoveryDecision(
+                        outcome="background_accounting_reconciliation",
+                        reason="close_reconciliation_requires_accounting_evidence",
+                        blocking=False,
+                    ),
+                    blocking=False,
                 )
             )
 

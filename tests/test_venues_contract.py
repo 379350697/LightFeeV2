@@ -538,6 +538,63 @@ class TestAsterOrderRequestShape:
         finally:
             await adapter.shutdown()
 
+    @pytest.mark.asyncio
+    async def test_private_order_rejection_records_http_and_rule_evidence(self):
+        from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/fapi/v1/exchangeInfo":
+                return httpx.Response(200, json={
+                    "symbols": [{
+                        "symbol": "BTCUSDT",
+                        "filters": [
+                            {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                            {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                            {"filterType": "MIN_NOTIONAL", "notional": "5"},
+                        ],
+                    }],
+                })
+            assert request.url.path == "/fapi/v3/order"
+            return httpx.Response(400, json={"code": -3007, "msg": "fixture reject"})
+
+        mock = httpx.MockTransport(handler)
+        cred = LiveCredential(
+            api_secret=ASTER_FIXTURE_PRIVATE_KEY,
+            account_address=ASTER_FIXTURE_ACCOUNT_ADDRESS,
+        )
+        adapter = AsterAdapter(mode="live", credential=cred)
+        assert adapter._private is not None
+        adapter._transport._client = httpx.AsyncClient(transport=mock)
+        adapter._private._client = httpx.AsyncClient(transport=mock)
+        adapter._private._owns_client = True
+        get_symbol_rules_cache().clear()
+
+        try:
+            request = OrderRequest(
+                venue=Venue.ASTER,
+                symbol="BTCUSDT",
+                side=Side.SELL,
+                quantity=0.01,
+            )
+            with pytest.raises(OrderSubmitError):
+                await adapter.place_order(request)
+            records = adapter._transport.drain_order_diagnostics()
+            evidence = [
+                record for record in records
+                if record["kind"] == "order.private_submit_result"
+            ]
+            assert len(evidence) == 1
+            payload = evidence[0]["payload"]
+            assert payload["operation"] == "place_order"
+            assert payload["endpoint"] == "/fapi/v3/order"
+            assert payload["status_code"] == 400
+            assert "-3007" in payload["response_body"]
+            assert payload["rule_source"] == "exchangeInfo"
+            assert payload["raw_qty"] == pytest.approx(0.01)
+            assert payload["quantized_qty"] == pytest.approx(0.01)
+        finally:
+            await adapter.shutdown()
+
 
 class TestHyperliquidLiveOrderNowSupported:
     """Hyperliquid live order now works with EIP-712 signing."""

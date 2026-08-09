@@ -5338,6 +5338,18 @@ class TestV1PassiveBusinessFlowParity:
                 },
             )
         ]
+        evidence = [
+            record
+            for record in adapter._transport.drain_order_diagnostics()
+            if record["kind"] == "order.private_submit_result"
+        ]
+        assert len(evidence) == 1
+        payload = evidence[0]["payload"]
+        assert payload["operation"] == "submit_passive_order"
+        assert payload["endpoint"] == "/fapi/v3/order"
+        assert payload["status_code"] == 400
+        assert "-5018" in payload["response_body"]
+        assert payload["rule_source"] == "exchangeInfo"
         await adapter.shutdown()
 
     @pytest.mark.asyncio

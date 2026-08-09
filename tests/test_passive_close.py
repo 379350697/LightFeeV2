@@ -2636,13 +2636,26 @@ class TestFallbackResidualReal:
         assert position.position_id not in state.pending_passive_closes
         assert position.position_id not in state.open_positions
 
-    def test_live_flat_force_close_problem_keeps_close_reconciliation_work(self):
+    def test_live_flat_force_close_problem_keeps_close_reconciliation_work(
+        self, monkeypatch
+    ):
         """V1: lifecycle can clear flat while fill/PnL reconciliation continues."""
+        from lightfee.engine.recovery_decision_core import RecoveryEvidenceClass
+
         journal = _open_journal()
         executor = PassiveCloseExecutor(
             {},
             journal,
             config_overrides={"runtime_mode": "live"},
+        )
+        captured_decisions = []
+
+        def capture_core_decision(_state, decision, **_kwargs):
+            captured_decisions.append(decision)
+
+        monkeypatch.setattr(
+            "lightfee.engine.passive_close.clear_legacy_recovery_block_via_core",
+            capture_core_decision,
         )
 
         state = EngineState()
@@ -2703,6 +2716,10 @@ class TestFallbackResidualReal:
             "average_price": 0.0,
             "fee_quote": 0.0,
         }]
+        assert captured_decisions[-1].evidence_class == (
+            RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION
+        )
+        assert captured_decisions[-1].entry_allowed is True
 
     def test_restart_retains_close_order_identity_for_live_flat_reconciliation(self):
         """A recovered passive close must keep proven IDs for billing reconciliation."""

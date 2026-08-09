@@ -456,6 +456,33 @@ class TestProjectionWriter:
         ).fetchall()
         assert pnl == []
 
+    def test_projects_billing_evidence_debt_without_marking_position_terminal(self):
+        _td, store, conn = self._open_store()
+        records = [
+            _make_record(
+                1,
+                "exit.billing_evidence_debt_registered",
+                ts_ms=2000,
+                position_id="pos-billing-debt",
+                symbol="HOMEUSDT",
+                reconciliation_status="evidence_debt",
+                evidence_debt_reason="missing_close_order_identity",
+            )
+        ]
+
+        result = ProjectionWriter(store).project_records(conn, records)
+
+        assert result == {"appended": 1, "skipped": 0, "failed": 0}
+        facts = store.query_entry_exit_facts(conn)
+        assert [fact["kind"] for fact in facts] == [
+            "exit.billing_evidence_debt_registered"
+        ]
+        position = conn.execute(
+            "SELECT state FROM position_ledger WHERE position_id = ?",
+            ("pos-billing-debt",),
+        ).fetchone()
+        assert position is None
+
     def test_projects_risk_counter_facts(self):
         _td, store, conn = self._open_store()
         records = [

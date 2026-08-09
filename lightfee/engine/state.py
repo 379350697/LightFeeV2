@@ -972,6 +972,19 @@ def _reconciliation_identity_coverage(item: Any) -> tuple[int, int]:
     return (coverage[0], coverage[1])
 
 
+def _reconciliation_snapshot_evidence(item: Any) -> int:
+    """Count typed routing facts carried by a reconciliation snapshot."""
+    if not isinstance(item, dict):
+        return 0
+    snapshot = item.get("position_snapshot")
+    if not isinstance(snapshot, dict):
+        return 0
+    return sum(
+        bool(snapshot.get(field))
+        for field in ("position_id", "symbol", "long_venue", "short_venue")
+    )
+
+
 def pending_close_reconciliation_missing_legs(
     reconciliation: dict[str, Any],
 ) -> tuple[str, ...]:
@@ -1017,6 +1030,46 @@ def pending_close_reconciliation_missing_legs(
             continue
         missing.append(leg_label)
     return tuple(missing)
+
+
+def pending_close_reconciliation_evidence_debt_reason(
+    reconciliation: Any,
+) -> str | None:
+    """Return the non-retryable evidence gap for a billing-close task.
+
+    V1 constructs reconciliation work from typed position snapshots and durable
+    close-leg identities.  A legacy V2 record without those routing facts can
+    never be repaired by another execution-history request.  It remains a
+    fail-closed accounting owner, but must be classified once as an evidence
+    debt instead of being retried forever.
+    """
+    if not isinstance(reconciliation, dict):
+        return "invalid_reconciliation_item"
+    if reconciliation.get("invalid_pending_close_reconciliation") is True:
+        return str(reconciliation.get("reason") or "invalid_reconciliation_item")
+
+    kind = str(reconciliation.get("kind") or "final")
+    if kind == "accepted_order_truth_gap":
+        # Order-truth tasks have their own one-leg contract and do not enter
+        # the billing evidence route.
+        return None
+    if kind not in {"final", "partial"}:
+        return "unsupported_reconciliation_kind"
+
+    snapshot = reconciliation.get("position_snapshot")
+    if not isinstance(snapshot, dict) or not snapshot:
+        return "missing_position_snapshot"
+    if not str(reconciliation.get("position_id") or snapshot.get("position_id") or ""):
+        return "missing_position_id"
+    if not str(reconciliation.get("symbol") or snapshot.get("symbol") or ""):
+        return "missing_symbol"
+    if not str(reconciliation.get("long_venue") or snapshot.get("long_venue") or "") or not str(
+        reconciliation.get("short_venue") or snapshot.get("short_venue") or ""
+    ):
+        return "missing_position_snapshot_venues"
+    if pending_close_reconciliation_missing_legs(reconciliation):
+        return "missing_close_order_identity"
+    return None
 
 
 def normalize_pending_close_reconciliations(raw: Any) -> list[dict[str, Any]]:
@@ -1086,6 +1139,8 @@ def _build_reconciliation_summary(queue: list[dict[str, Any]]) -> dict[str, Any]
     by_kind: dict[str, int] = {}
     backed_off = 0
     unknown_status = 0
+    evidence_debt_count = 0
+    evidence_debt_by_reason: dict[str, int] = {}
     for item in queue:
         if not isinstance(item, dict):
             unknown_status += 1
@@ -1094,12 +1149,25 @@ def _build_reconciliation_summary(queue: list[dict[str, Any]]) -> dict[str, Any]
         by_kind[kind] = by_kind.get(kind, 0) + 1
         if _reconciliation_int(item.get("next_attempt_ms")) > 0:
             backed_off += 1
+        if item.get("reconciliation_status") == "evidence_debt":
+            evidence_debt_count += 1
+            reason = str(item.get("evidence_debt_reason") or "unknown")
+            evidence_debt_by_reason[reason] = (
+                evidence_debt_by_reason.get(reason, 0) + 1
+            )
     return {
         "total_count": total,
         "by_kind": by_kind,
         "backed_off_count": backed_off,
         "unknown_status_count": unknown_status,
+        "evidence_debt_count": evidence_debt_count,
+        "evidence_debt_by_reason": evidence_debt_by_reason,
     }
+
+
+def pending_close_reconciliation_summary(raw: Any) -> dict[str, Any]:
+    """Build the public reconciliation summary from any persisted queue form."""
+    return _build_reconciliation_summary(normalize_pending_close_reconciliations(raw))
 
 
 @dataclass
@@ -1185,10 +1253,24 @@ class EngineState:
                     != "venue_execution_history_required"
                     and identity_evidence_not_weaker
                 )
+                stronger_snapshot_evidence = (
+                    _reconciliation_snapshot_evidence(item)
+                    > _reconciliation_snapshot_evidence(existing)
+                )
+                replaces_evidence_debt = (
+                    existing.get("reconciliation_status") == "evidence_debt"
+                    and item.get("reconciliation_status") != "evidence_debt"
+                    and identity_evidence_not_weaker
+                    and stronger_snapshot_evidence
+                )
+                records_evidence_debt = (
+                    item.get("reconciliation_status") == "evidence_debt"
+                    and existing.get("reconciliation_status") != "evidence_debt"
+                )
                 if (
                     candidate_keys != existing_keys
                     and identity_evidence_not_weaker
-                ) or stronger_mode:
+                ) or stronger_mode or replaces_evidence_debt or records_evidence_debt:
                     index = self.pending_close_reconciliations.index(existing)
                     self.pending_close_reconciliations[index] = dict(item)
                 return
@@ -1219,6 +1301,9 @@ class EngineState:
         return len(self.pending_close_reconciliations) != before
 
     def to_dict(self) -> dict:
+        pending_close_reconciliations = normalize_pending_close_reconciliations(
+            self.pending_close_reconciliations
+        )
         return {
             "lifecycle": self.lifecycle.value,
             "risk_mode": self.risk_mode.value,
@@ -1230,6 +1315,7 @@ class EngineState:
             "pending_entry_count": len(self.pending_entries),
             "pending_close_count": len(self.pending_closes),
             "pending_passive_close_count": len(self.pending_passive_closes),
+            "pending_close_reconciliation_count": len(pending_close_reconciliations),
             "global_risk_reason": self.global_risk_reason,
             "hyperliquid_trading_disabled_reason": self.hyperliquid_trading_disabled_reason,
             "recovery_blocked_reason": self.recovery_blocked_reason,
@@ -1240,11 +1326,9 @@ class EngineState:
             "venue_market_data_degradations": self.venue_market_data_degradations,
             "transfer_truth": self.transfer_truth,
             "entry_liquidity_qualification_records": self.entry_liquidity_qualification_records,
-            "pending_close_reconciliations": normalize_pending_close_reconciliations(
-                self.pending_close_reconciliations
-            ),
-            "pending_close_reconciliation_summary": _build_reconciliation_summary(
-                self.pending_close_reconciliations
+            "pending_close_reconciliations": pending_close_reconciliations,
+            "pending_close_reconciliation_summary": (
+                pending_close_reconciliation_summary(pending_close_reconciliations)
             ),
             "last_scan": self.last_scan,
             "runtime_progress": dict(self.runtime_progress or {}),

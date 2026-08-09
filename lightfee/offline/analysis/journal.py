@@ -185,6 +185,7 @@ def summarize_quick_flat_events(
         is_unreconciled_billing = (
             kind == "exit.billing_unreconciled"
             or kind == "exit.billing_evidence_unavailable"
+            or kind == "exit.billing_evidence_debt_registered"
             or (
                 kind == "exit.reconciled"
                 and payload.get("venue_statement_reconciled") is not True

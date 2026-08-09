@@ -87,6 +87,7 @@ PROJECTED_ENTRY_EXIT_KINDS: frozenset[str] = frozenset({
     "exit.reconciled",
     "exit.billing_unreconciled",
     "exit.billing_evidence_unavailable",
+    "exit.billing_evidence_debt_registered",
     "exit.retry_wait",
 })
 

@@ -83,6 +83,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.v1_lifecycle_closure import (
     build_v1_lifecycle_closure_table,
     closure_event_fields,
@@ -5025,6 +5026,12 @@ class PassiveCloseExecutor:
                     operator_fail_closed=(
                         getattr(state.operator, "requested_mode", None)
                         == GlobalRiskMode.FAIL_CLOSED
+                    ),
+                    recovery_work_items=tuple(
+                        RecoveryLedger.from_local_and_exchange_truth(
+                            local=state,
+                            exchange_truth=exchange_truth,
+                        ).work_items
                     ),
                 )
             )

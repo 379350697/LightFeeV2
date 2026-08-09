@@ -9,6 +9,7 @@ from lightfee.engine.recovery_decision_core import (
     pending_close_owner_counts,
     pending_passive_close_evidence,
 )
+from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.ops.position_side_semantics import side_matches_business_leg
@@ -528,6 +529,9 @@ def analyze_current_state(
     pending_close_owners = pending_close_owner_counts(state)
     pending_closes = pending_close_owners.pending_close_count
     pending_passive_closes = pending_close_owners.pending_passive_close_count
+    pending_close_reconciliations = (
+        pending_close_owners.pending_close_reconciliation_count
+    )
     pending_close_owner_count = pending_close_owners.pending_close_owner_count
     pending_residual_repairs = int(state.get("pending_residual_repair_count") or 0)
     clean = (
@@ -685,6 +689,7 @@ def analyze_current_state(
             "pending_entry_count": pending_entries,
             "pending_close_count": pending_closes,
             "pending_passive_close_count": pending_passive_closes,
+            "pending_close_reconciliation_count": pending_close_reconciliations,
             "pending_close_owner_count": pending_close_owner_count,
             "pending_residual_repair_count": pending_residual_repairs,
             "last_scan_age_ms": last_scan_age_ms,
@@ -736,6 +741,14 @@ def _recovery_decision_payload(
     state: dict[str, Any],
     exchange_truth: Any,
 ) -> dict[str, Any]:
+    truth = exchange_truth if isinstance(exchange_truth, dict) else None
+    events = _state_journal_events(state)
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(state, events)
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=state,
+        exchange_truth=truth,
+        owner_index=owner_index,
+    )
     decision = V1RecoveryDecisionCore().decide(
         RecoveryEvidenceSnapshot(
             local_open_positions=_state_collection_or_count(
@@ -748,8 +761,9 @@ def _recovery_decision_payload(
                 state, "pending_residual_repairs", "pending_residual_repair_count"
             ),
             passive_closes=pending_passive_close_evidence(state),
-            exchange_truth=exchange_truth if isinstance(exchange_truth, dict) else None,
+            exchange_truth=truth,
             prior_recovery_block_reason=state.get("recovery_blocked_reason"),
+            recovery_work_items=tuple(ledger.work_items),
         )
     )
     return {

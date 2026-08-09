@@ -16,7 +16,7 @@ from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
-from lightfee.engine.state import pending_close_reconciliation_missing_legs
+from lightfee.engine.state import pending_close_reconciliation_evidence_debt_reason
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -433,6 +433,78 @@ class CloseRuntime:
                 "short_venue": short_venue.value,
                 "long_live_size": long_live_size,
                 "short_live_size": short_live_size,
+            },
+        )
+        return True
+
+    def _mark_pending_close_reconciliation_evidence_debt(
+        self,
+        reconciliation: dict[str, Any],
+        *,
+        reason: str,
+        now_ms: int,
+        symbol: str = "",
+        long_venue: Venue | None = None,
+        short_venue: Venue | None = None,
+    ) -> bool:
+        """Persist one non-retryable close-accounting evidence debt.
+
+        A task without its typed position routing or close-order identity cannot
+        gain that fact by polling execution history again.  Keep it as a
+        visible close-work owner, but transition it out of the retry loop once.
+        The journal includes the full task so a crash before the next snapshot
+        preserves the state transition during recovery.
+        """
+        if reconciliation.get("reconciliation_status") == "evidence_debt":
+            return False
+
+        snapshot = reconciliation.get("position_snapshot") or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        resolved_symbol = str(symbol or reconciliation.get("symbol") or snapshot.get("symbol") or "")
+        reconciliation["reconciliation_status"] = "evidence_debt"
+        reconciliation["evidence_debt_reason"] = reason
+        reconciliation["evidence_debt_at_ms"] = now_ms
+        reconciliation["next_attempt_ms"] = 0
+        reconciliation["billing_reconciliation_required"] = True
+        if reason == "missing_close_order_identity":
+            reconciliation["missing_close_order_identity"] = True
+
+        def _leg_count(name: str) -> int:
+            legs = reconciliation.get(name)
+            return len(legs) if isinstance(legs, list) else 0
+
+        self.ctx.journal.append_critical(
+            now_ms,
+            "exit.billing_evidence_debt_registered",
+            {
+                "position_id": str(
+                    reconciliation.get("position_id") or snapshot.get("position_id") or ""
+                ),
+                "symbol": resolved_symbol,
+                "kind": str(reconciliation.get("kind") or "final"),
+                "source": str(reconciliation.get("source") or ""),
+                "closed_at_ms": self._safe_reconciliation_int(
+                    reconciliation.get("closed_at_ms")
+                ),
+                "terminal_accounting_status": "evidence_debt_requires_operator",
+                "terminal_reason": reason,
+                "reconciliation_status": "evidence_debt",
+                "operator_action": "supply_typed_snapshot_and_close_leg_identity",
+                "billing_reconciliation_required": True,
+                "long_venue": (
+                    long_venue.value
+                    if long_venue is not None
+                    else str(reconciliation.get("long_venue") or snapshot.get("long_venue") or "")
+                ),
+                "short_venue": (
+                    short_venue.value
+                    if short_venue is not None
+                    else str(reconciliation.get("short_venue") or snapshot.get("short_venue") or "")
+                ),
+                "long_leg_count": _leg_count("long_legs"),
+                "short_leg_count": _leg_count("short_legs"),
+                "reconciliation": dict(reconciliation),
             },
         )
         return True
@@ -1140,6 +1212,7 @@ class CloseRuntime:
 
         retained: list[Any] = []
         eligible: list[dict[str, Any]] = []
+        changed = False
         current_cycle = self._safe_reconciliation_int(
             getattr(self.ctx.state, "tick_count", 0)
         )
@@ -1147,6 +1220,24 @@ class CloseRuntime:
             if not isinstance(reconciliation, dict):
                 retained.append(reconciliation)
                 continue
+            if reconciliation.get("reconciliation_status") == "evidence_debt":
+                retained.append(reconciliation)
+                continue
+            if str(reconciliation.get("kind") or "final") != "accepted_order_truth_gap":
+                evidence_debt_reason = (
+                    pending_close_reconciliation_evidence_debt_reason(reconciliation)
+                )
+                if evidence_debt_reason is not None:
+                    changed = (
+                        self._mark_pending_close_reconciliation_evidence_debt(
+                            reconciliation,
+                            reason=evidence_debt_reason,
+                            now_ms=now_ms,
+                        )
+                        or changed
+                    )
+                    retained.append(reconciliation)
+                    continue
             created_cycle = self._safe_reconciliation_int(
                 reconciliation.get("created_cycle")
             )
@@ -1174,8 +1265,6 @@ class CloseRuntime:
                 order_truth_eligible.append(reconciliation)
             else:
                 billing_eligible.append(reconciliation)
-
-        changed = False
 
         # -- Order-truth resolution (no billing) ---------------------------
         for reconciliation in sorted(
@@ -1205,6 +1294,9 @@ class CloseRuntime:
                 str(item.get("position_id") or ""),
             ),
         ):
+            if reconciliation.get("reconciliation_status") == "evidence_debt":
+                retained.append(reconciliation)
+                continue
             snapshot = reconciliation.get("position_snapshot") or {}
             if not isinstance(snapshot, dict):
                 snapshot = {}
@@ -1215,17 +1307,15 @@ class CloseRuntime:
                 reconciliation.get("short_venue") or snapshot.get("short_venue")
             )
             if long_venue is None or short_venue is None:
-                self.ctx.journal.append(
-                    "reconciliation.pending_close_reconciliation_invalid",
-                    {
-                        "position_id": reconciliation.get("position_id", ""),
-                        "symbol": reconciliation.get("symbol", ""),
-                        "reason": "missing_position_snapshot_venues",
-                    },
+                changed = (
+                    self._mark_pending_close_reconciliation_evidence_debt(
+                        reconciliation,
+                        reason="invalid_position_snapshot_venues",
+                        now_ms=now_ms,
+                    )
+                    or changed
                 )
-                self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
                 retained.append(reconciliation)
-                changed = True
                 continue
 
             symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
@@ -1237,97 +1327,19 @@ class CloseRuntime:
                     reconciliation.get("short_legs")
                 )
             )
-            missing_identity_legs = pending_close_reconciliation_missing_legs(
-                reconciliation
-            )
-            if (
-                not missing_identity_legs
-                and not has_leg_identity
-                and reconciliation.get("reconciliation_mode")
-                == "venue_execution_history_required"
-            ):
-                missing_identity_legs = ("long", "short")
-            if missing_identity_legs:
-                # A missing identity on either expected close leg is an
-                # accounting gap.  Do not let one venue's fill evidence make
-                # the other venue's unknown execution look terminal.
-                migrated = (
-                    reconciliation.get("reconciliation_mode")
-                    != "venue_execution_history_required"
-                )
-                reconciliation["reconciliation_mode"] = (
-                    "venue_execution_history_required"
-                )
-                reconciliation["missing_close_order_identity"] = True
-                reconciliation["billing_reconciliation_required"] = True
-                attempt = self._safe_reconciliation_int(
-                    reconciliation.get("attempt_count")
-                ) + 1
-                expected_long_quantity = self._safe_reconciliation_float(
-                    snapshot.get("long_quantity")
-                    if "long_quantity" in snapshot
-                    else snapshot.get("matched_quantity")
-                )
-                expected_short_quantity = self._safe_reconciliation_float(
-                    snapshot.get("short_quantity")
-                    if "short_quantity" in snapshot
-                    else snapshot.get("matched_quantity")
-                )
-                self.ctx.journal.append(
-                    "exit.billing_evidence_pending",
-                    {
-                        "position_id": reconciliation.get("position_id", ""),
-                        "symbol": symbol,
-                        "kind": reconciliation.get("kind", "final"),
-                        "source": reconciliation.get("source", ""),
-                        "long_venue": long_venue.value,
-                        "short_venue": short_venue.value,
-                        "long_leg_count": (
-                            len(reconciliation.get("long_legs"))
-                            if isinstance(reconciliation.get("long_legs"), list)
-                            else 0
-                        ),
-                        "short_leg_count": (
-                            len(reconciliation.get("short_legs"))
-                            if isinstance(reconciliation.get("short_legs"), list)
-                            else 0
-                        ),
-                        "missing_identity_legs": list(missing_identity_legs),
-                        "attempt_count": attempt,
-                        "closed_at_ms": self._safe_reconciliation_int(
-                            reconciliation.get("closed_at_ms")
-                        ),
-                        "expected_long_quantity": expected_long_quantity,
-                        "expected_short_quantity": expected_short_quantity,
-                        "missing_close_order_identity": True,
-                        "billing_reconciliation_required": True,
-                        "next_action": "venue_execution_history_required",
-                        "decision": (
-                            "migrated_legacy_queue_fail_closed"
-                            if migrated
-                            else "retain_pending_fail_closed"
-                        ),
-                    },
-                )
-                self._call_apply_pending_close_reconciliation_backoff(
-                    reconciliation, now_ms
-                )
-                retained.append(reconciliation)
-                changed = True
-                continue
-
             if not has_leg_identity:
-                self.ctx.journal.append(
-                    "reconciliation.pending_close_reconciliation_invalid",
-                    {
-                        "position_id": reconciliation.get("position_id", ""),
-                        "symbol": symbol,
-                        "reason": "missing_order_identity",
-                    },
+                changed = (
+                    self._mark_pending_close_reconciliation_evidence_debt(
+                        reconciliation,
+                        reason="missing_close_order_identity",
+                        now_ms=now_ms,
+                        symbol=symbol,
+                        long_venue=long_venue,
+                        short_venue=short_venue,
+                    )
+                    or changed
                 )
-                self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
                 retained.append(reconciliation)
-                changed = True
                 continue
 
             long_fills = await self._call_fetch_close_leg_reconciliations(
@@ -1380,7 +1392,7 @@ class CloseRuntime:
                     {
                         "position_id": reconciliation.get("position_id", ""),
                         "symbol": symbol,
-                        "reason": "missing_order_identity",
+                        "reason": "close_order_lookup_returned_no_fill",
                     },
                 )
                 self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)

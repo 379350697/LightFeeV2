@@ -1040,12 +1040,11 @@ async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_que
     )
     records = tmp_journal.read_all()
     assert [record["kind"] for record in records].count(
-        "exit.billing_evidence_pending"
+        "exit.billing_evidence_debt_registered"
     ) == 1
     retained = runtime.state.pending_close_reconciliations[0]
-    assert retained["reconciliation_mode"] == (
-        "venue_execution_history_required"
-    )
+    assert retained["reconciliation_status"] == "evidence_debt"
+    assert retained["evidence_debt_reason"] == "missing_close_order_identity"
     assert retained["missing_close_order_identity"] is True
 
 
@@ -1070,7 +1069,9 @@ async def test_pending_close_reconciliation_processor_retains_invalid_item_with_
     assert invalid["raw_type"] == "str"
     assert [
         record["kind"] for record in tmp_journal.read_all()
-    ].count("reconciliation.pending_close_reconciliation_invalid") == 1
+    ].count("exit.billing_evidence_debt_registered") == 1
+    assert invalid["reconciliation_status"] == "evidence_debt"
+    assert invalid["evidence_debt_reason"] == "invalid_item"
 
 
 @pytest.mark.asyncio

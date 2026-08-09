@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
-from lightfee.engine.state import EngineState
+from lightfee.engine.recovery_decision_core import pending_close_owner_counts
+from lightfee.engine.state import EngineState, pending_close_reconciliation_summary
 
 
 def metrics_export_path(config: AppConfig) -> Optional[str]:
@@ -167,6 +168,10 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
             exchange_truth=None,
             generated_at_ms=now_ms,
         ).to_dict()
+    pending_close_owners = pending_close_owner_counts(state)
+    pending_reconciliation_summary = pending_close_reconciliation_summary(
+        getattr(state, "pending_close_reconciliations", [])
+    )
 
     data = {
         "schema": "lightfee.current_state.v1",
@@ -195,6 +200,10 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
         "pending_entry_count": len(state.pending_entries),
         "pending_close_count": len(state.pending_closes),
         "pending_passive_close_count": len(state.pending_passive_closes),
+        "pending_close_reconciliation_count": (
+            pending_close_owners.pending_close_reconciliation_count
+        ),
+        "pending_close_reconciliation_summary": pending_reconciliation_summary,
         "pending_residual_repair_count": len(getattr(state, "pending_residual_repairs", []) or []),
         "pending_residual_repairs": list(getattr(state, "pending_residual_repairs", []) or []),
         "live_recovery_reduce_only_pairs": list(getattr(state, "live_recovery_reduce_only_pairs", []) or []),

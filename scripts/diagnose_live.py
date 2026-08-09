@@ -41,6 +41,7 @@ from lightfee.engine.recovery_decision_core import (
     pending_close_owner_counts,
     pending_passive_close_evidence,
 )
+from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
@@ -530,6 +531,16 @@ def _build_local_state(
             })
 
     pending_close_owners = pending_close_owner_counts(state)
+    pending_reconciliation_summary = state.get(
+        "pending_close_reconciliation_summary"
+    )
+    if not isinstance(pending_reconciliation_summary, dict):
+        pending_reconciliation_summary = {}
+    else:
+        pending_reconciliation_summary = dict(pending_reconciliation_summary)
+    pending_reconciliation_summary.setdefault(
+        "total_count", pending_close_owners.pending_close_reconciliation_count
+    )
     return {
         "lifecycle": str(state.get("lifecycle", "unknown")),
         "risk_mode": str(state.get("risk_mode", "unknown")),
@@ -539,6 +550,10 @@ def _build_local_state(
         "pending_passive_close_count": (
             pending_close_owners.pending_passive_close_count
         ),
+        "pending_close_reconciliation_count": (
+            pending_close_owners.pending_close_reconciliation_count
+        ),
+        "pending_close_reconciliation_summary": pending_reconciliation_summary,
         "pending_close_owner_count": (
             pending_close_owners.pending_close_owner_count
         ),
@@ -3879,8 +3894,8 @@ def _build_production_acceptance_gate(
     )
     pending_close_owner_count = pending_close_owners.pending_close_owner_count
     pending_reconciliation_summary = local_state.get("pending_close_reconciliation_summary") or {}
-    pending_reconciliation_total = int(
-        pending_reconciliation_summary.get("total_count", 0) or 0
+    pending_reconciliation_total = (
+        pending_close_owners.pending_close_reconciliation_count
     )
     pending_reconciliation_unknown = int(
         pending_reconciliation_summary.get("unknown_status_count", 0) or 0
@@ -4415,10 +4430,25 @@ def _v1_lifecycle_closure_payload(
     ).to_dict()
 
 
+def _state_journal_events(state: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("journal_events", "events", "recent_events"):
+        events = state.get(key)
+        if isinstance(events, list):
+            return [event for event in events if isinstance(event, dict)]
+    return []
+
+
 def _recovery_decision_payload(
     local_state: dict[str, Any],
     exchange_truth: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    events = _state_journal_events(local_state)
+    owner_index = RecoveryOwnerIndex.from_state_and_journal(local_state, events)
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=local_state,
+        exchange_truth=exchange_truth,
+        owner_index=owner_index,
+    )
     decision = V1RecoveryDecisionCore().decide(
         RecoveryEvidenceSnapshot(
             local_open_positions=_state_collection_or_count(
@@ -4433,6 +4463,7 @@ def _recovery_decision_payload(
             passive_closes=pending_passive_close_evidence(local_state),
             exchange_truth=exchange_truth,
             prior_recovery_block_reason=local_state.get("recovery_blocked_reason"),
+            recovery_work_items=tuple(ledger.work_items),
         )
     )
     return {

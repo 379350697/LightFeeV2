@@ -383,6 +383,21 @@ def test_recovery_decision_counts_compact_pending_passive_close_state():
     assert decision["block_reason"] == "truth_unavailable_for_required_recovery"
 
 
+def test_recovery_decision_marks_compact_close_reconciliation_as_background_debt():
+    from scripts.diagnose_live import _recovery_decision_payload
+
+    decision = _recovery_decision_payload(
+        {"pending_close_reconciliation_count": 1},
+        {"available": True, "positions": {}, "open_orders": {}},
+    )
+
+    assert decision["kind"] == "RUNNING_WITH_EVIDENCE_GAP"
+    assert decision["evidence_quality"] == "background_close_reconciliation"
+    assert decision["entry_allowed"] is True
+    assert decision["block_reason"] is None
+    assert decision["clear_reason"] == "core_background_close_reconciliation"
+
+
 def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
     from scripts.diagnose_live import _build_production_acceptance_gate
 

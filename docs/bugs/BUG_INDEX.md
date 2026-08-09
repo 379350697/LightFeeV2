@@ -17,6 +17,30 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+Latest close-reconciliation owner-contract and Aster V3 evidence closure,
+2026-08-09: a later read-only production check corrected CL-097's earlier
+queue conclusion. Exchange truth was flat/no-open-orders, but the full durable
+state held four COTI final reconciliation owners while the compact state
+omitted their count and summary, creating a false-green diagnose/health
+result. CL-098 makes reconciliation a first-class component of the canonical
+`pending_close_owner_count`, exports it in compact state, and keeps V1's
+background-reconciliation lifecycle semantics at every core-decision boundary:
+it is a warning/non-green acceptance state, not a global entry block, while the
+existing same-pair ledger gate remains active. Legacy tasks without typed
+routing or close-order identity now become durable, non-green `evidence_debt`
+once instead of retrying forever; they can only be replaced by stronger real
+evidence. The debt-registration event is audited without becoming a physical
+close terminal. The post-01:18 generic Aster HTTP 400 remains unproven, so both
+V3 order paths now emit a shared response/rule diagnostic rather than guessing
+a parameter fix. Local regression: `501` lifecycle/recovery/close/diagnostic,
+`311` current-state/runtime/residual, and `747` offline/venue/semantic tests
+passed. Final review found no further P0/P1: real exchange exposure and active
+recovery work still take precedence over the background accounting debt. A
+full-suite probe reached `1211 passed, 7 skipped` before intentional
+interruption in external-wait slow tests, so it is not claimed as a full-suite
+pass. Deploy verification remains required. See
+[daily/2026-08-09.md#cluster-cl-098-close-reconciliation-owner-contract-and-aster-v3-evidence](daily/2026-08-09.md#cluster-cl-098-close-reconciliation-owner-contract-and-aster-v3-evidence).
+
 Latest live-order/passive-close/owner-projection audit, 2026-08-09:
 Read-only cloud evidence proved a balanced COTI exchange position with one
 stuck passive-close owner, a repeated Bybit rejected-zero-fill evidence loop,

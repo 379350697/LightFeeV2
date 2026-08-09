@@ -268,6 +268,45 @@ class TestRecoveryLifecycleTransition:
         )
         assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
 
+    def test_close_reconciliation_is_running_background_work(self):
+        """A flat close's accounting debt is visible but not startup-owned risk."""
+        from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig
+        from lightfee.engine.recovery_decision_core import (
+            RecoveryDecisionKind,
+            RecoveryEvidenceClass,
+        )
+        from lightfee.engine.runtime import LiveRuntime
+
+        runtime = LiveRuntime(
+            AppConfig(
+                runtime=RuntimeConfig(mode="paper"),
+                strategy=StrategyConfig(),
+                persistence=PersistenceConfig(),
+            ),
+            venue_adapters=None,
+        )
+        runtime.state.lifecycle = EngineLifecycle.RECONCILING
+        runtime.state.set_pending_close_reconciliations([
+            {
+                "position_id": "entry-closed-beat",
+                "symbol": "BEATUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+                "reason": "billing_evidence_missing",
+            }
+        ])
+
+        runtime._finalize_startup_recovery()
+
+        assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+        assert runtime.recovery_decision.kind == (
+            RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+        )
+        assert runtime.recovery_decision.evidence_class == (
+            RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION
+        )
+        assert runtime.recovery_decision.entry_allowed is True
+
     def test_operator_fail_closed_clean_state_does_not_emit_runtime_running(self):
         """Core preserve policy must not be reported as startup running."""
         from lightfee.engine.runtime import LiveRuntime
@@ -388,6 +427,15 @@ class TestRecoveryLifecycleTransition:
         class ClearingPassiveClose:
             async def process_pending_passive_closes(self, state, now_ms):
                 state.pending_passive_closes.clear()
+                state.set_pending_close_reconciliations([
+                    {
+                        "position_id": "entry-closed-beat",
+                        "symbol": "BEATUSDT",
+                        "long_venue": "okx",
+                        "short_venue": "bybit",
+                        "reason": "billing_evidence_missing",
+                    }
+                ])
                 return set()
 
         config = AppConfig(
@@ -415,6 +463,10 @@ class TestRecoveryLifecycleTransition:
         await runtime._maybe_tick_passive_close(1778787000000)
 
         assert runtime.state.recovery_blocked_reason is None
+        assert runtime.recovery_decision.evidence_class == (
+            RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION
+        )
+        assert runtime.recovery_decision.entry_allowed is True
         assert runtime._gate_recovery_ledger(
             SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
         ) == (True, "")

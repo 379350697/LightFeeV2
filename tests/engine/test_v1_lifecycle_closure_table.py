@@ -52,6 +52,38 @@ def test_unavailable_truth_without_local_work_is_nonblocking_evidence_gap():
     assert payload["rows"][0]["evidence_class"] == "partial_evidence_gap"
 
 
+def test_close_reconciliation_is_visible_as_nonblocking_background_work():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-billing-debt",
+                    "symbol": "HOMEUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                    "reconciliation_status": "evidence_debt",
+                }
+            ]
+        },
+        exchange_truth=_clean_exchange_truth(),
+        generated_at_ms=1770000000000,
+    ).to_dict()
+
+    assert table["summary"]["entry_allowed"] is True
+    assert table["summary"]["recovery_block_policy"] == "warn_evidence_gap"
+    assert table["summary"]["recovery_decision_kind"] == "RUNNING_WITH_EVIDENCE_GAP"
+    row = next(
+        row
+        for row in table["rows"]
+        if row["row_key"] == "recovery_work:pending_close_reconciliation:pos-billing-debt"
+    )
+    assert row["entry_policy"] == "allow_new_risk_background_work"
+    assert row["recovery_policy"] == "background_pending_close_reconciliation"
+    assert row["details"]["blocking"] is False
+
+
 def test_orphan_non_reduce_open_order_blocks_as_v1_live_artifact():
     from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
 

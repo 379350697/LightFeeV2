@@ -121,6 +121,40 @@ class TestCurrentStateExportV1Semantics:
         finally:
             os.unlink(path)
 
+    def test_export_includes_reconciliation_close_owner_contract(self):
+        state = EngineState(
+            lifecycle=EngineLifecycle.RUNNING,
+            risk_mode=GlobalRiskMode.RUNNING,
+        )
+        state.pending_close_reconciliations = [{
+            "position_id": "entry-reconciliation-owner",
+            "symbol": "BTCUSDT",
+            "kind": "final",
+            "position_snapshot": {
+                "position_id": "entry-reconciliation-owner",
+                "symbol": "BTCUSDT",
+                "long_venue": "bybit",
+                "short_venue": "okx",
+                "matched_quantity": 1.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+            "reconciliation_status": "evidence_debt",
+            "evidence_debt_reason": "missing_close_order_identity",
+        }]
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            _export_current_state_snapshot(state, path)
+            with open(path) as f:
+                data = json.load(f)
+            assert data["pending_close_reconciliation_count"] == 1
+            assert data["pending_close_reconciliation_summary"]["total_count"] == 1
+            assert data["pending_close_reconciliation_summary"]["evidence_debt_count"] == 1
+        finally:
+            os.unlink(path)
+
     def test_export_includes_recovery_blocked_reason_when_present(self):
         """Current-state must expose active recovery blocks for ops health."""
         state = EngineState(

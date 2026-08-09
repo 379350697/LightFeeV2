@@ -36,6 +36,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.runtime_context import ResidualRepairRuntimeContext
 from lightfee.risk.modes import GlobalRiskMode
 from lightfee.venues.specs import VenueOperation
@@ -1005,6 +1006,12 @@ class ResidualRepairRuntime:
                     operator_fail_closed=(
                         self.ctx.state.operator.requested_mode
                         == GlobalRiskMode.FAIL_CLOSED
+                    ),
+                    recovery_work_items=tuple(
+                        RecoveryLedger.from_local_and_exchange_truth(
+                            local=self.ctx.state,
+                            exchange_truth=None,
+                        ).work_items
                     ),
                 )
             )

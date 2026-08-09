@@ -75,6 +75,21 @@ def _is_invalid_symbol_transport_error(exc: Exception) -> bool:
     return False
 
 
+def _aster_transport_error_in_chain(exc: BaseException) -> TransportError | None:
+    """Return the transport response carried by an Aster private-order error."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TransportError):
+            return current
+        transport_error = getattr(current, "transport_error", None)
+        if isinstance(transport_error, TransportError):
+            return transport_error
+        current = current.__cause__ or current.__context__
+    return None
+
+
 class AsterAdapter(VenueAdapter):
     """Aster public FAPI + private Pro API V3 adapter."""
 
@@ -300,19 +315,98 @@ class AsterAdapter(VenueAdapter):
     async def fetch_market_snapshot(self, symbols: list[str]) -> VenueMarketSnapshot:
         return await self._transport.fetch_market_snapshot(symbols)
 
+    def _record_private_order_submit_result(
+        self,
+        *,
+        preflight: dict[str, Any],
+        request: OrderRequest,
+        operation: str,
+        result: OrderFill | PassiveOrderAck | None = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        """Record Aster V3 order evidence through the shared transport buffer.
+
+        Aster's private V3 client has a different signer/transport, so it
+        cannot emit the generic transport submit record.  Keep both aggressive
+        and passive paths on this single evidence contract: the live rule
+        preflight, HTTP response status/body when supplied, and the final
+        submit classification are all journaled together.
+        """
+        record = getattr(self._transport, "_record_order_diagnostic", None)
+        if not callable(record):
+            return
+        payload = dict(preflight)
+        payload.update({
+            "venue": self.venue.value,
+            "symbol": request.symbol,
+            "operation": operation,
+            "endpoint": "/fapi/v3/order",
+            "private_api": "aster_v3",
+        })
+        if exc is None:
+            payload["response_classification"] = (
+                "ack_accepted" if operation == "submit_passive_order" else "filled"
+            )
+            if result is not None:
+                payload["order_id"] = str(getattr(result, "order_id", "") or "")
+                payload["client_order_id"] = str(
+                    getattr(result, "client_order_id", "") or request.client_order_id or ""
+                )
+            record("order.private_submit_result", payload)
+            return
+
+        classification = getattr(getattr(exc, "class_", None), "value", "")
+        payload["response_classification"] = str(classification or "uncertain")
+        payload["response_msg"] = str(exc)[:500]
+        transport_error = _aster_transport_error_in_chain(exc)
+        if transport_error is not None:
+            payload["status_code"] = int(transport_error.status_code or 0)
+            payload["response_body"] = str(transport_error.body or "")[:500]
+            payload["transport_category"] = transport_error.category.value
+        record("order.private_submit_result", payload)
+
+    async def _submit_private_order(
+        self,
+        request: OrderRequest,
+        *,
+        passive: bool,
+    ) -> OrderFill | PassiveOrderAck:
+        """Submit either Aster private order flavor through one evidence path."""
+        operation = "submit_passive_order" if passive else "place_order"
+        prepared_request, preflight, _ = await self._transport.prepare_order_request(
+            request,
+            require_exchange_rules=self._mode == "live",
+        )
+        try:
+            result = (
+                await self._private.submit_passive_order(prepared_request)
+                if passive
+                else await self._private.place_order(prepared_request)
+            )
+        except Exception as exc:
+            self._record_private_order_submit_result(
+                preflight=preflight,
+                request=request,
+                operation=operation,
+                exc=exc,
+            )
+            self._handle_private_invalid_symbol(
+                exc, request.symbol, endpoint="/fapi/v3/order"
+            )
+            raise
+        self._record_private_order_submit_result(
+            preflight=preflight,
+            request=request,
+            operation=operation,
+            result=result,
+        )
+        return result
+
     async def place_order(self, request: OrderRequest) -> OrderFill:
         if self._private is not None:
-            try:
-                prepared_request, _, _ = await self._transport.prepare_order_request(
-                    request,
-                    require_exchange_rules=self._mode == "live",
-                )
-                return await self._private.place_order(prepared_request)
-            except Exception as exc:
-                self._handle_private_invalid_symbol(
-                    exc, request.symbol, endpoint="/fapi/v3/order"
-                )
-                raise
+            result = await self._submit_private_order(request, passive=False)
+            assert isinstance(result, OrderFill)
+            return result
         if self._mode == "live":
             raise self._private_unavailable()
         return await self._transport.place_order(request)
@@ -388,17 +482,9 @@ class AsterAdapter(VenueAdapter):
 
     async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
         if self._private is not None:
-            try:
-                prepared_request, _, _ = await self._transport.prepare_order_request(
-                    request,
-                    require_exchange_rules=self._mode == "live",
-                )
-                return await self._private.submit_passive_order(prepared_request)
-            except Exception as exc:
-                self._handle_private_invalid_symbol(
-                    exc, request.symbol, endpoint="/fapi/v3/order"
-                )
-                raise
+            result = await self._submit_private_order(request, passive=True)
+            assert isinstance(result, PassiveOrderAck)
+            return result
         if self._mode == "live":
             raise self._private_unavailable()
         return await self._transport.submit_passive_order(request)

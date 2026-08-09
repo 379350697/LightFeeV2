@@ -55,6 +55,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
 )
+from lightfee.engine.recovery_ledger import RecoveryLedger
 
 
 LEGACY_RECOVERY_BLOCK_CLEARABLE_REASONS = LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
@@ -1051,7 +1052,10 @@ def _apply_journal_replay_to_state(
             if payload.get("operation") == "submit_passive_order":
                 pending.phase_state.maker_client_order_id = client_order_id
 
-        elif kind == "exit.pending_close_reconciliation_registered":
+        elif kind in (
+            "exit.pending_close_reconciliation_registered",
+            "exit.billing_evidence_debt_registered",
+        ):
             # The full reconciliation record is carried by the critical
             # registration event so a crash before the next snapshot cannot
             # lose billing work.  Older events only contain a summary; restore
@@ -1084,11 +1088,10 @@ def _apply_journal_replay_to_state(
                 reconciliation = dict(reconciliation)
             if reconciliation.get("position_id"):
                 state.enqueue_pending_close_reconciliation(reconciliation)
-                # This event is emitted only by the live-flat cleanup path.
-                # Restore the queue and remove local position/close owners
-                # without dropping the financial reconciliation task.  The
-                # unconditional behavior also migrates old summary-only
-                # registration events that predate ``live_flat_terminal``.
+                # Registration and evidence-debt transitions preserve the queue
+                # after live-flat cleanup.  Restore it without dropping the
+                # financial reconciliation owner; the unconditional behavior also
+                # migrates old summary-only registration events.
                 _clear_terminal_close_owners(
                     state, str(reconciliation["position_id"])
                 )
@@ -1559,6 +1562,12 @@ def recover_from_snapshot(
             prior_recovery_block_reason=state.recovery_blocked_reason,
             operator_fail_closed=(
                 state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+            ),
+            recovery_work_items=tuple(
+                RecoveryLedger.from_local_and_exchange_truth(
+                    local=state,
+                    exchange_truth=None,
+                ).work_items
             ),
         )
     )

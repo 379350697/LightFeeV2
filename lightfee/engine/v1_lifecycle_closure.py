@@ -506,6 +506,7 @@ def _recovery_work_rows(ledger: RecoveryLedger) -> list[V1LifecycleClosureRow]:
             ),
         )
         phase = _recovery_work_phase(kind)
+        blocking = bool(_get(item, "blocking", True))
         rows.append(
             _row(
                 row_key=f"recovery_work:{kind}:{owner_id}",
@@ -513,12 +514,24 @@ def _recovery_work_rows(ledger: RecoveryLedger) -> list[V1LifecycleClosureRow]:
                 owner_id=owner_id,
                 evidence_class=kind,
                 terminality=kind,
-                entry_policy="block_conflicting_new_risk",
-                recovery_policy=f"manage_{kind}",
+                entry_policy=(
+                    "block_conflicting_new_risk"
+                    if blocking
+                    else "allow_new_risk_background_work"
+                ),
+                recovery_policy=(
+                    f"manage_{kind}" if blocking else f"background_{kind}"
+                ),
                 diagnostic_severity="warning",
-                v1_anchor="RecoveryLedger work scope feeds runtime entry gate",
+                v1_anchor=(
+                    "RecoveryLedger work scope feeds runtime entry gate"
+                    if blocking
+                    else "V1 background reconciliation remains visible without "
+                    "blocking new execution"
+                ),
                 details={
                     "kind": kind,
+                    "blocking": blocking,
                     "symbol": _get(item, "symbol", ""),
                     "venues": sorted(_get(item, "venues", ()) or ()),
                     "decision_reason": _get(_get(item, "decision", None), "reason", ""),
@@ -1182,6 +1195,7 @@ _EVENT_KIND_PHASES = {
     "exit.close_residual_detected": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "exit.closed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_evidence_unavailable": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
+    "exit.billing_evidence_debt_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_evidence_pending": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.reconciliation_abandoned": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_unreconciled": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

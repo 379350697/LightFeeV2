@@ -23,6 +23,7 @@ class RuntimePostureReport:
     pending_entries: int = 0
     pending_closes: int = 0
     pending_passive_closes: int = 0
+    pending_close_reconciliations: int = 0
     pending_close_owners: int = 0
     recent_errors: list[str] = field(default_factory=list)
 
@@ -47,6 +48,9 @@ def load_runtime_posture_report(snapshot_path: str) -> Optional[RuntimePostureRe
         pending_passive_closes=(
             pending_close_owners.pending_passive_close_count
         ),
+        pending_close_reconciliations=(
+            pending_close_owners.pending_close_reconciliation_count
+        ),
         pending_close_owners=pending_close_owners.pending_close_owner_count,
     )
 
@@ -65,6 +69,7 @@ def render_runtime_posture_text(report: RuntimePostureReport) -> str:
         f"  pending entries: {report.pending_entries}",
         f"  pending closes : {report.pending_closes}",
         f"  pending passive closes: {report.pending_passive_closes}",
+        f"  pending close reconciliations: {report.pending_close_reconciliations}",
         f"  pending close owners : {report.pending_close_owners}",
         "=" * 54,
     ]

@@ -133,6 +133,46 @@ def test_current_state_pending_close_owner_is_visible_and_blocks_green_health():
     assert report.details["recovery_decision"]["entry_allowed"] is False
 
 
+def test_current_state_reconciliation_owner_is_visible_from_compact_count():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "last_scan": {"ts_ms": 1778786999000},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_close_reconciliation_count": 1,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is False
+    assert "pending_close_owner_present" in report.fingerprints
+    assert report.details["pending_close_reconciliation_count"] == 1
+    assert report.details["pending_close_owner_count"] == 1
+    assert report.details["recovery_decision"]["kind"] == "RUNNING_WITH_EVIDENCE_GAP"
+    assert report.details["recovery_decision"]["evidence_quality"] == (
+        "background_close_reconciliation"
+    )
+    assert report.details["recovery_decision"]["entry_allowed"] is True
+
+
 def test_current_state_clean_local_exchange_nonzero_is_critical():
     state = {
         "lifecycle": "running",

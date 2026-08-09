@@ -34,6 +34,7 @@ _ENTRY_EXIT_KINDS = frozenset({
     "entry.opened",
     "exit.closed",
     "exit.billing_evidence_unavailable",
+    "exit.billing_evidence_debt_registered",
 })
 
 _LEDGER_POSITION_OPEN_KINDS = frozenset({
