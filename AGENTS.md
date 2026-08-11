@@ -84,3 +84,39 @@ Code-change rules:
 
 Docs-only edits that do not modify functions, classes, or methods do not require
 symbol impact analysis.
+
+## Root-Cause Repair Protocol
+
+All bug fixes, regressions, compatibility repairs, production remediations, and
+review follow-ups must follow
+[`docs/root-cause-repair-protocol.md`](docs/root-cause-repair-protocol.md).
+
+Mandatory rules:
+
+- Define the authoritative contract, root-cause mechanism, full production path,
+  and affected bug family before editing.
+- Fix the earliest shared broken boundary; do not patch only the reported
+  example or create a parallel implementation.
+- Keep implementation minimal: reuse existing owners and abstractions, remove
+  superseded duplicate logic when safe, and do not add speculative frameworks,
+  configurability, compatibility layers, helpers, or files without a current
+  caller or contract need.
+- Build a counterexample matrix before implementation and cover complementary
+  outcomes such as block/release, retry/terminal, and complete/partial evidence.
+  Parameterize equivalent cases instead of adding repetitive tests.
+- Add a real production-path RED/GREEN regression. Helper-only tests or tests
+  that monkeypatch the method under repair are insufficient closure evidence.
+- Search for duplicate predicates, copied reason lists, alternate APIs, legacy
+  bypasses, and every state-transition/clear path in the same bug family.
+- Run layered verification and an independent read-only closure review. Report
+  incomplete, interrupted, or scoped test runs accurately.
+- If a P0/P1 appears after a fix was declared complete, or the same bug family
+  fails two fix-review cycles, trigger the protocol's repair-loop circuit
+  breaker: stop point-fixing, mark the change not closed, and redo the contract,
+  path, and counterexample analysis before further implementation.
+- A GitNexus index matching `HEAD` does not include unstaged changes. Combine
+  graph results with local diff/search analysis for the current working tree.
+- Use the protocol's completion checklist and handoff format. If any mandatory
+  gate is missing, say `implemented but not closed`, not `fixed`.
+- During review, reject unnecessary code and over-design even when behavior is
+  correct; require the smallest coherent root fix.

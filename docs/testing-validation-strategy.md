@@ -1,5 +1,10 @@
 # Testing Validation Strategy
 
+This document defines validation commands and profiles. It does not replace the
+mandatory [`Root-Cause Repair Protocol`](root-cause-repair-protocol.md), which
+defines contract analysis, production-path coverage, counterexample matrices,
+independent review, and closure requirements for every repair.
+
 Use focused validation for bug fixes. Full pytest is not the default gate for every
 local repair because broad suites can be slow or silent when a fixture path stalls.
 
@@ -79,3 +84,6 @@ For a root-fix bug ledger entry, record:
 - production read-only evidence when a live symptom was involved
 
 Do not claim full-suite success unless `full` actually completed.
+Focused profile success alone means the implementation passed scoped validation;
+it does not satisfy the repair protocol's completion gate or justify a "fixed"
+claim without production-path coverage and independent closure review.

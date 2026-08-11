@@ -4,18 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from typing import Any, Mapping
 
 
 EPSILON = 1e-9
+STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON = (
+    "stale_risk_only_requires_account_truth"
+)
 
 CORE_OWNED_BLOCK_REASONS = frozenset(
     {
         "exchange_truth_recovery_ledger_blocked",
         "truth_unavailable_for_required_recovery",
         "orphan_maker_order",
+        "orphan_reduce_only_order",
         "unpaired_live_position",
         "owned_pending_entry_live_conflict",
+        STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON,
         "owned_recovery_work",
         "pending_residual_repair",
         "pending_passive_close",
@@ -26,9 +32,19 @@ CORE_OWNED_BLOCK_REASONS = frozenset(
 LIVE_ARTIFACT_BLOCK_REASONS = frozenset(
     {
         "orphan_maker_order",
+        "orphan_reduce_only_order",
         "unpaired_live_position",
         "owned_pending_entry_live_conflict",
     }
+)
+
+# A persisted RISK_ONLY state without an owner is ambiguous at restart: it may
+# be a historical recovery latch rather than a current health-line decision.
+# Treat it like a live artifact for release purposes until account-wide position
+# and order truth proves it is safe to resume.
+ACCOUNT_TRUTH_REQUIRED_BLOCK_REASONS = (
+    LIVE_ARTIFACT_BLOCK_REASONS
+    | frozenset({STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON})
 )
 
 LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS = frozenset(
@@ -42,9 +58,13 @@ CORE_CLEARABLE_BLOCK_REASONS = (
     CORE_OWNED_BLOCK_REASONS | LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
 )
 
-EVIDENCE_GAP_CLEARABLE_BLOCK_REASONS = (
-    CORE_CLEARABLE_BLOCK_REASONS - LIVE_ARTIFACT_BLOCK_REASONS
-)
+
+class RecoveryTruthScope(StrEnum):
+    """Coverage of the exchange truth supplied to a recovery decision."""
+
+    ACCOUNT = "account"
+    SYMBOLS = "symbols"
+
 
 class RecoveryEvidenceClass(StrEnum):
     COMPLETE_FLAT = "complete_flat"
@@ -324,7 +344,7 @@ class V1RecoveryDecisionCore:
                 kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
                 evidence_class=RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION,
                 entry_allowed=True,
-                clear_previous_block=self._should_clear_evidence_gap_block(snapshot),
+                clear_previous_block=self._should_clear_core_block(snapshot),
                 clear_reason="core_background_close_reconciliation",
                 recovery_work_items=snapshot.recovery_work_items,
                 diagnostic_severity="warning",
@@ -347,7 +367,7 @@ class V1RecoveryDecisionCore:
                 kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
                 evidence_class=RecoveryEvidenceClass.PARTIAL_EVIDENCE_GAP,
                 entry_allowed=True,
-                clear_previous_block=self._should_clear_evidence_gap_block(snapshot),
+                clear_previous_block=self._should_clear_core_block(snapshot),
                 clear_reason="core_evidence_gap_no_local_work",
                 recovery_work_items=(),
                 diagnostic_severity="warning",
@@ -384,13 +404,19 @@ class V1RecoveryDecisionCore:
             ):
                 return kind
         for order in _exchange_open_orders(snapshot.exchange_truth):
-            if _quantity(order) <= EPSILON or _bool(_get(order, "reduce_only", False)):
+            # An open-orders endpoint contains only live orders; a non-reduce
+            # order must not disappear from recovery merely because its size is
+            # zero, missing, or malformed in a venue response.
+            if _bool(_get(order, "reduce_only", False)):
                 continue
             if _order_has_owned_work(order, recovery_work_items):
                 continue
             return "orphan_maker_order"
         for position in _exchange_positions(snapshot.exchange_truth):
-            if _quantity(position) > EPSILON:
+            quantity = self._finite_position_quantity(position)
+            if quantity is None:
+                return "unpaired_live_position"
+            if abs(quantity) > EPSILON:
                 if (
                     _position_matches_local_open(position, local_open_positions)
                     or _position_has_owned_work(position, recovery_work_items)
@@ -440,7 +466,8 @@ class V1RecoveryDecisionCore:
                 return True
         return False
 
-    def _truth_available(self, exchange_truth: Any | None) -> bool:
+    @staticmethod
+    def _truth_available(exchange_truth: Any | None) -> bool:
         if exchange_truth is None:
             return False
         if isinstance(exchange_truth, Mapping):
@@ -450,46 +477,96 @@ class V1RecoveryDecisionCore:
                 return bool(exchange_truth.get("available"))
         return bool(_get(exchange_truth, "truth_available", _get(exchange_truth, "available", True)))
 
-    def _has_partial_evidence_gap(self, exchange_truth: Any | None) -> bool:
+    @staticmethod
+    def _has_partial_evidence_gap(exchange_truth: Any | None) -> bool:
         if exchange_truth is None:
+            return True
+        # Producers that report support must explicitly report True before
+        # their account result can be treated as evidence.  V1 represents an
+        # unsupported bulk probe separately from an empty response.
+        if isinstance(exchange_truth, Mapping):
+            if (
+                "truth_supported" in exchange_truth
+                and exchange_truth["truth_supported"] is not True
+            ):
+                return True
+        elif (
+            hasattr(exchange_truth, "truth_supported")
+            and getattr(exchange_truth, "truth_supported") is not True
+        ):
             return True
         missing = _get(exchange_truth, "missing_evidence", ())
         errors = _get(exchange_truth, "errors", ())
         probe_evidence = _get(exchange_truth, "probe_evidence", ())
         if _has_items(missing) or _has_items(errors):
             return True
+        if _exchange_truth_has_error_placeholder(exchange_truth):
+            return True
         return any(_probe_is_gap(item) for item in _as_items(probe_evidence))
 
     def _should_clear_core_block(self, snapshot: RecoveryEvidenceSnapshot) -> bool:
         reason = snapshot.prior_recovery_block_reason
+        if reason in ACCOUNT_TRUTH_REQUIRED_BLOCK_REASONS:
+            return self._exchange_truth_is_complete_flat(snapshot.exchange_truth)
         return reason is None or reason in CORE_CLEARABLE_BLOCK_REASONS
 
-    def _should_clear_evidence_gap_block(
-        self, snapshot: RecoveryEvidenceSnapshot
-    ) -> bool:
-        reason = snapshot.prior_recovery_block_reason
-        if reason in LIVE_ARTIFACT_BLOCK_REASONS:
-            # A background accounting debt is not an execution owner, but it
-            # must not erase a live-artifact latch on partial or symbol-scoped
-            # evidence.  Only fresh account-wide position and order truth that
-            # is physically flat can release that old live-risk classification.
-            return self._exchange_truth_is_complete_flat(snapshot.exchange_truth)
-        return reason is None or reason in EVIDENCE_GAP_CLEARABLE_BLOCK_REASONS
+    @classmethod
+    def is_complete_account_flat_truth(cls, exchange_truth: Any | None) -> bool:
+        """Whether exchange truth can safely release any recovery lifecycle latch."""
 
-    def _exchange_truth_is_complete_flat(self, exchange_truth: Any | None) -> bool:
-        if not self._truth_available(exchange_truth) or self._has_partial_evidence_gap(
+        # A flat subset proves nothing about an account-level live artifact or
+        # stale risk_only lifecycle.  Only complete account truth may release
+        # either latch.
+        scope = str(_get(exchange_truth, "truth_scope", "") or "").strip().lower()
+        if scope != RecoveryTruthScope.ACCOUNT.value:
+            return False
+        if not cls._truth_explicitly_supported(exchange_truth):
+            return False
+        if not cls._truth_available(exchange_truth) or cls._has_partial_evidence_gap(
             exchange_truth
         ):
             return False
-        if any(
-            _quantity(position) > EPSILON
-            for position in _exchange_positions(exchange_truth)
-        ):
+
+        # Complete truth requires both collections to be present.  A missing
+        # collection is not evidence that the account is flat.
+        positions_value = _get(exchange_truth, "positions", None)
+        open_orders_value = _get(exchange_truth, "open_orders", None)
+        if positions_value is None or open_orders_value is None:
             return False
-        return not any(
-            _quantity(order) > EPSILON
-            for order in _exchange_open_orders(exchange_truth)
-        )
+
+        # A malformed or non-finite position amount must remain fail-closed;
+        # comparisons with NaN otherwise look like a flat zero position.
+        for position in _exchange_positions(exchange_truth):
+            quantity = cls._finite_position_quantity(position)
+            if quantity is None or abs(quantity) > EPSILON:
+                return False
+
+        # An account open-orders endpoint already returns only live orders.
+        # Therefore *any* returned row is a live artifact, regardless of a
+        # missing, zero, or malformed quantity field.
+        return not _exchange_open_orders(exchange_truth)
+
+    @staticmethod
+    def _truth_explicitly_supported(exchange_truth: Any | None) -> bool:
+        if isinstance(exchange_truth, Mapping):
+            return exchange_truth.get("truth_supported") is True
+        return getattr(exchange_truth, "truth_supported", None) is True
+
+    @staticmethod
+    def _finite_position_quantity(position: Any) -> float | None:
+        for key in ("quantity", "qty", "size"):
+            value = _get(position, key, None)
+            if value is None:
+                continue
+            try:
+                quantity = float(value)
+            except (TypeError, ValueError):
+                return None
+            return quantity if isfinite(quantity) else None
+        return None
+
+    def _exchange_truth_is_complete_flat(self, exchange_truth: Any | None) -> bool:
+        return self.is_complete_account_flat_truth(exchange_truth)
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -521,14 +598,20 @@ def _exchange_open_orders(exchange_truth: Any | None) -> tuple[Any, ...]:
 
 
 def _flatten_exchange_collection(value: Any) -> tuple[Any, ...]:
-    if value is None:
+    if value is None or _is_exchange_error_placeholder(value):
         return ()
     if isinstance(value, Mapping):
         items: list[Any] = []
         for venue, venue_value in value.items():
+            if _is_exchange_error_placeholder(venue_value):
+                continue
             if isinstance(venue_value, Mapping):
                 for symbol, symbol_value in venue_value.items():
+                    if _is_exchange_error_placeholder(symbol_value):
+                        continue
                     for item in _as_items(symbol_value):
+                        if _is_exchange_error_placeholder(item):
+                            continue
                         if isinstance(item, Mapping):
                             merged = dict(item)
                             merged.setdefault("venue", venue)
@@ -537,9 +620,65 @@ def _flatten_exchange_collection(value: Any) -> tuple[Any, ...]:
                         else:
                             items.append(item)
             else:
-                items.extend(_as_items(venue_value))
+                items.extend(
+                    item
+                    for item in _as_items(venue_value)
+                    if not _is_exchange_error_placeholder(item)
+                )
         return tuple(items)
-    return _as_items(value)
+    return tuple(
+        item for item in _as_items(value) if not _is_exchange_error_placeholder(item)
+    )
+
+
+def _exchange_truth_has_error_placeholder(exchange_truth: Any | None) -> bool:
+    """Whether a collection contains an unconfirmed endpoint-error placeholder.
+
+    Diagnostics preserve failed endpoint payloads alongside successful venue data.
+    Such placeholders are evidence gaps, not orders or positions.  Keep this
+    classification next to collection flattening so every core decision path
+    consumes the same distinction.
+    """
+    return any(
+        _contains_exchange_error_placeholder(_get(exchange_truth, key, ()))
+        for key in ("positions", "open_orders")
+    )
+
+
+def _contains_exchange_error_placeholder(value: Any) -> bool:
+    if _is_exchange_error_placeholder(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(_contains_exchange_error_placeholder(item) for item in value.values())
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_exchange_error_placeholder(item) for item in value)
+    return False
+
+
+def _is_exchange_error_placeholder(value: Any) -> bool:
+    """Recognize a failed endpoint payload without hiding concrete live rows."""
+    if not isinstance(value, Mapping) or not _get(value, "error", ""):
+        return False
+    # A concrete row remains live even when a venue annotates it with an error.
+    # For a bare error container, there is no live artifact to classify.
+    return not any(
+        key in value
+        for key in (
+            "quantity",
+            "qty",
+            "size",
+            "positionAmt",
+            "order_id",
+            "orderId",
+            "ordId",
+            "id",
+            "client_order_id",
+            "clientOrderId",
+            "orderLinkId",
+            "clientOid",
+            "clOrdId",
+        )
+    )
 
 
 def _quantity(obj: Any) -> float:

@@ -17,6 +17,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-099 startup stale-risk-only correction, 2026-08-11: the earlier live-artifact
+release contract required account-flat truth, but its startup ordering still
+let a persisted local-clean `risk_only/running` resume directly and left a
+persisted `risk_only/fail_closed` without a recovery owner for Supervisor to
+resume as a normal health latch. The unified correction reuses the canonical
+`recovery_blocked_reason`: only ambiguous persisted recovery state receives
+`stale_risk_only_requires_account_truth`; the recovery decision core owns its
+complete-account-truth release, while normal fresh health fail-closed behavior
+remains V1-compatible. Production-path RED/GREEN covers unavailable truth
+through the first Supervisor tick, three persisted state forms, and complete
+account-flat release. Local targeted
+and repair-gate suites pass; full pytest is `4265 passed, 9 skipped, 3 failed`
+from pre-existing Aster V3 fixture evidence gaps, not this path. This correction
+is local and deploy pending, therefore **implemented but not closed** until
+post-deploy read-only evidence confirms the event/order and no unexpected
+Supervisor bypass. See
+[daily/2026-08-09.md#cl-099-后续启动期陈旧-risk_only-的账户真相收口2026-08-11](daily/2026-08-09.md#cl-099-后续启动期陈旧-risk_only-的账户真相收口2026-08-11).
+
 Latest close-reconciliation owner-contract and Aster V3 evidence closure,
 2026-08-09: a later read-only production check corrected CL-097's earlier
 queue conclusion. Exchange truth was flat/no-open-orders, but the full durable

@@ -20,6 +20,7 @@ from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalizer,
 )
 from lightfee.engine.recovery_decision_core import (
+    LIVE_ARTIFACT_BLOCK_REASONS,
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
     pending_passive_close_evidence,
@@ -446,12 +447,7 @@ def _open_position_rows(local_state: Any, ledger: RecoveryLedger) -> list[V1Life
         )
     for item in ledger.work_items:
         kind = str(_get(item, "kind", "") or "")
-        if kind not in {
-            "orphan_maker_order",
-            "unpaired_live_position",
-            "owned_pending_entry_live_conflict",
-            "orphan_reduce_only_order",
-        }:
+        if kind not in LIVE_ARTIFACT_BLOCK_REASONS:
             continue
         owner = _get(item, "owner", None)
         owner_id = _owner_id(
@@ -485,11 +481,7 @@ def _recovery_work_rows(ledger: RecoveryLedger) -> list[V1LifecycleClosureRow]:
     rows: list[V1LifecycleClosureRow] = []
     for item in ledger.work_items:
         kind = str(_get(item, "kind", "") or "")
-        if kind in {
-            "orphan_maker_order",
-            "unpaired_live_position",
-            "owned_pending_entry_live_conflict",
-            "orphan_reduce_only_order",
+        if kind in LIVE_ARTIFACT_BLOCK_REASONS | {
             "ambiguous_exchange_truth",
             "owned_open_position",
         }:
@@ -1153,6 +1145,9 @@ _EVENT_KIND_PHASES = {
     "runtime.reconciling": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.recovery_block_reconcile_attempt": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.recovery_fail_closed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "runtime.recovery_awaiting_account_truth": (
+        V1LifecycleClosurePhase.RECOVERY_TRUTH.value
+    ),
     "runtime.risk_mode_changed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "runtime.stale_fail_closed_cleared": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     # Risk warnings are observability records for an existing position, not

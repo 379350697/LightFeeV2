@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from lightfee.core.domain import (
@@ -48,7 +50,7 @@ class TransportOnlyOpenOrdersAdapter(_FakeVenueAdapter):
 
 
 class RecordingOpenOrdersTransport:
-    def __init__(self, venue: Venue, response: dict | list):
+    def __init__(self, venue: Venue, response: Any):
         self.venue = venue
         self.response = response
         self.calls: list[tuple[str, str, dict | None, bool]] = []
@@ -865,6 +867,54 @@ async def test_exhausted_residual_repair_transport_open_order_truth_failure_keep
     assert len(runtime.state.pending_residual_repairs) == 1
     task = runtime.state.pending_residual_repairs[0]
     assert task["last_error"].startswith("residual_repair_live_truth_untrusted:")
+    assert "execution.residual_repair_completed" not in [
+        event["kind"] for event in runtime.journal.read_all()
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {"unexpected": "shape"},
+        {"data": {"unknown": []}},
+    ],
+    ids=["null", "unknown_top_level", "unknown_data_shape"],
+)
+async def test_exhausted_residual_repair_transport_unknown_order_truth_keeps_task(
+    tmp_path,
+    response: Any,
+):
+    """Unknown order evidence cannot complete a live residual repair as flat."""
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-1779594732734-OPGUSDT",
+        "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT",
+        "origin": "entry_open",
+        "repair_venue": "okx",
+        "repair_side": "buy",
+        "repair_quantity": 9.0,
+        "local_entry_paused": True,
+        "last_error": "residual_repair_deadline_or_attempts_exhausted",
+        "deadline_ms": now_ms - 1,
+        "retry_count": 3,
+        "next_attempt_ms": 0,
+    })
+
+    transport = RecordingOpenOrdersTransport(Venue.OKX, response)
+    okx = TransportOnlyOpenOrdersAdapter(Venue.OKX, transport)
+    okx.position = _flat_position(Venue.OKX, "OPGUSDT", now_ms)
+    runtime._venue_adapters = {Venue.OKX: okx}
+
+    await runtime._recover_residual_repairs(now_ms)
+
+    assert len(runtime.state.pending_residual_repairs) == 1
+    assert runtime.state.pending_residual_repairs[0]["last_error"].startswith(
+        "residual_repair_live_truth_untrusted:"
+    )
     assert "execution.residual_repair_completed" not in [
         event["kind"] for event in runtime.journal.read_all()
     ]

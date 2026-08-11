@@ -1,0 +1,30 @@
+version = 1
+
+[profiles.safety-release]
+description = "External account evidence must not release a protected trading state unless it is complete and typed."
+protected_paths = [
+  "lightfee/engine/exchange_truth.py",
+  "lightfee/engine/close_runtime.py",
+  "lightfee/engine/passive_close.py",
+  "lightfee/engine/pending_entry_runtime.py",
+  "lightfee/engine/recovery_decision_core.py",
+  "lightfee/engine/recovery_ledger.py",
+  "lightfee/engine/recovery_startup_runtime.py",
+  "lightfee/engine/residual_repair_runtime.py",
+  "lightfee/engine/runtime.py",
+  "lightfee/engine/v1_lifecycle_closure.py",
+]
+test_paths = ["tests/"]
+require_test_change = true
+commands = [
+  ["{python}", "-m", "pytest", "-q", "tests/test_repair_gate.py"],
+  ["{python}", "-m", "pytest", "-q", "tests/test_live_startup_preflight.py"],
+  ["{python}", "-m", "pytest", "-q", "tests/live_harness/test_residual_repair_incident_replay.py", "-k", "transport_unknown_order_truth_keeps_task or uses_transport_open_order_truth or transport_open_order_truth_failure_keeps_task"],
+  ["{python}", "-m", "pytest", "-q", "tests/test_runtime_split_architecture.py", "tests/test_pending_entry_v1_semantic_drift.py", "-k", "shared_open_order_probe or recovery_startup_account_open_orders_use_venue_operation_contract or passive_and_residual_open_order_truth_share_contract_helper"],
+  ["{python}", "-m", "pytest", "-q", "tests/test_passive_close.py::TestProcessPendingPassiveCloseLiveFlatReconcile::test_open_orders_transport_request_fallback_scenarios"],
+  ["{python}", "-m", "pytest", "-q", "tests/engine/test_recovery_decision_core.py", "tests/engine/test_recovery_ledger.py", "tests/engine/test_v1_lifecycle_closure_table.py"],
+  ["{python}", "-m", "compileall", "-q", "lightfee", "tests", "scripts"],
+  ["git", "diff", "--check", "{base}...HEAD"],
+  ["git", "diff", "--check", "--cached"],
+  ["git", "diff", "--check"],
+]

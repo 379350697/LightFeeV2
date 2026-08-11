@@ -2010,6 +2010,49 @@ async def test_shared_open_order_probe_accepts_recognized_empty_list():
     assert evidence is None
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"data": []},
+        {"data": {"entrustedList": []}},
+        {"data": {"orderList": []}},
+        {"data": {"list": []}},
+        {"data": {"orders": []}},
+        {"list": []},
+        {"orders": []},
+        {"openOrders": []},
+    ],
+)
+def test_shared_open_order_probe_accepts_known_legacy_empty_envelopes(raw):
+    """The shared strict parser keeps every adapter response envelope V2 accepts."""
+    from lightfee.engine.exchange_truth import parse_open_orders_response
+
+    rows, error = parse_open_orders_response(raw)
+
+    assert rows == []
+    assert error is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        [None],
+        [{"orderId": "known"}, None],
+        {"data": [None]},
+        {"result": {"list": [None]}},
+    ],
+)
+def test_shared_open_order_probe_rejects_malformed_order_rows(raw):
+    """A recognized envelope still needs typed order rows before it is trusted."""
+    from lightfee.engine.exchange_truth import parse_open_orders_response
+
+    rows, error = parse_open_orders_response(raw)
+
+    assert rows is None
+    assert error is not None
+    assert "row_not_mapping" in error
+
+
 @pytest.mark.asyncio
 async def test_entry_dispatch_retains_pre_submit_owner_when_executor_has_no_local_successor(
     config, tmp_journal,

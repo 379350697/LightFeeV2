@@ -130,6 +130,53 @@ def test_orphan_non_reduce_open_order_blocks_as_v1_live_artifact():
     )
 
 
+def test_orphan_reduce_only_order_blocks_as_v1_live_artifact():
+    """Reduce-only orphans use the same global live-artifact contract as makers."""
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    table = build_v1_lifecycle_closure_table(
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "truth_available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {},
+            "open_orders": {
+                "bybit": {
+                    "BTCUSDT": {
+                        "symbol": "BTCUSDT",
+                        "venue": "bybit",
+                        "quantity": 1.0,
+                        "price": 100.0,
+                        "reduce_only": True,
+                        "order_id": "order-reduce-only-1",
+                    }
+                }
+            },
+        },
+        generated_at_ms=1770000000000,
+    ).to_dict()
+
+    assert table["summary"]["entry_allowed"] is False
+    assert table["summary"]["recovery_block_reason"] == "orphan_reduce_only_order"
+    assert table["summary"]["recovery_decision_kind"] == "BLOCK_OR_FLATTEN_LIVE_ARTIFACT"
+    row = next(
+        row for row in table["rows"] if row["terminality"] == "orphan_reduce_only_order"
+    )
+    assert row["phase"] == "OPEN_POSITION"
+    assert row["entry_policy"] == "block_all_new_risk"
+    assert row["recovery_policy"] == "block_or_flatten_live_artifact"
+
+
 def test_owned_pending_entry_live_conflict_projects_as_live_artifact_row():
     from lightfee.engine.recovery_ledger import (
         ExchangeArtifact,
@@ -364,6 +411,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.reconciling",
         "runtime.recovery_block_reconcile_attempt",
         "runtime.recovery_fail_closed",
+        "runtime.recovery_awaiting_account_truth",
         "scan.no_entry_diagnostics",
         "startup.order_path_preflight",
         "startup.trading_preflight",
@@ -492,6 +540,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.recovery_fail_closed") == "RECOVERY_TRUTH"
+    assert (
+        map_lifecycle_event_kind("runtime.recovery_awaiting_account_truth")
+        == "RECOVERY_TRUTH"
+    )
     assert map_lifecycle_event_kind("runtime.stale_fail_closed_cleared") == "RECOVERY_TRUTH"
     assert (
         map_lifecycle_event_kind("runtime.entry_quote_rewarm_scheduled_after_rest_stale")

@@ -1194,7 +1194,7 @@ def _apply_journal_replay_to_state(
                 except ValueError:
                     pass
             # V1: restore operator latch so clean restart preserves operator-intended
-            # fail_closed (clear_stale_fail_closed_if_recovery_clean checks this)
+            # fail_closed (the recovery core preserves this operator latch)
             cmd = payload.get("command", "")
             if cmd == "fail_closed":
                 state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
@@ -2000,38 +2000,6 @@ def is_safe_to_resume(state: EngineState) -> bool:
         if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
             return False
     return not needs_reconciliation(state)
-
-
-def clear_stale_fail_closed_if_recovery_clean(state: EngineState, journal: Journal | None = None) -> bool:
-    """Clear persisted fail_closed only when there is no recovery or operator block.
-
-    This is deliberately narrower than RESUME_IF_SAFE. It handles stale persisted
-    state from prior incidents after open/pending work is already gone.
-    """
-    if state.risk_mode != GlobalRiskMode.FAIL_CLOSED:
-        return False
-    if state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
-        return False
-    if needs_reconciliation(state):
-        return False
-    if state.recovery_blocked_reason:
-        return False
-
-    previous = state.risk_mode.value
-    state.risk_mode = GlobalRiskMode.RUNNING
-    state.lifecycle = EngineLifecycle.RUNNING
-    state.global_risk_reason = None
-    state.recovery_blocked_at_ms = 0
-    if journal is not None:
-        _try_emit_recovery(journal, "runtime.risk_mode_changed", {
-            "from": previous,
-            "to": state.risk_mode.value,
-            "reason": "startup_clean_stale_fail_closed_cleared",
-        })
-        _try_emit_recovery(journal, "runtime.stale_fail_closed_cleared", {
-            "reason": "startup_clean_no_recovery_work",
-        })
-    return True
 
 
 def clear_legacy_recovery_block_via_core(

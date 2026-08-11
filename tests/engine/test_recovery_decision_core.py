@@ -11,6 +11,7 @@ from lightfee.engine.recovery_decision_core import (
     RecoveryManagementAction,
     RecoveryDecisionKind,
     RecoveryEvidenceSnapshot,
+    STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON,
     V1RecoveryDecisionCore,
 )
 
@@ -45,12 +46,13 @@ def test_full_flat_truth_releases_prior_live_conflict_with_background_close_debt
         pending_entries=(),
         residual_repairs=(),
         passive_closes=(),
-        exchange_truth=ExchangeTruthSnapshot(
-            available=True,
-            confidence="high",
-            positions=(),
-            open_orders=(),
-        ),
+        exchange_truth={
+            "truth_scope": "account",
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": (),
+            "open_orders": (),
+        },
         prior_recovery_block_reason="owned_pending_entry_live_conflict",
         recovery_work_items=(
             {
@@ -67,6 +69,216 @@ def test_full_flat_truth_releases_prior_live_conflict_with_background_close_debt
     assert decision.entry_allowed is True
     assert decision.clear_previous_block is True
     assert decision.clear_reason == "core_background_close_reconciliation"
+
+
+def test_symbol_scoped_flat_truth_does_not_release_prior_live_conflict():
+    """A candidate sweep cannot disprove a live artifact on another symbol."""
+    snapshot = RecoveryEvidenceSnapshot(
+        local_open_positions=(),
+        pending_entries=(),
+        residual_repairs=(),
+        passive_closes=(),
+        exchange_truth={
+            "truth_scope": "symbols",
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": (),
+            "open_orders": (),
+        },
+        prior_recovery_block_reason="owned_pending_entry_live_conflict",
+        recovery_work_items=(
+            {
+                "kind": "pending_close_reconciliation",
+                "blocking": False,
+                "position_id": "entry-coti-billing-debt",
+            },
+        ),
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+    assert decision.entry_allowed is True
+    assert decision.clear_previous_block is False
+
+
+def test_account_flat_truth_requires_an_empty_open_order_collection():
+    """Every account open-order row is live until the endpoint removes it."""
+    core = V1RecoveryDecisionCore()
+    for open_order in (
+        {"quantity": 0.0},
+        {"order_id": "still-open"},
+        {"quantity": float("nan")},
+    ):
+        assert not core.is_complete_account_flat_truth(
+            {
+                "truth_scope": "account",
+                "truth_supported": True,
+                "truth_available": True,
+                "positions": (),
+                "open_orders": (open_order,),
+            }
+        )
+
+
+def test_account_flat_truth_rejects_missing_or_nonfinite_position_quantity():
+    """Malformed position rows cannot be silently interpreted as flat."""
+    core = V1RecoveryDecisionCore()
+    for position in (
+        {"symbol": "BTCUSDT"},
+        {"quantity": float("nan")},
+        {"quantity": "not-a-number"},
+    ):
+        assert not core.is_complete_account_flat_truth(
+            {
+                "truth_scope": "account",
+                "truth_supported": True,
+                "truth_available": True,
+                "positions": (position,),
+                "open_orders": (),
+            }
+        )
+
+
+def test_account_flat_truth_requires_both_exchange_collections():
+    core = V1RecoveryDecisionCore()
+    assert not core.is_complete_account_flat_truth(
+        {
+            "truth_scope": "account",
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": (),
+        }
+    )
+
+
+def test_unsupported_account_truth_never_releases_prior_live_artifact_block():
+    """V1's unsupported account probe is unknown evidence, never flat proof."""
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_scope": "account",
+                "truth_supported": False,
+                "truth_available": True,
+                "positions": (),
+                "open_orders": (),
+            },
+            prior_recovery_block_reason="orphan_maker_order",
+        )
+    )
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+    assert decision.entry_allowed is True
+    assert decision.clear_previous_block is False
+
+
+def test_stale_risk_only_block_requires_complete_account_flat_truth_to_release():
+    core = V1RecoveryDecisionCore()
+    partial_truth_decision = core.decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_scope": "account",
+                "truth_supported": False,
+                "truth_available": True,
+                "positions": (),
+                "open_orders": (),
+            },
+            prior_recovery_block_reason=(
+                STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON
+            ),
+        )
+    )
+    complete_truth_decision = core.decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_scope": "account",
+                "truth_supported": True,
+                "truth_available": True,
+                "positions": (),
+                "open_orders": (),
+            },
+            prior_recovery_block_reason=(
+                STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON
+            ),
+        )
+    )
+
+    assert partial_truth_decision.clear_previous_block is False
+    assert complete_truth_decision.clear_previous_block is True
+
+
+def test_non_reduce_open_order_without_quantity_blocks_new_entry():
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_available": True,
+                "positions": (),
+                "open_orders": ({"order_id": "still-open"},),
+            }
+        )
+    )
+
+    assert decision.kind == RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "orphan_maker_order"
+
+
+def test_nonfinite_position_blocks_new_entry():
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_available": True,
+                "positions": ({"quantity": float("nan")},),
+                "open_orders": (),
+            }
+        )
+    )
+
+    assert decision.kind == RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "unpaired_live_position"
+
+
+def test_endpoint_error_placeholders_are_evidence_gaps_not_live_artifacts():
+    """Failed diagnostic payloads cannot masquerade as an order or position."""
+    exchange_truth = {
+        "truth_scope": "account",
+        "truth_available": True,
+        "positions": {"okx": {"error": "no position credentials"}},
+        "open_orders": {"okx": {"error": "no order credentials"}},
+    }
+
+    core = V1RecoveryDecisionCore()
+    decision = core.decide(RecoveryEvidenceSnapshot(exchange_truth=exchange_truth))
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+    assert decision.entry_allowed is True
+    assert decision.block_reason is None
+    assert not core.is_complete_account_flat_truth(exchange_truth)
+
+
+def test_confirmed_live_order_still_blocks_when_another_venue_has_error_placeholder():
+    """An evidence gap cannot erase a concrete live order from a healthy venue."""
+    decision = V1RecoveryDecisionCore().decide(
+        RecoveryEvidenceSnapshot(
+            exchange_truth={
+                "truth_available": True,
+                "positions": (),
+                "open_orders": {
+                    "okx": {"error": "credentials unavailable"},
+                    "bybit": {
+                        "BTCUSDT": [
+                            {"id": "live-order", "error": "request warning"}
+                        ]
+                    },
+                },
+            }
+        )
+    )
+
+    assert decision.kind == RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "orphan_maker_order"
 
 
 def test_local_recovery_work_plus_unavailable_truth_blocks_new_entry():
@@ -116,6 +328,25 @@ def test_orphan_live_open_order_blocks_as_live_artifact():
     assert decision.kind == RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT
     assert decision.entry_allowed is False
     assert decision.block_reason == "orphan_maker_order"
+    assert decision.management_action == RecoveryManagementAction.FLATTEN_OR_BLOCK_LIVE_ARTIFACT
+
+
+def test_orphan_reduce_only_order_blocks_as_live_artifact():
+    snapshot = RecoveryEvidenceSnapshot(
+        exchange_truth=ExchangeTruthSnapshot(available=True, confidence="high"),
+        recovery_work_items=(
+            {
+                "kind": "orphan_reduce_only_order",
+                "blocking": True,
+            },
+        ),
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "orphan_reduce_only_order"
     assert decision.management_action == RecoveryManagementAction.FLATTEN_OR_BLOCK_LIVE_ARTIFACT
 
 

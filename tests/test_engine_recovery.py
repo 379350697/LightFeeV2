@@ -15,7 +15,6 @@ from lightfee.engine.lifecycle import (
 )
 from lightfee.engine.recovery import (
     build_recovery_snapshot,
-    clear_stale_fail_closed_if_recovery_clean,
     clear_legacy_recovery_block_via_core,
     normalize_engine_state,
     recover_from_snapshot,
@@ -118,10 +117,7 @@ class TestLifecycle:
             core_decision,
             None,
         )
-        fail_closed_cleared = clear_stale_fail_closed_if_recovery_clean(state, None)
-
         assert block_cleared is False
-        assert fail_closed_cleared is False
         assert state.lifecycle == EngineLifecycle.RISK_ONLY
         assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
         assert state.recovery_blocked_reason == "live_position_mismatch_flatten_failed"

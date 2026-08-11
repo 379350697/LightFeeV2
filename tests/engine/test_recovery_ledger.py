@@ -591,6 +591,8 @@ def test_orphan_reduce_only_order_is_cleanup_work_not_ignored():
     assert item.kind == "orphan_reduce_only_order"
     assert item.owner.confidence == "orphan"
     assert item.decision.outcome == "reduce_only_cleanup_submitted"
+    assert item.blocks_all_new_entries is True
+    assert ledger.allows_new_entry(SimpleNamespace(symbol="ETHUSDT")) is False
 
 
 def test_multi_symbol_owned_work_blocks_same_symbol_without_global_block():

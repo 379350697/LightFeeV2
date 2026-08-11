@@ -1,0 +1,38 @@
+name: Repair closure gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  safety-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      REPAIR_GATE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Load the gate control plane from the trusted base revision
+        shell: bash
+        run: |
+          if git cat-file -e "$REPAIR_GATE_BASE:scripts/repair_gate.py" 2>/dev/null && \
+             git cat-file -e "$REPAIR_GATE_BASE:repair-gate.toml" 2>/dev/null; then
+            git show "$REPAIR_GATE_BASE:scripts/repair_gate.py" > "$RUNNER_TEMP/repair_gate.py"
+            git show "$REPAIR_GATE_BASE:repair-gate.toml" > "$RUNNER_TEMP/repair-gate.toml"
+          else
+            cp scripts/repair_gate.py "$RUNNER_TEMP/repair_gate.py"
+            cp repair-gate.toml "$RUNNER_TEMP/repair-gate.toml"
+          fi
+      - run: >-
+          python "$RUNNER_TEMP/repair_gate.py" verify
+          --config "$RUNNER_TEMP/repair-gate.toml"
+          --profile safety-release
+          --base "$REPAIR_GATE_BASE"

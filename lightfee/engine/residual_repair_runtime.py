@@ -23,7 +23,10 @@ from lightfee.engine.bybit_duplicate_reconcile import (
     reconcile_bybit_duplicate_client_order,
 )
 from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
-from lightfee.engine.exchange_truth import request_venue_operation
+from lightfee.engine.exchange_truth import (
+    require_open_orders_response,
+    request_venue_operation,
+)
 from lightfee.engine.lifecycle import clear_risk_mode_for_recovery, enter_fail_closed
 from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
@@ -1462,8 +1465,6 @@ class ResidualRepairRuntime:
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if callable(fetch_open_orders):
             open_orders = await fetch_open_orders(symbol)
-            if isinstance(open_orders, dict) and open_orders.get("error"):
-                raise RuntimeError(str(open_orders.get("error")))
             return self._residual_repair_open_order_items(open_orders)
 
         transport = getattr(adapter, "_transport", None)
@@ -1486,22 +1487,7 @@ class ResidualRepairRuntime:
 
     @staticmethod
     def _residual_repair_open_order_items(raw: Any) -> list[Any]:
-        if raw is None:
-            return []
-        if isinstance(raw, list):
-            return raw
-        if not isinstance(raw, dict):
-            return [raw]
-        if raw.get("error"):
-            raise RuntimeError(str(raw.get("error")))
-        result = raw.get("result")
-        if isinstance(result, dict) and isinstance(result.get("list"), list):
-            return result["list"]
-        if isinstance(raw.get("data"), list):
-            return raw["data"]
-        if isinstance(raw.get("list"), list):
-            return raw["list"]
-        return []
+        return require_open_orders_response(raw)
 
     def _residual_repair_baseline_size(self, task: dict, repair_venue: Venue) -> float:
         position_id = task.get("position_id", "")

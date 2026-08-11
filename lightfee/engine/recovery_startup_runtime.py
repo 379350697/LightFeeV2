@@ -5,7 +5,7 @@ from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import PositionSnapshot, Venue
-from lightfee.engine.exchange_truth import request_venue_operation
+from lightfee.engine.exchange_truth import require_open_orders_response, request_venue_operation
 from lightfee.engine.lifecycle import (
     clear_risk_mode_for_recovery,
     enter_fail_closed,
@@ -15,6 +15,7 @@ from lightfee.engine.recovery_decision_core import (
     CORE_CLEARABLE_BLOCK_REASONS,
     RecoveryDecisionKind,
     RecoveryEvidenceSnapshot,
+    RecoveryTruthScope,
     V1RecoveryDecisionCore,
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
@@ -145,28 +146,13 @@ class RecoveryStartupRuntime:
         handles the post-deploy/runtime latch where the recovery core is already
         clean, the exchange is provably flat, and no local recovery owner remains.
         """
-        if self.ctx.state.lifecycle != EngineLifecycle.RISK_ONLY:
-            return False
-        if self.ctx.state.risk_mode not in {
-            GlobalRiskMode.RUNNING,
-            GlobalRiskMode.FAIL_CLOSED,
-        }:
-            return False
-        if self.ctx.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED:
+        if not self._risk_only_lifecycle_needs_account_truth():
             return False
         if self.ctx.state.recovery_blocked_reason:
             return False
-        if self.ctx._has_local_recovery_work():
-            return False
         if not isinstance(exchange_truth, dict):
             return False
-        if exchange_truth.get("truth_supported", True) is False:
-            return False
-        if not bool(exchange_truth.get("truth_available", False)):
-            return False
-        if not self.ctx._recovery_exchange_truth_flat(exchange_truth):
-            return False
-        if not self.ctx._recovery_exchange_truth_open_orders_empty(exchange_truth):
+        if not V1RecoveryDecisionCore.is_complete_account_flat_truth(exchange_truth):
             return False
 
         core_decision = getattr(self.ctx, "recovery_decision", None)
@@ -196,29 +182,6 @@ class RecoveryStartupRuntime:
                 "ts_ms": now_ms,
             },
         )
-        return True
-
-    @staticmethod
-    def _recovery_exchange_truth_flat(exchange_truth: dict[str, Any]) -> bool:
-        for position in exchange_truth.get("positions") or []:
-            if not isinstance(position, dict):
-                continue
-            qty = position.get("quantity", position.get("position_qty", 0.0))
-            try:
-                if abs(float(qty or 0.0)) > 1e-9:
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
-
-    @staticmethod
-    def _recovery_exchange_truth_open_orders_empty(exchange_truth: dict[str, Any]) -> bool:
-        if "open_orders" not in exchange_truth:
-            return False
-        for order in exchange_truth.get("open_orders") or []:
-            if isinstance(order, dict) and order.get("error"):
-                return False
-            return False
         return True
 
     def _recovery_state_collection(self, name: str) -> list[Any]:
@@ -270,6 +233,32 @@ class RecoveryStartupRuntime:
             lifecycle_clear_reason=lifecycle_clear_reason,
         )
 
+    def _risk_only_lifecycle_needs_account_truth(self) -> bool:
+        """Whether a risk-only lifecycle is eligible for core-owned release."""
+        return (
+            self.ctx.state.lifecycle == EngineLifecycle.RISK_ONLY
+            and self.ctx.state.risk_mode in {
+                GlobalRiskMode.RUNNING,
+                GlobalRiskMode.FAIL_CLOSED,
+            }
+            and self.ctx.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
+            and not self.ctx._has_local_recovery_work()
+        )
+
+    async def _refresh_risk_only_lifecycle_from_account_truth(
+        self,
+        now_ms: int,
+        *,
+        lifecycle_clear_reason: str,
+    ) -> RecoveryLedger | None:
+        """Route every risk-only release candidate through account truth."""
+        if not self._risk_only_lifecycle_needs_account_truth():
+            return None
+        return await self._refresh_recovery_ledger_from_account_truth(
+            now_ms,
+            lifecycle_clear_reason=lifecycle_clear_reason,
+        )
+
     async def _collect_recovery_ledger_account_truth(
         self,
         now_ms: int,
@@ -303,15 +292,19 @@ class RecoveryStartupRuntime:
                 try:
                     rows = await fetch_all_positions()
                     truth_probe_count += 1
-                    if isinstance(rows, (list, tuple, set)):
-                        for position in rows:
-                            positions.append(
-                                self.ctx._recovery_ledger_position_payload(
-                                    position,
-                                    venue_name=venue_name,
-                                    symbol="*",
-                                )
+                    if not isinstance(rows, (list, tuple, set)):
+                        raise RuntimeError(
+                            "fetch_all_positions_invalid_response:"
+                            f"{type(rows).__name__}"
+                        )
+                    for position in rows:
+                        positions.append(
+                            self.ctx._recovery_ledger_position_payload(
+                                position,
+                                venue_name=venue_name,
+                                symbol="*",
                             )
+                        )
                     probe_evidence.append(
                         {
                             "venue": venue_name,
@@ -320,9 +313,7 @@ class RecoveryStartupRuntime:
                             "method": "fetch_all_positions",
                             "finished_at_ms": now_ms,
                             "classification": "position_probe_unfiltered_succeeded",
-                            "position_count": len(rows)
-                            if isinstance(rows, (list, tuple, set))
-                            else 0,
+                            "position_count": len(rows),
                         }
                     )
                 except Exception as exc:
@@ -381,6 +372,7 @@ class RecoveryStartupRuntime:
                 )
 
         return {
+            "truth_scope": RecoveryTruthScope.ACCOUNT.value,
             "truth_supported": truth_probe_count > 0,
             "truth_available": not errors,
             "positions": positions,
@@ -564,6 +556,7 @@ class RecoveryStartupRuntime:
                     )
 
         return {
+            "truth_scope": RecoveryTruthScope.SYMBOLS.value,
             "truth_supported": truth_probe_count > 0,
             "truth_available": not errors,
             "positions": positions,
@@ -579,16 +572,21 @@ class RecoveryStartupRuntime:
         venue_name: str,
         symbol: str,
     ) -> dict[str, Any]:
-        side = getattr(position, "side", "")
+        if not isinstance(position, PositionSnapshot):
+            raise RuntimeError(
+                "position_row_invalid_type:"
+                f"{type(position).__name__}"
+            )
+        side = position.side
         if hasattr(side, "value"):
             side = side.value
         return {
-            "venue": str(getattr(position, "venue", venue_name) or venue_name).lower(),
-            "symbol": str(getattr(position, "symbol", symbol) or symbol).upper(),
+            "venue": str(position.venue or venue_name).lower(),
+            "symbol": str(position.symbol or symbol).upper(),
             "side": str(side or "").lower(),
-            "quantity": float(getattr(position, "quantity", 0.0) or 0.0),
-            "entry_price": float(getattr(position, "entry_price", 0.0) or 0.0),
-            "observed_at_ms": int(getattr(position, "observed_at_ms", 0) or 0),
+            "quantity": float(position.quantity),
+            "entry_price": float(position.entry_price),
+            "observed_at_ms": int(position.observed_at_ms),
         }
 
     @staticmethod
@@ -598,72 +596,72 @@ class RecoveryStartupRuntime:
         venue_name: str,
         symbol: str,
     ) -> list[dict[str, Any]]:
-        if rows is None:
-            return []
-        if isinstance(rows, dict) and rows.get("error"):
-            raise RuntimeError(str(rows.get("error")))
-        if isinstance(rows, dict):
-            iterable = list(rows.values())
-        elif isinstance(rows, (list, tuple, set)):
-            iterable = list(rows)
-        else:
-            iterable = [rows]
+        if not isinstance(rows, (list, tuple, set)):
+            raise RuntimeError(
+                "open_orders_invalid_collection:"
+                f"{type(rows).__name__}"
+            )
+        iterable = list(rows)
 
         result: list[dict[str, Any]] = []
-        for row in iterable:
-            if isinstance(row, dict):
-                result.append(
-                    {
-                        "venue": str(row.get("venue") or venue_name).lower(),
-                        "symbol": str(
-                            row.get("symbol")
-                            or row.get("instId")
-                            or row.get("contract")
-                            or row.get("coin")
-                            or symbol
-                        ).upper(),
-                        "side": str(row.get("side") or "").lower(),
-                        "quantity": float(
+        for index, row in enumerate(iterable):
+            if not isinstance(row, dict):
+                raise RuntimeError(
+                    "open_orders_invalid_row:"
+                    f"{index}:{type(row).__name__}"
+                )
+            result.append(
+                {
+                    "venue": str(row.get("venue") or venue_name).lower(),
+                    "symbol": str(
+                        row.get("symbol")
+                        or row.get("instId")
+                        or row.get("contract")
+                        or row.get("coin")
+                        or symbol
+                    ).upper(),
+                    "side": str(row.get("side") or "").lower(),
+                    "quantity": float(
+                        row.get(
+                            "quantity",
                             row.get(
-                                "quantity",
+                                "origQty",
                                 row.get(
-                                    "origQty",
+                                    "qty",
                                     row.get(
-                                        "qty",
-                                        row.get(
-                                            "size",
-                                            row.get("sz", row.get("amount", 0.0)),
-                                        ),
+                                        "size",
+                                        row.get("sz", row.get("amount", 0.0)),
                                     ),
                                 ),
-                            )
-                            or 0.0
-                        ),
-                        "price": float(row.get("price", row.get("px", 0.0)) or 0.0),
-                        "reduce_only": RecoveryStartupRuntime._truthy_recovery_order_field(
-                            row.get("reduce_only", row.get("reduceOnly", False))
-                        ),
-                        "order_id": str(
-                            row.get("order_id")
-                            or row.get("orderId")
-                            or row.get("ordId")
-                            or row.get("id")
-                            or row.get("orderLinkId")
-                            or row.get("clientOid")
-                            or row.get("clOrdId")
-                            or ""
-                        ),
-                        "client_order_id": str(
-                            row.get("client_order_id")
-                            or row.get("clientOrderId")
-                            or row.get("order_link_id")
-                            or row.get("orderLinkId")
-                            or row.get("clientOid")
-                            or row.get("clOrdId")
-                            or ""
-                        ),
-                    }
-                )
+                            ),
+                        )
+                        or 0.0
+                    ),
+                    "price": float(row.get("price", row.get("px", 0.0)) or 0.0),
+                    "reduce_only": RecoveryStartupRuntime._truthy_recovery_order_field(
+                        row.get("reduce_only", row.get("reduceOnly", False))
+                    ),
+                    "order_id": str(
+                        row.get("order_id")
+                        or row.get("orderId")
+                        or row.get("ordId")
+                        or row.get("id")
+                        or row.get("orderLinkId")
+                        or row.get("clientOid")
+                        or row.get("clOrdId")
+                        or ""
+                    ),
+                    "client_order_id": str(
+                        row.get("client_order_id")
+                        or row.get("clientOrderId")
+                        or row.get("order_link_id")
+                        or row.get("orderLinkId")
+                        or row.get("clientOid")
+                        or row.get("clOrdId")
+                        or ""
+                    ),
+                }
+            )
         return result
 
     @staticmethod
@@ -674,30 +672,7 @@ class RecoveryStartupRuntime:
 
     @staticmethod
     def _recovery_ledger_order_rows(raw: Any) -> list[Any]:
-        if raw is None:
-            return []
-        if isinstance(raw, list):
-            return raw
-        if not isinstance(raw, dict):
-            return [raw]
-        if raw.get("error"):
-            raise RuntimeError(str(raw.get("error")))
-        result = raw.get("result")
-        if isinstance(result, dict) and isinstance(result.get("list"), list):
-            return result["list"]
-        data = raw.get("data")
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            for key in ("entrustedList", "orderList", "list", "orders"):
-                rows = data.get(key)
-                if isinstance(rows, list):
-                    return rows
-        for key in ("list", "orders", "openOrders"):
-            rows = raw.get(key)
-            if isinstance(rows, list):
-                return rows
-        return []
+        return require_open_orders_response(raw)
 
     def _startup_recovery_ledger_symbols(self, symbol_info: object) -> list[str]:
         symbols = set(self.ctx._startup_position_probe_symbols(symbol_info))
@@ -1182,27 +1157,8 @@ class RecoveryStartupRuntime:
             now_ms,
             source="runtime_live_position_probe",
         )
-        if (
-            recovery_result == "no_live_positions"
-            and self.ctx.state.recovery_blocked_reason
-            in {"unpaired_live_position", "owned_pending_entry_live_conflict"}
-            and not self.ctx._has_local_recovery_work()
-            and self.ctx.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
-        ):
-            await self.ctx._refresh_recovery_ledger_from_account_truth(
-                now_ms,
-                lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
-            )
-        elif (
-            recovery_result == "no_live_positions"
-            and self.ctx.state.lifecycle == EngineLifecycle.RISK_ONLY
-            and self.ctx.state.risk_mode == GlobalRiskMode.RUNNING
-            and self.ctx.state.recovery_blocked_reason is None
-            and not self.ctx._has_local_recovery_work()
-            and self.ctx.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
-        ):
-            await self.ctx._refresh_recovery_ledger_for_symbols(
-                self.ctx._startup_recovery_ledger_symbols({}),
+        if recovery_result == "no_live_positions":
+            await self.ctx._refresh_risk_only_lifecycle_from_account_truth(
                 now_ms,
                 lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
             )

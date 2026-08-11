@@ -180,6 +180,7 @@ JOURNAL_ONLY_LIFECYCLE_KINDS: frozenset[str] = frozenset({
     "runtime.reconciling_complete",
     "runtime.fail_closed",
     "runtime.recovery_blocked",
+    "runtime.recovery_awaiting_account_truth",
     "runtime.snapshot_missing",
     "runtime.snapshot_stale",
 })

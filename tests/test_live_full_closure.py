@@ -248,7 +248,7 @@ class TestLiveFullClosure:
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
 
     @pytest.mark.asyncio
-    async def test_housekeeping_clears_clean_fail_closed_after_live_recovery(self):
+    async def test_housekeeping_retains_clean_fail_closed_without_account_truth(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
 
@@ -265,11 +265,15 @@ class TestLiveFullClosure:
 
             await runtime._post_tick_housekeeping(5000)
 
-            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
-            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
             records = runtime.journal.read_all()
-            assert any(
-                r.get("kind") == "runtime.stale_fail_closed_cleared"
+            assert not any(
+                r.get("kind") in {
+                    "runtime.stale_fail_closed_cleared",
+                    "recovery.lifecycle_clear",
+                    "recovery.ledger_clear",
+                }
                 for r in records
             )
 
@@ -459,7 +463,7 @@ class TestLiveStartupPreflight:
             assert runtime.state.risk_mode == GlobalRiskMode.REDUCE_ONLY
 
     @pytest.mark.asyncio
-    async def test_stale_fail_closed_clean_state_is_cleared_on_startup(self):
+    async def test_stale_fail_closed_clean_state_waits_for_account_truth_on_startup(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
             snap = __import__("lightfee.persistence.snapshot_store", fromlist=["SnapshotStore"]).SnapshotStore(
@@ -479,10 +483,18 @@ class TestLiveStartupPreflight:
             runtime = LiveRuntime(config)
             await runtime.start()
 
-            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
-            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == (
+                "stale_risk_only_requires_account_truth"
+            )
             records = runtime.journal.read_all()
-            assert any(r.get("kind") == "runtime.stale_fail_closed_cleared" for r in records)
+            assert any(
+                r.get("kind") == "runtime.recovery_awaiting_account_truth"
+                and r.get("payload", {}).get("reason")
+                == "stale_risk_only_requires_account_truth"
+                for r in records
+            )
 
     @pytest.mark.asyncio
     async def test_tick_populates_last_scan_with_fresh_snapshot(self):

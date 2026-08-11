@@ -161,30 +161,68 @@ def parse_open_orders_response(
     failure returns (None, reason) so the caller treats the probe as untrusted —
     an empty/None/unknown response is NOT equivalent to a proven flat.
     """
+    def trusted_rows(rows: Any, *, source: str) -> tuple[list[Any] | None, str | None]:
+        if not isinstance(rows, list):
+            return None, f"open_orders_response_field_not_list:{source}"
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                return (
+                    None,
+                    "open_orders_response_row_not_mapping:"
+                    f"{source}:{index}:{type(row).__name__}",
+                )
+        return list(rows), None
+
     if isinstance(raw, list):
         # A bare list may itself be the order collection (Aster/Bybit style).
-        return list(raw), None
+        return trusted_rows(raw, source="root")
     if not isinstance(raw, dict):
         return None, "open_orders_response_not_mapping"
+
     # Bybit /api/v5/order/realtime nests orders under result.list.
-    result = raw.get("result")
-    if isinstance(result, dict):
-        result_list = result.get("list")
-        if isinstance(result_list, list):
-            return list(result_list), None
-        if result_list is not None:
+    if "result" in raw:
+        result = raw["result"]
+        if not isinstance(result, dict):
+            return None, "open_orders_response_result_not_mapping"
+        if "list" not in result:
+            return None, "open_orders_response_result_missing_list"
+        result_list = result["list"]
+        if not isinstance(result_list, list):
             return None, "open_orders_response_result_list_not_list"
-        if not result:
-            return None, "open_orders_response_result_empty"
-    for key in ("data", "list", "orders"):
-        value = raw.get(key)
-        if isinstance(value, list):
-            return list(value), None
-        if value is not None and not isinstance(value, list):
-            return None, f"open_orders_response_field_not_list:{key}"
+        return trusted_rows(result_list, source="result.list")
+
+    # Bitget-style responses keep the collection in a named data field.
+    if "data" in raw:
+        data = raw["data"]
+        if isinstance(data, list):
+            return trusted_rows(data, source="data")
+        if not isinstance(data, dict):
+            return None, "open_orders_response_field_not_list:data"
+        for key in ("entrustedList", "orderList", "list", "orders"):
+            if key not in data:
+                continue
+            rows = data[key]
+            return trusted_rows(rows, source=f"data.{key}")
+        return None, "open_orders_response_data_unrecognized_shape"
+
+    for key in ("list", "orders", "openOrders"):
+        if key not in raw:
+            continue
+        rows = raw[key]
+        return trusted_rows(rows, source=key)
     if not raw:
         return None, "open_orders_response_empty"
     return None, "open_orders_response_unrecognized_shape"
+
+
+def require_open_orders_response(raw: Any) -> list[Any]:
+    """Return trusted open-order rows or raise; never synthesize an empty list."""
+    if isinstance(raw, dict) and raw.get("error"):
+        raise RuntimeError(str(raw["error"]))
+    rows, error = parse_open_orders_response(raw)
+    if rows is None:
+        raise RuntimeError(error or "open_orders_response_untrusted")
+    return rows
 
 
 async def probe_venue_open_orders_flat(

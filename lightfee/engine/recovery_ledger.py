@@ -10,19 +10,14 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from lightfee.engine.recovery_decision_core import (
+    LIVE_ARTIFACT_BLOCK_REASONS,
     pending_close_reconciliation_evidence,
 )
 from lightfee.venues.specs import canonical_symbol_from_venue
 
 EPSILON = 1e-9
 
-GLOBAL_BLOCKING_KINDS = frozenset(
-    {
-        "orphan_maker_order",
-        "unpaired_live_position",
-        "owned_pending_entry_live_conflict",
-    }
-)
+GLOBAL_BLOCKING_KINDS = LIVE_ARTIFACT_BLOCK_REASONS
 
 
 @dataclass(frozen=True)

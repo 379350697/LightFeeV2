@@ -26,7 +26,10 @@ from lightfee.engine.bootstrap import (
     wall_clock_now_ms,
 )
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
+from lightfee.engine.recovery_decision_core import (
+    LIVE_ARTIFACT_BLOCK_REASONS,
+    RecoveryDecisionKind,
+)
 from lightfee.engine.state import (
     ActiveMakerLeg,
     OpenPosition,
@@ -2463,29 +2466,39 @@ class TestRuntimePreflight:
             )
 
     @pytest.mark.asyncio
-    async def test_runtime_position_flat_truth_clears_unpaired_live_position_block(self):
-        """A later flat position probe terminalizes a prior unpaired-position block."""
+    @pytest.mark.parametrize("block_reason", sorted(LIVE_ARTIFACT_BLOCK_REASONS))
+    async def test_runtime_complete_account_truth_clears_every_live_artifact_block(
+        self,
+        block_reason: str,
+    ):
+        """Every live-artifact latch releases only after complete account truth."""
 
-        class FlatBulkPositionAdapter(FakeVenueAdapter):
+        class AccountFlatTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
             async def fetch_all_positions(self):
                 return []
 
-            async def fetch_open_orders(self, symbol: str):
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
                 return []
 
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
-            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
+            bybit = AccountFlatTruthAdapter(Venue.BYBIT)
             runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
             runtime.journal.open()
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
             runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
-            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_reason = block_reason
             runtime.state.recovery_blocked_at_ms = 1234
             runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
 
             await runtime._maybe_recover_clean_live_positions(1700000005000)
 
+            assert bybit.open_order_scopes == [None]
             assert runtime.recovery_decision is not None
             assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
             assert runtime.recovery_decision.clear_reason == "core_running_clean"
@@ -2496,35 +2509,58 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
-    async def test_runtime_flat_truth_clears_owned_pending_entry_live_conflict_block(self):
-        """A later account-flat probe releases an owned pending-entry live conflict."""
+    async def test_runtime_orphan_reduce_only_order_rechecks_and_clears_from_account_truth(self):
+        """The real ledger-to-runtime path clears a vanished reduce-only orphan."""
 
-        class FlatBulkPositionAdapter(FakeVenueAdapter):
+        class AccountFlatTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
             async def fetch_all_positions(self):
                 return []
 
-            async def fetch_open_orders(self, symbol: str):
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
                 return []
 
         with tempfile.TemporaryDirectory() as td:
-            config = make_test_config(td)
-            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
-            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            bybit = AccountFlatTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={Venue.BYBIT: bybit},
+            )
             runtime.journal.open()
-            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
-            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
-            runtime.state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
-            runtime.state.recovery_blocked_at_ms = 1234
-            runtime.state.last_scan = {"recent_touched_symbols": ["HOMEUSDT"]}
+            runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_scope": "account",
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "BTCUSDT",
+                            "side": "sell",
+                            "quantity": 1.0,
+                            "reduce_only": True,
+                            "order_id": "orphan-reduce-only",
+                        }
+                    ],
+                },
+                now_ms=1700000000000,
+            )
+
+            assert runtime.state.recovery_blocked_reason == "orphan_reduce_only_order"
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
 
             await runtime._maybe_recover_clean_live_positions(1700000005000)
 
+            assert bybit.open_order_scopes == [None]
             assert runtime.recovery_decision is not None
             assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
             assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
             assert runtime.state.recovery_blocked_reason is None
-            assert runtime.state.recovery_blocked_at_ms == 0
             runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -2652,17 +2688,53 @@ class TestRuntimePreflight:
             assert adapter.open_order_symbol is None
 
     @pytest.mark.asyncio
-    async def test_runtime_unpaired_live_position_flat_truth_requires_open_order_truth(self):
-        """The unpaired-position release must not synthesize empty open orders."""
+    async def test_runtime_account_truth_rejects_malformed_all_position_response(self):
+        """A non-collection response cannot prove an account is position-flat."""
+
+        class MalformedPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return None
+
+            async def fetch_open_orders(self, symbol: str | None = None):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={Venue.BYBIT: MalformedPositionAdapter(Venue.BYBIT)},
+            )
+
+            truth = await runtime._collect_recovery_ledger_account_truth(1700000005000)
+
+            assert truth["truth_scope"] == "account"
+            assert truth["truth_available"] is False
+            assert truth["positions"] == []
+            assert truth["open_orders"] == []
+            assert truth["errors"] == [
+                "bybit:*:positions:fetch_all_positions_invalid_response:NoneType"
+            ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("block_reason", sorted(LIVE_ARTIFACT_BLOCK_REASONS))
+    async def test_runtime_live_artifact_flat_truth_requires_open_order_truth(
+        self,
+        block_reason: str,
+    ):
+        """A live account order retains every prior live-artifact latch."""
 
         class OpenOrderAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
             def supported_symbols(self) -> list[str]:
                 return ["BTCUSDT"]
 
             async def fetch_all_positions(self):
                 return []
 
-            async def fetch_open_orders(self, symbol: str):
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
                 return [
                     {
                         "venue": self.venue.value,
@@ -2680,32 +2752,41 @@ class TestRuntimePreflight:
             runtime.journal.open()
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
             runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
-            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_reason = block_reason
             runtime.state.recovery_blocked_at_ms = 1234
             runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
 
             await runtime._maybe_recover_clean_live_positions(1700000005000)
 
+            assert bybit.open_order_scopes == [None]
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
             assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-            assert runtime.state.recovery_blocked_reason
-            assert runtime.state.recovery_blocked_reason != "unpaired_live_position"
+            assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
             assert runtime.recovery_decision is not None
             assert runtime.recovery_decision.entry_allowed is False
             runtime.journal.close()
 
     @pytest.mark.asyncio
-    async def test_runtime_unpaired_live_position_flat_truth_requires_available_order_truth(self):
-        """Flat positions cannot clear an unpaired block when order truth errors."""
+    @pytest.mark.parametrize("block_reason", sorted(LIVE_ARTIFACT_BLOCK_REASONS))
+    async def test_runtime_live_artifact_flat_truth_requires_available_order_truth(
+        self,
+        block_reason: str,
+    ):
+        """Incomplete order truth retains every prior live-artifact latch."""
 
         class OpenOrderUnavailableAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
             def supported_symbols(self) -> list[str]:
                 return ["BTCUSDT"]
 
             async def fetch_all_positions(self):
                 return []
 
-            async def fetch_open_orders(self, symbol: str):
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
                 raise RuntimeError("open order truth unavailable")
 
         with tempfile.TemporaryDirectory() as td:
@@ -2715,29 +2796,101 @@ class TestRuntimePreflight:
             runtime.journal.open()
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
             runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
-            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_reason = block_reason
             runtime.state.recovery_blocked_at_ms = 1234
             runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
 
             await runtime._maybe_recover_clean_live_positions(1700000005000)
 
+            assert bybit.open_order_scopes == [None]
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
             assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-            assert runtime.state.recovery_blocked_reason == "unpaired_live_position"
+            assert runtime.state.recovery_blocked_reason == block_reason
             assert runtime.state.recovery_blocked_at_ms == 1234
             assert runtime.recovery_decision is not None
             assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("positions_response", "orders_response", "error_fragment"),
+        [
+            ([None], [], "position_row_invalid_type:NoneType"),
+            ([{"symbol": "BTCUSDT", "quantity": 1.0}], [], "position_row_invalid_type:dict"),
+            ([], None, "open_orders_response_not_mapping"),
+            ([], {"unexpected": 1}, "open_orders_response_unrecognized_shape"),
+            ([], [None], "open_orders_response_row_not_mapping:root:0:NoneType"),
+        ],
+    )
+    async def test_runtime_live_artifact_release_rejects_untrusted_account_truth(
+        self,
+        positions_response: object,
+        orders_response: object,
+        error_fragment: str,
+    ):
+        """Unknown account evidence must retain a live-artifact risk latch."""
+
+        class UntrustedAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return positions_response
+
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol is None
+                return orders_response
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={
+                    Venue.BYBIT: UntrustedAccountTruthAdapter(Venue.BYBIT),
+                },
+            )
+            runtime.journal.open()
+            runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_scope": "account",
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [
+                        {
+                            "venue": "bybit",
+                            "symbol": "BTCUSDT",
+                            "side": "sell",
+                            "quantity": 1.0,
+                            "reduce_only": True,
+                            "order_id": "orphan-reduce-only",
+                        }
+                    ],
+                },
+                now_ms=1700000000000,
+            )
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            truth = runtime._last_recovery_exchange_truth
+            assert truth["truth_scope"] == "account"
+            assert truth["truth_available"] is False
+            assert any(error_fragment in error for error in truth["errors"])
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.recovery_blocked_reason == "orphan_reduce_only_order"
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_runtime_flat_truth_clears_stale_risk_only_lifecycle_without_block_reason(self):
-        """Production stale latch: core is clean but lifecycle stayed risk_only."""
+        """Complete account truth releases a stale fail_closed lifecycle."""
 
         class FlatTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
             async def fetch_all_positions(self):
                 return []
 
-            async def fetch_open_orders(self, symbol: str):
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
                 return []
 
         with tempfile.TemporaryDirectory() as td:
@@ -2747,11 +2900,12 @@ class TestRuntimePreflight:
             await runtime.start()
 
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
-            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
             runtime.state.recovery_blocked_reason = None
             runtime.state.recovery_blocked_at_ms = 0
             runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
             runtime._last_private_position_probe_ms = 0
+            bybit.open_order_scopes.clear()
 
             await runtime._post_tick_housekeeping(1700000005000)
 
@@ -2759,6 +2913,7 @@ class TestRuntimePreflight:
             assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
             assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert bybit.open_order_scopes == [None]
             events = runtime.journal.read_all()
             assert any(
                 event["kind"] == "recovery.lifecycle_clear"
@@ -2784,6 +2939,8 @@ class TestRuntimePreflight:
 
             runtime._refresh_recovery_ledger_from_exchange_truth(
                 {
+                    "truth_scope": "account",
+                    "truth_supported": True,
                     "truth_available": True,
                     "positions": [],
                     "open_orders": [],
@@ -2808,20 +2965,61 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
-    async def test_runtime_stale_lifecycle_requires_open_order_truth_before_clear(self):
-        """Flat positions alone are not enough when live open-order truth exists."""
+    async def test_symbol_scoped_flat_truth_does_not_clear_stale_lifecycle(self):
+        """A stale lifecycle needs account coverage even without a prior blocker."""
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(make_test_config(td))
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = None
+            runtime.state.recovery_blocked_at_ms = 0
+
+            runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_scope": "symbols",
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                    "probe_evidence": [],
+                    "errors": [],
+                },
+                now_ms=1700000005000,
+                lifecycle_clear_reason="runtime_flat_truth_current_state_clean",
+            )
+
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert not any(
+                event["kind"] == "recovery.lifecycle_clear"
+                for event in runtime.journal.read_all()
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_stale_lifecycle_requires_account_wide_open_order_truth_before_clear(self):
+        """An order outside the candidate sweep must keep a stale lifecycle latched."""
 
         class OpenOrderTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
             async def fetch_all_positions(self):
                 return []
 
-            async def fetch_open_orders(self, symbol: str):
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
+                if symbol is not None:
+                    return []
                 return [
                     {
                         "venue": self.venue.value,
-                        "symbol": symbol,
+                        "symbol": "UNSCANNEDUSDT",
                         "side": "buy",
-                        "quantity": 1.0,
                         "order_id": "live-open-order",
                     }
                 ]
@@ -2833,14 +3031,16 @@ class TestRuntimePreflight:
             await runtime.start()
 
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
-            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
             runtime.state.recovery_blocked_reason = None
             runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
             runtime._last_private_position_probe_ms = 0
+            bybit.open_order_scopes.clear()
 
             await runtime._post_tick_housekeeping(1700000005000)
 
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert bybit.open_order_scopes == [None]
             assert runtime.recovery_decision is not None
             assert runtime.recovery_decision.entry_allowed is False
             await runtime.stop()
@@ -2863,7 +3063,7 @@ class TestRuntimePreflight:
             await runtime.start()
 
             runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
-            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
             runtime.state.recovery_blocked_reason = None
             runtime.state.last_scan = {"recent_touched_symbols": ["BTCUSDT"]}
             runtime._last_private_position_probe_ms = 0
@@ -2876,31 +3076,6 @@ class TestRuntimePreflight:
             await runtime.stop()
 
     @pytest.mark.asyncio
-    async def test_runtime_position_flat_truth_does_not_clear_orphan_order_block(self):
-        """Position-flat truth alone cannot clear an order-artifact blocker."""
-
-        class FlatBulkPositionAdapter(FakeVenueAdapter):
-            async def fetch_all_positions(self):
-                return []
-
-        with tempfile.TemporaryDirectory() as td:
-            config = make_test_config(td)
-            bybit = FlatBulkPositionAdapter(Venue.BYBIT)
-            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
-            runtime.journal.open()
-            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
-            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
-            runtime.state.recovery_blocked_reason = "orphan_maker_order"
-            runtime.state.recovery_blocked_at_ms = 1234
-
-            await runtime._maybe_recover_clean_live_positions(1700000005000)
-
-            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
-            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-            assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
-            assert runtime.state.recovery_blocked_at_ms == 1234
-            runtime.journal.close()
-
     @pytest.mark.asyncio
     async def test_runtime_live_mismatch_flatten_closes_core_ledger_block(self):
         """A successful runtime flatten must return to the core to clear its block."""
@@ -3477,6 +3652,8 @@ class TestRuntimePreflight:
 
             ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
                 {
+                    "truth_scope": "account",
+                    "truth_supported": True,
                     "truth_available": True,
                     "positions": [],
                     "open_orders": [],
@@ -3491,6 +3668,80 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_reason is None
             assert runtime.state.recovery_blocked_at_ms == 0
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            runtime.journal.close()
+
+    def test_unsupported_account_truth_keeps_previous_live_artifact_blocker(self):
+        """No supported account probe must not clear an orphan-order risk lock."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(make_test_config(td))
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "orphan_maker_order"
+            runtime.state.recovery_blocked_at_ms = 123
+
+            ledger = runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_scope": "account",
+                    "truth_supported": False,
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                },
+                now_ms=1778787000000,
+            )
+
+            assert not any(item.blocking for item in ledger.work_items)
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            assert runtime.recovery_decision.clear_previous_block is False
+            assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
+            assert runtime.state.recovery_blocked_at_ms == 123
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_symbol_scoped_flat_truth_does_not_clear_live_artifact_blocker(self):
+        """Candidate-symbol truth may refresh the ledger but cannot release risk_only."""
+
+        class SymbolFlatAdapter(FakeVenueAdapter):
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=self.venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1700000005000,
+                )
+
+            async def fetch_open_orders(self, symbol: str):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={Venue.BYBIT: SymbolFlatAdapter(Venue.BYBIT)},
+            )
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 123
+
+            await runtime._refresh_recovery_ledger_for_symbols(
+                ["BTCUSDT"],
+                1700000005000,
+            )
+
+            assert runtime._last_recovery_exchange_truth["truth_scope"] == "symbols"
+            assert runtime.recovery_decision is not None
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.recovery_decision.clear_previous_block is False
+            assert runtime.state.recovery_blocked_reason == "unpaired_live_position"
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
             runtime.journal.close()
 
     def test_evidence_gap_clears_previous_ledger_blocker_through_core(self):
@@ -3560,6 +3811,136 @@ class TestRuntimePreflight:
                 "live_position_mismatch_flatten_failed"
             )
             assert runtime.state.recovery_blocked_at_ms == 1234
+
+    @pytest.mark.asyncio
+    async def test_startup_stale_fail_closed_requires_account_truth_before_release(self):
+        """A clean local snapshot is not account-flat proof during startup."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": "risk_only",
+                "risk_mode": "fail_closed",
+                "recovery_blocked_reason": None,
+                "recovery_blocked_at_ms": 0,
+                "open_positions": [],
+                "pending_entries": [],
+                "pending_closes": [],
+                "pending_passive_closes": [],
+                "pending_residual_repairs": [],
+            })
+
+            runtime = LiveRuntime(config, venue_adapters={})
+            await runtime.start()
+            await runtime.stop()
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == (
+                "stale_risk_only_requires_account_truth"
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("lifecycle", "risk_mode", "expected_risk_mode"),
+        [
+            ("risk_only", "running", GlobalRiskMode.RUNNING),
+            ("risk_only", "fail_closed", GlobalRiskMode.FAIL_CLOSED),
+            ("running", "fail_closed", GlobalRiskMode.FAIL_CLOSED),
+        ],
+    )
+    async def test_startup_stale_risk_only_survives_first_housekeeping_without_account_truth(
+        self,
+        lifecycle,
+        risk_mode,
+        expected_risk_mode,
+    ):
+        """Neither stale risk-only form may be released before account truth.
+
+        This is the production ordering: start() retains the persisted
+        lifecycle, then the first housekeeping tick runs supervisor before the
+        account-truth probe.  A health-latch resume must not erase a startup
+        recovery latch while that probe is unavailable.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.strategy.risk_monitor_enabled = False
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": lifecycle,
+                "risk_mode": risk_mode,
+                "recovery_blocked_reason": None,
+                "recovery_blocked_at_ms": 0,
+                "open_positions": [],
+                "pending_entries": [],
+                "pending_closes": [],
+                "pending_passive_closes": [],
+                "pending_residual_repairs": [],
+            })
+
+            runtime = LiveRuntime(config, venue_adapters={})
+            await runtime.start()
+            await runtime._post_tick_housekeeping(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == expected_risk_mode
+            assert runtime.state.recovery_blocked_reason == (
+                "stale_risk_only_requires_account_truth"
+            )
+            await runtime.stop()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("lifecycle", "risk_mode"),
+        [
+            ("risk_only", "running"),
+            ("risk_only", "fail_closed"),
+            ("running", "fail_closed"),
+        ],
+    )
+    async def test_startup_account_flat_truth_releases_stale_risk_only(
+        self,
+        lifecycle,
+        risk_mode,
+    ):
+        """Startup uses the same account-truth release path as runtime ticks."""
+
+        class FlatAccountTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": lifecycle,
+                "risk_mode": risk_mode,
+                "recovery_blocked_reason": None,
+                "recovery_blocked_at_ms": 0,
+                "open_positions": [],
+                "pending_entries": [],
+                "pending_closes": [],
+                "pending_passive_closes": [],
+                "pending_residual_repairs": [],
+            })
+            bybit = FlatAccountTruthAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            await runtime.start()
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert None in bybit.open_order_scopes
+            assert any(
+                event["kind"] == "recovery.ledger_clear"
+                and event["payload"].get("decision") == "RUNNING_CLEAN"
+                for event in runtime.journal.read_all()
+            )
+            await runtime.stop()
 
     @pytest.mark.asyncio
     async def test_startup_live_mismatch_flatten_closes_core_ledger_block(self):

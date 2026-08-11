@@ -61,12 +61,14 @@ from lightfee.engine.order_truth_ledger import (
 from lightfee.engine.recovery import (
     recover_from_snapshot,
     build_recovery_dedup_index,
-    clear_stale_fail_closed_if_recovery_clean,
     clear_legacy_recovery_block_via_core,
     build_persistent_state_view,
 )
 from lightfee.engine.recovery_decision_core import (
+    CORE_OWNED_BLOCK_REASONS,
+    LIVE_ARTIFACT_BLOCK_REASONS,
     RecoveryEvidenceSnapshot,
+    STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON,
     V1RecoveryDecisionCore,
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
@@ -1065,11 +1067,7 @@ class LiveRuntime:
         ]
         if not blocking_rows:
             return False
-        if reason in {
-            "orphan_maker_order",
-            "unpaired_live_position",
-            "owned_pending_entry_live_conflict",
-        }:
+        if reason in LIVE_ARTIFACT_BLOCK_REASONS:
             return True
         phases = {str(row.get("phase") or "") for row in blocking_rows}
         if (
@@ -1141,17 +1139,7 @@ class LiveRuntime:
 
     @staticmethod
     def _v1_lifecycle_runtime_gate_reason(reason: str) -> str:
-        if reason in {
-            "orphan_maker_order",
-            "unpaired_live_position",
-            "owned_pending_entry_live_conflict",
-            "owned_recovery_work",
-            "pending_residual_repair",
-            "pending_passive_close",
-            "owned_pending_entry",
-            "truth_unavailable_for_required_recovery",
-            "exchange_truth_recovery_ledger_blocked",
-        }:
+        if reason in CORE_OWNED_BLOCK_REASONS:
             return "recovery_ledger_blocked"
         return reason or "v1_lifecycle_closure_blocked"
 
@@ -1869,12 +1857,51 @@ class LiveRuntime:
             )
 
         if recovery_class == "clean":
-            set_lifecycle(self.state, EngineLifecycle.RUNNING)
-            clear_stale_fail_closed_if_recovery_clean(self.state, self.journal)
-            self.journal.append(
-                "runtime.running",
-                {"reason": "startup_no_recovery_work", "ts_ms": wall_clock_now_ms()},
+            stale_risk_only_requires_account_truth = (
+                self.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
+                and (
+                    (
+                        self.state.lifecycle == EngineLifecycle.RISK_ONLY
+                        and self.state.risk_mode in {
+                            GlobalRiskMode.RUNNING,
+                            GlobalRiskMode.FAIL_CLOSED,
+                        }
+                    )
+                    or self.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+                )
             )
+            if stale_risk_only_requires_account_truth:
+                # A recovered FAIL_CLOSED must be represented as RISK_ONLY
+                # before the supervisor runs; otherwise a normal health-latch
+                # resume can bypass the recovery-core account-truth owner.
+                set_lifecycle(self.state, EngineLifecycle.RISK_ONLY)
+                self.state.recovery_blocked_reason = (
+                    STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON
+                )
+                self.state.recovery_blocked_at_ms = wall_clock_now_ms()
+                self.journal.append(
+                    "runtime.recovery_awaiting_account_truth",
+                    {
+                        "reason": (
+                            STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON
+                        ),
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
+            elif self.state.risk_mode != GlobalRiskMode.FAIL_CLOSED:
+                set_lifecycle(self.state, EngineLifecycle.RUNNING)
+                self.journal.append(
+                    "runtime.running",
+                    {"reason": "startup_no_recovery_work", "ts_ms": wall_clock_now_ms()},
+                )
+            else:
+                self.journal.append(
+                    "runtime.recovery_awaiting_account_truth",
+                    {
+                        "reason": "startup_fail_closed_preserved",
+                        "ts_ms": wall_clock_now_ms(),
+                    },
+                )
         elif recovery_class == "recovery_needed":
             transition_to_reconciling(self.state)
             self.journal.append(
@@ -1970,6 +1997,10 @@ class LiveRuntime:
 
         # Phase 8 – Recover pending passive closes
         await self._recover_passive_closes()
+        await self._refresh_risk_only_lifecycle_from_account_truth(
+            wall_clock_now_ms(),
+            lifecycle_clear_reason="startup_account_truth_current_state_clean",
+        )
         if startup_live_recovery_result not in {
             "mismatch_flattened",
             "mismatch_blocked",
@@ -1996,14 +2027,6 @@ class LiveRuntime:
     def _clear_stale_recovery_lifecycle_if_core_clean(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._clear_stale_recovery_lifecycle_if_core_clean(*args, **kwargs)
 
-    @staticmethod
-    def _recovery_exchange_truth_flat(*args: Any, **kwargs: Any) -> Any:
-        return RecoveryStartupRuntime._recovery_exchange_truth_flat(*args, **kwargs)
-
-    @staticmethod
-    def _recovery_exchange_truth_open_orders_empty(*args: Any, **kwargs: Any) -> Any:
-        return RecoveryStartupRuntime._recovery_exchange_truth_open_orders_empty(*args, **kwargs)
-
     def _recovery_state_collection(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._recovery_state_collection(*args, **kwargs)
 
@@ -2012,6 +2035,11 @@ class LiveRuntime:
 
     async def _refresh_recovery_ledger_from_account_truth(self, *args: Any, **kwargs: Any) -> Any:
         return await self.recovery_startup_runtime._refresh_recovery_ledger_from_account_truth(*args, **kwargs)
+
+    async def _refresh_risk_only_lifecycle_from_account_truth(
+        self, *args: Any, **kwargs: Any
+    ) -> Any:
+        return await self.recovery_startup_runtime._refresh_risk_only_lifecycle_from_account_truth(*args, **kwargs)
 
     async def _collect_recovery_ledger_account_truth(self, *args: Any, **kwargs: Any) -> Any:
         return await self.recovery_startup_runtime._collect_recovery_ledger_account_truth(*args, **kwargs)
@@ -2483,11 +2511,6 @@ class LiveRuntime:
         truth_required_symbol_sources = (
             self._truth_required_recovery_probe_symbol_sources(requested_symbols)
         )
-        truth_required_sources = sorted(truth_required_symbol_sources)
-        truth_required_symbol_source_payload = {
-            source: list(truth_required_symbol_sources.get(source, []))
-            for source in truth_required_sources
-        }
         recovery_truth_required_symbol_sources = {
             source: symbols
             for source, symbols in truth_required_symbol_sources.items()
@@ -10037,11 +10060,6 @@ class LiveRuntime:
 
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
-        # V1 latch parity: a fail-closed state with no operator override,
-        # no recovery block, and no recovery work is stale even after live
-        # entry/recovery cleanup, not only during startup snapshot recovery.
-        clear_stale_fail_closed_if_recovery_clean(self.state, self.journal)
-
         # V1: ensure private WS workers are running for live adapters
         self._ensure_private_ws_started(now_ms)
 
