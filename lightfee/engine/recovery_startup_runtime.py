@@ -1,6 +1,8 @@
 """Startup recovery helpers delegated from LiveRuntime."""
 
 from __future__ import annotations
+
+import asyncio
 from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
@@ -263,117 +265,194 @@ class RecoveryStartupRuntime:
         self,
         now_ms: int,
     ) -> dict[str, Any]:
+        """Collect one bounded, account-wide truth result for every release path.
+
+        Startup and runtime both route risk-only release candidates through this
+        method.  A timeout is evidence loss, never an empty account: each probe
+        records the same result contract and RecoveryCore keeps the latch until
+        complete account truth is available.
+        """
         positions: list[dict[str, Any]] = []
         open_orders: list[dict[str, Any]] = []
         probe_evidence: list[dict[str, Any]] = []
         errors: list[str] = []
-        truth_probe_count = 0
+        timeout_budget_ms = max(
+            int(self.ctx.config.runtime.live_recovery_rest_probe_timeout_ms),
+            1,
+        )
+        timeout_s = timeout_budget_ms / 1000.0
 
+        async def collect_probe(
+            *,
+            venue_name: str,
+            collection: str,
+            default_endpoint: str,
+            fetch,
+        ) -> dict[str, Any]:
+            try:
+                endpoint, rows = await asyncio.wait_for(fetch(), timeout=timeout_s)
+                return {
+                    "collection": collection,
+                    "venue": venue_name,
+                    "endpoint": endpoint or default_endpoint,
+                    "rows": rows,
+                    "error": "",
+                    "timed_out": False,
+                }
+            except asyncio.TimeoutError:
+                return {
+                    "collection": collection,
+                    "venue": venue_name,
+                    "endpoint": default_endpoint,
+                    "rows": [],
+                    "error": (
+                        "account_truth_probe_timeout:"
+                        f"timeout_budget_ms={timeout_budget_ms}"
+                    ),
+                    "timed_out": True,
+                }
+            except Exception as exc:
+                return {
+                    "collection": collection,
+                    "venue": venue_name,
+                    "endpoint": default_endpoint,
+                    "rows": [],
+                    "error": str(exc),
+                    "timed_out": False,
+                }
+
+        probes = []
         for venue, adapter in self.ctx._venue_adapters.items():
             venue_name = venue.value if hasattr(venue, "value") else str(venue)
             fetch_all_positions = getattr(adapter, "fetch_all_positions", None)
             if not callable(fetch_all_positions):
                 transport = getattr(adapter, "_transport", None)
                 fetch_all_positions = getattr(transport, "fetch_all_positions", None)
-            if not callable(fetch_all_positions):
-                errors.append(f"{venue_name}:*:positions:fetch_all_positions_unavailable")
-                probe_evidence.append(
-                    {
-                        "venue": venue_name,
-                        "symbol": "*",
-                        "endpoint": "fetch_all_positions",
-                        "method": "fetch_all_positions",
-                        "finished_at_ms": now_ms,
-                        "classification": "position_probe_unfiltered_failed",
-                        "error": "fetch_all_positions_unavailable",
-                    }
-                )
-            else:
-                try:
-                    rows = await fetch_all_positions()
-                    truth_probe_count += 1
-                    if not isinstance(rows, (list, tuple, set)):
-                        raise RuntimeError(
-                            "fetch_all_positions_invalid_response:"
-                            f"{type(rows).__name__}"
-                        )
-                    for position in rows:
-                        positions.append(
-                            self.ctx._recovery_ledger_position_payload(
-                                position,
-                                venue_name=venue_name,
-                                symbol="*",
-                            )
-                        )
-                    probe_evidence.append(
-                        {
-                            "venue": venue_name,
-                            "symbol": "*",
-                            "endpoint": "fetch_all_positions",
-                            "method": "fetch_all_positions",
-                            "finished_at_ms": now_ms,
-                            "classification": "position_probe_unfiltered_succeeded",
-                            "position_count": len(rows),
-                        }
-                    )
-                except Exception as exc:
-                    truth_probe_count += 1
-                    errors.append(f"{venue_name}:*:positions:{exc}")
-                    probe_evidence.append(
-                        {
-                            "venue": venue_name,
-                            "symbol": "*",
-                            "endpoint": "fetch_all_positions",
-                            "method": "fetch_all_positions",
-                            "finished_at_ms": now_ms,
-                            "classification": "position_probe_unfiltered_failed",
-                            "error": str(exc),
-                        }
-                    )
 
-            try:
+            async def fetch_positions(
+                fetch_all_positions=fetch_all_positions,
+                venue_name=venue_name,
+            ) -> tuple[str, list[dict[str, Any]]]:
+                if not callable(fetch_all_positions):
+                    raise RuntimeError("fetch_all_positions_unavailable")
+                rows = await fetch_all_positions()
+                if not isinstance(rows, (list, tuple, set)):
+                    raise RuntimeError(
+                        "fetch_all_positions_invalid_response:"
+                        f"{type(rows).__name__}"
+                    )
+                return (
+                    "fetch_all_positions",
+                    [
+                        self.ctx._recovery_ledger_position_payload(
+                            position,
+                            venue_name=venue_name,
+                            symbol="*",
+                        )
+                        for position in rows
+                    ],
+                )
+
+            async def fetch_open_orders(
+                venue=venue,
+                adapter=adapter,
+                venue_name=venue_name,
+            ) -> tuple[str, list[dict[str, Any]]]:
                 rows, endpoint = await self.ctx._fetch_recovery_ledger_account_open_orders(
                     venue,
                     adapter,
                 )
-                truth_probe_count += 1
-                for row in self.ctx._recovery_ledger_open_order_payloads(
-                    rows,
-                    venue_name=venue_name,
-                    symbol="*",
-                ):
-                    open_orders.append(row)
+                return (
+                    endpoint,
+                    self.ctx._recovery_ledger_open_order_payloads(
+                        rows,
+                        venue_name=venue_name,
+                        symbol="*",
+                    ),
+                )
+
+            probes.extend(
+                (
+                    collect_probe(
+                        venue_name=venue_name,
+                        collection="positions",
+                        default_endpoint="fetch_all_positions",
+                        fetch=fetch_positions,
+                    ),
+                    collect_probe(
+                        venue_name=venue_name,
+                        collection="open_orders",
+                        default_endpoint="fetch_open_orders",
+                        fetch=fetch_open_orders,
+                    ),
+                )
+            )
+
+        for result in await asyncio.gather(*probes):
+            collection = result["collection"]
+            probe_kind = "position" if collection == "positions" else "open_order"
+            venue_name = result["venue"]
+            error = result["error"]
+            timed_out = result["timed_out"]
+            if error:
+                errors.append(f"{venue_name}:*:{collection}:{error}")
+                classification = (
+                    f"{probe_kind}_probe_unfiltered_timeout"
+                    if timed_out
+                    else f"{probe_kind}_probe_unfiltered_failed"
+                )
                 probe_evidence.append(
                     {
                         "venue": venue_name,
                         "symbol": "*",
-                        "endpoint": endpoint,
-                        "method": "fetch_open_orders",
+                        "endpoint": result["endpoint"],
+                        "method": (
+                            "fetch_all_positions"
+                            if collection == "positions"
+                            else "fetch_open_orders"
+                        ),
                         "finished_at_ms": now_ms,
-                        "classification": "open_order_probe_unfiltered_succeeded",
-                        "open_order_count": len(rows)
-                        if isinstance(rows, (list, tuple, set))
-                        else 0,
+                        "classification": classification,
+                        "error": error,
+                        "timeout_budget_ms": timeout_budget_ms,
+                        "timeout_budget_s": timeout_s,
+                        "timeout_budget_source": (
+                            "runtime.live_recovery_rest_probe_timeout_ms"
+                        ),
+                        "timeout_trigger": "per_probe_wait_for" if timed_out else "",
                     }
                 )
-            except Exception as exc:
-                truth_probe_count += 1
-                errors.append(f"{venue_name}:*:open_orders:{exc}")
-                probe_evidence.append(
-                    {
-                        "venue": venue_name,
-                        "symbol": "*",
-                        "endpoint": "fetch_open_orders",
-                        "method": "fetch_open_orders",
-                        "finished_at_ms": now_ms,
-                        "classification": "open_order_probe_unfiltered_failed",
-                        "error": str(exc),
-                    }
-                )
+                continue
+
+            rows = result["rows"]
+            if collection == "positions":
+                positions.extend(rows)
+            else:
+                open_orders.extend(rows)
+            probe_evidence.append(
+                {
+                    "venue": venue_name,
+                    "symbol": "*",
+                    "endpoint": result["endpoint"],
+                    "method": (
+                        "fetch_all_positions"
+                        if collection == "positions"
+                        else "fetch_open_orders"
+                    ),
+                    "finished_at_ms": now_ms,
+                    "classification": f"{probe_kind}_probe_unfiltered_succeeded",
+                    f"{probe_kind}_count": len(rows),
+                    "timeout_budget_ms": timeout_budget_ms,
+                    "timeout_budget_s": timeout_s,
+                    "timeout_budget_source": (
+                        "runtime.live_recovery_rest_probe_timeout_ms"
+                    ),
+                }
+            )
 
         return {
             "truth_scope": RecoveryTruthScope.ACCOUNT.value,
-            "truth_supported": truth_probe_count > 0,
+            "truth_supported": bool(probes),
             "truth_available": not errors,
             "positions": positions,
             "open_orders": open_orders,

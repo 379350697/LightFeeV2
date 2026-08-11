@@ -2609,6 +2609,150 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("slow_probe", "expected_classification"),
+        [
+            ("positions", "position_probe_unfiltered_timeout"),
+            ("open_orders", "open_order_probe_unfiltered_timeout"),
+        ],
+    )
+    async def test_runtime_account_truth_timeout_keeps_live_conflict_blocked_within_probe_budget(
+        self,
+        slow_probe: str,
+        expected_classification: str,
+    ):
+        """A slow account probe is bounded evidence loss, never an implicit flat account."""
+
+        class SlowAccountPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                if slow_probe == "positions":
+                    await asyncio.sleep(0.2)
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol is None
+                if slow_probe == "open_orders":
+                    await asyncio.sleep(0.2)
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.live_recovery_rest_probe_timeout_ms = 10
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={
+                    Venue.BYBIT: SlowAccountPositionAdapter(Venue.BYBIT),
+                },
+            )
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
+            runtime.state.recovery_blocked_at_ms = 1234
+
+            await asyncio.wait_for(
+                runtime._maybe_recover_clean_live_positions(1700000005000),
+                timeout=0.1,
+            )
+
+            truth = runtime._last_recovery_exchange_truth
+            assert truth["truth_scope"] == "account"
+            assert truth["truth_available"] is False
+            assert any("account_truth_probe_timeout" in error for error in truth["errors"])
+            assert any(
+                item["classification"] == expected_classification
+                and item["timeout_budget_ms"] == 10
+                for item in truth["probe_evidence"]
+            )
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == "owned_pending_entry_live_conflict"
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_startup_account_truth_timeout_keeps_live_conflict_blocked_within_probe_budget(self):
+        """Startup uses the same bounded account-truth contract before release."""
+
+        class SlowAccountPositionAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                await asyncio.sleep(0.2)
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol is None
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.runtime.live_recovery_rest_probe_timeout_ms = 10
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": "risk_only",
+                "risk_mode": "fail_closed",
+                "recovery_blocked_reason": "owned_pending_entry_live_conflict",
+                "recovery_blocked_at_ms": 1234,
+                "open_positions": [],
+                "pending_entries": [],
+                "pending_closes": [],
+                "pending_passive_closes": [],
+                "pending_residual_repairs": [],
+            })
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={
+                    Venue.BYBIT: SlowAccountPositionAdapter(Venue.BYBIT),
+                },
+            )
+
+            await asyncio.wait_for(runtime.start(), timeout=0.1)
+
+            truth = runtime._last_recovery_exchange_truth
+            assert truth["truth_scope"] == "account"
+            assert truth["truth_available"] is False
+            assert any("account_truth_probe_timeout" in error for error in truth["errors"])
+            assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+            assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+            assert runtime.state.recovery_blocked_reason == "owned_pending_entry_live_conflict"
+            await runtime.stop()
+
+    @pytest.mark.asyncio
+    async def test_account_truth_collects_all_venue_probes_with_one_shared_budget(self):
+        """Account truth must not turn per-probe limits back into serial delay."""
+
+        class SlowFlatAccountAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                await asyncio.sleep(0.04)
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol is None
+                await asyncio.sleep(0.04)
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            adapters = {
+                venue: SlowFlatAccountAdapter(venue)
+                for venue in (Venue.ASTER, Venue.BINANCE, Venue.BYBIT, Venue.OKX)
+            }
+            runtime = LiveRuntime(config, venue_adapters=adapters)
+
+            truth = await asyncio.wait_for(
+                runtime._collect_recovery_ledger_account_truth(1700000005000),
+                timeout=0.14,
+            )
+
+            assert truth["truth_available"] is True
+            assert truth["positions"] == []
+            assert truth["open_orders"] == []
+            assert len(truth["probe_evidence"]) == 8
+            assert {
+                item["classification"] for item in truth["probe_evidence"]
+            } == {
+                "position_probe_unfiltered_succeeded",
+                "open_order_probe_unfiltered_succeeded",
+            }
+
+    @pytest.mark.asyncio
     async def test_runtime_unpaired_live_position_uses_account_truth_not_symbol_sweep(self):
         """Old live-artifact blockers clear from unfiltered account truth, not dirty symbols."""
 
