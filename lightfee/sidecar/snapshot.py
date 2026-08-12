@@ -120,8 +120,14 @@ class CandidateInput:
     total_funding_edge_bps: float = 0.0
     transfer_bias_bps: float = 0.0
     entry_cross_bps: float = 0.0
+    long_entry_slippage_bps: float = 0.0
+    short_entry_slippage_bps: float = 0.0
     fee_bps: float = 0.0
     entry_slippage_bps: float = 0.0
+    long_exit_slippage_bps: float = 0.0
+    short_exit_slippage_bps: float = 0.0
+    exit_fee_bps: float = 0.0
+    exit_slippage_bps: float = 0.0
     opportunity_type: str = "aligned"
     blocked: bool = False
     blocked_reasons: list[str] = field(default_factory=list)

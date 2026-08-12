@@ -11,6 +11,7 @@ from typing import Optional
 
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
+    AccountFeeSnapshot,
     AccountRiskSnapshot,
     AssetTransferStatus,
     ExecutionLiquiditySnapshot,
@@ -82,6 +83,12 @@ class VenueAdapter(ABC):
         return None
 
     async def fetch_account_balance_snapshot(self) -> Optional[AccountBalanceSnapshot]:
+        return None
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        """Read account maker/taker fees without changing trading state."""
         return None
 
     async def fetch_order_fill_reconciliation(
@@ -311,6 +318,16 @@ class VenueAdapter(ABC):
         Default empty — adapters that filter symbols override this.
         """
         return []
+
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float | None:
+        """Return base units represented by one local-L2 quantity unit.
+
+        Most venue books already report base-asset quantity.  Contract-count
+        books override this with their cached instrument multiplier; ``None``
+        means the exact final-cost path must fail closed.
+        """
+        del symbol
+        return 1.0
 
     # --- V1 contract completeness: Market data activity control ---
 

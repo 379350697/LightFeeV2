@@ -79,6 +79,20 @@ def _load_fixture(venue_name: str, name: str):
         return json.load(f)
 
 
+def _aster_opening_admission_fixture(path: str):
+    """Return the two V3 evidence responses required before an opening order."""
+    if path == "/fapi/v3/positionRisk":
+        return [{
+            "symbol": "BTCUSDT",
+            "positionAmt": "0",
+            "markPrice": "50000",
+            "maxNotionalValue": "100000",
+        }]
+    if path == "/fapi/v3/openOrders":
+        return []
+    return None
+
+
 def _attach_mock_transport(adapter, transport, mock) -> None:
     transport._client = httpx.AsyncClient(transport=mock)
     private = getattr(adapter, "_private", None)
@@ -334,6 +348,12 @@ class TestFixtureDrivenOrderSuccess:
     ):
         fixture = _load_fixture(fixture_name, "place_order_success")
         mock = _build_mock_transport(fixture)
+        if venue_id == Venue.ASTER:
+            def aster_handler(request: httpx.Request) -> httpx.Response:
+                admission = _aster_opening_admission_fixture(request.url.path)
+                return httpx.Response(200, json=fixture if admission is None else admission)
+
+            mock = httpx.MockTransport(aster_handler)
 
         cred = LiveCredential(
             api_key="k",
@@ -507,6 +527,9 @@ class TestAsterOrderRequestShape:
                         ],
                     }],
                 })
+            admission = _aster_opening_admission_fixture(request.url.path)
+            if admission is not None:
+                return httpx.Response(200, json=admission)
             return httpx.Response(200, json=fixture)
 
         mock = httpx.MockTransport(handler)
@@ -525,8 +548,10 @@ class TestAsterOrderRequestShape:
             req = OrderRequest(venue=Venue.ASTER, symbol="BTCUSDT",
                               side=Side.SELL, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 2
+            assert len(captured_url) == 4
             assert "/fapi/v1/exchangeInfo?symbol=BTCUSDT" in captured_url[0]
+            assert "/fapi/v3/positionRisk" in captured_url[1]
+            assert "/fapi/v3/openOrders" in captured_url[2]
             url = [item for item in captured_url if "/fapi/v3/order" in item][0]
             assert "https://fapi.asterdex.com/fapi/v3/order" in url
             assert "signer=" in url, f"Missing signer in URL: {url}"
@@ -554,6 +579,9 @@ class TestAsterOrderRequestShape:
                         ],
                     }],
                 })
+            admission = _aster_opening_admission_fixture(request.url.path)
+            if admission is not None:
+                return httpx.Response(200, json=admission)
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -3007, "msg": "fixture reject"})
 

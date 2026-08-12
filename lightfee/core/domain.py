@@ -199,6 +199,26 @@ class AccountBalanceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountFeeSnapshot:
+    """Latest account-specific maker/taker commission schedule for one venue."""
+
+    venue: Venue
+    maker_fee_bps: float
+    taker_fee_bps: float
+    observed_at_ms: int
+    source: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "venue": self.venue.value,
+            "maker_fee_bps": self.maker_fee_bps,
+            "taker_fee_bps": self.taker_fee_bps,
+            "observed_at_ms": self.observed_at_ms,
+            "source": self.source,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AccountRiskSnapshot:
     venue: Venue
     total_equity_usd: float

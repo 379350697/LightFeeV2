@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountFeeSnapshot,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -15,6 +16,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.account_fees import fee_rate_from_mapping
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
     entry_tradability_unavailable,
@@ -57,6 +59,28 @@ class BinanceAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        venue_symbol = self._transport._venue_symbol(reference_symbol) if reference_symbol else ""
+        if not venue_symbol:
+            return None
+        raw = await self._transport._request(
+            "GET",
+            "/fapi/v1/commissionRate",
+            params={"symbol": venue_symbol},
+            private=True,
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("Binance commission-rate response is malformed")
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(raw, "maker fee", "makerCommissionRate"),
+            taker_fee_bps=fee_rate_from_mapping(raw, "taker fee", "takerCommissionRate"),
+            observed_at_ms=int(time.time() * 1000),
+            source="binance_fapi_commission_rate",
+        )
 
     def supported_symbols(self) -> list[str]:
         """Return loaded Binance USD-M trading symbols, if available."""

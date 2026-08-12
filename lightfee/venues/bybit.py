@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountFeeSnapshot,
     OrderFill,
     OrderRequest,
     PositionSnapshot,
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
     entry_tradability_unavailable,
@@ -46,6 +49,30 @@ class BybitAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        venue_symbol = self._transport._venue_symbol(reference_symbol) if reference_symbol else ""
+        if not venue_symbol:
+            return None
+        raw = await self._transport._request(
+            "GET",
+            "/v5/account/fee-rate",
+            params={"category": "linear", "symbol": venue_symbol},
+            private=True,
+        )
+        if not isinstance(raw, dict) or int(raw.get("retCode", 0)) != 0:
+            raise ValueError("Bybit fee-rate request failed")
+        result = raw.get("result")
+        row = first_mapping(result.get("list") if isinstance(result, dict) else None, "Bybit fee-rate row")
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(row, "maker fee", "makerFeeRate"),
+            taker_fee_bps=fee_rate_from_mapping(row, "taker fee", "takerFeeRate"),
+            observed_at_ms=int(time.time() * 1000),
+            source=f"bybit_fee_rate:{venue_symbol}",
+        )
 
     def supported_symbols(self) -> list[str]:
         """Return loaded Bybit linear USDT perpetual symbols, if available."""

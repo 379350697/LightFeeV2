@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import math
+import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountFeeSnapshot,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -13,6 +16,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
     entry_tradability_unavailable,
@@ -47,6 +51,56 @@ class OkxAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        venue_symbol = self._transport._venue_symbol(reference_symbol) if reference_symbol else ""
+        if not venue_symbol:
+            return None
+        raw = await self._transport._request(
+            "GET",
+            "/api/v5/account/trade-fee",
+            params={"instType": "SWAP", "instFamily": venue_symbol.removesuffix("-SWAP")},
+            private=True,
+        )
+        if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
+            raise ValueError("OKX trade-fee request failed")
+        row = first_mapping(raw.get("data"), "OKX trade-fee row")
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(row, "maker fee", "maker", "makerU", "makerUSDC"),
+            taker_fee_bps=fee_rate_from_mapping(row, "taker fee", "taker", "takerU", "takerUSDC"),
+            observed_at_ms=int(time.time() * 1000),
+            source=f"okx_trade_fee:{venue_symbol.removesuffix('-SWAP')}",
+        )
+
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float | None:
+        """Convert OKX local-book contract counts with cached ``ctVal``."""
+        metadata_by_symbol = getattr(self._transport, "_symbol_metadata", {}) or {}
+        keys = [self._transport._venue_symbol(symbol), symbol]
+        for key in keys:
+            metadata = metadata_by_symbol.get(key)
+            if not isinstance(metadata, dict):
+                continue
+            ct_type = str(
+                metadata.get(
+                    "ctType",
+                    metadata.get("ct_type", metadata.get("contractType", "")),
+                )
+                or ""
+            )
+            if not ct_type:
+                return None
+            for field in ("ct_val", "ctVal", "contract_size", "contractSize"):
+                try:
+                    value = float(metadata.get(field, 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0.0 and math.isfinite(value):
+                    return value
+            return None
+        return None
 
     def supported_symbols(self) -> list[str]:
         """Return loaded OKX SWAP symbols, if the instrument catalog is available."""

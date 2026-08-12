@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
+    AccountFeeSnapshot,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -15,6 +17,7 @@ from lightfee.core.domain import (
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.account_fees import fee_rate_from_mapping
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
     entry_tradability_unavailable,
@@ -51,6 +54,29 @@ class HyperliquidAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        del reference_symbol
+        account_address = self._credential.account_address if self._credential else ""
+        if not account_address:
+            return None
+        raw = await self._transport._request(
+            "POST",
+            "/info",
+            body={"type": "userFees", "user": account_address},
+            private=False,
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("Hyperliquid user-fees response is malformed")
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(raw, "maker fee", "userAddRate"),
+            taker_fee_bps=fee_rate_from_mapping(raw, "taker fee", "userCrossRate"),
+            observed_at_ms=int(time.time() * 1000),
+            source="hyperliquid_user_fees",
+        )
 
     def supported_symbols(self) -> list[str]:
         """Return loaded Hyperliquid perp asset names, if available."""

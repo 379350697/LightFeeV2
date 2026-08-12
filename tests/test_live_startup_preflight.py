@@ -4087,6 +4087,56 @@ class TestRuntimePreflight:
             await runtime.stop()
 
     @pytest.mark.asyncio
+    async def test_startup_account_flat_truth_releases_live_conflict_with_final_close_debt(self):
+        """Historical final close accounting must not retain a disproven live lock."""
+
+        class FlatAccountTruthAdapter(FakeVenueAdapter):
+            async def fetch_all_positions(self):
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol is None
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": "risk_only",
+                "risk_mode": "fail_closed",
+                "recovery_blocked_reason": "owned_pending_entry_live_conflict",
+                "recovery_blocked_at_ms": 1234,
+                "open_positions": {},
+                "pending_entries": {},
+                "pending_closes": {},
+                "pending_passive_closes": {},
+                "pending_residual_repairs": [],
+                "pending_close_reconciliations": [
+                    {
+                        "position_id": "entry-coti-billing-debt",
+                        "kind": "final",
+                        "symbol": "COTIUSDT",
+                        "long_venue": "bybit",
+                        "short_venue": "binance",
+                        "closed_at_ms": 1234,
+                        "reconciliation_status": "evidence_debt",
+                        "evidence_debt_reason": "missing_position_snapshot",
+                    }
+                ],
+            })
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BYBIT: FlatAccountTruthAdapter(Venue.BYBIT)},
+            )
+
+            await runtime.start()
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert len(runtime.state.pending_close_reconciliations) == 1
+            await runtime.stop()
+
+    @pytest.mark.asyncio
     async def test_startup_live_mismatch_flatten_closes_core_ledger_block(self):
         """Startup mismatch flatten must not skip the core-owned clear decision."""
         with tempfile.TemporaryDirectory() as td:

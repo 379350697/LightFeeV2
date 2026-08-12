@@ -1287,6 +1287,8 @@ class EngineState:
     runtime_progress: dict[str, Any] = field(default_factory=dict)
     runtime_market_data_config: dict[str, Any] = field(default_factory=dict)
     v1_lifecycle_closure: dict[str, Any] = field(default_factory=dict)
+    # Slow account data; retained across restarts for private-endpoint outages.
+    account_fee_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     # --- V1 PassiveOrderManager runtime state persistence ---
     # Maps entry_id -> PassiveOrderManager.runtime_dict()
     passive_order_manager_states: dict[str, dict] = field(default_factory=dict)
@@ -1540,6 +1542,7 @@ class EngineState:
             "runtime_progress": dict(self.runtime_progress or {}),
             "runtime_market_data_config": dict(self.runtime_market_data_config or {}),
             "v1_lifecycle_closure": dict(self.v1_lifecycle_closure or {}),
+            "account_fee_snapshots": dict(self.account_fee_snapshots or {}),
             "retained_local_l2_books": self.retained_local_l2_books,
             "local_l2_books_snapshot": self.local_l2_books_snapshot,
             "local_l2_session_snapshot": self.local_l2_session_snapshot,

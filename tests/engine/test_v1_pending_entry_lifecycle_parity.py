@@ -118,7 +118,9 @@ def test_v1_handle_zero_fill_switches_high_slippage_to_low_slippage_after_budget
     assert action.kind == "submit_next_cycle"
     assert action.reason == "phase_switched_to_low_slippage_maker"
     assert pending.maker_leg == "short"
+    assert pending.entry_maker_leg == "short"
     assert pending.phase_state.phase == "low_slippage_maker"
+    assert pending.phase_state.preferred_maker_leg == "long"
     assert pending.phase_state.active_maker_leg == "short"
     assert pending.phase_state.zero_fill_cycles_in_phase == 0
     assert pending.phase_state.cycle_attempt == 0

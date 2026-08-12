@@ -220,6 +220,10 @@ def advance_pending_entry_zero_fill_phase(
         phase_state.phase_started_at_ms = int(now_ms)
         phase_state.small_fill_min_notional_attempts = 0
         pending.maker_leg = next_maker_leg
+        # The route has changed before any fill.  Preserve the immutable
+        # preferred direction in phase_state, while the entry record follows
+        # the route that can actually fill next.
+        pending.entry_maker_leg = next_maker_leg
         pending.repost_attempt_count = 0
         pending.passive_attempt_count = 0
         return PendingEntryLifecycleAction(

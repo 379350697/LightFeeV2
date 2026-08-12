@@ -23,13 +23,20 @@ from lightfee.engine.state import (
     PendingPassiveOrder,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-from tests.test_live_full_closure import make_test_config
+from tests.test_live_full_closure import make_test_config as _make_test_config
 
 
 pytestmark = pytest.mark.live_harness
 
 FIXTURE = Path("tests/fixtures/live_incidents/2026-05-27/passive_maker_zero_fill.jsonl")
 _VIABLE_FIRST_FUNDING_MS = 1779816647600
+
+
+def make_test_config(temp_dir: str):
+    """Build a valid Local-L2 live profile for passive-entry recovery tests."""
+    config = _make_test_config(temp_dir)
+    config.strategy.local_l2_enabled = True
+    return config
 
 
 class _ZeroFillMakerAdapter:
@@ -58,6 +65,10 @@ class _ZeroFillMakerAdapter:
         self.place_order_calls: list[object] = []
         self.query_calls: list[dict[str, object]] = []
         self.refresh_market_snapshot_calls: list[str] = []
+
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float:
+        del symbol
+        return 1.0
 
     async def query_passive_order_progress(
         self,
@@ -249,11 +260,28 @@ def _tradeable_frozen_candidate(*, entry_notional_quote: float = 50.0) -> dict:
 
 def _install_passive_repost_quote(runtime: LiveRuntime) -> None:
     runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    _install_current_final_l2_books(runtime)
 
     async def fake_retry_sleep(_wait_ms: int) -> None:
         return None
 
     runtime._pending_entry_post_only_retry_sleep = fake_retry_sleep
+
+
+def _install_current_final_l2_books(runtime: LiveRuntime) -> None:
+    """Provide the current executable L2 required before a route changes."""
+    from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
+
+    now_ms = 1779816048600
+    for venue, bid, ask in (
+        ("okx", 6.99, 7.00),
+        ("bybit", 8.00, 8.01),
+    ):
+        book = runtime.local_l2_runtime.ensure_book(venue, "RIVERUSDT")
+        book.status = L2BookStatus.HOT
+        book.bids = [PriceLevel(price=bid, quantity=100.0)]
+        book.asks = [PriceLevel(price=ask, quantity=100.0)]
+        book.observed_at_ms = now_ms
 
 
 class _RecordingEntryExecutor:
@@ -288,6 +316,7 @@ async def test_zero_fill_canceled_maker_reposts_without_fail_closed(tmp_path):
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
     _install_passive_repost_quote(runtime)
     await runtime.start()
+    _install_current_final_l2_books(runtime)
     pending = _pending_from_fixture()
     runtime.state.pending_entries[pending.pending_id] = pending
 
@@ -356,6 +385,7 @@ async def test_recovered_terminal_zero_fill_pending_reposts_without_stalling(tmp
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
     _install_passive_repost_quote(runtime)
     await runtime.start()
+    _install_current_final_l2_books(runtime)
     pending = _pending_from_fixture()
     pending.passive_order.cancel_requested_at_ms = pending.passive_order.accepted_at_ms + 1500
     pending.passive_order.last_progress_state = PassiveOrderState.CANCELED
@@ -405,6 +435,7 @@ async def test_second_zero_fill_cycle_reposts_until_repost_budget_is_reached(tmp
         journal=runtime.journal,
     )
     await runtime.start()
+    _install_current_final_l2_books(runtime)
     pending = _pending_from_fixture()
     runtime.state.pending_entries[pending.pending_id] = pending
 
@@ -438,11 +469,13 @@ async def test_second_zero_fill_cycle_reposts_until_repost_budget_is_reached(tmp
     assert len(bybit.submit_passive_order_calls) == 1
     assert pending.repost_count == 3
     assert pending.maker_leg == "short"
+    assert pending.entry_maker_leg == "short"
     assert pending.repost_attempt_count == 0
     assert pending.passive_attempt_count == 1
     assert pending.passive_ops_total == 4
     assert pending.phase_state is not None
     assert pending.phase_state.phase == "low_slippage_maker"
+    assert pending.phase_state.preferred_maker_leg == "long"
     assert pending.phase_state.active_maker_leg == "short"
     assert pending.phase_state.zero_fill_cycles_in_phase == 0
     assert pending.phase_state.cycle_attempt == 1
@@ -476,6 +509,7 @@ async def test_low_slippage_zero_fill_exhaustion_arms_dual_taker_terminal(tmp_pa
         journal=runtime.journal,
     )
     await runtime.start()
+    _install_current_final_l2_books(runtime)
     pending = _pending_from_fixture()
     runtime.state.pending_entries[pending.pending_id] = pending
 
@@ -526,6 +560,7 @@ async def test_terminal_taker_fallback_rechecks_runtime_guards_before_force_stan
     recorder = _RecordingEntryExecutor()
     runtime.entry_executor = recorder
     await runtime.start()
+    _install_current_final_l2_books(runtime)
 
     pending = _pending_from_fixture()
     pending.frozen_candidate = _tradeable_frozen_candidate()
@@ -568,6 +603,7 @@ async def test_force_standard_terminal_fallback_uses_rechecked_candidate_sizing(
     recorder = _RecordingEntryExecutor()
     runtime.entry_executor = recorder
     await runtime.start()
+    _install_current_final_l2_books(runtime)
 
     pending = _pending_from_fixture()
     pending.target_quantity = 3.0
@@ -620,6 +656,7 @@ async def test_zero_fill_global_repost_count_does_not_skip_v1_phase_switch(tmp_p
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
     _install_passive_repost_quote(runtime)
     await runtime.start()
+    _install_current_final_l2_books(runtime)
     pending = _pending_from_fixture()
     pending.frozen_candidate = _tradeable_frozen_candidate()
     pending.repost_count = config.strategy.maker_entry_max_reposts
@@ -880,6 +917,7 @@ async def test_zero_fill_same_phase_ignores_legacy_repost_count_limit(tmp_path):
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
     _install_passive_repost_quote(runtime)
     await runtime.start()
+    _install_current_final_l2_books(runtime)
     pending = _pending_from_fixture()
     pending.repost_count = config.strategy.maker_entry_max_reposts
     pending.repost_attempt_count = 1

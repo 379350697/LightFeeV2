@@ -1967,8 +1967,15 @@ class EntryDispatchRuntime:
         # are resolved from the adapter or spec when available.
         strategy = self.ctx.config.strategy
         min_notional = strategy.min_entry_leg_notional_quote
-        # V1: maker leg from strategy config (funding arb: long side is typically maker)
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
+        # Final L2 pricing chooses the entry maker leg.  The config remains
+        # only the deterministic fallback for legacy/missing candidates.
+        selected_maker_leg = str(getattr(candidate, "entry_maker_leg", "") or "").lower()
+        if selected_maker_leg == "long":
+            maker_leg = Side.BUY
+        elif selected_maker_leg == "short":
+            maker_leg = Side.SELL
+        else:
+            maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         maker_venue = long_venue if maker_leg == Side.BUY else short_venue
         hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
         if quote_lease is not None:

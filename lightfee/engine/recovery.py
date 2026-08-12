@@ -546,6 +546,16 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
     state.entry_liquidity_qualification_records = snap.get("entry_liquidity_qualification_records", [])
     state.set_pending_close_reconciliations(snap.get("pending_close_reconciliations", []))
     state.passive_order_manager_states = snap.get("passive_order_manager_states", {})
+    raw_fee_snapshots = snap.get("account_fee_snapshots", {})
+    state.account_fee_snapshots = (
+        {
+            str(venue): dict(snapshot)
+            for venue, snapshot in raw_fee_snapshots.items()
+            if isinstance(snapshot, dict)
+        }
+        if isinstance(raw_fee_snapshots, dict)
+        else {}
+    )
 
     # Restore operator control state
     op = snap.get("operator", {})

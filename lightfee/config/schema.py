@@ -365,6 +365,7 @@ class VenueLiveConfig:
 class VenueConfig:
     venue: str = ""
     taker_fee_bps: float = 0.5
+    maker_fee_bps: Optional[float] = None
     max_notional: float = 1000.0
     market_data_file: Optional[str] = None
     live: VenueLiveConfig = field(default_factory=VenueLiveConfig)

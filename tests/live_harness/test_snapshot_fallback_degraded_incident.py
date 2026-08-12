@@ -7,6 +7,7 @@ import pytest
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import Venue
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
@@ -35,6 +36,10 @@ class CapturingEntryExecutor:
 class TrustedVenueAdapter:
     trading_capability_trusted = True
     okx_base_quantity_step = 0.001
+
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float:
+        del symbol
+        return 1.0
 
     def passive_metadata(self, symbol: str):
         return {
@@ -95,7 +100,7 @@ def _runtime(tmp_path) -> LiveRuntime:
             sidecar_perp_liquidity_budget_ms=30000,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -123,6 +128,13 @@ async def _run_tick(tmp_path, monkeypatch, snapshot: SidecarSnapshot) -> tuple[L
     runtime = _runtime(tmp_path)
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
     monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
+    for candidate in snapshot.candidates:
+        for venue, bid, ask in (("okx", 99.9, 100.0), ("bybit", 100.1, 100.2)):
+            book = runtime.local_l2_runtime.ensure_book(venue, candidate.symbol)
+            book.status = L2BookStatus.HOT
+            book.bids = [PriceLevel(price=bid, quantity=100.0)]
+            book.asks = [PriceLevel(price=ask, quantity=100.0)]
+            book.observed_at_ms = 70000
 
     runtime.journal.open()
     try:

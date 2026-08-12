@@ -7,7 +7,7 @@ Do not change entry selection, admission, or no-entry diagnostic semantics while
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any
+from typing import Any, Callable
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import AccountBalanceSnapshot, Venue
@@ -2278,6 +2278,7 @@ class EntryGateRuntime:
         candidate_blockers: dict[str, str],
         market_quotes=None,
         admission_blocker_counts: Counter | None = None,
+        final_cost_reprice: Callable[[list, int], list] | None = None,
     ) -> list:
         """V1 select_entry_candidates_from_refs parity for the final entry list."""
         from lightfee.engine.v1_lifecycle import V1TradingLifecycle
@@ -2451,6 +2452,13 @@ class EntryGateRuntime:
                     )
                 continue
             ranked.append(candidate)
+
+        # Final economics belongs after the existing readiness/L2 checks and
+        # before the existing risk-aware final ordering.  It is injected by
+        # LiveRuntime only for live trading, so paper and the lightweight
+        # shortlist remain unchanged.
+        if final_cost_reprice is not None:
+            ranked = final_cost_reprice(ranked, now_ms)
 
         quote_lookup = self._market_quote_lookup(market_quotes)
         ranked.sort(

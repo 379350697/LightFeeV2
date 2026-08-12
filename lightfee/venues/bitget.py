@@ -10,12 +10,14 @@ from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountFeeSnapshot,
     OrderFill,
     OrderRequest,
     PositionSnapshot,
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.exchange_truth import request_venue_operation
 from lightfee.venues.entry_tradability import (
@@ -55,9 +57,11 @@ def _is_classic_mode_error(status_code: int, body: dict) -> bool:
 
 
 def _payload_indicates_classic(payload: dict) -> bool:
-    """Check whether a successful payload reports classic account mode."""
+    """Check whether a fee response requires the Classic account endpoint."""
     if not isinstance(payload, dict):
         return False
+    if _is_classic_mode_error(0, payload):
+        return True
     data = payload.get("data", {})
     if isinstance(data, dict):
         if data.get("accountType") == "classic":
@@ -377,6 +381,62 @@ class BitgetAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        venue_symbol = self._transport._venue_symbol(reference_symbol) if reference_symbol else ""
+        if not venue_symbol:
+            return None
+        if self._profile is BitgetAccountProfile.CLASSIC:
+            return await self._fetch_classic_account_fee_snapshot(venue_symbol)
+        try:
+            raw = await self._transport._request(
+                "GET",
+                "/api/v3/account/fee-rate",
+                params={"symbol": venue_symbol, "category": "USDT-FUTURES"},
+                private=True,
+            )
+        except TransportError as exc:
+            if not self._contract_family_resolver._is_classic_mismatch(exc):
+                raise
+            self._profile = BitgetAccountProfile.CLASSIC
+            return await self._fetch_classic_account_fee_snapshot(venue_symbol)
+        if _payload_indicates_classic(raw):
+            self._profile = BitgetAccountProfile.CLASSIC
+            return await self._fetch_classic_account_fee_snapshot(venue_symbol)
+        if not isinstance(raw, dict) or str(raw.get("code", "00000")) != "00000":
+            raise ValueError("Bitget fee-rate request failed")
+        row = first_mapping(raw.get("data") if isinstance(raw, dict) else None, "Bitget fee-rate row")
+        self._profile = BitgetAccountProfile.UTA
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(row, "maker fee", "makerFeeRate"),
+            taker_fee_bps=fee_rate_from_mapping(row, "taker fee", "takerFeeRate"),
+            observed_at_ms=int(time.time() * 1000),
+            source=f"bitget_fee_rate:{venue_symbol}",
+        )
+
+    async def _fetch_classic_account_fee_snapshot(
+        self, venue_symbol: str
+    ) -> AccountFeeSnapshot:
+        raw = await self._transport._request(
+            "GET",
+            "/api/v2/common/trade-rate",
+            params={"symbol": venue_symbol, "businessType": "mix"},
+            private=True,
+        )
+        if not isinstance(raw, dict) or str(raw.get("code", "00000")) != "00000":
+            raise ValueError("Bitget classic trade-rate request failed")
+        row = first_mapping(raw.get("data") if isinstance(raw, dict) else None, "Bitget classic fee-rate row")
+        self._profile = BitgetAccountProfile.CLASSIC
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(row, "maker fee", "makerFeeRate"),
+            taker_fee_bps=fee_rate_from_mapping(row, "taker fee", "takerFeeRate"),
+            observed_at_ms=int(time.time() * 1000),
+            source=f"bitget_classic_trade_rate:{venue_symbol}",
+        )
 
     def supported_symbols(self) -> list[str]:
         """Return the loaded Bitget contract catalog symbols, if available."""

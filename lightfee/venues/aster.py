@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountFeeSnapshot,
     OrderFill,
     OrderRequest,
     PassiveOrderAck,
@@ -21,6 +22,7 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+from lightfee.venues.account_fees import fee_rate_from_mapping
 from lightfee.venues.aster_v3 import AsterV3Client
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
@@ -143,6 +145,27 @@ class AsterAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return False
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        venue_symbol = self._transport._venue_symbol(reference_symbol) if reference_symbol else ""
+        if not venue_symbol or self._private is None:
+            return None
+        raw = await self._private._request(
+            "GET",
+            "/fapi/v3/commissionRate",
+            params={"symbol": venue_symbol},
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("Aster commission-rate response is malformed")
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(raw, "maker fee", "makerCommissionRate"),
+            taker_fee_bps=fee_rate_from_mapping(raw, "taker fee", "takerCommissionRate"),
+            observed_at_ms=int(time.time() * 1000),
+            source="aster_v3_commission_rate",
+        )
 
     def supported_symbols(self) -> list[str]:
         """Return loaded Aster trading symbols, excluding invalidated ones."""

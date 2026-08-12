@@ -15,6 +15,7 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
+    AccountFeeSnapshot,
     OrderFill,
     PassiveOrderState,
     PositionSnapshot,
@@ -122,6 +123,11 @@ from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment
 from lightfee.sidecar.snapshot import evaluate_snapshot_freshness, SnapshotFreshness
 from lightfee.sidecar.publisher import load_snapshot
 from lightfee.strategy.discovery import discover_tradeable_candidates
+from lightfee.strategy.scoring import (
+    compute_ranking_edge_bps,
+    compute_worst_case_edge_bps,
+    price_final_l2_cost,
+)
 from lightfee.venues.transport import (
     TransportErrorCategory,
     is_hyperliquid_non_retryable_auth_signing_error,
@@ -1808,6 +1814,11 @@ class LiveRuntime:
         if self.state.started_at_ms == 0:
             self.state.started_at_ms = wall_clock_now_ms()
 
+        # Account fee schedules are slow account data.  Refresh them once at
+        # live startup; per-venue failure deliberately leaves a recovered
+        # snapshot (or configuration fallback) usable for the scan path.
+        await self._refresh_account_fee_snapshots()
+
         # Build recovery dedup index from recovered pending state
         self._recovery_dedup_index = build_recovery_dedup_index(self.state)
         startup_live_probe_ms = wall_clock_now_ms()
@@ -2020,6 +2031,166 @@ class LiveRuntime:
             },
             flush=True,
         )
+
+    def _configured_account_fee_snapshot(self, venue: Venue) -> AccountFeeSnapshot:
+        """Return the configured slow-fee fallback for one trading venue."""
+        venue_config = next(
+            (
+                item
+                for item in self.config.venues
+                if str(getattr(item, "venue", "")).strip().lower() == venue.value
+            ),
+            None,
+        )
+        taker_value = getattr(venue_config, "taker_fee_bps", 0.5)
+        maker_value = getattr(venue_config, "maker_fee_bps", None)
+        try:
+            taker_fee_bps = float(taker_value)
+        except (TypeError, ValueError):
+            taker_fee_bps = 0.5
+        if not math.isfinite(taker_fee_bps):
+            taker_fee_bps = 0.5
+        try:
+            maker_fee_bps = float(maker_value)
+        except (TypeError, ValueError):
+            maker_fee_bps = taker_fee_bps
+        if not math.isfinite(maker_fee_bps):
+            maker_fee_bps = taker_fee_bps
+        return AccountFeeSnapshot(
+            venue=venue,
+            maker_fee_bps=maker_fee_bps,
+            taker_fee_bps=taker_fee_bps,
+            observed_at_ms=0,
+            source="config_fee_fallback",
+        )
+
+    def _account_fee_snapshot_for_venue(self, venue: Venue) -> AccountFeeSnapshot:
+        """Prefer the latest valid persisted account schedule over config."""
+        raw = self.state.account_fee_snapshots.get(venue.value)
+        if isinstance(raw, dict):
+            try:
+                maker_fee_bps = float(raw["maker_fee_bps"])
+                taker_fee_bps = float(raw["taker_fee_bps"])
+                observed_at_ms = int(raw.get("observed_at_ms", 0))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                maker_fee_bps = float("nan")
+                taker_fee_bps = float("nan")
+                observed_at_ms = 0
+            if (
+                math.isfinite(maker_fee_bps)
+                and math.isfinite(taker_fee_bps)
+                and observed_at_ms >= 0
+            ):
+                return AccountFeeSnapshot(
+                    venue=venue,
+                    maker_fee_bps=maker_fee_bps,
+                    taker_fee_bps=taker_fee_bps,
+                    observed_at_ms=observed_at_ms,
+                    source=str(raw.get("source") or "persisted_account_fee_snapshot"),
+                )
+        return self._configured_account_fee_snapshot(venue)
+
+    async def _refresh_account_fee_snapshots(self) -> None:
+        """Refresh all configured adapter schedules without failing startup."""
+        if str(self.config.runtime.mode).lower() != "live":
+            return
+
+        def reference_symbols(venue: Venue, adapter: VenueAdapter) -> list[str]:
+            # Gate and Hyperliquid expose account-wide schedules, so no symbol
+            # should be manufactured for them.  Symbol-scoped endpoints only
+            # ever receive manually configured symbols.
+            if venue in {Venue.GATE, Venue.HYPERLIQUID}:
+                return [""]
+            configured = [str(symbol) for symbol in self.config.symbols if str(symbol)]
+            try:
+                cached_symbols = adapter.supported_symbols()
+            except Exception:
+                cached_symbols = []
+            supported = {
+                str(symbol).upper()
+                for symbol in cached_symbols
+                if str(symbol)
+            }
+            if not supported:
+                return configured
+            return [symbol for symbol in configured if symbol.upper() in supported]
+
+        async def fetch_one(
+            venue: Venue, adapter: VenueAdapter
+        ) -> tuple[Venue, AccountFeeSnapshot | Exception | None]:
+            symbols = reference_symbols(venue, adapter)
+            if not symbols:
+                return venue, ValueError("account_fee_reference_symbol_unavailable")
+
+            async def fetch_first_available() -> AccountFeeSnapshot | Exception | None:
+                last_failure: Exception | None = None
+                for reference_symbol in symbols:
+                    try:
+                        snapshot = await adapter.fetch_account_fee_snapshot(reference_symbol)
+                    except Exception as exc:
+                        last_failure = exc
+                        continue
+                    if snapshot is not None:
+                        return snapshot
+                return last_failure
+
+            try:
+                # A slow-data refresh must not hold the live startup path
+                # hostage to a venue's complete configured-symbol attempts.
+                return venue, await asyncio.wait_for(
+                    fetch_first_available(),
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                return venue, exc
+
+        results = await asyncio.gather(
+            *(fetch_one(venue, adapter) for venue, adapter in self._venue_adapters.items()),
+        )
+        updated = 0
+        for venue, result in results:
+            if isinstance(result, AccountFeeSnapshot):
+                if (
+                    result.venue != venue
+                    or not math.isfinite(result.maker_fee_bps)
+                    or not math.isfinite(result.taker_fee_bps)
+                ):
+                    result = ValueError("invalid_account_fee_snapshot")
+                else:
+                    self.state.account_fee_snapshots[venue.value] = result.to_dict()
+                    updated += 1
+                    self.journal.append(
+                        "runtime.account_fee_snapshot_refreshed",
+                        {
+                            "venue": venue.value,
+                            "maker_fee_bps": result.maker_fee_bps,
+                            "taker_fee_bps": result.taker_fee_bps,
+                            "observed_at_ms": result.observed_at_ms,
+                            "source": result.source,
+                        },
+                    )
+                    continue
+            fallback = self._account_fee_snapshot_for_venue(venue)
+            self.journal.append(
+                "runtime.account_fee_snapshot_refresh_unavailable",
+                {
+                    "venue": venue.value,
+                    "reason": (
+                        type(result).__name__ if isinstance(result, Exception) else "no_snapshot"
+                    ),
+                    "fallback_source": fallback.source,
+                    "fallback_observed_at_ms": fallback.observed_at_ms,
+                },
+            )
+        if updated <= 0:
+            return
+        try:
+            self.snapshot_store.write(build_persistent_state_view(self.state))
+        except Exception as exc:
+            self.journal.append(
+                "runtime.account_fee_snapshot_persist_failed",
+                {"reason": type(exc).__name__},
+            )
 
     def _refresh_recovery_ledger_from_exchange_truth(self, *args: Any, **kwargs: Any) -> Any:
         return self.recovery_startup_runtime._refresh_recovery_ledger_from_exchange_truth(*args, **kwargs)
@@ -4420,6 +4591,11 @@ class LiveRuntime:
                         entry_quote_truth_overlay,
                     ),
                     admission_blocker_counts=admission_blocker_counts,
+                    final_cost_reprice=(
+                        self._reprice_final_l2_candidates
+                        if str(self.config.runtime.mode).lower() == "live"
+                        else None
+                    ),
                 )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
                 dispatched = await self._dispatch_selected_entry_candidates(
@@ -5071,6 +5247,64 @@ class LiveRuntime:
         return checked
 
     @staticmethod
+    def _pending_zero_fill_terminal_is_confirmed(pending: Any, po: Any) -> bool:
+        """Allow route changes only after the prior passive order is known flat."""
+        terminal_states = {
+            PassiveOrderState.CANCELED,
+            PassiveOrderState.REJECTED,
+            PassiveOrderState.EXPIRED,
+        }
+        return bool(
+            po is not None
+            and po.cancel_requested()
+            and getattr(po, "last_progress_state", PassiveOrderState.UNKNOWN)
+            in terminal_states
+            and not pending.has_any_fill()
+            and getattr(pending, "hedge_inflight", None) is None
+        )
+
+    @staticmethod
+    def _apply_final_l2_candidate_to_pending(pending: Any, candidate: Any) -> None:
+        """Keep pending-entry accounting aligned with the route that will execute."""
+        pending.expected_edge_bps_entry = float(
+            getattr(candidate, "expected_edge_bps", pending.expected_edge_bps_entry) or 0.0
+        )
+        pending.worst_case_edge_bps_entry = float(
+            getattr(candidate, "worst_case_edge_bps", pending.worst_case_edge_bps_entry)
+            or 0.0
+        )
+        pending.entry_maker_leg = str(
+            getattr(candidate, "entry_maker_leg", pending.entry_maker_leg) or ""
+        )
+        pending.exit_maker_leg = str(
+            getattr(candidate, "exit_maker_leg", pending.exit_maker_leg) or ""
+        )
+        pending.entry_cross_bps_entry = float(
+            getattr(candidate, "entry_cross_bps", pending.entry_cross_bps_entry) or 0.0
+        )
+        pending.fee_bps_entry = float(
+            getattr(candidate, "fee_bps", pending.fee_bps_entry) or 0.0
+        )
+        pending.entry_slippage_bps_entry = float(
+            getattr(candidate, "entry_slippage_bps", pending.entry_slippage_bps_entry)
+            or 0.0
+        )
+        pending.long_entry_vwap = getattr(
+            candidate, "long_entry_vwap", pending.long_entry_vwap
+        )
+        pending.short_entry_vwap = getattr(
+            candidate, "short_entry_vwap", pending.short_entry_vwap
+        )
+        pending.entry_liquidity_source_at_entry = str(
+            getattr(
+                candidate,
+                "entry_liquidity_source_at_entry",
+                pending.entry_liquidity_source_at_entry,
+            )
+            or ""
+        )
+
+    @staticmethod
     def _candidate_float_hint(candidate: Any, *names: str) -> float:
         for name in names:
             try:
@@ -5127,7 +5361,17 @@ class LiveRuntime:
         terminal_reason: str,
     ) -> bool:
         """V1: try_terminal_taker_fallback for pending entry zero-fill terminal."""
-        source_candidate = self._pending_entry_terminal_fallback_candidate(pending)
+        source_candidate = self._candidate_to_runtime_namespace(
+            self._pending_entry_terminal_fallback_candidate(pending),
+            pending,
+        )
+        # The dual-taker terminal path must never inherit the earlier maker
+        # quote. Reprice both entry and expected exit from current L2 books.
+        self._reprice_final_l2_candidate(
+            source_candidate,
+            now_ms,
+            dual_taker=True,
+        )
         candidate = self._apply_terminal_taker_runtime_entry_guards(
             source_candidate,
             pending,
@@ -5188,6 +5432,7 @@ class LiveRuntime:
             )
             return False
 
+        self._apply_final_l2_candidate_to_pending(pending, candidate)
         self.journal.append(
             "execution.entry_fallback_to_taker",
             {
@@ -5227,21 +5472,35 @@ class LiveRuntime:
             expected_edge_bps_entry=float(
                 getattr(candidate, "expected_edge_bps", pending.expected_edge_bps_entry) or 0.0
             ),
-            worst_case_edge_bps_entry=pending.worst_case_edge_bps_entry,
-            entry_maker_leg=pending.entry_maker_leg,
-            exit_maker_leg=pending.exit_maker_leg,
-            entry_cross_bps_entry=pending.entry_cross_bps_entry,
-            fee_bps_entry=pending.fee_bps_entry,
-            entry_slippage_bps_entry=pending.entry_slippage_bps_entry,
+            worst_case_edge_bps_entry=float(
+                getattr(candidate, "worst_case_edge_bps", pending.worst_case_edge_bps_entry)
+                or 0.0
+            ),
+            entry_maker_leg=str(getattr(candidate, "entry_maker_leg", "") or ""),
+            exit_maker_leg=str(getattr(candidate, "exit_maker_leg", "") or ""),
+            entry_cross_bps_entry=float(
+                getattr(candidate, "entry_cross_bps", pending.entry_cross_bps_entry) or 0.0
+            ),
+            fee_bps_entry=float(
+                getattr(candidate, "fee_bps", pending.fee_bps_entry) or 0.0
+            ),
+            entry_slippage_bps_entry=float(
+                getattr(candidate, "entry_slippage_bps", pending.entry_slippage_bps_entry)
+                or 0.0
+            ),
             transfer_bias_bps_entry=pending.transfer_bias_bps_entry,
             transfer_state_at_entry=pending.transfer_state_at_entry,
-            entry_liquidity_source_at_entry=pending.entry_liquidity_source_at_entry,
+            entry_liquidity_source_at_entry=getattr(
+                candidate,
+                "entry_liquidity_source_at_entry",
+                pending.entry_liquidity_source_at_entry,
+            ),
             long_volume_24h_quote_at_entry=pending.long_volume_24h_quote_at_entry,
             short_volume_24h_quote_at_entry=pending.short_volume_24h_quote_at_entry,
             long_open_interest_quote_at_entry=pending.long_open_interest_quote_at_entry,
             short_open_interest_quote_at_entry=pending.short_open_interest_quote_at_entry,
-            long_entry_vwap=pending.long_entry_vwap,
-            short_entry_vwap=pending.short_entry_vwap,
+            long_entry_vwap=getattr(candidate, "long_entry_vwap", pending.long_entry_vwap),
+            short_entry_vwap=getattr(candidate, "short_entry_vwap", pending.short_entry_vwap),
             entry_capacity_constrained=pending.entry_capacity_constrained,
             entry_target_quantity=pending.entry_target_quantity,
             long_max_executable_quantity=pending.long_max_executable_quantity,
@@ -6240,8 +6499,50 @@ class LiveRuntime:
 
         phase_state = ensure_pending_entry_phase_state(pending, now_ms)
         previous_phase = phase_state.phase
-        zero_fill_candidate = self._apply_terminal_taker_runtime_entry_guards(
+        phase_budget = pending_entry_phase_zero_fill_budget(self.config.strategy)
+        switching_maker_leg = (
+            previous_phase == "high_slippage_maker"
+            and int(phase_state.zero_fill_cycles_in_phase or 0) >= phase_budget
+        )
+        if switching_maker_leg and not self._pending_zero_fill_terminal_is_confirmed(
+            pending,
+            po,
+        ):
+            self.journal.append(
+                "execution.direction_switch_blocked",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "reason": "prior_maker_route_not_confirmed_zero_fill",
+                    "phase": previous_phase,
+                    "maker_leg": pending.maker_leg,
+                },
+            )
+            pending.next_progress_poll_ms = now_ms + self._RECONCILE_RETRY_BASE_MS
+            return True
+        if switching_maker_leg:
+            # This terminal progress response is the reconciliation evidence
+            # that resolves the earlier resting-order uncertainty.
+            pending.uncertain_outcome = False
+            pending.outcome = po.last_progress_state.value
+
+        zero_fill_candidate = self._candidate_to_runtime_namespace(
             self._pending_entry_terminal_fallback_candidate(pending),
+            pending,
+        )
+        if switching_maker_leg:
+            alternate_maker_leg = (
+                "short"
+                if str(phase_state.preferred_maker_leg or pending.maker_leg) == "long"
+                else "long"
+            )
+            self._reprice_final_l2_candidate(
+                zero_fill_candidate,
+                now_ms,
+                forced_entry_maker_leg=alternate_maker_leg,
+            )
+        zero_fill_candidate = self._apply_terminal_taker_runtime_entry_guards(
+            zero_fill_candidate,
             pending,
             now_ms,
         )
@@ -6251,7 +6552,6 @@ class LiveRuntime:
             now_ms,
             candidate=zero_fill_candidate,
         )
-        phase_budget = pending_entry_phase_zero_fill_budget(self.config.strategy)
         if action.reason == "candidate_not_tradeable_after_zero_fill_reprice":
             self.journal.append(
                 "execution.direction_drift_blocked",
@@ -6269,6 +6569,7 @@ class LiveRuntime:
             return True
         if action.reason == "phase_switched_to_low_slippage_maker":
             phase_state = ensure_pending_entry_phase_state(pending, now_ms)
+            self._apply_final_l2_candidate_to_pending(pending, zero_fill_candidate)
             metadata["passive_zero_fill_cycles"] = 0
             self.journal.append(
                 "execution.passive_phase_switched",
@@ -11144,6 +11445,7 @@ class LiveRuntime:
         candidate_blockers: dict[str, str],
         market_quotes=None,
         admission_blocker_counts: Counter | None = None,
+        final_cost_reprice=None,
     ) -> list:
         return self.entry_gate_runtime._select_entry_candidates(
             tradeable,
@@ -11153,7 +11455,320 @@ class LiveRuntime:
             candidate_blockers=candidate_blockers,
             market_quotes=market_quotes,
             admission_blocker_counts=admission_blocker_counts,
+            final_cost_reprice=final_cost_reprice,
         )
+
+    @staticmethod
+    def _final_l2_clear_reprice_blockers(candidate) -> None:
+        reprice_reasons = {
+            "final_l2_expected_edge_below_floor",
+            "final_l2_worst_case_edge_below_floor",
+            "final_l2_entry_slippage_above_vwap_limit",
+            "final_l2_unavailable",
+            "final_l2_insufficient_depth",
+            "final_l2_invalid_price",
+            "final_l2_quantity_scale_unavailable",
+        }
+        remaining = [
+            str(reason)
+            for reason in (getattr(candidate, "blocked_reasons", []) or [])
+            if str(reason) not in reprice_reasons
+        ]
+        candidate.blocked_reasons = remaining
+        candidate.blocked = bool(remaining)
+
+    @staticmethod
+    def _final_l2_block(candidate, reason: str) -> bool:
+        reasons = list(getattr(candidate, "blocked_reasons", []) or [])
+        if reason not in reasons:
+            reasons.append(reason)
+        candidate.blocked_reasons = reasons
+        candidate.blocked = True
+        return False
+
+    def _final_l2_book(self, venue: str, symbol: str, now_ms: int):
+        book = self.local_l2_runtime.get_book(str(venue), str(symbol))
+        if book is None or not book.is_ready(self._entry_local_l2_stale_after_ms(), now_ms):
+            return None
+        if (
+            book.best_bid() <= 0.0
+            or book.best_ask() <= 0.0
+            or not math.isfinite(book.best_bid())
+            or not math.isfinite(book.best_ask())
+        ):
+            return None
+        return book
+
+    @staticmethod
+    def _final_l2_taker_slippage_bps(
+        book,
+        side: Side,
+        target_quantity: float,
+        quantity_to_base_scale: float = 1.0,
+    ) -> tuple[float, float]:
+        """Return the exact L2 VWAP for one equal-base-quantity execution leg."""
+        if (
+            target_quantity <= 0.0
+            or not math.isfinite(target_quantity)
+            or quantity_to_base_scale <= 0.0
+            or not math.isfinite(quantity_to_base_scale)
+        ):
+            raise ValueError("invalid_l2_quantity")
+        levels = book.asks if side == Side.BUY else book.bids
+        remaining_quantity = target_quantity
+        filled_quantity = 0.0
+        filled_quote = 0.0
+        for level in levels:
+            price = float(getattr(level, "price", 0.0) or 0.0)
+            raw_quantity = float(getattr(level, "quantity", 0.0) or 0.0)
+            if (
+                price <= 0.0
+                or raw_quantity <= 0.0
+                or not math.isfinite(price)
+                or not math.isfinite(raw_quantity)
+            ):
+                continue
+            quantity = raw_quantity * quantity_to_base_scale
+            if quantity <= 0.0 or not math.isfinite(quantity):
+                raise ValueError("invalid_l2_quantity")
+            take_quantity = min(quantity, remaining_quantity)
+            filled_quantity += take_quantity
+            filled_quote += take_quantity * price
+            remaining_quantity -= take_quantity
+            if remaining_quantity <= 1e-12:
+                break
+        if filled_quantity + 1e-9 < target_quantity or filled_quote <= 0.0:
+            raise LookupError("insufficient_l2_depth")
+        vwap = filled_quote / filled_quantity
+        if side == Side.BUY:
+            reference_price = book.best_ask()
+            slippage_bps = (vwap / reference_price - 1.0) * 10_000.0
+        else:
+            reference_price = book.best_bid()
+            slippage_bps = (reference_price / vwap - 1.0) * 10_000.0
+        if (
+            vwap <= 0.0
+            or reference_price <= 0.0
+            or not math.isfinite(vwap)
+            or not math.isfinite(reference_price)
+        ):
+            raise LookupError("insufficient_l2_depth")
+        return max(slippage_bps, 0.0), vwap
+
+    def _final_l2_quantity_to_base_scale(self, venue: Venue, symbol: str) -> float | None:
+        """Read a cached multiplier; do not request metadata while scanning candidates."""
+        adapter = self._venue_adapters.get(venue)
+        if adapter is None:
+            # Paper-only tests can construct local books without an adapter.
+            # A live scan that can trade always owns both venue adapters.
+            return 1.0
+        try:
+            raw_scale = adapter.l2_book_quantity_to_base_scale(symbol)
+            scale = float(raw_scale) if raw_scale is not None else float("nan")
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return scale if scale > 0.0 and math.isfinite(scale) else None
+
+    def _final_l2_tie_maker_leg(self) -> str:
+        return (
+            "long"
+            if str(getattr(self.config.strategy, "maker_leg_default", "buy")).lower() == "buy"
+            else "short"
+        )
+
+    def _final_l2_thresholds(self, entry_notional_quote: float) -> tuple[float, float, float]:
+        strategy = self.config.strategy
+        min_expected = float(getattr(strategy, "min_expected_edge_bps", 0.0) or 0.0)
+        min_worst = float(getattr(strategy, "min_worst_case_edge_bps", 0.0) or 0.0)
+        max_slippage = float(getattr(strategy, "max_entry_slippage_bps", 0.0) or 0.0)
+        small_live_test = (
+            str(self.config.runtime.mode).lower() == "live"
+            and float(getattr(strategy, "small_test_max_entry_notional_quote", 0.0) or 0.0) > 0.0
+            and entry_notional_quote
+            <= float(getattr(strategy, "small_test_max_entry_notional_quote", 0.0) or 0.0) + 1e-9
+        )
+        if small_live_test:
+            min_expected -= max(
+                float(getattr(strategy, "small_test_expected_edge_relaxation_bps", 0.0) or 0.0),
+                0.0,
+            )
+            min_worst -= max(
+                float(getattr(strategy, "small_test_worst_case_edge_relaxation_bps", 0.0) or 0.0),
+                0.0,
+            )
+            max_slippage += max(
+                float(
+                    getattr(strategy, "small_test_max_entry_slippage_relaxation_bps", 0.0)
+                    or 0.0
+                ),
+                0.0,
+            )
+        return min_expected, min_worst, max_slippage
+
+    def _reprice_final_l2_candidate(
+        self,
+        candidate,
+        now_ms: int,
+        *,
+        forced_entry_maker_leg: str | None = None,
+        dual_taker: bool = False,
+    ) -> bool:
+        """Recompute final execution economics from the ready local L2 books."""
+        self._final_l2_clear_reprice_blockers(candidate)
+        try:
+            long_venue = Venue.from_str(str(getattr(candidate, "long_venue", "")))
+            short_venue = Venue.from_str(str(getattr(candidate, "short_venue", "")))
+            symbol = str(getattr(candidate, "symbol", ""))
+            notional_quote = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return self._final_l2_block(candidate, "final_l2_invalid_price")
+        long_book = self._final_l2_book(long_venue.value, symbol, now_ms)
+        short_book = self._final_l2_book(short_venue.value, symbol, now_ms)
+        if long_book is None or short_book is None:
+            return self._final_l2_block(candidate, "final_l2_unavailable")
+        reference_mid = (long_book.best_ask() + short_book.best_bid()) / 2.0
+        if not math.isfinite(reference_mid) or reference_mid <= 0.0:
+            return self._final_l2_block(candidate, "final_l2_invalid_price")
+        target_quantity = notional_quote / reference_mid
+        long_quantity_scale = self._final_l2_quantity_to_base_scale(long_venue, symbol)
+        short_quantity_scale = self._final_l2_quantity_to_base_scale(short_venue, symbol)
+        if long_quantity_scale is None or short_quantity_scale is None:
+            return self._final_l2_block(candidate, "final_l2_quantity_scale_unavailable")
+        try:
+            long_buy_slippage, long_buy_vwap = self._final_l2_taker_slippage_bps(
+                long_book, Side.BUY, target_quantity, long_quantity_scale
+            )
+            long_sell_slippage, _ = self._final_l2_taker_slippage_bps(
+                long_book, Side.SELL, target_quantity, long_quantity_scale
+            )
+            short_buy_slippage, _ = self._final_l2_taker_slippage_bps(
+                short_book, Side.BUY, target_quantity, short_quantity_scale
+            )
+            short_sell_slippage, short_sell_vwap = self._final_l2_taker_slippage_bps(
+                short_book, Side.SELL, target_quantity, short_quantity_scale
+            )
+        except LookupError:
+            return self._final_l2_block(candidate, "final_l2_insufficient_depth")
+        except (ArithmeticError, ValueError):
+            return self._final_l2_block(candidate, "final_l2_invalid_price")
+
+        long_fees = self._account_fee_snapshot_for_venue(long_venue)
+        short_fees = self._account_fee_snapshot_for_venue(short_venue)
+        funding_edge = float(getattr(candidate, "funding_edge_bps", 0.0) or 0.0)
+        if (
+            not math.isfinite(funding_edge)
+        ):
+            return self._final_l2_block(candidate, "final_l2_invalid_price")
+
+        if dual_taker:
+            entry_cross = (short_book.best_bid() - long_book.best_ask()) / reference_mid * 10_000.0
+            entry_fee = long_fees.taker_fee_bps + short_fees.taker_fee_bps
+            entry_slippage = long_buy_slippage + short_sell_slippage
+            exit_fee = long_fees.taker_fee_bps + short_fees.taker_fee_bps
+            exit_slippage = long_sell_slippage + short_buy_slippage
+            entry_maker_leg = ""
+            exit_maker_leg = ""
+            long_entry_slippage, short_entry_slippage = long_buy_slippage, short_sell_slippage
+            long_exit_slippage, short_exit_slippage = long_sell_slippage, short_buy_slippage
+            expected_edge = (
+                funding_edge + entry_cross - entry_fee - entry_slippage - exit_fee
+                - exit_slippage - self.config.strategy.entry_exit_reserve_bps
+                - self.config.strategy.capital_buffer_bps
+            )
+        else:
+            priced = price_final_l2_cost(
+                funding_edge_bps=funding_edge,
+                long_bid=long_book.best_bid(),
+                long_ask=long_book.best_ask(),
+                short_bid=short_book.best_bid(),
+                short_ask=short_book.best_ask(),
+                long_buy_slippage_bps=long_buy_slippage,
+                long_sell_slippage_bps=long_sell_slippage,
+                short_buy_slippage_bps=short_buy_slippage,
+                short_sell_slippage_bps=short_sell_slippage,
+                long_maker_fee_bps=long_fees.maker_fee_bps,
+                long_taker_fee_bps=long_fees.taker_fee_bps,
+                short_maker_fee_bps=short_fees.maker_fee_bps,
+                short_taker_fee_bps=short_fees.taker_fee_bps,
+                config=self.config.strategy,
+                tie_maker_leg=self._final_l2_tie_maker_leg(),
+                forced_entry_maker_leg=forced_entry_maker_leg,
+            )
+            entry_cross = priced.entry_cross_bps
+            entry_fee = priced.entry_fee_bps
+            entry_slippage = priced.entry_slippage_bps
+            exit_fee = priced.exit_fee_bps
+            exit_slippage = priced.exit_slippage_bps
+            entry_maker_leg = priced.entry_maker_leg
+            exit_maker_leg = priced.exit_maker_leg
+            long_entry_slippage = priced.long_entry_slippage_bps
+            short_entry_slippage = priced.short_entry_slippage_bps
+            long_exit_slippage = priced.long_exit_slippage_bps
+            short_exit_slippage = priced.short_exit_slippage_bps
+            expected_edge = priced.expected_edge_bps
+
+        candidate.entry_cross_bps = entry_cross
+        candidate.long_entry_slippage_bps = long_entry_slippage
+        candidate.short_entry_slippage_bps = short_entry_slippage
+        candidate.fee_bps = entry_fee
+        candidate.entry_slippage_bps = entry_slippage
+        candidate.long_exit_slippage_bps = long_exit_slippage
+        candidate.short_exit_slippage_bps = short_exit_slippage
+        candidate.exit_fee_bps = exit_fee
+        candidate.exit_slippage_bps = exit_slippage
+        candidate.entry_maker_leg = entry_maker_leg
+        candidate.exit_maker_leg = exit_maker_leg
+        candidate.long_entry_vwap = (
+            long_book.best_bid() if entry_maker_leg == "long" else long_buy_vwap
+        )
+        candidate.short_entry_vwap = (
+            short_book.best_ask() if entry_maker_leg == "short" else short_sell_vwap
+        )
+        candidate.entry_liquidity_source_at_entry = "true_l2"
+        candidate.expected_edge_bps = expected_edge
+        candidate.worst_case_edge_bps = compute_worst_case_edge_bps(
+            expected_edge, self.config.strategy
+        )
+        candidate.ranking_edge_bps = compute_ranking_edge_bps(
+            candidate.worst_case_edge_bps,
+            float(getattr(candidate, "transfer_bias_bps", 0.0) or 0.0),
+        )
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                candidate.expected_edge_bps,
+                candidate.worst_case_edge_bps,
+                candidate.ranking_edge_bps,
+                candidate.entry_cross_bps,
+                candidate.entry_slippage_bps,
+            )
+        ):
+            return self._final_l2_block(candidate, "final_l2_invalid_price")
+
+        min_expected, min_worst, max_slippage = self._final_l2_thresholds(notional_quote)
+        if candidate.expected_edge_bps < min_expected:
+            return self._final_l2_block(candidate, "final_l2_expected_edge_below_floor")
+        if candidate.worst_case_edge_bps < min_worst:
+            return self._final_l2_block(candidate, "final_l2_worst_case_edge_below_floor")
+        if candidate.entry_slippage_bps > max_slippage:
+            return self._final_l2_block(candidate, "final_l2_entry_slippage_above_vwap_limit")
+        return True
+
+    def _reprice_final_l2_candidates(self, candidates: list, now_ms: int) -> list:
+        """Apply the one existing post-L2 economics decision before selection."""
+        repriced = [
+            candidate
+            for candidate in candidates
+            if self._reprice_final_l2_candidate(candidate, now_ms)
+        ]
+        repriced.sort(
+            key=lambda candidate: float(getattr(candidate, "ranking_edge_bps", 0.0) or 0.0),
+            reverse=True,
+        )
+        self.state.last_scan["final_l2_repriced_candidate_count"] = len(repriced)
+        self.state.last_scan["final_l2_filtered_candidate_count"] = len(candidates) - len(repriced)
+        return repriced
 
     def _entry_finalization_window_blocker(
         self,

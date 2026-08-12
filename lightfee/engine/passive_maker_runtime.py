@@ -50,6 +50,21 @@ class PassiveMakerRuntime:
             return None
         return method if callable(method) else None
 
+    def _pending_active_maker_side(self, pending) -> Side:
+        """Use the persisted active route; config is legacy fallback only."""
+        maker_leg = str(getattr(pending, "maker_leg", "") or "").lower()
+        if maker_leg not in {"long", "short"}:
+            maker_leg = str(getattr(pending, "entry_maker_leg", "") or "").lower()
+        if maker_leg == "short":
+            return Side.SELL
+        if maker_leg == "long":
+            return Side.BUY
+        return (
+            Side.BUY
+            if str(self.ctx.config.strategy.maker_leg_default).lower() == "buy"
+            else Side.SELL
+        )
+
     async def _call_reprice_passive_maker(
         self,
         pending,
@@ -184,7 +199,6 @@ class PassiveMakerRuntime:
             return
 
         strategy = self.ctx.config.strategy
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
 
@@ -196,6 +210,7 @@ class PassiveMakerRuntime:
         venues: set[str] = set()
 
         for entry_id, pending in pending_passive:
+            maker_leg = self._pending_active_maker_side(pending)
             # Check if any matching event involves this entry's venues
             entry_venues = {(pending.long_venue.value, pending.symbol),
                           (pending.short_venue.value, pending.symbol)}
@@ -345,7 +360,6 @@ class PassiveMakerRuntime:
     ) -> None:
         """WS BBO maker-event lane using the in-situ pending hedge driver."""
         strategy = self.ctx.config.strategy
-        maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         reprice_threshold_bps = strategy.passive_reprice_threshold_bps
         cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
 
@@ -365,6 +379,7 @@ class PassiveMakerRuntime:
         min_quote_age_ms = 1_000_000_000
 
         for entry_id, pending in pending_passive:
+            maker_leg = self._pending_active_maker_side(pending)
             maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
             venue_str = maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
             quote = None
@@ -628,7 +643,7 @@ class PassiveMakerRuntime:
         from lightfee.core.domain import Side
         from lightfee.engine.entry import EntryContext, EntryType
 
-        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_leg = self._pending_active_maker_side(pending)
 
         ctx = EntryContext(
             entry_id=entry_id,
@@ -710,7 +725,7 @@ class PassiveMakerRuntime:
         from lightfee.core.domain import Side
         from lightfee.engine.entry_sync import drive_pending_entry_hedge
 
-        maker_leg = Side.BUY if self.ctx.config.strategy.maker_leg_default == "buy" else Side.SELL
+        maker_leg = self._pending_active_maker_side(pending)
 
         result = await drive_pending_entry_hedge(
             entry_id=entry_id,

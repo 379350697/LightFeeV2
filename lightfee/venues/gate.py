@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import math
+import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
+    AccountFeeSnapshot,
     OrderFill,
     OrderRequest,
     PositionSnapshot,
     Venue,
     VenueMarketSnapshot,
 )
+from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
     entry_tradability_unavailable,
@@ -49,6 +53,69 @@ class GateAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._mode == "live"
+
+    async def fetch_account_fee_snapshot(
+        self, reference_symbol: str = ""
+    ) -> Optional[AccountFeeSnapshot]:
+        del reference_symbol
+        raw = await self._transport._request(
+            "GET",
+            "/api/v4/wallet/fee",
+            params={"settle": "usdt"},
+            private=True,
+        )
+        row = raw.get("data", raw) if isinstance(raw, dict) else raw
+        return self._account_fee_snapshot_from_row(row, "gate_wallet_fee")
+
+    def _account_fee_snapshot_from_row(
+        self, row: Any, source: str
+    ) -> AccountFeeSnapshot:
+        values = first_mapping(row, "Gate fee response")
+        return AccountFeeSnapshot(
+            venue=self.venue,
+            maker_fee_bps=fee_rate_from_mapping(
+                values,
+                "maker fee",
+                "futures_maker_fee",
+                "futuresMakerFee",
+                "maker_fee_rate",
+                "maker_fee",
+                "makerFeeRate",
+                "makerFee",
+            ),
+            taker_fee_bps=fee_rate_from_mapping(
+                values,
+                "taker fee",
+                "futures_taker_fee",
+                "futuresTakerFee",
+                "taker_fee_rate",
+                "taker_fee",
+                "takerFeeRate",
+                "takerFee",
+            ),
+            observed_at_ms=int(time.time() * 1000),
+            source=source,
+        )
+
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float | None:
+        """Convert Gate local-book contract counts with ``quanto_multiplier``."""
+        metadata_by_symbol = getattr(self._transport, "_symbol_metadata", {}) or {}
+        for key in (self._transport._venue_symbol(symbol), symbol):
+            metadata = metadata_by_symbol.get(key)
+            if not isinstance(metadata, dict):
+                continue
+            try:
+                value = float(
+                    metadata.get(
+                        "quanto_multiplier",
+                        metadata.get("quantoMultiplier", 0.0),
+                    )
+                    or 0.0
+                )
+            except (TypeError, ValueError):
+                return None
+            return value if value > 0.0 and math.isfinite(value) else None
+        return None
 
     def supported_symbols(self) -> list[str]:
         """Return loaded Gate USDT futures symbols in canonical LightFee format."""
