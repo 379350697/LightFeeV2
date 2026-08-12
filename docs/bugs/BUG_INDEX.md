@@ -17,6 +17,18 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-102 Binance close-fee evidence, 2026-08-13: V2 reconciled four imported
+COTIUSDT historical closes using Binance order status alone. That endpoint has
+quantity and price but no commission; the missing fee was converted to zero,
+so only the Bybit fee entered the terminal bill. V2 now follows V1 by querying
+Binance `/fapi/v1/userTrades` for the resolved order ID, retains a true zero as
+known evidence, and refuses `exit.reconciled` when any nonzero fill has an
+unknown/invalid exit fee. Cloud `03b53855` re-ran the normal typed import and
+reconciliation path from the retained pre-import state: all four terminal
+records now contain both-leg actual fees and the production acceptance gate is
+green. See
+[daily/2026-08-12.md#cluster-cl-102-binance-close-fee-evidence](daily/2026-08-12.md#cluster-cl-102-binance-close-fee-evidence).
+
 CL-101 unattributed recovered-close accounting boundary, 2026-08-12: the
 exchange-flat `live-recovered:CLUSDT:okx->bitget` owner had no durable V2 entry
 or close-order identity, yet the generic live-flat path made it a permanent
