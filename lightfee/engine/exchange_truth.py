@@ -153,6 +153,9 @@ def _venue_contract_symbol(spec: Any, symbol: str) -> str:
 
 def parse_open_orders_response(
     raw: Any,
+    *,
+    venue: Venue | None = None,
+    require_venue_success: bool = False,
 ) -> tuple[list[Any] | None, str | None]:
     """Strictly parse an open-orders response into a list.
 
@@ -174,10 +177,33 @@ def parse_open_orders_response(
         return list(rows), None
 
     if isinstance(raw, list):
+        if venue == Venue.BITGET and require_venue_success:
+            return None, "bitget_open_orders_response_missing_success_code"
         # A bare list may itself be the order collection (Aster/Bybit style).
         return trusted_rows(raw, source="root")
     if not isinstance(raw, dict):
         return None, "open_orders_response_not_mapping"
+
+    # Raw Bitget private responses use a business-level success code even when
+    # HTTP transport succeeds.  V1 validates this before inspecting `data`.
+    # The direct truth-query fallback below receives that raw envelope, so it
+    # must not turn an error response with an empty-looking collection into
+    # evidence that no orders exist.  Adapter-normalized collections remain
+    # supported, but an explicit non-success code is never trusted.
+    bitget_success = False
+    if venue == Venue.BITGET:
+        code = raw.get("code")
+        if code is None:
+            if require_venue_success:
+                return None, "bitget_open_orders_response_missing_success_code"
+        else:
+            bitget_success = str(code) in {"00000", "0"}
+            if not bitget_success:
+                return (
+                    None,
+                    "bitget_open_orders_response_rejected:"
+                    f"code={code}:msg={str(raw.get('msg', ''))[:200]}",
+                )
 
     # Bybit /api/v5/order/realtime nests orders under result.list.
     if "result" in raw:
@@ -202,6 +228,17 @@ def parse_open_orders_response(
             if key not in data:
                 continue
             rows = data[key]
+            # Bitget Classic returns null, rather than an empty array, for
+            # some successful empty pending-order responses.  Accept only
+            # this exact documented collection field behind an explicit
+            # Bitget success code; every other nullable/unknown shape remains
+            # untrusted.
+            if (
+                key == "entrustedList"
+                and rows is None
+                and bitget_success
+            ):
+                return [], None
             return trusted_rows(rows, source=f"data.{key}")
         return None, "open_orders_response_data_unrecognized_shape"
 
@@ -215,11 +252,20 @@ def parse_open_orders_response(
     return None, "open_orders_response_unrecognized_shape"
 
 
-def require_open_orders_response(raw: Any) -> list[Any]:
+def require_open_orders_response(
+    raw: Any,
+    *,
+    venue: Venue | None = None,
+    require_venue_success: bool = False,
+) -> list[Any]:
     """Return trusted open-order rows or raise; never synthesize an empty list."""
     if isinstance(raw, dict) and raw.get("error"):
         raise RuntimeError(str(raw["error"]))
-    rows, error = parse_open_orders_response(raw)
+    rows, error = parse_open_orders_response(
+        raw,
+        venue=venue,
+        require_venue_success=require_venue_success,
+    )
     if rows is None:
         raise RuntimeError(error or "open_orders_response_untrusted")
     return rows
@@ -248,7 +294,7 @@ async def probe_venue_open_orders_flat(
             return None, str(exc)
         if isinstance(raw, dict) and raw.get("error"):
             return None, str(raw["error"])
-        orders, reason = parse_open_orders_response(raw)
+        orders, reason = parse_open_orders_response(raw, venue=venue)
         if orders is None:
             return None, reason or "open_orders_untrusted"
         if orders:
@@ -272,7 +318,11 @@ async def probe_venue_open_orders_flat(
         )
     except Exception as exc:
         return None, str(exc)
-    orders, reason = parse_open_orders_response(raw)
+    orders, reason = parse_open_orders_response(
+        raw,
+        venue=venue,
+        require_venue_success=True,
+    )
     if orders is None:
         return None, reason or "open_orders_untrusted"
     if orders:

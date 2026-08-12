@@ -493,7 +493,14 @@ class RecoveryStartupRuntime:
                 account_address=account,
                 agent_wallet_address=agent_wallet,
             )
-            return self.ctx._recovery_ledger_order_rows(raw), contract_request.label
+            return (
+                self.ctx._recovery_ledger_order_rows(
+                    raw,
+                    venue=venue,
+                    require_venue_success=True,
+                ),
+                contract_request.label,
+            )
 
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if not callable(fetch_open_orders):
@@ -750,8 +757,17 @@ class RecoveryStartupRuntime:
         return str(value or "").lower() in {"true", "1", "yes"}
 
     @staticmethod
-    def _recovery_ledger_order_rows(raw: Any) -> list[Any]:
-        return require_open_orders_response(raw)
+    def _recovery_ledger_order_rows(
+        raw: Any,
+        *,
+        venue: Venue | None = None,
+        require_venue_success: bool = False,
+    ) -> list[Any]:
+        return require_open_orders_response(
+            raw,
+            venue=venue,
+            require_venue_success=require_venue_success,
+        )
 
     def _startup_recovery_ledger_symbols(self, symbol_info: object) -> list[str]:
         symbols = set(self.ctx._startup_position_probe_symbols(symbol_info))

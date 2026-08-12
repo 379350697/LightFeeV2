@@ -1483,11 +1483,24 @@ class ResidualRepairRuntime:
             ),
         )
 
-        return self._residual_repair_open_order_items(raw)
+        return self._residual_repair_open_order_items(
+            raw,
+            venue=venue,
+            require_venue_success=True,
+        )
 
     @staticmethod
-    def _residual_repair_open_order_items(raw: Any) -> list[Any]:
-        return require_open_orders_response(raw)
+    def _residual_repair_open_order_items(
+        raw: Any,
+        *,
+        venue: Venue | None = None,
+        require_venue_success: bool = False,
+    ) -> list[Any]:
+        return require_open_orders_response(
+            raw,
+            venue=venue,
+            require_venue_success=require_venue_success,
+        )
 
     def _residual_repair_baseline_size(self, task: dict, repair_venue: Venue) -> float:
         position_id = task.get("position_id", "")

@@ -75,6 +75,11 @@ processing, supervisor venue coverage, and entry-conflict gating.
 - V1 lets live exchange truth dominate stale recovered local close state.
 - V1 terminal-maker and under-min branches do not spin forever; they either prove flat, compensate, or fail-closed.
 - Unsupported or failed open-order truth is not flat evidence.
+- A raw Bitget Classic open-order response is empty-order truth only when its
+  business code explicitly succeeds and its documented
+  `data.entrustedList` collection is empty or `null`. Missing/non-success
+  codes and every other nullable/unknown shape remain untrusted; direct
+  transport fallbacks must not bypass this check.
 - Exchange min-notional / reduce-only terminal rejects must be interpreted with live position truth, not used blindly as success.
 - Missing close price evidence must explain whether Local-L2 was stale, WS BBO
   fallback was stale, or WS BBO fallback had no cache/quote/budget. A bare
@@ -105,6 +110,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-15 | Bybit 110017 submit-time terminal zero-qty evidence | fixed, deployed/cloud verified | HOMEUSDT closed flat/no-open-orders, but Bybit returned `110017 orderQty will be truncated to zero` after passive maker submit rather than before submit precheck. CL-083 preserves raw Bybit retCode body, emits terminal-zero evidence, immediately reuses V1 live-truth closure, and keeps diagnose from treating resolved terminal-zero cases as unresolved order errors. Cloud verification under `fd1579d` is flat/no-open-orders with no active order errors and no unmapped lifecycle events. |
 | 2026-08-04 | Fully filled passive close had no terminal bill | base deployed `ec1d305`; behavior watch | CL-095 keeps `exit.passive_close_resolved` operational-only and emits exactly one standard terminal accounting event after dual-leg-zero/no-residual completion. Missing entry-fee evidence stays explicitly provisional. |
 | 2026-08-04 | Recovered close lost order identity and retry/escalation budget | root correction local; deploy pending | The deployed HOMEUSDT recovery exposed that snapshots kept only aggregate maker/hedge fields. The correction round-trips all passive close execution legs, independent position snapshot, and phase retry/escalation counters; recovered known IDs enter reconciliation while a near-threshold L2 failure escalates without replaying maker retries. Truly identity-less legacy evidence still emits a conservative provisional terminal without fabricated PnL. |
+| 2026-08-12 | Bitget successful null pending-order response | local green; deploy pending | CLUSDT recovery showed Classic `code=00000` plus `data.entrustedList=null`; the shared raw-truth parser now accepts only that exact successful nullable collection as empty and keeps business errors/missing codes fail-closed. |
 
 ## Recurrences
 
@@ -120,6 +126,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-06-07 | `BABYUSDT` OKX/Bybit plus unowned Bybit `MORPHOUSDT`, `MONUSDT`, `SEIUSDT` live artifacts | working tree | local RED/GREEN coverage complete for `PC-06`/`PC-07`/`PC-08`; deploy and production verification pending | [daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry](../daily/2026-06-07.md#cluster-cl-051-post-bff33ec-passive-close-live-flat-cleanup-re-entry) |
 | 2026-06-08 | ACK-only timeout/order-truth evidence for production issue 10 | `89e2b93` / `74475c5` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
+| 2026-08-12 | `CLUSDT` OKX/Bitget | working tree | local green; deploy pending | [daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth](../daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth) |
 
 ## Regression Harness
 

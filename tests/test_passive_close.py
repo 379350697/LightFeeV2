@@ -5453,6 +5453,111 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         assert "recovery.flat" in kinds
         assert "runtime.position_drift_corrected" in kinds
 
+    def test_bitget_error_envelope_never_clears_live_flat_recovery(self):
+        """A Bitget business-error envelope is not proof of zero open orders."""
+        from lightfee.venues.specs import BitgetContractFamily
+
+        state, position, journal, executor, _, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        position.symbol = "CLUSDT"
+        position.short_venue = Venue.BITGET
+        short_adapter.venue = Venue.BITGET
+        short_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="CLUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ))
+        short_adapter.fetch_open_orders = None
+
+        class _BitgetErrorTransport:
+            async def _bitget_resolve_contract_family(self):
+                return BitgetContractFamily.CLASSIC_MIX_V2
+
+            async def _request(self, method, path, **kwargs):
+                assert (method, path) == ("GET", "/api/v2/mix/order/orders-pending")
+                assert kwargs == {
+                    "params": {
+                        "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT",
+                        "symbol": "CLUSDT",
+                    },
+                    "private": True,
+                }
+                return {
+                    "code": "99999",
+                    "msg": "business error",
+                    "data": {"entrustedList": None},
+                }
+
+        short_adapter._transport = _BitgetErrorTransport()
+        executor._adapters = {
+            Venue.BINANCE: executor._adapters[Venue.BINANCE],
+            Venue.BITGET: short_adapter,
+        }
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == {position.position_id}
+        assert position.position_id in state.pending_passive_closes
+        assert position.position_id in state.open_positions
+        diagnostic = next(
+            event for event in journal.read_all()
+            if event.get("kind") == "exit.passive_close_recovery_probe_diagnostic"
+        )
+        assert diagnostic["payload"]["live_short_open_orders"] == (
+            "bitget_open_orders_response_rejected:code=99999:msg=business error"
+        )
+
+    def test_bitget_success_null_envelope_clears_live_flat_recovery(self):
+        """Bitget's observed successful null result means no pending order."""
+        from lightfee.venues.specs import BitgetContractFamily
+
+        state, position, _, executor, _, short_adapter = self._arrange_live_flat_cleanup()
+        position.symbol = "CLUSDT"
+        position.short_venue = Venue.BITGET
+        short_adapter.venue = Venue.BITGET
+        short_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="CLUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=3000,
+        ))
+        short_adapter.fetch_open_orders = None
+
+        class _BitgetSuccessTransport:
+            async def _bitget_resolve_contract_family(self):
+                return BitgetContractFamily.CLASSIC_MIX_V2
+
+            async def _request(self, method, path, **kwargs):
+                assert (method, path) == ("GET", "/api/v2/mix/order/orders-pending")
+                assert kwargs == {
+                    "params": {
+                        "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT",
+                        "symbol": "CLUSDT",
+                    },
+                    "private": True,
+                }
+                return {"code": "00000", "data": {"entrustedList": None}}
+
+        short_adapter._transport = _BitgetSuccessTransport()
+        executor._adapters = {
+            Venue.BINANCE: executor._adapters[Venue.BINANCE],
+            Venue.BITGET: short_adapter,
+        }
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == set()
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+
     def test_live_flat_without_order_identity_retains_billing_reconciliation(self):
         """A proved-flat close without IDs remains durable accounting work."""
         state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()

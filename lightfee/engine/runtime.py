@@ -10127,8 +10127,11 @@ class LiveRuntime:
         )
 
     @staticmethod
-    def _residual_repair_open_order_items(raw: Any) -> list[Any]:
-        return ResidualRepairRuntime._residual_repair_open_order_items(raw)
+    def _residual_repair_open_order_items(
+        raw: Any,
+        **kwargs: Any,
+    ) -> list[Any]:
+        return ResidualRepairRuntime._residual_repair_open_order_items(raw, **kwargs)
 
     def _residual_repair_baseline_size(self, task: dict, repair_venue: Venue) -> float:
         return self.residual_repair_runtime._residual_repair_baseline_size(

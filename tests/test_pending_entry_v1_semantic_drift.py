@@ -2034,6 +2034,62 @@ def test_shared_open_order_probe_accepts_known_legacy_empty_envelopes(raw):
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected_rows", "expected_error"),
+    [
+        (
+            [],
+            None,
+            "bitget_open_orders_response_missing_success_code",
+        ),
+        (
+            {"code": "00000", "data": {"entrustedList": []}},
+            [],
+            None,
+        ),
+        (
+            {"code": 0, "data": {"list": [{"orderId": "uta-open"}]}},
+            [{"orderId": "uta-open"}],
+            None,
+        ),
+        (
+            {
+                "code": "99999",
+                "msg": "business error",
+                "data": {"entrustedList": None},
+            },
+            None,
+            "bitget_open_orders_response_rejected:code=99999:msg=business error",
+        ),
+        (
+            {"data": {"entrustedList": []}},
+            None,
+            "bitget_open_orders_response_missing_success_code",
+        ),
+        (
+            {"code": "00000", "data": {"entrustedList": None}},
+            [],
+            None,
+        ),
+    ],
+)
+def test_shared_bitget_raw_open_order_contract_requires_success_and_list(
+    raw, expected_rows, expected_error,
+):
+    """Raw Bitget truth requires a success code and a recognized collection."""
+    from lightfee.core.domain import Venue
+    from lightfee.engine.exchange_truth import parse_open_orders_response
+
+    rows, error = parse_open_orders_response(
+        raw,
+        venue=Venue.BITGET,
+        require_venue_success=True,
+    )
+
+    assert rows == expected_rows
+    assert error == expected_error
+
+
+@pytest.mark.parametrize(
     "raw",
     [
         [None],

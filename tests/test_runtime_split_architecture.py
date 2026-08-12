@@ -225,7 +225,7 @@ def test_recovery_startup_account_open_orders_use_venue_operation_contract():
             return []
 
     ctx = SimpleNamespace(
-        _recovery_ledger_order_rows=lambda rows: rows,
+        _recovery_ledger_order_rows=lambda rows, **_kwargs: rows,
         venue_contracts=SimpleNamespace(request_venue_operation=request_venue_operation),
     )
     runtime = RecoveryStartupRuntime(ctx)
@@ -238,6 +238,39 @@ def test_recovery_startup_account_open_orders_use_venue_operation_contract():
     assert rows == []
     assert endpoint == "GET /fapi/v3/openOrders"
     assert calls == [("GET", "/fapi/v3/openOrders", {"params": {}, "private": True})]
+
+
+def test_bitget_raw_open_order_error_stays_untrusted_in_recovery_and_residual_paths():
+    """Both raw-truth consumers preserve a Bitget business-error boundary."""
+    from lightfee.venues.specs import BitgetContractFamily
+
+    class Transport:
+        async def _bitget_resolve_contract_family(self):
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        async def _request(self, method, path, **kwargs):
+            assert (method, path) == ("GET", "/api/v2/mix/order/orders-pending")
+            return {
+                "code": "99999",
+                "msg": "business error",
+                "data": {"entrustedList": None},
+            }
+
+    adapter = SimpleNamespace(_transport=Transport())
+    recovery = RecoveryStartupRuntime(SimpleNamespace(
+        _recovery_ledger_order_rows=RecoveryStartupRuntime._recovery_ledger_order_rows,
+    ))
+    residual = ResidualRepairRuntime(SimpleNamespace())
+
+    expected = "bitget_open_orders_response_rejected:code=99999:msg=business error"
+    with pytest.raises(RuntimeError, match=expected):
+        asyncio.run(
+            recovery._fetch_recovery_ledger_account_open_orders(Venue.BITGET, adapter)
+        )
+    with pytest.raises(RuntimeError, match=expected):
+        asyncio.run(
+            residual._fetch_residual_repair_open_orders(adapter, Venue.BITGET, "CLUSDT")
+        )
 
 
 def test_diagnose_symbol_open_orders_use_venue_operation_contract():
