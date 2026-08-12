@@ -579,15 +579,13 @@ class CloseRuntime:
         long_venue: Venue,
         short_venue: Venue,
     ) -> bool:
-        """End a physically proven close whose historical entry bill is unavailable.
+        """End a physically proven close whose fee or fill evidence is unavailable.
 
-        A legacy close snapshot may have no durable entry-fee provenance.  Retrying
-        its close fills cannot manufacture that evidence, so this is not a retryable
-        transport failure.  It is only terminal after both exchange legs are proved
-        flat, including open-order truth; the resulting event deliberately remains
-        financially provisional.  The close-quantity-incomplete branch (one leg has
-        no close fill quantity) is provisional exactly like a missing entry fee:
-        exchange truth can prove flatness but cannot manufacture a PnL fact.
+        Retrying cannot manufacture missing historical entry- or exit-fee evidence.
+        This is only terminal after both exchange legs are proved flat, including
+        open-order truth; the resulting event deliberately remains financially
+        provisional.  The close-quantity-incomplete branch (one leg has no close
+        fill quantity) is provisional for the same reason.
         """
         if str(reconciliation.get("kind") or "final") != "final":
             return False
@@ -616,12 +614,33 @@ class CloseRuntime:
             payload.get("close_quantity_evidence_complete") is True
         )
         if close_quantity_evidence_complete:
-            terminal_reason = (
-                "entry_fee_evidence_unavailable_after_confirmed_flat_close"
+            entry_fee_evidence_complete = (
+                payload.get("entry_fee_evidence_complete") is True
             )
-            terminal_accounting_status = (
-                "provisional_entry_fee_evidence_unavailable"
+            exit_fee_evidence_complete = (
+                payload.get("exit_fee_evidence_complete") is True
             )
+            if not entry_fee_evidence_complete and not exit_fee_evidence_complete:
+                terminal_reason = (
+                    "entry_and_exit_fee_evidence_unavailable_after_confirmed_flat_close"
+                )
+                terminal_accounting_status = (
+                    "provisional_entry_and_exit_fee_evidence_unavailable"
+                )
+            elif not exit_fee_evidence_complete:
+                terminal_reason = (
+                    "exit_fee_evidence_unavailable_after_confirmed_flat_close"
+                )
+                terminal_accounting_status = (
+                    "provisional_exit_fee_evidence_unavailable"
+                )
+            else:
+                terminal_reason = (
+                    "entry_fee_evidence_unavailable_after_confirmed_flat_close"
+                )
+                terminal_accounting_status = (
+                    "provisional_entry_fee_evidence_unavailable"
+                )
             terminal_payload = dict(payload)
         else:
             terminal_reason = (
@@ -740,10 +759,16 @@ class CloseRuntime:
         for fill in fills:
             leg_qty = CloseRuntime._close_reconciliation_fill_qty(fill)
             price = _recon_fill_price(fill)
-            fee = float(getattr(fill, "fee_quote", None) or 0.0)
+            fee = None
+            try:
+                candidate_fee = float(getattr(fill, "fee_quote", None))
+                if math.isfinite(candidate_fee):
+                    fee = candidate_fee
+            except (TypeError, ValueError):
+                pass
             qty += leg_qty
             notional += leg_qty * price
-            fee_quote += fee
+            fee_quote += fee or 0.0
             leg_payloads.append({
                 "venue": getattr(getattr(fill, "venue", ""), "value", getattr(fill, "venue", "")),
                 "order_id": getattr(fill, "order_id", "") or "",
@@ -892,6 +917,18 @@ class CloseRuntime:
             (short_entry - float(short["average_price"])) * short_qty
         )
         exit_fee = float(long["fee_quote"]) + float(short["fee_quote"])
+        exit_fee_evidence_complete = True
+        for fill in [*long_fills, *short_fills]:
+            if self._close_reconciliation_fill_qty(fill) <= 1e-12:
+                continue
+            try:
+                fee = float(getattr(fill, "fee_quote", None))
+            except (TypeError, ValueError):
+                exit_fee_evidence_complete = False
+                break
+            if not math.isfinite(fee):
+                exit_fee_evidence_complete = False
+                break
         expected_long_qty = float(snapshot.get("long_quantity") or snapshot.get("matched_quantity") or 0.0)
         expected_short_qty = float(snapshot.get("short_quantity") or snapshot.get("matched_quantity") or 0.0)
         close_quantity_evidence_complete = (
@@ -900,7 +937,11 @@ class CloseRuntime:
             and (expected_long_qty <= 1e-12 or long_qty + 1e-12 >= expected_long_qty)
             and (expected_short_qty <= 1e-12 or short_qty + 1e-12 >= expected_short_qty)
         )
-        complete = close_quantity_evidence_complete and entry_fee_evidence_complete
+        complete = (
+            close_quantity_evidence_complete
+            and entry_fee_evidence_complete
+            and exit_fee_evidence_complete
+        )
         return {
             "position_id": reconciliation.get("position_id", ""),
             "symbol": reconciliation.get("symbol", snapshot.get("symbol", "")),
@@ -926,6 +967,7 @@ class CloseRuntime:
             "entry_fee_source": entry_fee_source,
             "entry_fee_evidence_complete": entry_fee_evidence_complete,
             "exit_fee_quote": exit_fee,
+            "exit_fee_evidence_complete": exit_fee_evidence_complete,
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
             "net_quote_status": "final" if complete else "provisional",
             "expected_long_closed_qty": expected_long_qty,

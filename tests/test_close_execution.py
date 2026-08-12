@@ -225,6 +225,47 @@ def test_exit_reconciliation_requires_explicit_entry_fee_provenance_even_for_zer
     assert payload["venue_statement_reconciled"] is True
 
 
+def test_exit_reconciliation_requires_explicit_exit_fee_provenance_even_for_zero_fee():
+    runtime = CloseRuntime(ctx=None)
+    reconciliation = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "position_snapshot": {
+            "long_quantity": 10.0,
+            "short_quantity": 10.0,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.2,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
+        },
+    }
+    unknown_fee_fill = OrderFill(
+        venue=Venue.BINANCE, symbol="HOMEUSDT", side=Side.SELL,
+        quantity=10.0, price=1.1, order_id="long", fee_quote=None,
+    )
+    known_zero_fee_fill = OrderFill(
+        venue=Venue.BINANCE, symbol="HOMEUSDT", side=Side.SELL,
+        quantity=10.0, price=1.1, order_id="long", fee_quote=0.0,
+    )
+    short_fill = OrderFill(
+        venue=Venue.BYBIT, symbol="HOMEUSDT", side=Side.BUY,
+        quantity=10.0, price=1.0, order_id="short", fee_quote=0.01,
+    )
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation, [unknown_fee_fill], [short_fill], now_ms=2_000,
+    )
+    assert payload["exit_fee_evidence_complete"] is False
+    assert payload["venue_statement_reconciled"] is False
+    assert payload["long_legs"][0]["fee_quote"] is None
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation, [known_zero_fee_fill], [short_fill], now_ms=2_000,
+    )
+    assert payload["exit_fee_evidence_complete"] is True
+    assert payload["venue_statement_reconciled"] is True
+
+
 # ---------------------------------------------------------------------------
 # CloseBalance
 # ---------------------------------------------------------------------------

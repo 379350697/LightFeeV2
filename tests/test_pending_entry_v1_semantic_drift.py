@@ -1469,6 +1469,7 @@ async def test_pending_close_reconciliation_does_not_depend_on_entry_reconciler(
             average_price=1.01,
             order_id="okx-close-order",
             client_order_id="okx-close-cid",
+            fee_quote=0.0,
         ),
     })
     short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
@@ -1480,6 +1481,7 @@ async def test_pending_close_reconciliation_does_not_depend_on_entry_reconciler(
             average_price=1.02,
             order_id="bybit-force-order",
             client_order_id="bybit-force-cid",
+            fee_quote=0.0,
         ),
     })
     runtime = LiveRuntime(config, venue_adapters={
@@ -1592,6 +1594,79 @@ async def test_pending_close_reconciliation_terminalizes_confirmed_flat_close_wi
     assert terminal["terminal_accounting_status"] == "provisional_entry_fee_evidence_unavailable"
     assert terminal["long_live_size"] == 0.0
     assert terminal["short_live_size"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_terminalizes_confirmed_flat_close_with_missing_exit_fee_evidence(
+    config, tmp_journal,
+):
+    """Known fills without one exit fee must not be recorded as reconciled."""
+    _mark_live(config)
+    long_adapter = _CloseLegFillAdapter(Venue.OKX, {
+        ("okx-close-order", "okx-close-cid"): OrderFillReconciliation(
+            venue=Venue.OKX, symbol="BEATUSDT", side=Side.SELL,
+            quantity=20.0, average_price=1.01, order_id="okx-close-order",
+            client_order_id="okx-close-cid", fee_quote=None,
+        ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-force-order", "bybit-force-cid"): OrderFillReconciliation(
+            venue=Venue.BYBIT, symbol="BEATUSDT", side=Side.BUY,
+            quantity=20.0, average_price=1.02, order_id="bybit-force-order",
+            client_order_id="bybit-force-cid", fee_quote=0.01,
+        ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state.pending_close_reconciliations.append({
+        "position_id": "entry-exit-fee-pending",
+        "symbol": "BEATUSDT",
+        "kind": "final",
+        "closed_at_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-exit-fee-pending",
+            "symbol": "BEATUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+            "matched_quantity": 20.0,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.03,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
+        },
+        "long_legs": [{
+            "venue": Venue.OKX.value,
+            "order_id": "okx-close-order",
+            "client_order_id": "okx-close-cid",
+        }],
+        "short_legs": [{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-force-order",
+            "client_order_id": "bybit-force-cid",
+        }],
+    })
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    records = tmp_journal.read_all()
+    assert "exit.reconciled" not in [record["kind"] for record in records]
+    billing = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_unreconciled"
+    ][0]
+    assert billing["entry_fee_evidence_complete"] is True
+    assert billing["exit_fee_evidence_complete"] is False
+    assert billing["long_legs"][0]["fee_quote"] is None
+    terminal = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_evidence_unavailable"
+    ][0]
+    assert terminal["terminal_accounting_status"] == "provisional_exit_fee_evidence_unavailable"
 
 
 @pytest.mark.asyncio

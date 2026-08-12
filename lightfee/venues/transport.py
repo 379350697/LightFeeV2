@@ -4881,6 +4881,51 @@ class VenueTransport(MarketDataClient):
             return None
 
         result = self._parse_order_status_binance(raw, venue_sym, now_ms)
+        queried_endpoints = ["/fapi/v1/order"]
+        if result is not None:
+            # Binance's order-status payload establishes fill quantity and
+            # price, but never contains the commission.  V1 therefore reads
+            # the exact order executions before treating the fill as billing
+            # evidence.  Keep a missing/invalid execution fee as None rather
+            # than silently converting it to a zero fee.
+            trade_raw = await self._request(
+                "GET",
+                "/fapi/v1/userTrades",
+                params={"symbol": venue_sym, "orderId": result.order_id},
+                private=True,
+            )
+            queried_endpoints.append("/fapi/v1/userTrades")
+            trade_rows = trade_raw if isinstance(trade_raw, list) else []
+            matching_trades = [
+                row
+                for row in trade_rows
+                if isinstance(row, dict)
+                and str(row.get("orderId", "")) == result.order_id
+            ]
+            fee_values = [
+                _parse_optional_float(row.get("commission"))
+                for row in matching_trades
+            ]
+            fee_quote = (
+                sum(value for value in fee_values if value is not None)
+                if matching_trades and all(value is not None for value in fee_values)
+                else None
+            )
+            metadata = dict(result.metadata or {})
+            metadata["queried_endpoints"] = queried_endpoints
+            metadata["fee_evidence_complete"] = fee_quote is not None
+            result = OrderFillReconciliation(
+                venue=result.venue,
+                symbol=result.symbol,
+                side=result.side,
+                quantity=result.quantity,
+                average_price=result.average_price,
+                order_id=result.order_id,
+                client_order_id=result.client_order_id,
+                fee_quote=fee_quote,
+                filled_at_ms=result.filled_at_ms,
+                metadata=metadata,
+            )
         classification = "filled" if result is not None else self._classify_binance_zero_fill(raw)
         subtype = "" if result is not None else (
             "stale_accepted_order"
@@ -4891,7 +4936,7 @@ class VenueTransport(MarketDataClient):
             symbol=venue_sym,
             order_id=str(raw.get("orderId", order_id)) if isinstance(raw, dict) else order_id,
             client_order_id=str(raw.get("clientOrderId", client_order_id)) if isinstance(raw, dict) else client_order_id,
-            queried_endpoints=["/fapi/v1/order"],
+            queried_endpoints=queried_endpoints,
             response_classification=classification,
             uncertain_subtype=subtype,
             next_action="clear_uncertain_state" if result is not None else "check_live_position",

@@ -8166,6 +8166,15 @@ class TestVenueSpecificOrderReconciliationEvidence:
                     "side": "BUY",
                     "updateTime": 1770000000000,
                 })
+            if request.url.path == "/fapi/v1/userTrades":
+                return httpx.Response(200, json=[{
+                    "orderId": 12345,
+                    "qty": "0.25",
+                    "price": "51000",
+                    "commission": "0.01785",
+                    "commissionAsset": "USDT",
+                    "time": 1770000000001,
+                }])
             return httpx.Response(404, json={"msg": "unexpected"})
 
         adapter = BinanceAdapter(
@@ -8185,16 +8194,69 @@ class TestVenueSpecificOrderReconciliationEvidence:
 
         assert result is not None
         assert result.quantity == pytest.approx(0.25)
-        assert result.metadata["queried_endpoints"] == ["/fapi/v1/order"]
+        assert result.fee_quote == pytest.approx(0.01785)
+        assert result.metadata["queried_endpoints"] == [
+            "/fapi/v1/order", "/fapi/v1/userTrades",
+        ]
         assert result.metadata["response_classification"] == "filled"
         assert "/fapi/v1/order" in seen_paths
+        assert "/fapi/v1/userTrades" in seen_paths
         query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
-        assert query_payload["queried_endpoints"] == ["/fapi/v1/order"]
+        assert query_payload["queried_endpoints"] == [
+            "/fapi/v1/order", "/fapi/v1/userTrades",
+        ]
         assert query_payload["client_order_id"] == "bn-timeout-cid"
         assert query_payload["identifier_kind"] == "order_id"
         assert query_payload["has_order_id"] is True
         assert query_payload["has_client_order_id"] is True
         assert isinstance(query_payload["observed_at_ms"], int)
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("trades", "expected_fee", "fee_evidence_complete"),
+        [
+            ([{"orderId": 12345, "commission": "0.0"}], 0.0, True),
+            ([], None, False),
+        ],
+    )
+    async def test_binance_order_reconciliation_distinguishes_zero_fee_from_missing_execution_evidence(
+        self, trades, expected_fee, fee_evidence_complete,
+    ):
+        from lightfee.venues.binance import BinanceAdapter
+
+        async def mock_handler(request):
+            if request.url.path == "/fapi/v1/order":
+                return httpx.Response(200, json={
+                    "symbol": "BTCUSDT",
+                    "orderId": 12345,
+                    "clientOrderId": "bn-close-cid",
+                    "status": "FILLED",
+                    "executedQty": "0.25",
+                    "avgPrice": "51000",
+                    "side": "BUY",
+                    "updateTime": 1770000000000,
+                })
+            if request.url.path == "/fapi/v1/userTrades":
+                return httpx.Response(200, json=trades)
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = BinanceAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "BTCUSDT", order_id="12345", client_order_id="bn-close-cid",
+        )
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.fee_quote == expected_fee
+        assert result.metadata["fee_evidence_complete"] is fee_evidence_complete
 
     @pytest.mark.anyio
     async def test_binance_http_400_minus_2013_is_recoverable_order_truth_gap(self):
@@ -8245,6 +8307,15 @@ class TestVenueSpecificOrderReconciliationEvidence:
         seen_queries: list[dict[str, str]] = []
 
         async def mock_handler(request):
+            if request.url.path == "/fapi/v1/userTrades":
+                return httpx.Response(200, json=[{
+                    "orderId": 123456,
+                    "qty": "178",
+                    "price": "0.00041",
+                    "commission": "0.00007298",
+                    "commissionAsset": "USDT",
+                    "time": 1770000000001,
+                }])
             query = dict(request.url.params)
             seen_queries.append(query)
             if query.get("origClientOrderId") == "bn-recovery-cid" and "orderId" not in query:
@@ -8283,8 +8354,9 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert result is not None
         assert result.order_id == "123456"
         assert result.client_order_id == "bn-recovery-cid"
-        assert seen_queries[-1]["origClientOrderId"] == "bn-recovery-cid"
-        assert "orderId" not in seen_queries[-1]
+        assert result.fee_quote == pytest.approx(0.00007298)
+        assert seen_queries[0]["origClientOrderId"] == "bn-recovery-cid"
+        assert "orderId" not in seen_queries[0]
         query_payload = [e["payload"] for e in events if e["kind"] == "order.reconcile_query"][-1]
         assert query_payload["order_id"] == "123456"
         assert query_payload["client_order_id"] == "bn-recovery-cid"
