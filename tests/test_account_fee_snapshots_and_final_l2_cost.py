@@ -36,6 +36,8 @@ class _FeeTransport:
     def __init__(self, responses: list[dict]) -> None:
         self._responses = list(responses)
         self.calls: list[tuple[str, str, dict | None, dict | None, bool]] = []
+        self.mode = "paper"
+        self._symbol_metadata: dict = {}
 
     def _venue_symbol(self, symbol: str) -> str:
         return "BTC-USDT-SWAP" if symbol == "BTCUSDT" else symbol
@@ -43,6 +45,9 @@ class _FeeTransport:
     async def _request(self, method, path, *, params=None, body=None, private=False):
         self.calls.append((method, path, params, body, private))
         return self._responses.pop(0)
+
+    async def close(self) -> None:
+        return None
 
 
 def _adapter_for_fee_response(venue: Venue, response: dict):
@@ -73,20 +78,29 @@ def _adapter_for_fee_response(venue: Venue, response: dict):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("venue", "response", "path", "private", "expected_taker_bps"),
+    (
+        "venue",
+        "response",
+        "path",
+        "private",
+        "expected_maker_bps",
+        "expected_taker_bps",
+    ),
     [
         (
             Venue.BINANCE,
             {"makerCommissionRate": "-0.00002", "takerCommissionRate": "0.0004"},
             "/fapi/v1/commissionRate",
             True,
+            -0.2,
             4.0,
         ),
         (
             Venue.OKX,
-            {"code": "0", "data": [{"maker": "-0.00002", "taker": "0.0005"}]},
+            {"code": "0", "data": [{"maker": "-0.00002", "taker": "-0.0005"}]},
             "/api/v5/account/trade-fee",
             True,
+            0.2,
             5.0,
         ),
         (
@@ -97,6 +111,7 @@ def _adapter_for_fee_response(venue: Venue, response: dict):
             },
             "/v5/account/fee-rate",
             True,
+            -0.2,
             6.0,
         ),
         (
@@ -104,6 +119,7 @@ def _adapter_for_fee_response(venue: Venue, response: dict):
             {"code": "00000", "data": {"makerFeeRate": "-0.00002", "takerFeeRate": "0.0006"}},
             "/api/v3/account/fee-rate",
             True,
+            -0.2,
             6.0,
         ),
         (
@@ -111,6 +127,7 @@ def _adapter_for_fee_response(venue: Venue, response: dict):
             {"futures_maker_fee": "-0.00002", "futures_taker_fee": "0.0006"},
             "/api/v4/wallet/fee",
             True,
+            -0.2,
             6.0,
         ),
         (
@@ -118,6 +135,7 @@ def _adapter_for_fee_response(venue: Venue, response: dict):
             {"makerCommissionRate": "-0.00002", "takerCommissionRate": "0.0004"},
             "/fapi/v3/commissionRate",
             False,
+            -0.2,
             4.0,
         ),
         (
@@ -125,12 +143,13 @@ def _adapter_for_fee_response(venue: Venue, response: dict):
             {"userAddRate": "-0.00002", "userCrossRate": "0.0004"},
             "/info",
             False,
+            -0.2,
             4.0,
         ),
     ],
 )
 async def test_each_venue_parses_its_account_maker_taker_fee_schedule(
-    venue, response, path, private, expected_taker_bps
+    venue, response, path, private, expected_maker_bps, expected_taker_bps
 ):
     adapter, transport = _adapter_for_fee_response(venue, response)
 
@@ -138,10 +157,24 @@ async def test_each_venue_parses_its_account_maker_taker_fee_schedule(
 
     assert snapshot is not None
     assert snapshot.venue == venue
-    assert snapshot.maker_fee_bps == pytest.approx(-0.2)
+    assert snapshot.maker_fee_bps == pytest.approx(expected_maker_bps)
     assert snapshot.taker_fee_bps == pytest.approx(expected_taker_bps)
     assert transport.calls[0][1] == path
     assert transport.calls[0][4] is private
+
+
+@pytest.mark.asyncio
+async def test_okx_positive_account_rates_are_rebates_in_final_cost_convention():
+    adapter, _ = _adapter_for_fee_response(
+        Venue.OKX,
+        {"code": "0", "data": [{"maker": "0.00002", "taker": "0.0005"}]},
+    )
+
+    snapshot = await adapter.fetch_account_fee_snapshot("BTCUSDT")
+
+    assert snapshot is not None
+    assert snapshot.maker_fee_bps == pytest.approx(-0.2)
+    assert snapshot.taker_fee_bps == pytest.approx(-5.0)
 
 
 @pytest.mark.asyncio
@@ -244,6 +277,23 @@ def _live_config(tmp_path: Path) -> AppConfig:
     )
 
 
+class _LiveOkxFeeAdapter(OkxAdapter):
+    """Real OKX fee parser with flat live-recovery responses for startup coverage."""
+
+    async def ensure_supported_symbols_loaded(self) -> None:
+        return None
+
+    async def fetch_position(self, symbol: str):
+        return SimpleNamespace(
+            venue=Venue.OKX,
+            symbol=symbol,
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=1000,
+        )
+
+
 @pytest.mark.asyncio
 async def test_fee_refresh_persists_success_and_keeps_cache_then_config_on_failure(tmp_path):
     config = _live_config(tmp_path)
@@ -285,6 +335,47 @@ async def test_fee_refresh_persists_success_and_keeps_cache_then_config_on_failu
     )
     assert runtime.state.lifecycle.value == "running"
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_live_startup_persists_okx_commission_as_positive_final_l2_cost(tmp_path):
+    adapter = _LiveOkxFeeAdapter(mode="paper")
+    adapter._transport = _FeeTransport(
+        [{"code": "0", "data": [{"maker": "-0.0002", "taker": "-0.0005"}]}]
+    )
+    adapter._transport._symbol_metadata = {
+        "BTC-USDT-SWAP": {"ctType": "linear", "ctVal": "1"}
+    }
+    runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={Venue.OKX: adapter})
+
+    await runtime.start()
+    try:
+        persisted = runtime.snapshot_store.read()
+        assert persisted is not None
+        assert persisted["account_fee_snapshots"]["okx"]["maker_fee_bps"] == 2.0
+        assert persisted["account_fee_snapshots"]["okx"]["taker_fee_bps"] == 5.0
+
+        now_ms = 10_000
+        runtime.state.last_scan = {}
+        _install_hot_book(runtime, "binance", "BTCUSDT", 100.0, 100.0, now_ms)
+        _install_hot_book(runtime, "okx", "BTCUSDT", 100.0, 100.0, now_ms)
+        candidate = _candidate("BTCUSDT", funding_edge_bps=5.0)
+
+        assert runtime._reprice_final_l2_candidates([candidate], now_ms) == []
+        assert "final_l2_expected_edge_below_floor" in candidate.blocked_reasons
+
+        dual_taker_candidate = _candidate("BTCUSDT", funding_edge_bps=5.0)
+        assert (
+            runtime._reprice_final_l2_candidate(
+                dual_taker_candidate,
+                now_ms,
+                dual_taker=True,
+            )
+            is False
+        )
+        assert "final_l2_expected_edge_below_floor" in dual_taker_candidate.blocked_reasons
+    finally:
+        await runtime.stop()
 
 
 @pytest.mark.asyncio

@@ -67,10 +67,17 @@ class OkxAdapter(VenueAdapter):
         if not isinstance(raw, dict) or str(raw.get("code", "0")) != "0":
             raise ValueError("OKX trade-fee request failed")
         row = first_mapping(raw.get("data"), "OKX trade-fee row")
+        # OKX signs account fee rates as cash flow: negative is commission and
+        # positive is rebate.  Final-L2 scoring uses the inverse convention:
+        # positive cost and negative rebate.
         return AccountFeeSnapshot(
             venue=self.venue,
-            maker_fee_bps=fee_rate_from_mapping(row, "maker fee", "maker", "makerU", "makerUSDC"),
-            taker_fee_bps=fee_rate_from_mapping(row, "taker fee", "taker", "takerU", "takerUSDC"),
+            maker_fee_bps=-fee_rate_from_mapping(
+                row, "maker fee", "maker", "makerU", "makerUSDC"
+            ),
+            taker_fee_bps=-fee_rate_from_mapping(
+                row, "taker fee", "taker", "takerU", "takerUSDC"
+            ),
             observed_at_ms=int(time.time() * 1000),
             source=f"okx_trade_fee:{venue_symbol.removesuffix('-SWAP')}",
         )
