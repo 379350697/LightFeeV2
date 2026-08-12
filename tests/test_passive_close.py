@@ -5588,6 +5588,52 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             position.position_id
         ]
 
+    def test_unattributed_recovered_pair_flat_is_audited_without_billing_debt(self):
+        """A recovered external pair has no V2 PnL owner to reconcile."""
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+        position.position_id = "live-recovered:UBUSDT:binance->bybit"
+        pending = state.pending_passive_closes.pop("entry-flat-ubusdt")
+        pending.position_id = position.position_id
+        pending.position_snapshot = position
+        state.open_positions.clear()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == set()
+        assert state.pending_close_reconciliations == []
+        events = journal.read_all()
+        observed = next(
+            event for event in events
+            if event.get("kind") == "recovery.external_pair_flat_observed"
+        )
+        assert observed["payload"]["accounting_owner"] == "external_unattributed"
+        assert observed["payload"]["local_order_identity_present"] is False
+        kinds = [event.get("kind") for event in events]
+        assert "exit.billing_evidence_unavailable" not in kinds
+        assert "exit.passive_close_resolved" not in kinds
+
+    def test_recovered_pair_with_v2_close_identity_retains_billing_reconciliation(self):
+        """A recovered position is not external once a V2 close ID exists."""
+        state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()
+        position.position_id = "live-recovered:UBUSDT:binance->bybit"
+        pending = state.pending_passive_closes.pop("entry-flat-ubusdt")
+        pending.position_id = position.position_id
+        pending.position_snapshot = position
+        pending.phase_state.maker_client_order_id = "v2-close-cid"
+        state.open_positions.clear()
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == set()
+        assert len(state.pending_close_reconciliations) == 1
+        assert "recovery.external_pair_flat_observed" not in [
+            event.get("kind") for event in journal.read_all()
+        ]
+
     def test_live_flat_cleanup_normalizes_dict_shaped_pending_close_reconciliation_queue(self):
         state, position, journal, executor, long_adapter, short_adapter = (
             self._arrange_live_flat_cleanup()

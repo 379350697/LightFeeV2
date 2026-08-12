@@ -16,7 +16,10 @@ from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
-from lightfee.engine.state import pending_close_reconciliation_evidence_debt_reason
+from lightfee.engine.state import (
+    is_unattributed_recovered_live_flat_reconciliation,
+    pending_close_reconciliation_evidence_debt_reason,
+)
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -1219,6 +1222,32 @@ class CloseRuntime:
         for reconciliation in list(pending_reconciliations):
             if not isinstance(reconciliation, dict):
                 retained.append(reconciliation)
+                continue
+            if is_unattributed_recovered_live_flat_reconciliation(reconciliation):
+                snapshot = reconciliation.get("position_snapshot") or {}
+                self.ctx.journal.append_critical(
+                    now_ms,
+                    "recovery.external_pair_flat_reclassified",
+                    {
+                        "position_id": str(reconciliation.get("position_id") or ""),
+                        "symbol": str(
+                            reconciliation.get("symbol")
+                            or snapshot.get("symbol")
+                            or ""
+                        ),
+                        "source": str(reconciliation.get("source") or ""),
+                        "kind": str(reconciliation.get("kind") or "final"),
+                        "closed_at_ms": self._safe_reconciliation_int(
+                            reconciliation.get("closed_at_ms")
+                        ),
+                        "accounting_owner": "external_unattributed",
+                        "local_order_identity_present": False,
+                        "reclassified_from": str(
+                            reconciliation.get("reconciliation_status") or "pending"
+                        ),
+                    },
+                )
+                changed = True
                 continue
             if reconciliation.get("reconciliation_status") == "evidence_debt":
                 retained.append(reconciliation)

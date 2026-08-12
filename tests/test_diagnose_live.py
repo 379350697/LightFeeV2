@@ -310,6 +310,51 @@ def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
     assert gate["runtime_progress"]["active_lane"] == "housekeeping"
 
 
+def test_acceptance_gate_excludes_reclassified_external_recovery_observation():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[
+            {
+                "ts_ms": 1000,
+                "kind": "exit.billing_evidence_unavailable",
+                "payload": {
+                    "position_id": "live-recovered:CLUSDT:okx->bitget",
+                    "net_quote_status": "provisional",
+                },
+            },
+            {
+                "ts_ms": 2000,
+                "kind": "recovery.external_pair_flat_reclassified",
+                "payload": {
+                    "position_id": "live-recovered:CLUSDT:okx->bitget",
+                    "accounting_owner": "external_unattributed",
+                },
+            },
+        ],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_close_reconciliations": [],
+        },
+        exchange_truth={
+            "available": True,
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["provisional_billing_evidence_count"] == 0
+    assert "billing_evidence_provisional" not in gate["blocking_reasons"]
+
+
 def test_acceptance_gate_remaining_slots_include_pending_entry_owners():
     from scripts.diagnose_live import _build_production_acceptance_gate
 

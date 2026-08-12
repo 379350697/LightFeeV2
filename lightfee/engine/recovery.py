@@ -41,6 +41,7 @@ from lightfee.engine.state import (
     PendingPassiveOrder,
     PersistedCloseExecutionLeg,
     RecoveryWorkSnapshot,
+    is_unattributed_recovered_live_flat_reconciliation,
     normalize_pending_close_reconciliations,
 )
 from lightfee.core.domain import Side, Venue
@@ -67,6 +68,7 @@ _TERMINAL_CLOSE_EVENT_KINDS = frozenset(
         "exit.reconciled",
         "exit.billing_evidence_unavailable",
         "exit.reconciliation_abandoned",
+        "recovery.external_pair_flat_observed",
         "recovery.flat",
     }
 )
@@ -1095,6 +1097,38 @@ def _apply_journal_replay_to_state(
                 # owner.  If its old debt is present it remains visible; if it
                 # is absent there is no safe replacement to infer.
                 continue
+
+        elif kind == "recovery.external_pair_flat_reclassified":
+            # Recheck the persisted task rather than trusting an audit event
+            # alone.  A malformed event must never release a V2 accounting
+            # owner; a valid event removes precisely the old debt tuple.
+            position_id = str(payload.get("position_id") or "")
+            if not position_id:
+                continue
+            try:
+                closed_at_ms = int(payload.get("closed_at_ms"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            kind_name = str(payload.get("kind") or "final")
+            for reconciliation in normalize_pending_close_reconciliations(
+                state.pending_close_reconciliations
+            ):
+                try:
+                    reconciliation_closed_at_ms = int(
+                        reconciliation.get("closed_at_ms")
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    str(reconciliation.get("position_id") or "") == position_id
+                    and str(reconciliation.get("kind") or "final") == kind_name
+                    and reconciliation_closed_at_ms == closed_at_ms
+                    and is_unattributed_recovered_live_flat_reconciliation(
+                        reconciliation
+                    )
+                ):
+                    state.remove_pending_close_reconciliation(reconciliation)
+                    break
 
         elif kind in (
             "exit.pending_close_reconciliation_registered",

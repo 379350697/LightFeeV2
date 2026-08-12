@@ -159,6 +159,8 @@ ALL_PROJECTED_KINDS: frozenset[str] = (
 
 JOURNAL_ONLY_RECOVERY_KINDS: frozenset[str] = frozenset({
     "recovery.blocked",
+    "recovery.external_pair_flat_observed",
+    "recovery.external_pair_flat_reclassified",
     "recovery.flat",
     "recovery.live_detected",
     "recovery.mismatch_detected",

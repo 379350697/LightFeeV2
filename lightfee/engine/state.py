@@ -989,6 +989,48 @@ def _reconciliation_snapshot_evidence(item: Any) -> int:
     )
 
 
+def is_unattributed_recovered_live_flat_reconciliation(item: Any) -> bool:
+    """Whether a recovered-flat record has no durable V2 execution owner.
+
+    Startup recovery represents an exchange-observed pair in local state to
+    protect it from a new entry.  If that temporary pair later proves flat but
+    carries neither a persisted V2 close leg nor an original V2 order identity,
+    V2 cannot truthfully own its PnL.  Keep the predicate deliberately strict:
+    malformed or partially identified records remain fail-closed accounting
+    work.
+    """
+    if not isinstance(item, dict):
+        return False
+    position_id = str(item.get("position_id") or "")
+    if not position_id.startswith("live-recovered:"):
+        return False
+    if str(item.get("kind") or "final") not in {"final", "partial"}:
+        return False
+    snapshot = item.get("position_snapshot")
+    if not isinstance(snapshot, dict) or str(snapshot.get("position_id") or "") != position_id:
+        return False
+    if snapshot.get("entry_fee_evidence_complete") is True:
+        return False
+    for leg_group in (item.get("long_legs"), item.get("short_legs")):
+        if not isinstance(leg_group, list):
+            return False
+        for leg in leg_group:
+            if not isinstance(leg, dict):
+                return False
+            if leg.get("order_id") or leg.get("client_order_id"):
+                return False
+    original_payload = item.get("original_payload")
+    if not isinstance(original_payload, dict):
+        return False
+    for identity_field in ("order_ids", "client_order_ids"):
+        values = original_payload.get(identity_field)
+        if not isinstance(values, list):
+            return False
+        if any(str(value or "") for value in values):
+            return False
+    return True
+
+
 def pending_close_reconciliation_missing_legs(
     reconciliation: dict[str, Any],
 ) -> tuple[str, ...]:

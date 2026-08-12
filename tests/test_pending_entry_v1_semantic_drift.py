@@ -1049,6 +1049,55 @@ async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_que
 
 
 @pytest.mark.asyncio
+async def test_pending_close_reconciliation_processor_reclassifies_unattributed_recovered_debt(
+    config, tmp_journal,
+):
+    """Historical external recovery observations do not remain billing debt."""
+    _mark_live(config)
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(
+            position_id="live-recovered:CLUSDT:okx->bitget",
+            symbol="CLUSDT",
+        )
+    ))
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations = [{
+        "position_id": "live-recovered:CLUSDT:okx->bitget",
+        "symbol": "CLUSDT",
+        "kind": "final",
+        "source": "passive_close_recovery_flat_probe",
+        "closed_at_ms": 1786542792764,
+        "created_cycle": 1,
+        "position_snapshot": {
+            "position_id": "live-recovered:CLUSDT:okx->bitget",
+            "symbol": "CLUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BITGET.value,
+            "long_quantity": 0.5,
+            "short_quantity": 0.5,
+            "entry_fee_evidence_complete": False,
+        },
+        "original_payload": {"client_order_ids": [], "order_ids": []},
+        "long_legs": [],
+        "short_legs": [],
+        "reconciliation_status": "evidence_debt",
+        "evidence_debt_reason": "missing_close_order_identity",
+    }]
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations == []
+    reclassified = next(
+        record for record in tmp_journal.read_all()
+        if record["kind"] == "recovery.external_pair_flat_reclassified"
+    )
+    assert reclassified["payload"]["position_id"] == (
+        "live-recovered:CLUSDT:okx->bitget"
+    )
+    assert reclassified["payload"]["accounting_owner"] == "external_unattributed"
+
+
+@pytest.mark.asyncio
 async def test_pending_close_reconciliation_processor_retains_invalid_item_with_evidence(
     config, tmp_journal,
 ):

@@ -67,6 +67,7 @@ from lightfee.engine.state import (
     PendingPassiveClose,
     PendingPassiveLegFill,
     PersistedCloseExecutionLeg,
+    is_unattributed_recovered_live_flat_reconciliation,
     pending_close_reconciliation_missing_legs,
 )
 from lightfee.persistence.journal import Journal
@@ -4974,6 +4975,44 @@ class PassiveCloseExecutor:
         if extra:
             payload.update(extra)
         payload.update(closure_fields)
+        reconciliation_long_legs, reconciliation_short_legs = (
+            self._pending_close_reconciliation_records(
+                pending,
+                position,
+                extra=extra,
+            )
+        )
+        external_recovery_observation = (
+            is_unattributed_recovered_live_flat_reconciliation(
+                {
+                    "position_id": pending.position_id,
+                    "kind": "final",
+                    "position_snapshot": self._position_snapshot_for_close_reconciliation(
+                        position
+                    ),
+                    "original_payload": dict(payload),
+                    "long_legs": reconciliation_long_legs,
+                    "short_legs": reconciliation_short_legs,
+                }
+            )
+        )
+        external_recovery_payload: dict[str, Any] | None = None
+        if external_recovery_observation:
+            external_recovery_payload = {
+                "position_id": pending.position_id,
+                "symbol": position.symbol,
+                "source": source,
+                "closed_at_ms": self._now_ms(),
+                "accounting_owner": "external_unattributed",
+                "local_order_identity_present": False,
+                "exchange_truth": exchange_truth or {
+                    "truth_available": True,
+                    "positions_flat": (
+                        actual_long_size <= 1e-9 and actual_short_size <= 1e-9
+                    ),
+                    "source": source,
+                },
+            }
         missing = object()
         original_pending = state.pending_passive_closes.get(pending.position_id, missing)
         original_open = state.open_positions.get(pending.position_id, missing)
@@ -4991,14 +5030,18 @@ class PassiveCloseExecutor:
         ]
         failure_reason = "pending_close_reconciliation_registration_failed"
         try:
-            reconciliation_registered = self._register_close_reconciliation_after_live_flat(
-                state,
-                pending,
-                position,
-                source=source,
-                payload=payload,
-                extra=extra,
-            )
+            reconciliation_registered = False
+            if not external_recovery_observation:
+                reconciliation_registered = (
+                    self._register_close_reconciliation_after_live_flat(
+                        state,
+                        pending,
+                        position,
+                        source=source,
+                        payload=payload,
+                        extra=extra,
+                    )
+                )
             failure_reason = "managed_state_clear_failed"
             state.pending_passive_closes.pop(pending.position_id, None)
             state.open_positions.pop(pending.position_id, None)
@@ -5040,29 +5083,30 @@ class PassiveCloseExecutor:
                 core_decision,
                 journal=self._journal,
             )
-            failure_reason = "terminal_close_resolution_failed"
-            terminal_extra = dict(extra or {})
-            terminal_extra["closure_fields"] = closure_fields
-            self._emit_passive_close_terminal_resolution(
-                pending,
-                position,
-                source=source,
-                actual_long_size=actual_long_size,
-                actual_short_size=actual_short_size,
-                extra=terminal_extra,
-                exchange_truth=exchange_truth,
-            )
-            if not reconciliation_registered:
-                failure_reason = "billing_evidence_terminalization_failed"
-                self._emit_live_flat_billing_evidence_unavailable(
+            if not external_recovery_observation:
+                failure_reason = "terminal_close_resolution_failed"
+                terminal_extra = dict(extra or {})
+                terminal_extra["closure_fields"] = closure_fields
+                self._emit_passive_close_terminal_resolution(
                     pending,
                     position,
                     source=source,
                     actual_long_size=actual_long_size,
                     actual_short_size=actual_short_size,
+                    extra=terminal_extra,
                     exchange_truth=exchange_truth,
-                    closure_fields=closure_fields,
                 )
+                if not reconciliation_registered:
+                    failure_reason = "billing_evidence_terminalization_failed"
+                    self._emit_live_flat_billing_evidence_unavailable(
+                        pending,
+                        position,
+                        source=source,
+                        actual_long_size=actual_long_size,
+                        actual_short_size=actual_short_size,
+                        exchange_truth=exchange_truth,
+                        closure_fields=closure_fields,
+                    )
         except Exception as error:
             state.pending_close_reconciliations = original_reconciliations
             if original_pending is missing:
@@ -5091,6 +5135,12 @@ class PassiveCloseExecutor:
             )
             return
 
+        if external_recovery_payload is not None:
+            self._journal.append_critical(
+                int(external_recovery_payload["closed_at_ms"]),
+                "recovery.external_pair_flat_observed",
+                external_recovery_payload,
+            )
         self._journal.append("runtime.position_drift_detected", payload)
         self._journal.append("exit.passive_close_fallback_terminal_flat", payload)
         self._journal.append(

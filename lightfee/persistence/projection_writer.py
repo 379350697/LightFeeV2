@@ -89,6 +89,8 @@ _JOURNAL_ONLY_KINDS = frozenset({
     "exit.billing_evidence_imported",
     "pending_entry.viability_blocked",
     "recovery.live_detected",
+    "recovery.external_pair_flat_observed",
+    "recovery.external_pair_flat_reclassified",
     "recovery.flat",
     "recovery.blocked",
     "recovery.mismatch_detected",

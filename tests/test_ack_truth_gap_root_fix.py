@@ -451,6 +451,100 @@ class TestBillingEvidenceIdentityGap:
             "reconciliation_status"
         ) is None
 
+    def test_external_recovery_reclassification_replays_as_debt_removal(self):
+        """A crash after reclassification cannot resurrect external debt."""
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.engine.state import EngineState
+        from lightfee.persistence.journal import replay_journal_records
+
+        debt = {
+            "position_id": "live-recovered:CLUSDT:okx->bitget",
+            "symbol": "CLUSDT",
+            "kind": "final",
+            "closed_at_ms": 1786542792764,
+            "position_snapshot": {
+                "position_id": "live-recovered:CLUSDT:okx->bitget",
+                "symbol": "CLUSDT",
+                "long_venue": "okx",
+                "short_venue": "bitget",
+                "entry_fee_evidence_complete": False,
+            },
+            "original_payload": {"client_order_ids": [], "order_ids": []},
+            "long_legs": [],
+            "short_legs": [],
+            "reconciliation_status": "evidence_debt",
+        }
+        records = [
+            {
+                "kind": "exit.billing_evidence_debt_registered",
+                "ts_ms": 1000,
+                "payload": {"reconciliation": debt},
+            },
+            {
+                "kind": "recovery.external_pair_flat_reclassified",
+                "ts_ms": 2000,
+                "payload": {
+                    "position_id": debt["position_id"],
+                    "kind": debt["kind"],
+                    "closed_at_ms": debt["closed_at_ms"],
+                    "accounting_owner": "external_unattributed",
+                },
+            },
+        ]
+
+        restored = EngineState()
+        _apply_journal_replay_to_state(restored, records)
+        assert restored.pending_close_reconciliations == []
+        replayed = replay_journal_records(records)
+        assert replayed["pending_close_reconciliation_count"] == 0
+        assert "recovery.external_pair_flat_reclassified" in {
+            record["kind"] for record in replayed["timeline"]
+        }
+
+    def test_reclassification_replay_preserves_identified_v2_debt(self):
+        """An audit event alone cannot erase a durable V2 order identity."""
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.engine.state import EngineState
+
+        debt = {
+            "position_id": "live-recovered:CLUSDT:okx->bitget",
+            "symbol": "CLUSDT",
+            "kind": "final",
+            "closed_at_ms": 1786542792764,
+            "position_snapshot": {
+                "position_id": "live-recovered:CLUSDT:okx->bitget",
+                "symbol": "CLUSDT",
+                "long_venue": "okx",
+                "short_venue": "bitget",
+                "entry_fee_evidence_complete": False,
+            },
+            "original_payload": {"client_order_ids": [], "order_ids": []},
+            "long_legs": [{"client_order_id": "v2-close-cid"}],
+            "short_legs": [],
+            "reconciliation_status": "evidence_debt",
+        }
+        records = [
+            {
+                "kind": "exit.billing_evidence_debt_registered",
+                "ts_ms": 1000,
+                "payload": {"reconciliation": debt},
+            },
+            {
+                "kind": "recovery.external_pair_flat_reclassified",
+                "ts_ms": 2000,
+                "payload": {
+                    "position_id": debt["position_id"],
+                    "kind": debt["kind"],
+                    "closed_at_ms": debt["closed_at_ms"],
+                    "accounting_owner": "external_unattributed",
+                },
+            },
+        ]
+
+        restored = EngineState()
+        _apply_journal_replay_to_state(restored, records)
+        assert restored.pending_close_reconciliations == [debt]
+
     @pytest.mark.asyncio
     async def test_confirmed_execution_fill_resolves_no_billing(self):
         """Adapter returns fill from confirmed execution source →
@@ -758,3 +852,16 @@ class TestStateAndClosureContract:
         ):
             assert key in _EVENT_KIND_PHASES, f"{key} missing"
             assert _EVENT_KIND_PHASES[key] == p, f"{key} phase mismatch"
+
+    def test_external_recovery_audit_kind_mappings(self):
+        from lightfee.engine.v1_lifecycle_closure import (
+            _EVENT_KIND_PHASES,
+            V1LifecycleClosurePhase,
+        )
+
+        phase = V1LifecycleClosurePhase.RECOVERY_TRUTH.value
+        for key in (
+            "recovery.external_pair_flat_observed",
+            "recovery.external_pair_flat_reclassified",
+        ):
+            assert _EVENT_KIND_PHASES[key] == phase

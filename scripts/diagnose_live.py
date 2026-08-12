@@ -3601,6 +3601,7 @@ def _build_production_acceptance_gate(
     billing_unreconciled_events: list[dict[str, Any]] = []
     billing_evidence_unavailable_events: list[dict[str, Any]] = []
     billing_reconciled_ts_by_position: dict[str, int] = {}
+    external_recovery_reclassified_ts_by_position: dict[str, int] = {}
     runtime_progress = _runtime_progress_from_state(local_state)
     runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
     ws_bbo_effective_mode = (
@@ -3817,6 +3818,16 @@ def _build_production_acceptance_gate(
                     billing_evidence_unavailable_events.append(rec)
         elif kind == "exit.billing_unreconciled":
             billing_unreconciled_events.append(rec)
+        elif (
+            kind == "recovery.external_pair_flat_reclassified"
+            and payload.get("accounting_owner") == "external_unattributed"
+        ):
+            pid = str(payload.get("position_id") or "")
+            if pid:
+                external_recovery_reclassified_ts_by_position[pid] = max(
+                    external_recovery_reclassified_ts_by_position.get(pid, 0),
+                    int(_event_timestamp_ms(rec)),
+                )
 
         if "residual" in kind or "residual" in reason:
             residual_count += 1
@@ -3846,10 +3857,14 @@ def _build_production_acceptance_gate(
         if not pid:
             continue
         evidence_ts = int(_event_timestamp_ms(rec))
-        # Physical flatness closes lifecycle risk, but it is not accounting
-        # reconciliation. Only a later, explicitly reconciled venue statement
-        # may clear the financial-evidence warning.
-        reconciled_ts = billing_reconciled_ts_by_position.get(pid, 0)
+        # A normal V2 accounting owner is cleared only by a later venue
+        # statement.  A later strict external-recovery reclassification instead
+        # says V2 never owned the historical PnL, so it clears only that
+        # provisional local warning without manufacturing a reconciliation.
+        reconciled_ts = max(
+            billing_reconciled_ts_by_position.get(pid, 0),
+            external_recovery_reclassified_ts_by_position.get(pid, 0),
+        )
         if reconciled_ts <= 0 or reconciled_ts < evidence_ts:
             provisional_billing_position_ids.add(pid)
     provisional_billing_evidence_count = len(provisional_billing_position_ids)

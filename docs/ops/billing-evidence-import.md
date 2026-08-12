@@ -99,7 +99,7 @@ and `data/snapshot.json`.
    cd /opt/lightfee-v2
    PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/lightfee-ops \
      import-billing-evidence --file /secure/evidence-owner-01.json --apply \
-     --event-log-path runtime/events.jsonl --snapshot-path runtime/state.json
+     --event-log-path runtime/live-events.jsonl --snapshot-path runtime/live-state.json
    ```
 
 4. Restart the live service. Its normal close runtime performs the exact

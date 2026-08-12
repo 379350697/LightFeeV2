@@ -17,6 +17,18 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-101 unattributed recovered-close accounting boundary, 2026-08-12: the
+exchange-flat `live-recovered:CLUSDT:okx->bitget` owner had no durable V2 entry
+or close-order identity, yet the generic live-flat path made it a permanent
+V2 accounting debt. The local repair distinguishes only that strict case from
+all V2-owned and malformed records: it records external recovery audit truth,
+never writes zero PnL, and reclassifies the old debt during normal close
+runtime/replay. Existing `entry-*` COTI debts remain fail-closed and require
+their real exchange evidence. Local regression is green; deployment is blocked
+until the concurrent legacy V1 service is isolated from the V2 trading
+accounts. See
+[daily/2026-08-12.md#cluster-cl-101-unattributed-recovered-close-accounting](daily/2026-08-12.md#cluster-cl-101-unattributed-recovered-close-accounting).
+
 CL-100 Bitget successful-null open-order truth correction, 2026-08-12:
 read-only production probes found the recovered `CLUSDT` OKX/Bitget passive
 close had both exchange positions at zero, while Bitget Classic returned

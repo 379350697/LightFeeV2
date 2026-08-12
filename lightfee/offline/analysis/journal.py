@@ -176,6 +176,8 @@ def summarize_quick_flat_events(
     low_confidence_event_count = 0
     unreconciled_billing_count = 0
     unreconciled_billing_positions: set[str] = set()
+    unreconciled_billing_at: dict[str, int] = {}
+    external_recovery_reclassified_at: dict[str, int] = {}
     window_ms = int(quick_flat_window_ms or 0)
 
     for record in records:
@@ -197,6 +199,19 @@ def summarize_quick_flat_events(
             if position_id not in unreconciled_billing_positions:
                 unreconciled_billing_positions.add(position_id)
                 unreconciled_billing_count += 1
+            unreconciled_billing_at[position_id] = max(
+                unreconciled_billing_at.get(position_id, 0),
+                _event_ts_ms(record),
+            )
+        if (
+            kind == "recovery.external_pair_flat_reclassified"
+            and payload.get("accounting_owner") == "external_unattributed"
+            and position_id
+        ):
+            external_recovery_reclassified_at[position_id] = max(
+                external_recovery_reclassified_at.get(position_id, 0),
+                _event_ts_ms(record),
+            )
         if kind not in _QUICK_FLAT_TERMINAL_KIND_PRIORITY:
             continue
         if not position_id:
@@ -238,6 +253,10 @@ def summarize_quick_flat_events(
         terminal_kind_counts[kind] = terminal_kind_counts.get(kind, 0) + 1
 
     close_identity_confidence = "lower" if low_confidence_event_count else "high"
+    unreconciled_billing_count = sum(
+        external_recovery_reclassified_at.get(position_id, 0) < debt_at
+        for position_id, debt_at in unreconciled_billing_at.items()
+    )
     return {
         "quick_flat_count": len(quick_flat_positions),
         "duplicate_event_count": duplicate_event_count,

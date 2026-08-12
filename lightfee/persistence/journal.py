@@ -338,7 +338,8 @@ def replay_journal_records(
         "exit.reconciliation_abandoned",
         "exit.pending_close_registered",
         "exit.pending_close_reconciliation_registered",
-        "recovery.live_detected", "recovery.flat", "recovery.blocked",
+        "recovery.live_detected", "recovery.external_pair_flat_observed",
+        "recovery.external_pair_flat_reclassified", "recovery.flat", "recovery.blocked",
         "recovery.mismatch_detected", "recovery.mismatch_flattened",
         "recovery.resumed",
         "runtime.lifecycle_changed", "runtime.risk_mode_changed",
@@ -390,6 +391,7 @@ def replay_journal_records(
             "exit.reconciled",
             "exit.billing_evidence_unavailable",
             "exit.reconciliation_abandoned",
+            "recovery.external_pair_flat_observed",
             "recovery.flat",
         ):
             pid = payload.get("position_id", "")
@@ -466,6 +468,11 @@ def replay_journal_records(
                 for cid in stale_closes:
                     pending_close_ids.discard(cid)
                     del _close_to_position[cid]
+
+        elif kind == "recovery.external_pair_flat_reclassified":
+            pid = str(payload.get("position_id") or "")
+            if pid:
+                pending_close_reconciliation_ids.discard(pid)
 
         elif kind == "runtime.lifecycle_changed":
             to_val = payload.get("to")

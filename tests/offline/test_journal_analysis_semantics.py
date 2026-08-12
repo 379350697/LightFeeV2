@@ -250,6 +250,28 @@ class TestQuickFlatObservability:
         assert summary["quick_flat_count"] == 0
         assert summary["quick_flat_unreconciled_billing_count"] == 1
 
+    def test_external_recovery_reclassification_clears_only_its_old_debt(self):
+        position_id = "live-recovered:CLUSDT:okx->bitget"
+        records = [
+            {
+                "ts_ms": 1000,
+                "kind": "exit.billing_evidence_debt_registered",
+                "payload": {"position_id": position_id},
+            },
+            {
+                "ts_ms": 2000,
+                "kind": "recovery.external_pair_flat_reclassified",
+                "payload": {
+                    "position_id": position_id,
+                    "accounting_owner": "external_unattributed",
+                },
+            },
+        ]
+
+        summary = summarize_quick_flat_events(records, quick_flat_window_ms=60_000)
+
+        assert summary["quick_flat_unreconciled_billing_count"] == 0
+
     def test_terminal_billing_evidence_gap_is_physical_terminal_but_not_financially_reconciled(self):
         records = [
             {

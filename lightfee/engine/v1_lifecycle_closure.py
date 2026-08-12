@@ -1207,6 +1207,8 @@ _EVENT_KIND_PHASES = {
     "execution.entry_residual_dust_tolerated": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "execution.residual_repair_terminal": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "execution.residual_repair_completed": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
+    "recovery.external_pair_flat_observed": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
+    "recovery.external_pair_flat_reclassified": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "recovery.flat": V1LifecycleClosurePhase.RECOVERY_TRUTH.value,
     "recovery.residual_repairs_complete": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
     "runtime.entry_quote_revalidate_targeted": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
