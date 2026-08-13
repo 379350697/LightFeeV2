@@ -3604,7 +3604,7 @@ def _build_production_acceptance_gate(
     external_recovery_reclassified_ts_by_position: dict[str, int] = {}
     runtime_progress = _runtime_progress_from_state(local_state)
     runtime_market_data_config = _runtime_market_data_config_from_state(local_state)
-    ws_bbo_effective_mode = (
+    ws_bbo_entry_readiness_mode = (
         str(
             runtime_market_data_config.get("entry_readiness_provider_effective", "")
             or ""
@@ -3612,6 +3612,15 @@ def _build_production_acceptance_gate(
         == "ws_bbo_quote_lease"
         and runtime_market_data_config.get("local_l2_effective_enabled") is False
     )
+    final_l2_candidate_data_enabled = (
+        runtime_market_data_config.get("final_l2_candidate_data_enabled") is True
+    )
+    legacy_ws_bbo_local_l2_events = {
+        "runtime.local_l2_phase_start",
+        "runtime.local_l2_phase_complete",
+        "runtime.local_l2_ws_started",
+        "runtime.local_l2_bootstrap_started",
+    }
     local_l2_residual_runtime_enabled_count = 0
 
     for rec in events:
@@ -3772,13 +3781,19 @@ def _build_production_acceptance_gate(
                 exception_conclusions["local_l2_official_rebuild"] = "official_doc"
             else:
                 exception_conclusions.setdefault("local_l2_official_rebuild", "insufficient_evidence")
-        if ws_bbo_effective_mode and (
-            kind.startswith("runtime.local_l2_")
-            or kind
-            in {
-                "runtime.entry_blocked_local_l2_selection",
-                "runtime.entry_local_l2_readiness_diagnostics",
-            }
+        if ws_bbo_entry_readiness_mode and (
+            kind in legacy_ws_bbo_local_l2_events
+            or (
+                not final_l2_candidate_data_enabled
+                and (
+                    kind.startswith("runtime.local_l2_")
+                    or kind
+                    in {
+                        "runtime.entry_blocked_local_l2_selection",
+                        "runtime.entry_local_l2_readiness_diagnostics",
+                    }
+                )
+            )
         ):
             local_l2_residual_runtime_enabled_count += 1
 

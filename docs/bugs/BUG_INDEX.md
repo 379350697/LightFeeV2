@@ -17,6 +17,21 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-103 WS-BBO candidate L2 final-cost path, 2026-08-13: V2's
+`ws_bbo_quote_lease` profile correctly retained BBO as the entry-readiness and
+passive-maker data plane, but incorrectly used that profile switch to suppress
+candidate-scoped Local L2 entirely. The already-restored final cost repricer
+requires both L2 books, so every otherwise eligible candidate ended at
+`final_l2_unavailable`. V1 keeps its shortlist-scoped L2 preparation separate
+from its quote/readiness mechanism. V2 now does the same: after the existing
+primary/shadow shortlist, it activates and refreshes only those candidate L2
+books, then applies the existing true-L2 maker/taker cost reprice and final
+ordering. BBO execution, startup L2 suppression, persistence, and passive
+maker behavior remain unchanged. The paired production configuration change
+raises only the independent sidecar/order-quote age threshold from 10 s to
+15 s; the BBO quote-lease freshness threshold remains 1.5 s. See
+[daily/2026-08-13.md#cluster-cl-103-ws-bbo-candidate-l2-final-cost-path](daily/2026-08-13.md#cluster-cl-103-ws-bbo-candidate-l2-final-cost-path).
+
 CL-102 Binance close-fee evidence, 2026-08-13: V2 reconciled four imported
 COTIUSDT historical closes using Binance order status alone. That endpoint has
 quantity and price but no commission; the missing fee was converted to zero,

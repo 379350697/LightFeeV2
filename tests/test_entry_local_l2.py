@@ -1873,6 +1873,7 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
             strategy=StrategyConfig(
                 local_l2_enabled=True,
                 local_l2_ws_enabled=False,
+                entry_readiness_provider="ws_bbo_quote_lease",
                 max_concurrent_positions=2,
                 entry_local_l2_primary_count=2,
                 shadow_entry_opportunity_count=1,
@@ -1905,6 +1906,48 @@ class TestEntryLocalL2SelectionBlockerRealCandidateInput:
         rt.journal.close()
 
         assert activated_symbols == ["S0USDT", "S1USDT", "S2USDT"]
+
+    @pytest.mark.asyncio
+    async def test_ws_bbo_readiness_still_activates_candidate_l2_data(
+        self, runtime_with_l2, monkeypatch,
+    ):
+        """V1 keeps candidate L2 data active even when BBO owns entry readiness."""
+        from lightfee.core.domain import Venue
+        from tests.fake_adapters import FakeVenueAdapter
+
+        class SupportedAdapter(FakeVenueAdapter):
+            def supported_symbols(self) -> list[str]:
+                return ["BTCUSDT"]
+
+        rt = runtime_with_l2
+        rt.config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+        rt._venue_adapters = {
+            Venue.BINANCE: SupportedAdapter(Venue.BINANCE),
+            Venue.BYBIT: SupportedAdapter(Venue.BYBIT),
+        }
+        bootstrap_calls = []
+        monkeypatch.setattr(
+            rt.l2_data_plane,
+            "start_background_bootstrap",
+            lambda **kwargs: bootstrap_calls.append(kwargs),
+        )
+
+        candidate = self._make_real_candidate(first_funding_timestamp_ms=20_000)
+        rt.journal.open()
+        try:
+            await rt._ensure_l2_active_for_candidates([candidate], now_ms=10_000)
+        finally:
+            rt.journal.close()
+
+        assert rt._local_l2_effective_enabled() is False
+        assert {
+            (call["venue"], tuple(call["symbols"])) for call in bootstrap_calls
+        } == {
+            ("binance", ("BTCUSDT",)),
+            ("bybit", ("BTCUSDT",)),
+        }
+        assert rt.local_l2_runtime.get_book("binance", "BTCUSDT") is not None
+        assert rt.local_l2_runtime.get_book("bybit", "BTCUSDT") is not None
 
     @pytest.mark.asyncio
     async def test_dynamic_l2_activation_connects_registered_ws_streams(

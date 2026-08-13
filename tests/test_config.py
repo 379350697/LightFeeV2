@@ -74,6 +74,7 @@ class TestConfigLoading:
         assert config.runtime.mode == "live"
         assert len(config.venues) == 7
         assert config.strategy.max_concurrent_positions == 3
+        assert config.runtime.max_order_quote_age_ms == 15_000
 
     def test_live_missing_entry_provider_defaults_to_ws_bbo_even_with_legacy_local_l2_flag(
         self, tmp_path

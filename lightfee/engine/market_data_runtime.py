@@ -198,6 +198,9 @@ class MarketDataRuntime:
     def _local_l2_effective_enabled(self) -> bool:
         return self.ctx._local_l2_effective_enabled()
 
+    def _final_l2_candidate_data_enabled(self) -> bool:
+        return self.ctx._final_l2_candidate_data_enabled()
+
     def _entry_local_l2_stale_after_ms(self) -> int:
         return self.ctx._entry_local_l2_stale_after_ms()
 
@@ -275,8 +278,11 @@ class MarketDataRuntime:
                 getattr(self.ctx.config.strategy, "local_l2_ws_enabled", False)
             ),
             "local_l2_effective_enabled": self._local_l2_effective_enabled(),
+            "final_l2_candidate_data_enabled": (
+                self._final_l2_candidate_data_enabled()
+            ),
             "local_l2_effective_disabled_reason": (
-                "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
+                "ws_bbo_quote_lease_selected_for_entry_readiness"
                 if (
                     provider == "ws_bbo_quote_lease"
                     and bool(getattr(self.ctx.config.strategy, "local_l2_enabled", False))
@@ -561,7 +567,7 @@ class MarketDataRuntime:
         Respects local_l2_hot_exec_per_venue_budget (V1).
         """
         self._refresh_runtime_market_data_config_state()
-        if not self._local_l2_effective_enabled():
+        if not self._final_l2_candidate_data_enabled():
             return
         if self.ctx.config.runtime.mode == "paper":
             return

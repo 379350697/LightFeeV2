@@ -19,7 +19,7 @@ from lightfee.core.domain import AccountFeeSnapshot, Side, Venue
 from lightfee.engine.entry_readiness import EntryReadinessDecision
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
-from lightfee.sidecar.snapshot import CandidateInput
+from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
 from lightfee.strategy.scoring import price_final_l2_cost
 from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.binance import BinanceAdapter
@@ -668,6 +668,139 @@ def test_final_l2_reprice_is_applied_in_the_final_selection_path(tmp_path):
     assert runtime.state.last_scan["final_l2_repriced_candidate_count"] == 2
     assert runtime.state.last_scan["final_l2_filtered_candidate_count"] == 1
     assert "final_l2_expected_edge_below_floor" in bad.blocked_reasons
+
+
+@pytest.mark.asyncio
+async def test_ws_bbo_tick_activates_candidate_l2_then_reprices_before_dispatch(
+    tmp_path, monkeypatch,
+):
+    """BBO readiness does not suppress the V1 candidate-L2 cost path."""
+    from lightfee.engine.entry import EntryState
+    from lightfee.engine.entry_sync import EntryExecutionResult
+    from lightfee.engine.execution_planner import ExecutionRoute
+    from lightfee.marketdata.ws_bbo import TopBookQuote
+    from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+    class CapturingExecutor:
+        def __init__(self) -> None:
+            self.contexts = []
+
+        async def execute(self, ctx):
+            self.contexts.append(ctx)
+            return EntryExecutionResult(
+                route=ExecutionRoute.PASSIVE_INCREMENTAL,
+                state=EntryState.COMPLETED,
+            )
+
+    now_ms = 10_000
+    config = _live_config(tmp_path)
+    config.runtime.live_scan_recovery_success_count = 1
+    config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+    config.strategy.local_l2_ws_enabled = False
+    config.strategy.entry_window_secs = 480
+    config.strategy.min_scan_minutes_before_funding = 0
+    adapters = {
+        Venue.BINANCE: _AccountFeeAdapter(
+            Venue.BINANCE,
+            AccountFeeSnapshot(Venue.BINANCE, -0.1, 4.0, now_ms, "test"),
+        ),
+        Venue.OKX: _AccountFeeAdapter(
+            Venue.OKX,
+            AccountFeeSnapshot(Venue.OKX, -0.1, 5.0, now_ms, "test"),
+        ),
+    }
+    runtime = LiveRuntime(config, venue_adapters=adapters)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    executor = CapturingExecutor()
+    runtime.entry_executor = executor
+    candidate = _candidate("BTCUSDT", 15.0)
+    candidate.first_funding_timestamp_ms = now_ms + 300_000
+    candidate.funding_timestamp_ms = now_ms + 300_000
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms,
+        market_observed_at_ms=now_ms,
+        acquisition_mode="fresh_sidecar",
+        quotes={
+            "binance:BTCUSDT": QuoteSnapshot(
+                venue="binance", symbol="BTCUSDT", bid=99.9, ask=100.0,
+                bid_size=100.0, ask_size=100.0, observed_at_ms=now_ms,
+                volume_24h_quote=10_000_000.0, open_interest=2_000_000.0,
+            ),
+            "okx:BTCUSDT": QuoteSnapshot(
+                venue="okx", symbol="BTCUSDT", bid=100.1, ask=100.2,
+                bid_size=100.0, ask_size=100.0, observed_at_ms=now_ms,
+                volume_24h_quote=10_000_000.0, open_interest=2_000_000.0,
+            ),
+        },
+        candidates=[candidate],
+    )
+    for venue, bid, ask in (
+        ("binance", 99.9, 100.0),
+        ("okx", 100.1, 100.2),
+    ):
+        runtime.ws_bbo_cache.update_quote(
+            TopBookQuote(
+                venue=venue, symbol="BTCUSDT", bid=bid, ask=ask,
+                bid_size=100.0, ask_size=100.0, observed_at_ms=now_ms,
+                received_at_ms=now_ms, source=f"{venue}_bbo_ws",
+            )
+        )
+
+    async def keep_existing_bbo_quotes(candidates, prewarm_now_ms):
+        del candidates, prewarm_now_ms
+        runtime._entry_bbo_subscription_budgeted_keys = {
+            ("binance", "BTCUSDT"), ("okx", "BTCUSDT"),
+        }
+        runtime._entry_bbo_subscription_budget_excluded_keys = set()
+        runtime._entry_bbo_subscription_per_venue_budget = 1
+
+    bootstrap_calls = []
+
+    def bootstrap_hot_l2(*, venue, symbols, **_kwargs):
+        bootstrap_calls.append((venue, tuple(symbols)))
+        for symbol in symbols:
+            _install_hot_book(
+                runtime,
+                venue,
+                symbol,
+                99.9 if venue == "binance" else 100.1,
+                100.0 if venue == "binance" else 100.2,
+                now_ms,
+            )
+
+    async def skip_external_l2_sync(**_kwargs):
+        return 0
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+    monkeypatch.setattr(
+        runtime,
+        "_ensure_entry_bbo_active_for_candidates",
+        keep_existing_bbo_quotes,
+    )
+    monkeypatch.setattr(
+        runtime.l2_data_plane,
+        "start_background_bootstrap",
+        bootstrap_hot_l2,
+    )
+    monkeypatch.setattr(runtime.l2_data_plane, "sync_snapshots", skip_external_l2_sync)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert runtime._local_l2_effective_enabled() is False
+    assert bootstrap_calls == [
+        ("binance", ("BTCUSDT",)),
+        ("okx", ("BTCUSDT",)),
+    ]
+    assert runtime.state.last_scan["final_l2_repriced_candidate_count"] == 1
+    assert runtime.state.last_scan["final_l2_filtered_candidate_count"] == 0
+    assert candidate.entry_liquidity_source_at_entry == "true_l2"
+    assert len(executor.contexts) == 1
 
 
 @pytest.mark.parametrize(

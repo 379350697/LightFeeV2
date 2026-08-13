@@ -443,7 +443,7 @@ def test_recovery_decision_marks_compact_close_reconciliation_as_background_debt
     assert decision["clear_reason"] == "core_background_close_reconciliation"
 
 
-def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
+def test_acceptance_gate_flags_local_l2_residual_events_when_final_l2_data_disabled():
     from scripts.diagnose_live import _build_production_acceptance_gate
 
     gate = _build_production_acceptance_gate(
@@ -469,6 +469,7 @@ def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
                 "entry_readiness_provider_effective": "ws_bbo_quote_lease",
                 "local_l2_configured_enabled": True,
                 "local_l2_effective_enabled": False,
+                "final_l2_candidate_data_enabled": False,
             },
         },
         exchange_truth={
@@ -486,6 +487,88 @@ def test_acceptance_gate_flags_local_l2_residual_events_in_ws_bbo_mode():
     assert "local_l2_residual_runtime_enabled" in gate["fingerprints"]
     assert "local_l2_residual_runtime_enabled" in gate["blocking_reasons"]
     assert gate["runtime_market_data_config"]["local_l2_effective_enabled"] is False
+
+
+def test_acceptance_gate_allows_ws_bbo_candidate_l2_cost_data_events():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[
+            {
+                "kind": "runtime.local_l2_dynamic_ws_started",
+                "payload": {"ts_ms": 1778786994000},
+            },
+            {
+                "kind": "runtime.local_l2_snapshots_synced",
+                "payload": {"ts_ms": 1778786994100},
+            },
+        ],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "max_concurrent_positions": 8,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "runtime_market_data_config": {
+                "entry_readiness_provider_effective": "ws_bbo_quote_lease",
+                "local_l2_configured_enabled": True,
+                "local_l2_effective_enabled": False,
+                "final_l2_candidate_data_enabled": True,
+            },
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["local_l2_residual_runtime_enabled_count"] == 0
+    assert "local_l2_residual_runtime_enabled" not in gate["blocking_reasons"]
+
+
+def test_acceptance_gate_still_blocks_legacy_l2_startup_in_ws_bbo_mode():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[
+            {
+                "kind": "runtime.local_l2_phase_start",
+                "payload": {"ts_ms": 1778786994000},
+            },
+        ],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "max_concurrent_positions": 8,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "runtime_market_data_config": {
+                "entry_readiness_provider_effective": "ws_bbo_quote_lease",
+                "local_l2_configured_enabled": True,
+                "local_l2_effective_enabled": False,
+                "final_l2_candidate_data_enabled": True,
+            },
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    )
+
+    assert gate["local_l2_residual_runtime_enabled_count"] == 1
+    assert "local_l2_residual_runtime_enabled" in gate["blocking_reasons"]
 
 
 def test_state_consistency_exposes_runtime_progress_diagnostics():

@@ -987,6 +987,15 @@ class LiveRuntime:
             and self._entry_readiness_provider_uses_local_l2()
         )
 
+    def _final_l2_candidate_data_enabled(self) -> bool:
+        """Whether candidate L2 data is required for final execution-cost repricing.
+
+        WS BBO owns entry-readiness and passive-maker quoting in its profile; it
+        is not a substitute for the independent L2 books consumed by the final
+        candidate cost calculation.
+        """
+        return bool(getattr(self.config.strategy, "local_l2_enabled", False))
+
     def _runtime_market_data_config_summary(self):
         return self.market_data_runtime._runtime_market_data_config_summary()
 
@@ -4502,10 +4511,7 @@ class LiveRuntime:
 
             # V1: refresh tracked entry local L2 opportunities from the scan
             # shortlist before quote freshness can block final entry selection.
-            if (
-                self._local_l2_effective_enabled()
-                and l2_tracking_tradeable
-            ):
+            if self._final_l2_candidate_data_enabled() and l2_tracking_tradeable:
                 tracked_pair_ids = {t.pair_id for t in tracked}
                 # V1: activity_local_l2_symbols() follows the tracked
                 # primary+shadow scope, not the whole tradeable shortlist.
@@ -4835,7 +4841,10 @@ class LiveRuntime:
         Delegates to the data plane which respects per-book cooldown intervals.
         """
         self._refresh_runtime_market_data_config_state()
-        if not self._local_l2_effective_enabled():
+        if not (
+            self._local_l2_effective_enabled()
+            or (scan_promoted and self._final_l2_candidate_data_enabled())
+        ):
             return
 
         try:
