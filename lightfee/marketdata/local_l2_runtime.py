@@ -329,12 +329,16 @@ class LocalL2Runtime:
     ):
         """Apply and produce result with events.
 
-        V1: observed_at_ms uses the exchange server timestamp from the REST/WS
-        response (e.g. Binance E field), not local wall clock.  This ensures
-        staleness checks compare exchange-observed time, not local processing time.
+        V1 normalizes an exchange timestamp into the local decision-clock domain
+        with the venue's server-time offset.  The V2 WS data plane does not own
+        that offset, so a source timestamp that is ahead of its local receipt
+        cannot be used directly: it would make a fresh book appear to come from
+        the future and trigger a false clock-skew rebuild.
         """
-        # Prefer exchange server timestamp over local clock (V1 parity)
-        effective_ms = update.event_time_ms if update.event_time_ms > 0 else now_ms
+        received_at_ms = update.received_at_ms if update.received_at_ms > 0 else now_ms
+        effective_ms = update.event_time_ms if update.event_time_ms > 0 else received_at_ms
+        if received_at_ms > 0 and effective_ms > received_at_ms:
+            effective_ms = received_at_ms
         if update.update_kind == LocalL2UpdateKind.SNAPSHOT:
             return book.apply_snapshot(
                 update.bids, update.asks,

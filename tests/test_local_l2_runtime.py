@@ -592,6 +592,124 @@ class TestDataPlaneBootstrap:
         assert ok
         assert adapter.call_count == 2
 
+    @pytest.mark.asyncio
+    async def test_binance_rest_snapshot_accepts_one_overlapping_first_delta_then_restores_strict_link(self):
+        """V1 accepts exactly one U..u bridge after a REST snapshot, then is strict."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "BRIDGEUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="BRIDGEUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[],
+                first_sequence=101,
+                sequence=102,
+                previous_sequence=99,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=1_001,
+        )
+
+        assert await dp.bootstrap_book(
+            "binance",
+            "BRIDGEUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2_000,
+        )
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 102
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="BRIDGEUSDT",
+                bids=[PriceLevel(99.0, 1.0)],
+                asks=[],
+                first_sequence=103,
+                sequence=104,
+                previous_sequence=101,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2_001,
+        )
+
+        assert book.status == L2BookStatus.REBUILDING
+        assert "previous_link_mismatch" in book.fault_reason
+
+    @pytest.mark.asyncio
+    async def test_binance_rest_snapshot_allows_the_same_overlap_on_the_live_ws_path(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "DIRECTUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        assert await dp.bootstrap_book(
+            "binance",
+            "DIRECTUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2_000,
+        )
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="DIRECTUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[],
+                first_sequence=101,
+                sequence=102,
+                previous_sequence=99,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2_001,
+        )
+
+        assert book.status == L2BookStatus.HOT
+        assert book.sequence == 102
+
+    @pytest.mark.asyncio
+    async def test_failed_first_bridge_clears_the_one_time_overlap_marker(self):
+        """A failed bridge must not carry its one-time V1 allowance into rebuild."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "FAILBRIDGEUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        assert await dp.bootstrap_book(
+            "binance",
+            "FAILBRIDGEUSDT",
+            MockL2Adapter("binance", sequence=100),
+            now_ms=2_000,
+        )
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="FAILBRIDGEUSDT",
+                bids=[PriceLevel(60_000.0, 1.0)],
+                asks=[],
+                first_sequence=101,
+                sequence=102,
+                previous_sequence=99,
+                previous_sequence_present=True,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2_001,
+        )
+
+        assert book.status == L2BookStatus.REBUILDING
+        assert LocalL2BookKey("binance", "FAILBRIDGEUSDT") not in (
+            dp._initial_snapshot_overlap_sequences
+        )
+
 
 class TestDataPlaneSync:
     def test_sync_dispatches_for_cold_book(self):
@@ -1313,7 +1431,7 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
         ]
 
     @pytest.mark.asyncio
-    async def test_rest_buffered_replay_proactive_refresh_stays_before_stale_threshold_for_30_minutes(self):
+    async def test_rest_buffered_replay_hot_book_uses_ws_without_proactive_rest_refresh(self):
         rt = LocalL2Runtime()
         book = rt.ensure_book("binance", "RESTFRESHUSDT")
         book.status = L2BookStatus.HOT
@@ -1324,8 +1442,7 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
         book.asks = [PriceLevel(101.0, 1.0)]
         journal = _RecordingJournal()
         dp = LocalL2DataPlane(rt, journal)
-        dp.hot_stale_after_ms = 5_000
-        dp.hot_refresh_interval_ms = 30_000
+        dp.hot_stale_after_ms = 60_000
 
         class FreshAdapter(MockL2Adapter):
             def __init__(self):
@@ -1344,11 +1461,12 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
 
         for now_ms in range(1_000, 30 * 60 * 1000 + 1_001, 1_000):
             adapter.now_ms = now_ms
+            dp.note_ws_delta("binance", "RESTFRESHUSDT", now_ms=now_ms)
             await self._sync(dp, {Venue.BINANCE: adapter}, now_ms)
             assert book.status == L2BookStatus.HOT
             assert now_ms - book.observed_at_ms <= dp.hot_stale_after_ms
 
-        assert adapter.call_count >= 300
+        assert adapter.call_count == 0
         assert not [
             payload for kind, payload in journal.records
             if kind == "runtime.local_l2_hot_stale_rebuild"
@@ -1490,7 +1608,7 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
         assert payloads[0]["reason"] == "no_keepalive"
 
     @pytest.mark.asyncio
-    async def test_rest_hot_book_without_proactive_adapter_is_rest_refresh_late(self):
+    async def test_rest_hot_book_without_ws_subscription_is_subscription_missing(self):
         rt = LocalL2Runtime()
         book = rt.ensure_book("binance", "RESTLATEUSDT")
         book.status = L2BookStatus.HOT
@@ -1510,7 +1628,37 @@ class TestLocalL2HotFreshnessThirtyMinuteSimulation:
             if kind == "runtime.local_l2_hot_stale_rebuild"
         ]
         assert len(payloads) == 1
-        assert payloads[0]["reason"] == "rest_refresh_late"
+        assert payloads[0]["reason"] == "subscription_missing"
+
+    def test_future_exchange_timestamp_uses_local_receive_time_for_l2_freshness(self):
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("binance", "CLOCKUSDT")
+        book.status = L2BookStatus.HOT
+        book.sequence = 10
+        book.last_update_id = 10
+        book.bids = [PriceLevel(100.0, 1.0)]
+        book.asks = [PriceLevel(101.0, 1.0)]
+        dp = LocalL2DataPlane(rt, _RecordingJournal())
+
+        dp.ingest_external_update(
+            LocalL2Update(
+                venue="binance",
+                symbol="CLOCKUSDT",
+                bids=[PriceLevel(100.0, 1.0)],
+                asks=[],
+                first_sequence=11,
+                sequence=11,
+                previous_sequence=10,
+                previous_sequence_present=True,
+                event_time_ms=12_000,
+                received_at_ms=2_000,
+                update_kind=LocalL2UpdateKind.DELTA,
+            ),
+            now_ms=2_000,
+        )
+
+        assert book.status == L2BookStatus.HOT
+        assert book.observed_at_ms == 2_000
 
     @pytest.mark.asyncio
     async def test_future_observed_timestamp_is_clock_skew_rebuild_reason(self):

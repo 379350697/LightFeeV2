@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, TYPE_CHECKING
 
 from lightfee.marketdata.l2 import (
@@ -94,14 +94,12 @@ class _BookFreshnessState:
     last_ws_keepalive_ms: int = 0
     last_book_confirmation_ms: int = 0
     last_subscription_confirmed_ms: int = 0
-    last_rest_refresh_ms: int = 0
 
 
 # Default snapshot intervals per book status
 SNAPSHOT_INTERVAL_COLD_MS = 0  # Immediate on cold
 SNAPSHOT_INTERVAL_BOOTSTRAPPING_MS = 2_000
 SNAPSHOT_INTERVAL_REBUILDING_MS = 3_000
-SNAPSHOT_INTERVAL_HOT_MS = 30_000  # Periodic refresh for HOT books (no WS)
 SNAPSHOT_INTERVAL_DEGRADED_MS = 10_000
 
 
@@ -140,13 +138,17 @@ class LocalL2DataPlane:
         # bootstrap start to invalidate buffered updates from old streams.
         self._stream_generations: dict[str, int] = {}
 
+        # V1 permits exactly one overlapping Binance-style delta immediately
+        # after a REST snapshot.  The marker is data-plane state because only a
+        # REST bootstrap (not an arbitrary WS snapshot) establishes that bridge.
+        self._initial_snapshot_overlap_sequences: dict[LocalL2BookKey, int] = {}
+
         # Background bootstrap worker tasks: keyed by "venue"
         self._bootstrap_tasks: dict[str, asyncio.Task] = {}
 
         # Global config
         self.max_concurrent_snapshots: int = 4
         self.bootstrap_timeout_ms: int = 15_000  # Overall bootstrap phase timeout
-        self.hot_refresh_interval_ms: int = SNAPSHOT_INTERVAL_HOT_MS
         self.hot_stale_after_ms: int = 300_000
         self.buffered_replay_failure_alert_threshold: int = 3
         self._buffered_replay_failure_counts: dict[str, int] = {}
@@ -264,6 +266,19 @@ class LocalL2DataPlane:
                 )
                 return False
 
+            # A REST snapshot may be followed by exactly one overlapping
+            # Binance-style delta.  Arm it before buffered replay so both the
+            # buffered and directly-live paths use the same V1 boundary rule.
+            book = self._runtime.get_book(venue, symbol)
+            if (
+                policy.replay_rest_snapshot_with_ws_deltas
+                and book is not None
+                and book.sequence > 0
+            ):
+                self._initial_snapshot_overlap_sequences[key] = book.sequence
+            else:
+                self._initial_snapshot_overlap_sequences.pop(key, None)
+
             # Replay buffered WS updates accumulated during bootstrap gap (V1 parity)
             # Skip replay only for policies that cannot bridge REST snapshots with
             # WS deltas. OKX stays on the V1 buffered replay classifier.
@@ -276,6 +291,7 @@ class LocalL2DataPlane:
                     {"venue": venue, "symbol": symbol, "replayed": replay.replayed},
                 )
             if not replay.ok:
+                self._initial_snapshot_overlap_sequences.pop(key, None)
                 book = self._runtime.get_book(venue, symbol)
                 ss.consecutive_failures += 1
                 ss.last_error = (
@@ -312,7 +328,6 @@ class LocalL2DataPlane:
             ss.last_snapshot_ms = now_ms
             ss.consecutive_failures = 0
             ss.last_error = ""
-            self._freshness_state(venue, symbol).last_rest_refresh_ms = now_ms
             self._buffered_replay_failure_counts.pop(f"{venue}:{symbol}", None)
             self._append_rate_limited_state_event(
                 "runtime.local_l2_snapshot_ok",
@@ -323,6 +338,7 @@ class LocalL2DataPlane:
             )
             return True
         except TransportError as e:
+            self._initial_snapshot_overlap_sequences.pop(key, None)
             ss.consecutive_failures += 1
             ss.last_error = str(e)
             if e.category == TransportErrorCategory.UNSUPPORTED_CAPABILITY:
@@ -348,6 +364,7 @@ class LocalL2DataPlane:
             )
             return False
         except Exception as e:
+            self._initial_snapshot_overlap_sequences.pop(key, None)
             ss.consecutive_failures += 1
             ss.last_error = str(e)
             # V1: clear pre-snapshot buffers on any failure
@@ -422,6 +439,9 @@ class LocalL2DataPlane:
 
             # Clear buffered updates from old stream (V1: clear_..._for_instance)
             self._pre_snapshot_buffers.pop(key, None)
+            self._initial_snapshot_overlap_sequences.pop(
+                LocalL2BookKey(venue=venue, symbol=symbol), None,
+            )
 
             # Reset sequence so snapshot isn't treated as stale (V1: set_last_sequence(None))
             book.sequence = 0
@@ -603,7 +623,6 @@ class LocalL2DataPlane:
             "last_book_confirmation_ms": (
                 int(state.last_book_confirmation_ms) if state is not None else 0
             ),
-            "last_rest_refresh_ms": int(state.last_rest_refresh_ms) if state is not None else 0,
         }
 
     def _effective_hot_freshness_ms(
@@ -619,31 +638,8 @@ class LocalL2DataPlane:
                 state.last_ws_keepalive_ms,
                 state.last_book_confirmation_ms,
                 state.last_subscription_confirmed_ms,
-                state.last_rest_refresh_ms,
             )
         return max(int(getattr(book, "observed_at_ms", 0) or 0), evidence_ms)
-
-    def _hot_proactive_refresh_interval_ms(self, stale_after_ms: int) -> int:
-        configured = int(getattr(self, "hot_refresh_interval_ms", 0) or 0)
-        if stale_after_ms <= 0:
-            return configured
-        proactive = max(250, (stale_after_ms * 3) // 4)
-        if configured <= 0:
-            return proactive
-        return min(configured, proactive)
-
-    def _hot_refresh_due(self, key: LocalL2BookKey, book, now_ms: int, stale_after_ms: int) -> bool:
-        interval_ms = self._hot_proactive_refresh_interval_ms(stale_after_ms)
-        if interval_ms <= 0:
-            return False
-        ss = self._snap_states.get(key)
-        state = self._freshness_states.get(key)
-        last_refresh_ms = max(
-            int(getattr(book, "last_snapshot_ms", 0) or 0),
-            int(getattr(ss, "last_snapshot_ms", 0) or 0) if ss is not None else 0,
-            int(getattr(state, "last_rest_refresh_ms", 0) or 0) if state is not None else 0,
-        )
-        return last_refresh_ms <= 0 or (now_ms - last_refresh_ms) >= interval_ms
 
     def _classify_hot_stale_reason(
         self,
@@ -657,36 +653,31 @@ class LocalL2DataPlane:
         if observed_at_ms > now_ms + self.clock_skew_tolerance_ms:
             return "clock_skew"
 
-        if policy.bridge_mode in (
-            BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
-            BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
-        ):
-            if self._hot_refresh_due(key, book, now_ms, stale_after_ms):
-                return "rest_refresh_late"
+        if policy.bridge_mode is BridgeMode.REST_POLLING_SNAPSHOT_ONLY:
+            return "rest_refresh_late"
 
-        if policy.bridge_mode in (BridgeMode.WS_SNAPSHOT_AUTHORITATIVE, BridgeMode.STREAM_ONLY):
-            if not self._ws_client_connected(key):
-                return "subscription_missing"
-            state = self._freshness_states.get(key)
-            if state is None:
-                return "subscription_missing"
-            has_ws_evidence = max(
-                state.last_subscription_confirmed_ms,
-                state.last_ws_delta_ms,
-                state.last_ws_keepalive_ms,
-                state.last_book_confirmation_ms,
-            ) > 0
-            if not has_ws_evidence:
-                return "subscription_missing"
-            if state.last_ws_delta_ms <= 0:
-                return "no_ws_delta"
-            keepalive_ms = max(
-                state.last_ws_keepalive_ms,
-                state.last_book_confirmation_ms,
-                state.last_subscription_confirmed_ms,
-            )
-            if keepalive_ms <= 0 or (now_ms - keepalive_ms) > stale_after_ms:
-                return "no_keepalive"
+        if not self._ws_client_connected(key):
+            return "subscription_missing"
+        state = self._freshness_states.get(key)
+        if state is None:
+            return "subscription_missing"
+        has_ws_evidence = max(
+            state.last_subscription_confirmed_ms,
+            state.last_ws_delta_ms,
+            state.last_ws_keepalive_ms,
+            state.last_book_confirmation_ms,
+        ) > 0
+        if not has_ws_evidence:
+            return "subscription_missing"
+        if state.last_ws_delta_ms <= 0:
+            return "no_ws_delta"
+        keepalive_ms = max(
+            state.last_ws_keepalive_ms,
+            state.last_book_confirmation_ms,
+            state.last_subscription_confirmed_ms,
+        )
+        if keepalive_ms <= 0 or (now_ms - keepalive_ms) > stale_after_ms:
+            return "no_keepalive"
 
         return "unknown"
 
@@ -788,6 +779,9 @@ class LocalL2DataPlane:
         replayed: int,
         replay_index: int,
     ) -> _BufferedReplayResult:
+        self._initial_snapshot_overlap_sequences.pop(
+            LocalL2BookKey(venue=venue, symbol=symbol), None,
+        )
         status_before = self._status_value(book.status)
         rebuild_attempt_id = self._next_rebuild_attempt_id(venue, symbol)
         book.sequence = 0
@@ -845,6 +839,9 @@ class LocalL2DataPlane:
         # OKX, Bitget, Gate, and Hyperliquid all use snapshots to establish or
         # re-establish the local book.
         if update.update_kind == LocalL2UpdateKind.SNAPSHOT:
+            self._initial_snapshot_overlap_sequences.pop(
+                LocalL2BookKey(update.venue, update.symbol), None,
+            )
             self._pre_snapshot_buffers.pop(key, None)
             result = self._runtime.record_update_result(update, now_ms)
             book = self._runtime.get_book(update.venue, update.symbol)
@@ -858,6 +855,7 @@ class LocalL2DataPlane:
             return result.events
 
         if book is not None and book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
+            update = self._normalize_initial_snapshot_overlap(book, update)
             if self._range_update_requires_rebuild(book, update, now_ms):
                 return []
 
@@ -886,13 +884,52 @@ class LocalL2DataPlane:
                 return []
 
         result = self._runtime.record_update_result(update, now_ms)
-        if result.applied and not result.rebuild_required:
+        if result.rebuild_required:
+            # V1 clears its one-shot REST-snapshot bridge allowance on every
+            # incremental failure before the next rebuild can begin.
+            self._initial_snapshot_overlap_sequences.pop(
+                LocalL2BookKey(update.venue, update.symbol), None,
+            )
+        elif result.applied:
+            self._initial_snapshot_overlap_sequences.pop(
+                LocalL2BookKey(update.venue, update.symbol), None,
+            )
             self.note_ws_delta(
                 update.venue,
                 update.symbol,
                 now_ms=now_ms,
             )
         return result.events
+
+    def _normalize_initial_snapshot_overlap(self, book, update: LocalL2Update) -> LocalL2Update:
+        """Apply V1's one-time REST-snapshot-to-stream boundary normalization."""
+        key = LocalL2BookKey(venue=update.venue, symbol=update.symbol)
+        snapshot_sequence = self._initial_snapshot_overlap_sequences.get(key)
+        if snapshot_sequence != getattr(book, "sequence", 0):
+            if snapshot_sequence is not None:
+                self._initial_snapshot_overlap_sequences.pop(key, None)
+            return update
+        if (
+            update.update_kind != LocalL2UpdateKind.DELTA
+            or update.sequence <= book.sequence
+            or not (update.previous_sequence_present or update.previous_sequence > 0)
+            or update.previous_sequence == book.sequence
+        ):
+            return update
+
+        first_sequence = update.first_sequence
+        if first_sequence <= 0:
+            first_sequence = update.previous_sequence + 1
+        if not sequence_range_overlaps_expected(
+            first_sequence, update.sequence, book.sequence + 1,
+        ):
+            return update
+
+        return replace(
+            update,
+            previous_sequence=book.sequence,
+            previous_sequence_present=True,
+        )
 
     def _range_update_requires_rebuild(
         self,
@@ -952,6 +989,9 @@ class LocalL2DataPlane:
         now_ms: int,
         reason: str,
     ) -> None:
+        self._initial_snapshot_overlap_sequences.pop(
+            LocalL2BookKey(update.venue, update.symbol), None,
+        )
         previous_book_seq = getattr(book, "sequence", 0)
         previous_book_last_update_id = getattr(book, "last_update_id", 0)
         status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
@@ -1176,22 +1216,23 @@ class LocalL2DataPlane:
         # V1: buffered_updates.into_iter().skip(start_index).enumerate()
         replayed = 0
         for i, bu in enumerate(filtered[start_index:], start=start_index):
-            if bu.update.sequence <= previous_sequence:
+            replay_update = self._normalize_initial_snapshot_overlap(book, bu.update)
+            if replay_update.sequence <= previous_sequence:
                 continue
             has_previous_link = (
-                (bu.update.previous_sequence_present or bu.update.previous_sequence > 0)
-                and bu.update.previous_sequence > 0
+                (replay_update.previous_sequence_present or replay_update.previous_sequence > 0)
+                and replay_update.previous_sequence > 0
             )
 
             first_id = (
-                bu.update.first_sequence
-                if bu.update.first_sequence > 0
-                else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
-                else bu.update.sequence
+                replay_update.first_sequence
+                if replay_update.first_sequence > 0
+                else replay_update.previous_sequence + 1 if replay_update.previous_sequence > 0
+                else replay_update.sequence
             )
             overlaps_expected = sequence_range_overlaps_expected(
                 first_id,
-                bu.update.sequence,
+                replay_update.sequence,
                 previous_sequence + 1,
             )
 
@@ -1202,21 +1243,21 @@ class LocalL2DataPlane:
             )
             if (
                 has_previous_link
-                and bu.update.previous_sequence != previous_sequence
+                and replay_update.previous_sequence != previous_sequence
                 and not accepts_overlap
             ):
                 reason = (
                     f"buffered_replay_previous_link_mismatch: expected {previous_sequence} "
-                    f"got {bu.update.previous_sequence}"
+                    f"got {replay_update.previous_sequence}"
                 )
                 if (
                     i == start_index
-                    and expected < bu.update.previous_sequence + 1
+                    and expected < replay_update.previous_sequence + 1
                     and not accepts_overlap
                 ):
                     reason = (
                         f"buffered_replay_snapshot_boundary: expected {expected} "
-                        f"got {bu.update.previous_sequence + 1}"
+                        f"got {replay_update.previous_sequence + 1}"
                     )
                 return self._mark_rebuilding_from_buffered_replay_failure(
                     venue=venue,
@@ -1236,12 +1277,12 @@ class LocalL2DataPlane:
             if (
                 i == start_index
                 and has_previous_link
-                and expected < bu.update.previous_sequence + 1
+                and expected < replay_update.previous_sequence + 1
                 and not accepts_overlap
             ):
                 # First replay: gap between snapshot and first buffered
                 reason = (
-                    f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}"
+                    f"buffered_replay_snapshot_boundary: expected {expected} got {replay_update.previous_sequence + 1}"
                 )
                 return self._mark_rebuilding_from_buffered_replay_failure(
                     venue=venue,
@@ -1260,7 +1301,7 @@ class LocalL2DataPlane:
 
             try:
                 replay_result = self._runtime.record_update_result(
-                    bu.update, bu.observed_at_ms,
+                    replay_update, bu.observed_at_ms,
                 )
                 if replay_result.rebuild_required:
                     reason = (
@@ -1282,7 +1323,10 @@ class LocalL2DataPlane:
                         replay_index=i,
                     )
                 if replay_result.applied:
-                    previous_sequence = bu.update.sequence
+                    self._initial_snapshot_overlap_sequences.pop(
+                        LocalL2BookKey(venue=venue, symbol=symbol), None,
+                    )
+                    previous_sequence = replay_update.sequence
                     replayed += 1
             except Exception:
                 reason = f"buffered_replay_apply_failed at index {i}"
@@ -1354,61 +1398,46 @@ class LocalL2DataPlane:
                         key.symbol,
                         effective_freshness_ms,
                     )
-                    if policy.bridge_mode not in (
-                        BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
-                        BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
-                    ):
-                        continue
-                    if not self._hot_refresh_due(key, book, now_ms, stale_after_ms):
-                        continue
+                    continue
                 reason = self._classify_hot_stale_reason(
                     key, book, now_ms, stale_after_ms, policy,
                 )
-                if (
-                    policy.bridge_mode in (
-                        BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
-                        BridgeMode.REST_POLLING_SNAPSHOT_ONLY,
-                    )
-                    and not effective_stale
-                ):
-                    pass
-                else:
-                    status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
-                    pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
-                    book.fault_reason = f"stale_hot_book:{reason}"
-                    book.transition_to_rebuilding(now_ms)
-                    status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
-                    self._append_rate_limited_state_event(
-                        "runtime.local_l2_hot_stale_rebuild",
-                        {
-                            "venue": key.venue,
-                            "symbol": key.symbol,
-                            "book_status": status_before,
-                            "status_before": status_before,
-                            "status_after": status_after,
-                            "pool": pool_before,
-                            "pool_before": pool_before,
-                            "age_ms": book.age_ms(now_ms),
-                            "effective_age_ms": (
-                                now_ms - effective_freshness_ms if effective_freshness_ms > 0 else 0
-                            ),
-                            "observed_at_ms": book.observed_at_ms,
-                            "effective_freshness_ms": effective_freshness_ms,
-                            "stale_after_ms": stale_after_ms,
-                            "last_update_id": book.last_update_id,
-                            "sequence": book.sequence,
-                            "bid_count": len(book.bids) if book.bids else 0,
-                            "ask_count": len(book.asks) if book.asks else 0,
-                            "ts_ms": now_ms,
-                            "policy_bridge_mode": policy.bridge_mode.value,
-                            "reason": reason,
-                            "reason_class": reason,
-                        },
-                        now_ms,
-                        reason=reason,
-                    )
-                    if policy.bridge_mode is BridgeMode.STREAM_ONLY:
-                        continue
+                status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
+                pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
+                book.fault_reason = f"stale_hot_book:{reason}"
+                book.transition_to_rebuilding(now_ms)
+                status_after = book.status.value if hasattr(book.status, "value") else str(book.status)
+                self._append_rate_limited_state_event(
+                    "runtime.local_l2_hot_stale_rebuild",
+                    {
+                        "venue": key.venue,
+                        "symbol": key.symbol,
+                        "book_status": status_before,
+                        "status_before": status_before,
+                        "status_after": status_after,
+                        "pool": pool_before,
+                        "pool_before": pool_before,
+                        "age_ms": book.age_ms(now_ms),
+                        "effective_age_ms": (
+                            now_ms - effective_freshness_ms if effective_freshness_ms > 0 else 0
+                        ),
+                        "observed_at_ms": book.observed_at_ms,
+                        "effective_freshness_ms": effective_freshness_ms,
+                        "stale_after_ms": stale_after_ms,
+                        "last_update_id": book.last_update_id,
+                        "sequence": book.sequence,
+                        "bid_count": len(book.bids) if book.bids else 0,
+                        "ask_count": len(book.asks) if book.asks else 0,
+                        "ts_ms": now_ms,
+                        "policy_bridge_mode": policy.bridge_mode.value,
+                        "reason": reason,
+                        "reason_class": reason,
+                    },
+                    now_ms,
+                    reason=reason,
+                )
+                if policy.bridge_mode is BridgeMode.STREAM_ONLY:
+                    continue
 
             if policy_for_venue(key.venue).bridge_mode is BridgeMode.STREAM_ONLY:
                 continue
@@ -1419,10 +1448,6 @@ class LocalL2DataPlane:
                 continue
 
             interval_ms = self._snapshot_interval_for_status(book.status)
-            if book.status == L2BookStatus.HOT:
-                interval_ms = self._hot_proactive_refresh_interval_ms(
-                    int(getattr(self, "hot_stale_after_ms", 0) or 0)
-                )
             if interval_ms > 0 and book.last_snapshot_ms > 0:
                 if (now_ms - book.last_snapshot_ms) < interval_ms:
                     continue
@@ -1485,6 +1510,7 @@ class LocalL2DataPlane:
                     self._state_event_suppressed.pop(event_key, None)
             self._pre_snapshot_buffers.pop(f"{key.venue}:{key.symbol}", None)
             self._stream_generations.pop(f"{key.venue}:{key.symbol}", None)
+            self._initial_snapshot_overlap_sequences.pop(key, None)
 
         self._journal.append(
             "runtime.local_l2_books_pruned",
@@ -1640,8 +1666,7 @@ class LocalL2DataPlane:
             return SNAPSHOT_INTERVAL_REBUILDING_MS
         elif status == L2BookStatus.DEGRADED:
             return SNAPSHOT_INTERVAL_DEGRADED_MS
-        else:
-            return SNAPSHOT_INTERVAL_HOT_MS
+        return 0
 
     # ------------------------------------------------------------------
     # WebSocket streaming

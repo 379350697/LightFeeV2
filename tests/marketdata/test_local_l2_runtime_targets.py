@@ -37,7 +37,6 @@ from lightfee.marketdata.local_l2_data_plane import (
     _BookSnapshotState,
     SNAPSHOT_INTERVAL_BOOTSTRAPPING_MS,
     SNAPSHOT_INTERVAL_COLD_MS,
-    SNAPSHOT_INTERVAL_HOT_MS,
     SNAPSHOT_INTERVAL_REBUILDING_MS,
 )
 
@@ -489,7 +488,7 @@ class TestMarketSnapshotDiagnostics:
         assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.COLD) == SNAPSHOT_INTERVAL_COLD_MS
         assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.BOOTSTRAPPING) == SNAPSHOT_INTERVAL_BOOTSTRAPPING_MS
         assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.REBUILDING) == SNAPSHOT_INTERVAL_REBUILDING_MS
-        assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.HOT) == SNAPSHOT_INTERVAL_HOT_MS
+        assert LocalL2DataPlane._snapshot_interval_for_status(L2BookStatus.HOT) == 0
 
     def test_book_snapshot_state_tracks_failures(self):
         ss = _BookSnapshotState(venue="binance", symbol="BTCUSDT")
