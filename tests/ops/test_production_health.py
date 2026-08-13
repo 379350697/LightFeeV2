@@ -759,6 +759,7 @@ def test_verify_production_services_attaches_exchange_truth_from_systemd_env_fil
     assert seen["symbols"] == []
     assert seen["venues"] is None
     assert seen["api_key"] == "key-from-file"
+    assert "LIGHTFEE_BYBIT_API_KEY" not in os.environ
 
 
 def test_verify_production_services_exchange_truth_probe_times_out(

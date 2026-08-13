@@ -3426,6 +3426,7 @@ class LiveRuntime:
             source_candidates,
             primary_count,
             shadow_count,
+            previous_primary_pair_ids=self._tracked_primary_pair_ids,
         )
         tracked_pair_ids = {opportunity.pair_id for opportunity in tracked}
         tracked_candidates = [
@@ -4260,27 +4261,33 @@ class LiveRuntime:
                 tracked_pair_ids = {t.pair_id for t in tracked}
                 # V1: activity_local_l2_symbols() follows the tracked
                 # primary+shadow scope, not the whole tradeable shortlist.
+                l2_now_ms = wall_clock_now_ms()
                 await self._ensure_l2_active_for_candidates(
                     tracked_candidates,
-                    now_ms,
+                    l2_now_ms,
                     tracked_opportunities=tracked,
                 )
+                # Activation may await venue I/O.  Do not carry its start
+                # timestamp into primary ownership or the following L2 gate.
+                l2_now_ms = wall_clock_now_ms()
                 self._tracked_primary_pair_ids = {
                     t.pair_id for t in tracked
                     if t.class_.value == "primary_tracked"
                 }
                 # Refresh session state for all tracked opportunities
                 for t in tracked:
-                    self.entry_l2_sessions.track_opportunity(t, now_ms)
+                    self.entry_l2_sessions.track_opportunity(t, l2_now_ms)
+                self.entry_l2_sessions.close_missing(tracked_pair_ids)
                 # V1 post-shortlist L2 sync after tracking: local books
                 # drive session readiness before the selection blocker.
-                await self._sync_local_l2_data(now_ms, scan_promoted=True)
-                self._refresh_entry_l2_session_readiness(now_ms)
+                await self._sync_local_l2_data(l2_now_ms, scan_promoted=True)
+                l2_now_ms = wall_clock_now_ms()
+                self._refresh_entry_l2_session_readiness(l2_now_ms)
                 # V1: shadow promotion — best shadow replaces worst primary
                 # when score delta, hold window, execution guard, and readiness
                 # all pass (execution_core/engine.rs:2643-2719)
                 self._apply_shadow_promotion_if_eligible(
-                    tracked, now_ms,
+                    tracked, l2_now_ms,
                 )
             if tradeable:
                 self.journal.append(
@@ -4321,9 +4328,10 @@ class LiveRuntime:
                 admission_blocker_counts: Counter[str] = Counter()
                 selection_blocker_counts: Counter[str] = Counter()
                 candidate_blockers: dict[str, str] = {}
+                selection_now_ms = wall_clock_now_ms()
                 finalists = self._select_entry_candidates(
                     tradeable,
-                    now_ms=now_ms,
+                    now_ms=selection_now_ms,
                     remaining_slots=remaining_slots,
                     selection_blocker_counts=selection_blocker_counts,
                     candidate_blockers=candidate_blockers,
@@ -4338,7 +4346,7 @@ class LiveRuntime:
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
                 dispatched = await self._dispatch_selected_entry_candidates(
                     finalists,
-                    now_ms=now_ms,
+                    now_ms=selection_now_ms,
                     price_hints=price_hints,
                 )
                 self.state.last_scan.update(self._entry_capacity_snapshot())
@@ -4353,7 +4361,7 @@ class LiveRuntime:
                         remaining_slots=remaining_slots,
                         tradeable_selection_blocker_counts=selection_blocker_counts,
                         candidate_blockers=candidate_blockers,
-                        now_ms=now_ms,
+                        now_ms=selection_now_ms,
                         admission_blocker_counts=admission_blocker_counts,
                     )
                 if dispatched == 0:
@@ -4373,7 +4381,7 @@ class LiveRuntime:
                         remaining_slots=remaining_slots,
                         tradeable_selection_blocker_counts=selection_blocker_counts,
                         candidate_blockers=candidate_blockers,
-                        now_ms=now_ms,
+                        now_ms=selection_now_ms,
                         admission_blocker_counts=admission_blocker_counts,
                     )
             elif can_enter_new_positions(self.state) and self.entry_executor is not None:
@@ -4578,18 +4586,19 @@ class LiveRuntime:
         ):
             return
 
+        decision_now_ms = wall_clock_now_ms()
         try:
             dispatched = await self.l2_data_plane.sync_snapshots(
                 adapters=self._venue_adapters,
-                now_ms=now_ms,
+                now_ms=decision_now_ms,
                 scan_promoted=scan_promoted,
             )
             if dispatched > 0:
-                self.local_l2_runtime.sync(now_ms)
+                self.local_l2_runtime.sync(wall_clock_now_ms())
         except Exception as e:
             self.journal.append(
                 "runtime.local_l2_sync_error",
-                {"error": str(e), "ts_ms": now_ms},
+                {"error": str(e), "ts_ms": decision_now_ms},
             )
 
     # ------------------------------------------------------------------
@@ -11071,8 +11080,12 @@ class LiveRuntime:
             self._tracked_primary_pair_ids.add(best_shadow.pair_id)
             best_shadow.class_ = TrackedOpportunityClass.PRIMARY
             worst_primary.class_ = TrackedOpportunityClass.SHADOW
+            if primary_session:
+                primary_session.primary_assigned_at_ms = 0
             if shadow_session:
+                shadow_session.primary_assigned_at_ms = now_ms
                 shadow_session.shadow_promoted_at_ms = now_ms
+                self.entry_l2_sessions.mark_sticky_prewarm(best_shadow.pair_id)
             self.journal.append(
                 "runtime.entry_local_l2_primary_changed",
                 {

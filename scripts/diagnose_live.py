@@ -24,6 +24,7 @@ import shlex
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -226,8 +227,10 @@ def _environment_file_paths(unit_texts: dict[str, str]) -> list[Path]:
     return paths
 
 
-def _load_environment_files(paths: list[Path]) -> list[str]:
+@contextmanager
+def _environment_file_scope(paths: list[Path]):
     loaded: list[str] = []
+    injected: dict[str, str] = {}
     for path in paths:
         if not path.exists():
             continue
@@ -255,16 +258,25 @@ def _load_environment_files(paths: list[Path]) -> list[str]:
                 and value[0] in {"'", '"'}
             ):
                 value = value[1:-1]
-            os.environ.setdefault(key, value)
-    return loaded
+            if key not in os.environ:
+                os.environ[key] = value
+                injected[key] = value
+    try:
+        yield loaded
+    finally:
+        for key, value in injected.items():
+            if os.environ.get(key) == value:
+                os.environ.pop(key, None)
 
 
-def _load_systemd_environment_files(unit_dir: str) -> list[str]:
+@contextmanager
+def _systemd_environment_file_scope(unit_dir: str):
     unit_texts = {
         name: _try_read_unit(unit_dir, name)
         for name in SERVICE_NAMES
     }
-    return _load_environment_files(_environment_file_paths(unit_texts))
+    with _environment_file_scope(_environment_file_paths(unit_texts)) as loaded:
+        yield loaded
 
 
 def _git_head(project_dir: str = "/opt/lightfee-v2") -> str:
@@ -4832,8 +4844,6 @@ def run_diagnose(
 
     deploy_status = _build_deploy_status(runtime_dir)
     service_status = _build_service_status(unit_dir)
-    exchange_truth_env_files_loaded = _load_systemd_environment_files(unit_dir)
-
     if event_paths:
         event_files = [Path(p) for p in event_paths]
     else:
@@ -4872,11 +4882,12 @@ def run_diagnose(
     if symbol and symbol not in pos_symbols:
         pos_symbols.append(symbol)
 
-    exchange_truth = _build_exchange_truth(
-        runtime_dir,
-        pos_symbols if pos_symbols else [],
-        venues if venues is not None else (pos_venues if pos_venues else None),
-    )
+    with _systemd_environment_file_scope(unit_dir) as exchange_truth_env_files_loaded:
+        exchange_truth = _build_exchange_truth(
+            runtime_dir,
+            pos_symbols if pos_symbols else [],
+            venues if venues is not None else (pos_venues if pos_venues else None),
+        )
 
     state_consistency = _build_state_consistency(local_state, exchange_truth)
     resolved_order_truth_gap_summary = _build_resolved_order_truth_gap_summary(

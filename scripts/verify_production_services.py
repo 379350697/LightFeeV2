@@ -26,6 +26,7 @@ from lightfee.ops.production_health import (
     summarize_reports,
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
+from scripts.diagnose_live import _environment_file_scope
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 
@@ -55,35 +56,6 @@ def _environment_file_paths(unit_texts: dict[str, str]) -> list[Path]:
                 if path:
                     paths.append(Path(path))
     return paths
-
-
-def _load_environment_files(paths: list[Path]) -> list[str]:
-    loaded: list[str] = []
-    for path in paths:
-        if not path.exists():
-            continue
-        loaded.append(str(path))
-        for raw in path.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].strip()
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not key or not key.replace("_", "").isalnum():
-                continue
-            value = value.strip()
-            if (
-                len(value) >= 2
-                and value[0] == value[-1]
-                and value[0] in {"'", '"'}
-            ):
-                value = value[1:-1]
-            os.environ.setdefault(key, value)
-    return loaded
 
 
 def _exchange_truth_probe_timeout_s() -> float:
@@ -149,32 +121,31 @@ def _attach_exchange_truth_if_missing(
         return state
 
     env_files = _environment_file_paths(unit_texts)
-    loaded_env_files = _load_environment_files(env_files)
-
     if exchange_truth_builder is None:
         from scripts.diagnose_live import _build_exchange_truth
         exchange_truth_builder = _build_exchange_truth
 
     runtime_dir = str(Path(current_state_path).resolve().parent)
     enriched = dict(state)
-    try:
-        exchange_truth = normalize_exchange_truth_payload(
-            _call_exchange_truth_builder_with_timeout(
-                exchange_truth_builder,
-                runtime_dir,
+    with _environment_file_scope(env_files) as loaded_env_files:
+        try:
+            exchange_truth = normalize_exchange_truth_payload(
+                _call_exchange_truth_builder_with_timeout(
+                    exchange_truth_builder,
+                    runtime_dir,
+                )
             )
-        )
-    except Exception as exc:
-        exchange_truth = normalize_exchange_truth_payload(
-            {
-                "available": False,
-                "confidence": "low",
-                "positions": {},
-                "open_orders": {},
-                "errors": [str(exc)[:500]],
-                "missing_evidence": ["exchange_truth_fetch_failed"],
-            }
-        )
+        except Exception as exc:
+            exchange_truth = normalize_exchange_truth_payload(
+                {
+                    "available": False,
+                    "confidence": "low",
+                    "positions": {},
+                    "open_orders": {},
+                    "errors": [str(exc)[:500]],
+                    "missing_evidence": ["exchange_truth_fetch_failed"],
+                }
+            )
     enriched["exchange_truth"] = exchange_truth
     enriched["exchange_truth_source"] = "verify_production_services_probe"
     enriched["exchange_truth_env_files_loaded"] = loaded_env_files

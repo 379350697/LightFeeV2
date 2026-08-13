@@ -16,7 +16,7 @@ Responsibilities:
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 
 from lightfee.marketdata.l2 import (
@@ -29,6 +29,10 @@ from lightfee.marketdata.l2 import (
     LocalL2Update,
     LocalL2UpdateKind,
     LocalL2UpdateResult,
+)
+from lightfee.marketdata.local_l2_policy import (
+    policy_for_venue,
+    sequence_range_overlaps_expected,
 )
 
 
@@ -339,6 +343,29 @@ class LocalL2Runtime:
                 now_ms=effective_ms,
             )
         else:
+            # Aster's V1 live path accepts its stale `pu` when the ranged
+            # update already covers this book's next required sequence.  Do the
+            # normalization at the shared book-owner boundary so live WS and
+            # buffered replay cannot interpret that one exchange fact differently.
+            policy = policy_for_venue(update.venue)
+            first_sequence = (
+                update.first_sequence
+                if update.first_sequence > 0
+                else update.sequence
+            )
+            if (
+                policy.allows_overlapping_previous_link
+                and book.sequence > 0
+                and update.previous_sequence != book.sequence
+                and sequence_range_overlaps_expected(
+                    first_sequence, update.sequence, book.sequence + 1,
+                )
+            ):
+                update = replace(
+                    update,
+                    previous_sequence=book.sequence,
+                    previous_sequence_present=True,
+                )
             return book.apply_delta(
                 update.bids, update.asks,
                 sequence=update.sequence,

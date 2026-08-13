@@ -424,6 +424,7 @@ class EntryLocalL2SessionRuntime:
             symbol=opp.symbol,
             now_ms=now_ms,
             primary=opp.class_ == TrackedOpportunityClass.PRIMARY,
+            demote_primary=opp.class_ == TrackedOpportunityClass.SHADOW,
         )
 
     def track_pair(
@@ -435,6 +436,7 @@ class EntryLocalL2SessionRuntime:
         symbol: str,
         now_ms: int,
         primary: bool = False,
+        demote_primary: bool = False,
     ) -> EntryLocalL2Session:
         """Create or refresh the exact two-leg session for one owned pair.
 
@@ -446,7 +448,11 @@ class EntryLocalL2SessionRuntime:
         session.ensure_leg(long_venue, symbol)
         session.ensure_leg(short_venue, symbol)
         if primary:
-            session.primary_assigned_at_ms = now_ms
+            if session.primary_assigned_at_ms <= 0:
+                session.primary_assigned_at_ms = now_ms
+            self.mark_sticky_prewarm(pair_id)
+        elif demote_primary:
+            session.primary_assigned_at_ms = 0
         return session
 
     def ready_pair_legs(
@@ -484,6 +490,25 @@ class EntryLocalL2SessionRuntime:
         if session is not None:
             session.state = EntryLocalL2SessionState.CLOSED
 
+    def mark_sticky_prewarm(self, pair_id: str) -> None:
+        """Retain a recent primary's session across a rank-churn scan.
+
+        This mirrors V1's bounded sticky prewarm set.  It preserves the
+        session owner only; a pair remains entry-eligible only while it is in
+        the current primary tracked scope.
+        """
+        self.sticky_pair_ids.add(pair_id)
+        while len(self.sticky_pair_ids) > 64:
+            self.sticky_pair_ids.remove(min(self.sticky_pair_ids))
+
+    def close_missing(self, active_pair_ids: set[str]) -> None:
+        """Close sessions that are neither currently tracked nor sticky."""
+        for pair_id, session in list(self.sessions.items()):
+            if pair_id in active_pair_ids or pair_id in self.sticky_pair_ids:
+                continue
+            session.state = EntryLocalL2SessionState.CLOSED
+            self.sessions.pop(pair_id, None)
+
     def remove_session(self, pair_id: str) -> None:
         self.sessions.pop(pair_id, None)
         self.sticky_pair_ids.discard(pair_id)
@@ -505,26 +530,54 @@ def make_candidate_pair_id(symbol: str, long_venue: str, short_venue: str) -> st
 
 
 def select_tracked_opportunities(
-    candidates: list, primary_count: int, shadow_count: int
+    candidates: list,
+    primary_count: int,
+    shadow_count: int,
+    *,
+    previous_primary_pair_ids: set[str] | None = None,
 ) -> list[TrackedOpportunity]:
     """Select primary and shadow tracked opportunities from candidates.
 
-    Top primary_count become PRIMARY, next shadow_count become SHADOW.
+    Keep an existing primary in the current tracked scope before filling the
+    remaining primary slots by rank.  This is V1's hold-window ownership rule:
+    a normal rank shuffle must not cold-start an otherwise still tracked book.
     Uses stable pair_id from make_candidate_pair_id() when candidate lacks one.
     """
     tracked_count = primary_count + shadow_count
+    selected = candidates[:tracked_count]
+    previous_primary_pair_ids = previous_primary_pair_ids or set()
+
+    pair_ids: list[str] = []
+    for candidate in selected:
+        symbol = getattr(candidate, "symbol", "")
+        long_venue = str(getattr(candidate, "long_venue", ""))
+        short_venue = str(getattr(candidate, "short_venue", ""))
+        pair_id = getattr(candidate, "pair_id", None)
+        pair_ids.append(
+            pair_id or make_candidate_pair_id(symbol, long_venue, short_venue)
+        )
+
+    primary_indexes: set[int] = set()
+    for index, pair_id in enumerate(pair_ids):
+        if len(primary_indexes) >= primary_count:
+            break
+        if pair_id in previous_primary_pair_ids:
+            primary_indexes.add(index)
+    for index in range(len(selected)):
+        if len(primary_indexes) >= primary_count:
+            break
+        primary_indexes.add(index)
+
     result: list[TrackedOpportunity] = []
-    for i, c in enumerate(candidates[:tracked_count]):
+    for i, c in enumerate(selected):
         class_ = (
-            TrackedOpportunityClass.PRIMARY if i < primary_count
+            TrackedOpportunityClass.PRIMARY if i in primary_indexes
             else TrackedOpportunityClass.SHADOW
         )
         symbol = getattr(c, "symbol", "")
         long_venue = str(getattr(c, "long_venue", ""))
         short_venue = str(getattr(c, "short_venue", ""))
-        pair_id = getattr(c, "pair_id", None)
-        if not pair_id:
-            pair_id = make_candidate_pair_id(symbol, long_venue, short_venue)
+        pair_id = pair_ids[i]
         result.append(TrackedOpportunity(
             pair_id=pair_id,
             symbol=symbol,

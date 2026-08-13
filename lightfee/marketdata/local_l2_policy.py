@@ -23,6 +23,17 @@ class ReplayLinkKind(Enum):
     INVALID = "invalid"
 
 
+def sequence_range_overlaps_expected(
+    first_sequence: int, sequence: int, expected_sequence: int,
+) -> bool:
+    """Whether a ranged delta contains the next sequence required locally."""
+    return (
+        first_sequence > 0
+        and sequence > 0
+        and first_sequence <= expected_sequence <= sequence
+    )
+
+
 @dataclass(frozen=True)
 class LocalL2VenuePolicy:
     venue: str
@@ -30,6 +41,7 @@ class LocalL2VenuePolicy:
     pre_snapshot_buffer_cap: int
     rest_snapshot_sequence_comparable: bool = True
     replay_rest_snapshot_with_ws_deltas: bool = True
+    allows_overlapping_previous_link: bool = False
 
     def classify_replay_link(
         self,
@@ -65,11 +77,18 @@ class LocalL2VenuePolicy:
 
 def policy_for_venue(venue: str) -> LocalL2VenuePolicy:
     normalized = str(venue).lower()
-    if normalized in {"binance", "aster"}:
+    if normalized == "binance":
         return LocalL2VenuePolicy(
             venue=normalized,
             bridge_mode=BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
             pre_snapshot_buffer_cap=V1_BINANCE_BUFFER_CAP,
+        )
+    if normalized == "aster":
+        return LocalL2VenuePolicy(
+            venue=normalized,
+            bridge_mode=BridgeMode.REST_SNAPSHOT_BUFFERED_REPLAY,
+            pre_snapshot_buffer_cap=V1_BINANCE_BUFFER_CAP,
+            allows_overlapping_previous_link=True,
         )
     if normalized == "okx":
         return LocalL2VenuePolicy(

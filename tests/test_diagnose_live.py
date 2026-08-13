@@ -2572,6 +2572,8 @@ def test_run_diagnose_loads_exchange_truth_credentials_from_systemd_env_file(tmp
     assert seen["api_secret"] == "secret-from-systemd"
     assert result["exchange_truth_env_files_loaded"] == [str(env_file)]
     assert result["exchange_truth"]["available"] is True
+    assert "LIGHTFEE_BYBIT_API_KEY" not in os.environ
+    assert "LIGHTFEE_BYBIT_API_SECRET" not in os.environ
 
 
 def test_diagnose_recovery_decision_treats_count_only_pending_as_required_work():

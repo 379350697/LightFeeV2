@@ -30,7 +30,11 @@ from lightfee.marketdata.l2 import (
     LocalL2Update,
     LocalL2UpdateKind,
 )
-from lightfee.marketdata.local_l2_policy import BridgeMode, policy_for_venue
+from lightfee.marketdata.local_l2_policy import (
+    BridgeMode,
+    policy_for_venue,
+    sequence_range_overlaps_expected,
+)
 from lightfee.marketdata.local_l2_runtime import LocalL2Runtime, RuntimeFaultKind
 from lightfee.venues.transport import TransportError, TransportErrorCategory
 from lightfee.persistence.journal import Journal
@@ -911,8 +915,16 @@ class LocalL2DataPlane:
             else:
                 first_sequence = update.sequence
 
+        policy = policy_for_venue(update.venue)
+        overlaps_expected = sequence_range_overlaps_expected(
+            first_sequence, update.sequence, expected,
+        )
+
         if update.previous_sequence_present or update.previous_sequence > 0:
-            if update.previous_sequence != book.sequence:
+            if (
+                update.previous_sequence != book.sequence
+                and not (policy.allows_overlapping_previous_link and overlaps_expected)
+            ):
                 self._mark_rebuilding_from_stream_gap(
                     book,
                     update,
@@ -1171,15 +1183,37 @@ class LocalL2DataPlane:
                 and bu.update.previous_sequence > 0
             )
 
-            # Binance/Aster strict continuity: for every replayed event, pu must
-            # equal the previous accepted u. Range overlap can bridge a snapshot,
-            # but it must never excuse a broken previous-link chain.
-            if has_previous_link and bu.update.previous_sequence != previous_sequence:
+            first_id = (
+                bu.update.first_sequence
+                if bu.update.first_sequence > 0
+                else bu.update.previous_sequence + 1 if bu.update.previous_sequence > 0
+                else bu.update.sequence
+            )
+            overlaps_expected = sequence_range_overlaps_expected(
+                first_id,
+                bu.update.sequence,
+                previous_sequence + 1,
+            )
+
+            # V1 keeps Binance/Gate strict.  Aster accepts a stale `pu` only
+            # when its U..u range contains the next local sequence.
+            accepts_overlap = (
+                policy.allows_overlapping_previous_link and overlaps_expected
+            )
+            if (
+                has_previous_link
+                and bu.update.previous_sequence != previous_sequence
+                and not accepts_overlap
+            ):
                 reason = (
                     f"buffered_replay_previous_link_mismatch: expected {previous_sequence} "
                     f"got {bu.update.previous_sequence}"
                 )
-                if i == start_index and expected < bu.update.previous_sequence + 1:
+                if (
+                    i == start_index
+                    and expected < bu.update.previous_sequence + 1
+                    and not accepts_overlap
+                ):
                     reason = (
                         f"buffered_replay_snapshot_boundary: expected {expected} "
                         f"got {bu.update.previous_sequence + 1}"
@@ -1199,7 +1233,12 @@ class LocalL2DataPlane:
                     replay_index=i,
                 )
 
-            if i == start_index and has_previous_link and expected < bu.update.previous_sequence + 1:
+            if (
+                i == start_index
+                and has_previous_link
+                and expected < bu.update.previous_sequence + 1
+                and not accepts_overlap
+            ):
                 # First replay: gap between snapshot and first buffered
                 reason = (
                     f"buffered_replay_snapshot_boundary: expected {expected} got {bu.update.previous_sequence + 1}"

@@ -33,10 +33,10 @@ def official_local_book_doc_url(venue: Any) -> str:
 def official_sequence_rebuild_reason(payload: dict[str, Any]) -> str:
     """Classify Binance-compatible local-book continuity evidence.
 
-    Binance and Aster diff-depth semantics require `pu` to match the previous
-    update's `u`; a mismatch or an unbridged snapshot boundary requires a
-    local-book rebuild. A real sequence skip after a valid previous link is
-    also an exchange-continuity rebuild, not a parser relaxation point.
+    Binance requires `pu` to match the previous update's `u`.  Aster's V1
+    live path has one narrower rule: a stale `pu` is not a rebuild when its
+    `U..u` range already covers the next expected local sequence.  A real
+    sequence skip after a valid previous link remains a rebuild.
     """
 
     venue = str(payload.get("venue", "") or "").lower()
@@ -61,6 +61,8 @@ def official_sequence_rebuild_reason(payload: dict[str, Any]) -> str:
         snapshot_last_update_id = _int_payload(payload, "snapshot_lastUpdateId")
 
     if raw_pu != expected_previous:
+        if venue == "aster" and raw_U <= expected_previous + 1 <= raw_u:
+            return ""
         if snapshot_last_update_id is not None and expected_previous < snapshot_last_update_id:
             return ""
         return "previous_link_mismatch"

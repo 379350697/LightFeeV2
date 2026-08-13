@@ -96,6 +96,20 @@ def test_okx_checksum_mismatch_uses_official_data_integrity_classification():
     assert official_sequence_rebuild_reason(payload) == "checksum_mismatch"
 
 
+def test_aster_overlap_is_not_official_rebuild_evidence():
+    payload = {
+        "venue": "aster",
+        "symbol": "ASTERUSDT",
+        "previous_sequence_present": True,
+        "expected_previous_sequence": 100,
+        "raw_U": 101,
+        "raw_u": 103,
+        "raw_pu": 99,
+    }
+
+    assert official_sequence_rebuild_reason(payload) == ""
+
+
 def test_existing_replay_fixtures_do_not_require_stale_threshold_relaxation():
     bybit_fixture = json.loads(
         (FIXTURES / "bybit_irysusdt_rest_ws_sequence_domain.json").read_text()

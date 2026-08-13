@@ -17,6 +17,19 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-105 Local-L2 decision-time/Aster-overlap/primary-ownership repair,
+2026-08-14: an awaited scan reused its start time for Local-L2 decisions, so a
+fresh WS book could look future-dated and rebuild; Aster's V1-covered `U..u`
+range was rejected as a `pu` mismatch in both live and buffered paths; and
+rank churn reset primary ownership every round.  Decision time is now fresh at
+the Local-L2 and final-entry boundaries, the existing venue policy admits only
+the V1-covered Aster range (Binance/OKX/Gate remain strict), and the existing
+primary/session owner preserves actual holds across rank churn.  Real runtime
+and DataPlane harnesses plus the Local-L2 profile pass locally. This is
+**implemented, locally validated**; cloud deployment/read-only verification is
+still required. See
+[daily/2026-08-14.md#cluster-cl-105-local-l2-decision-time-aster-overlap-primary-ownership](daily/2026-08-14.md#cluster-cl-105-local-l2-decision-time-aster-overlap-primary-ownership).
+
 CL-104 Local-L2 ownership/degraded-snapshot parity, 2026-08-13: V2 had three
 related entry-L2 drifts: it discarded V1's persisted pending pair identity,
 rejected a fresh valid retained snapshot solely because its feed was degraded,

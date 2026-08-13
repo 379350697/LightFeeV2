@@ -17,7 +17,6 @@ from lightfee.marketdata.l2 import (
 )
 from lightfee.marketdata.local_l2_data_plane import LocalL2DataPlane
 from lightfee.marketdata.local_l2_incident_classification import (
-    ASTER_LOCAL_BOOK_DOC,
     BINANCE_LOCAL_BOOK_DOC,
     official_local_book_doc_url,
     official_sequence_rebuild_reason,
@@ -96,6 +95,36 @@ def _has_required_binance_replay_evidence(payload: dict) -> bool:
     return all(payload.get(field) is not None for field in BINANCE_REPLAY_REQUIRED_FIELDS)
 
 
+def _aster_overlap_v1_parity_drift(
+    *,
+    event_kind: str,
+    venue: str,
+    raw_U: int | None,
+    raw_u: int | None,
+    expected_previous: int | None,
+) -> IncidentClassification | None:
+    if not (
+        venue == "aster"
+        and raw_U is not None
+        and raw_u is not None
+        and expected_previous is not None
+        and raw_U <= expected_previous + 1 <= raw_u
+    ):
+        return None
+    return IncidentClassification(
+        event_kind=event_kind,
+        classification="V1 parity drift",
+        evidence=(
+            "CL-L2-ASTER-OVERLAP: V1 accepts an Aster U..u range "
+            "that covers the next expected sequence despite a stale pu."
+        ),
+        v1_behavior="accept overlapping Aster ranged delta",
+        v2_behavior="rebuilt on stale previous-link before applying range",
+        proven_local_l2_drift=True,
+        data_plane_change_allowed=True,
+    )
+
+
 def classify_local_l2_incident(sample: dict) -> IncidentClassification:
     kind = str(sample["kind"])
     payload = sample.get("payload", {})
@@ -124,6 +153,15 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
             and raw_U <= raw_u
         )
         doc_url = official_local_book_doc_url(venue)
+        aster_v1_drift = _aster_overlap_v1_parity_drift(
+            event_kind=kind,
+            venue=venue,
+            raw_U=raw_U,
+            raw_u=raw_u,
+            expected_previous=expected_previous,
+        )
+        if aster_v1_drift is not None:
+            return aster_v1_drift
         official_reason = official_sequence_rebuild_reason(payload)
         if doc_url and venue == "okx" and official_reason in {
             "previous_link_mismatch",
@@ -186,6 +224,15 @@ def classify_local_l2_incident(sample: dict) -> IncidentClassification:
             and raw_U > snapshot_last_update_id
         )
         doc_url = official_local_book_doc_url(venue)
+        aster_v1_drift = _aster_overlap_v1_parity_drift(
+            event_kind=kind,
+            venue=venue,
+            raw_U=raw_U,
+            raw_u=raw_u,
+            expected_previous=expected_previous,
+        )
+        if aster_v1_drift is not None:
+            return aster_v1_drift
         official_reason = official_sequence_rebuild_reason(payload)
         if doc_url and venue == "okx" and official_reason in {
             "previous_link_mismatch",
@@ -342,7 +389,7 @@ def test_binance_buffered_replay_samples_require_raw_sequence_and_status_evidenc
         assert result.stale_threshold_change_allowed is False
 
 
-def test_aster_buffered_replay_previous_link_mismatch_uses_official_doc_classification():
+def test_aster_overlap_previous_link_is_v1_parity_drift_not_an_exchange_reset():
     sample = {
         "kind": "runtime.local_l2_snapshot_error",
         "payload": {
@@ -363,10 +410,10 @@ def test_aster_buffered_replay_previous_link_mismatch_uses_official_doc_classifi
 
     result = classify_local_l2_incident(sample)
 
-    assert result.classification == "official-doc exchange reset/sequence behavior"
-    assert result.official_doc_url == ASTER_LOCAL_BOOK_DOC
+    assert result.classification == "V1 parity drift"
+    assert result.official_doc_url == ""
     assert result.evidence_gap is False
-    assert result.data_plane_change_allowed is False
+    assert result.data_plane_change_allowed is True
     assert result.stale_threshold_change_allowed is False
 
 
@@ -380,12 +427,13 @@ class _RecordingJournal:
 
 
 class _MockL2Adapter:
-    def __init__(self, sequence: int):
+    def __init__(self, venue: str, sequence: int):
+        self.venue = venue
         self.sequence = sequence
 
     async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
         return LocalL2Update(
-            venue="binance",
+            venue=self.venue,
             symbol=symbol,
             bids=[PriceLevel(100.0, 1.0)],
             asks=[PriceLevel(101.0, 1.0)],
@@ -425,7 +473,7 @@ async def test_binance_buffered_replay_mismatch_rebuilds_without_entry_readiness
     ok = await dp.bootstrap_book(
         "binance",
         "EDENUSDT",
-        _MockL2Adapter(sequence=100),
+        _MockL2Adapter("binance", sequence=100),
         now_ms=2000,
     )
 
@@ -450,7 +498,7 @@ async def test_binance_buffered_replay_mismatch_rebuilds_without_entry_readiness
     recovered = await dp.bootstrap_book(
         "binance",
         "EDENUSDT",
-        _MockL2Adapter(sequence=200),
+        _MockL2Adapter("binance", sequence=200),
         now_ms=3000,
     )
 
@@ -463,3 +511,121 @@ async def test_binance_buffered_replay_mismatch_rebuilds_without_entry_readiness
         and payload.get("venue") == "binance"
         and payload.get("symbol") == "EDENUSDT"
     ]
+
+
+@pytest.mark.asyncio
+async def test_aster_overlapping_previous_link_survives_ws_and_buffered_replay():
+    """Production Local-L2 harness for the Aster U..u overlap V1 accepts.
+
+    Aster's `pu` can lag the local sequence while its `U..u` range already
+    contains the next required sequence.  V1 accepts that update both while
+    hot and during REST-snapshot buffered replay; V2 used to rebuild in both
+    paths and permanently block the owned entry session.
+    """
+    update = LocalL2Update(
+        venue="aster",
+        symbol="ASTERUSDT",
+        bids=[PriceLevel(100.0, 1.0)],
+        asks=[PriceLevel(101.0, 1.0)],
+        first_sequence=101,
+        sequence=103,
+        previous_sequence=99,
+        previous_sequence_present=True,
+        update_kind=LocalL2UpdateKind.DELTA,
+    )
+
+    hot_runtime = LocalL2Runtime()
+    hot_plane = LocalL2DataPlane(hot_runtime, _RecordingJournal())
+    hot_book = hot_runtime.ensure_book("aster", "ASTERUSDT")
+    hot_book.apply_snapshot(
+        [PriceLevel(100.0, 1.0)], [PriceLevel(101.0, 1.0)],
+        sequence=100, now_ms=1_000,
+    )
+    hot_book.status = L2BookStatus.BOOTSTRAPPING
+    hot_book.transition_to_hot()
+    hot_plane.ingest_external_update(update, now_ms=1_100)
+
+    assert hot_book.status == L2BookStatus.HOT
+    assert hot_book.sequence == 103
+
+    replay_runtime = LocalL2Runtime()
+    replay_plane = LocalL2DataPlane(replay_runtime, _RecordingJournal())
+    replay_book = replay_runtime.ensure_book("aster", "ASTERUSDT")
+    replay_book.status = L2BookStatus.BOOTSTRAPPING
+    replay_plane.ingest_external_update(update, now_ms=1_100)
+
+    recovered = await replay_plane.bootstrap_book(
+        "aster", "ASTERUSDT", _MockL2Adapter("aster", sequence=100), now_ms=1_200,
+    )
+
+    assert recovered is True
+    assert replay_book.status == L2BookStatus.HOT
+    assert replay_book.sequence == 103
+
+
+def test_aster_uncovered_range_still_rebuilds_fail_closed():
+    runtime = LocalL2Runtime()
+    data_plane = LocalL2DataPlane(runtime, _RecordingJournal())
+    book = runtime.ensure_book("aster", "ASTERUSDT")
+    book.apply_snapshot(
+        [PriceLevel(100.0, 1.0)], [PriceLevel(101.0, 1.0)],
+        sequence=100, now_ms=1_000,
+    )
+    book.status = L2BookStatus.BOOTSTRAPPING
+    book.transition_to_hot()
+
+    data_plane.ingest_external_update(
+        LocalL2Update(
+            venue="aster",
+            symbol="ASTERUSDT",
+            bids=[PriceLevel(100.0, 1.0)],
+            asks=[PriceLevel(101.0, 1.0)],
+            first_sequence=102,
+            sequence=103,
+            previous_sequence=99,
+            previous_sequence_present=True,
+            update_kind=LocalL2UpdateKind.DELTA,
+        ),
+        now_ms=1_100,
+    )
+
+    assert book.status == L2BookStatus.REBUILDING
+
+
+@pytest.mark.asyncio
+async def test_runtime_l2_sync_uses_decision_time_not_tick_start_time(tmp_path, monkeypatch):
+    """Production runtime harness for an async tick crossing the clock domain.
+
+    The old tick timestamp is intentionally 12 seconds behind a fresh WS book;
+    only using the decision-time clock must keep the book HOT.  A real future
+    observed timestamp remains covered by the data-plane stale-clock test.
+    """
+    from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
+    from lightfee.engine.runtime import LiveRuntime
+
+    runtime = LiveRuntime(
+        AppConfig(
+            runtime=RuntimeConfig(
+                mode="live",
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            ),
+            strategy=StrategyConfig(local_l2_enabled=True, local_l2_ws_enabled=True),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+        )
+    )
+    runtime.l2_data_plane.hot_stale_after_ms = 60_000
+    book = runtime.local_l2_runtime.ensure_book("binance", "BTCUSDT")
+    book.apply_snapshot(
+        [PriceLevel(100.0, 1.0)], [PriceLevel(101.0, 1.0)],
+        sequence=10, now_ms=12_000,
+    )
+    book.status = L2BookStatus.BOOTSTRAPPING
+    book.transition_to_hot()
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 13_000)
+
+    await runtime._sync_local_l2_data(1_000)
+
+    assert book.status == L2BookStatus.HOT

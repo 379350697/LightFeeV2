@@ -373,6 +373,59 @@ class TestSessionRuntime:
         session = rt.track_opportunity(opp, now_ms=10000)
         assert session.primary_assigned_at_ms == 10000
 
+    def test_retracking_primary_preserves_hold_start_and_demotion_clears_it(self):
+        rt = EntryLocalL2SessionRuntime()
+        primary = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=15.0, class_=TrackedOpportunityClass.PRIMARY,
+        )
+        shadow = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=15.0, class_=TrackedOpportunityClass.SHADOW,
+        )
+
+        session = rt.track_opportunity(primary, now_ms=10_000)
+        rt.track_opportunity(primary, now_ms=20_000)
+        assert session.primary_assigned_at_ms == 10_000
+
+        rt.track_opportunity(shadow, now_ms=30_000)
+        assert session.primary_assigned_at_ms == 0
+
+        rt.track_opportunity(primary, now_ms=40_000)
+        assert session.primary_assigned_at_ms == 40_000
+
+    def test_pending_session_reuse_does_not_demote_primary(self):
+        rt = EntryLocalL2SessionRuntime()
+        primary = TrackedOpportunity(
+            pair_id="p1", symbol="BTCUSDT",
+            long_venue="binance", short_venue="bybit",
+            ranking_edge_bps=15.0, class_=TrackedOpportunityClass.PRIMARY,
+        )
+        session = rt.track_opportunity(primary, now_ms=10_000)
+
+        rt.track_pair(
+            "p1",
+            long_venue="binance",
+            short_venue="bybit",
+            symbol="BTCUSDT",
+            now_ms=20_000,
+        )
+
+        assert session.primary_assigned_at_ms == 10_000
+
+    def test_close_missing_retains_sticky_primary_and_removes_untracked_shadow(self):
+        rt = EntryLocalL2SessionRuntime()
+        rt.get_or_create_session("primary")
+        rt.get_or_create_session("shadow")
+        rt.mark_sticky_prewarm("primary")
+
+        rt.close_missing(active_pair_ids=set())
+
+        assert "primary" in rt.sessions
+        assert "shadow" not in rt.sessions
+
     def test_track_opportunity_does_not_timestamp_or_mark_legs_ready(self):
         rt = EntryLocalL2SessionRuntime()
         opp = TrackedOpportunity(
@@ -558,6 +611,70 @@ class TestSelectTrackedOpportunities:
         assert result[0].class_ == TrackedOpportunityClass.PRIMARY
         assert result[1].class_ == TrackedOpportunityClass.PRIMARY
         assert result[2].class_ == TrackedOpportunityClass.SHADOW
+
+    def test_rank_churn_does_not_demote_a_still_tracked_primary(self):
+        class MockCandidate:
+            def __init__(self, pair_id, symbol, edge):
+                self.pair_id = pair_id
+                self.symbol = symbol
+                self.long_venue = "binance"
+                self.short_venue = "bybit"
+                self.ranking_edge_bps = edge
+
+        result = select_tracked_opportunities(
+            [
+                MockCandidate("new-top", "ETH", 20.0),
+                MockCandidate("existing-primary", "BTC", 19.0),
+            ],
+            primary_count=1,
+            shadow_count=1,
+            previous_primary_pair_ids={"existing-primary"},
+        )
+
+        classes = {opportunity.pair_id: opportunity.class_ for opportunity in result}
+        assert classes["existing-primary"] == TrackedOpportunityClass.PRIMARY
+        assert classes["new-top"] == TrackedOpportunityClass.SHADOW
+
+    def test_runtime_scope_preserves_primary_across_rank_churn(self, tmp_path):
+        """Exercise LiveRuntime's real scan-to-tracked-scope wiring."""
+        from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
+        from lightfee.engine.runtime import LiveRuntime
+
+        class Candidate:
+            def __init__(self, pair_id: str, edge: float):
+                self.pair_id = pair_id
+                self.symbol = "BTCUSDT"
+                self.long_venue = "binance"
+                self.short_venue = "bybit"
+                self.ranking_edge_bps = edge
+
+        runtime = LiveRuntime(
+            AppConfig(
+                runtime=RuntimeConfig(
+                    mode="live", sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                ),
+                strategy=StrategyConfig(
+                    local_l2_enabled=True,
+                    entry_local_l2_primary_count=1,
+                    shadow_entry_opportunity_count=1,
+                    max_concurrent_positions=1,
+                ),
+                persistence=PersistenceConfig(
+                    event_log_path=str(tmp_path / "events.jsonl"),
+                    snapshot_path=str(tmp_path / "state.json"),
+                ),
+            )
+        )
+        runtime._tracked_primary_pair_ids = {"existing-primary"}
+
+        tracked, _ = runtime._select_v1_entry_tracked_scope([
+            Candidate("new-top", 20.0),
+            Candidate("existing-primary", 19.0),
+        ])
+
+        classes = {opportunity.pair_id: opportunity.class_ for opportunity in tracked}
+        assert classes["existing-primary"] == TrackedOpportunityClass.PRIMARY
+        assert classes["new-top"] == TrackedOpportunityClass.SHADOW
 
 
 class TestMakeCandidatePairId:

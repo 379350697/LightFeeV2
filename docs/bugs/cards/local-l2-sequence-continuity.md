@@ -17,7 +17,9 @@ Never relax official continuity to make books ready. A local book may be trusted
 
 Classify as official when:
 
-- Binance/Aster `pu` does not match previous `u` after snapshot bridge evidence.
+- Binance `pu` does not match previous `u` after snapshot bridge evidence.
+- Aster `pu` does not match previous `u` **and** its `U..u` range does not
+  cover the next expected local sequence.
 - Binance/Aster update range proves a real skipped update.
 - REST snapshot boundary is not bridged by buffered updates.
 - OKX `prevSeqId/seqId` proves previous-link mismatch or sequence reset.
@@ -38,7 +40,11 @@ Last-good / quote fallback rules:
 
 ## V1 / Exchange Semantics
 
-- Binance/Aster: V1 and exchange docs require `pu == previous u`; mismatch means reinitialize local book.
+- Binance: V1 and exchange docs require `pu == previous u`; mismatch means
+  reinitialize the local book.
+- Aster: V1 accepts a stale `pu` only when `U <= previous_u + 1 <= u`; all
+  other previous-link mismatches remain rebuilds.  This exception is limited
+  to the shared Aster policy and must not be generalized to Binance or Gate.
 - Aster public Local-L2 semantics remain Binance-compatible FAPI. This does not
   imply Aster private account/order APIs are Binance-HMAC compatible; private
   Aster V3 account/order/open-order paths use a separate Web3 signer client.
@@ -57,6 +63,7 @@ Last-good / quote fallback rules:
 | 2026-06-07 | Entry admission prefilter and no-entry stage breakdown | local implementation pending deploy | `runtime.entry_admission_venue_degraded` now summarizes venue-scope admission pruning before Local-L2/quote tracking. `scan.no_entry_diagnostics` includes stage counts for candidate universe, unsupported symbol, entry-admission venue downgrade, snapshot/quote freshness, liquidity, and entry selection. |
 | 2026-06-08 | Structural open-interest degraded evidence | local RED/GREEN, deploy pending | CL-052 adds endpoint, source, floor/current value, fallback source, and targeted revalidate scope to `perp_open_interest_structural` payloads. This is diagnostic evidence only and does not relax Local-L2 sequence continuity or entry dispatch truth requirements. |
 | 2026-06-08 | Whole-snapshot stale quote noise split | local RED/GREEN, deploy pending | CL-056 limits stale quote entry blockers to admission-filtered candidate-leg quote keys and emits non-candidate or admission-blocked stale quote volume as rate-limited `runtime.order_quote_stale_health_summary` with `blocking=false`. |
+| 2026-08-14 | Decision-time/Aster-overlap/primary-owner repair | locally validated; cloud pending | CL-105 restores V1's Aster covered-range acceptance, uses decision-time for Local-L2 readiness, and prevents normal rank churn from resetting an existing primary's hold/session owner. |
 
 ## Recurrences
 
@@ -67,6 +74,7 @@ Last-good / quote fallback rules:
 | 2026-05-30 | Binance `LABUSDT`, `ALLOUSDT`, `IOUSDT`, `HEMIUSDT`; Aster `HMSTRUSDT`; post-fix `HEIUSDT` snapshot errors | `0fd9a74`; no Local-L2 code change selected | no dirty trading state; final affected-symbol probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-05-31 | current run high-volume rebuild/snapshot family across active candidates | no Local-L2 semantic change selected | production state and exchange truth stayed flat/no-open-orders; evidence is insufficient to relax official continuity | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 | 2026-06-08 | production issue 11 snapshot/OI degraded evidence | working tree | local RED/GREEN and full pytest green; deploy pending | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
+| 2026-08-14 | Aster overlap, stale tick clock, rank-churn primary sessions | working tree | deterministic runtime/DataPlane harness and Local-L2 profile green; cloud pending | [daily/2026-08-14.md#cluster-cl-105-local-l2-decision-time-aster-overlap-primary-ownership](../daily/2026-08-14.md#cluster-cl-105-local-l2-decision-time-aster-overlap-primary-ownership) |
 
 ## Regression Harness
 
