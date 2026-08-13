@@ -442,6 +442,19 @@ class EntrySyncExecutor:
         # Determine repost count and zero-fill state from existing pending entry
         pending_entries = self.state.get("pending_entries", {})
         existing = pending_entries.get(ctx.entry_id)
+        existing_metadata = (
+            getattr(existing, "metadata", {})
+            if existing is not None and hasattr(existing, "metadata")
+            else existing.get("metadata", {}) if isinstance(existing, dict) else {}
+        )
+        if not isinstance(existing_metadata, dict):
+            existing_metadata = {}
+        pair_id = str(
+            getattr(ctx, "pair_id", "")
+            or existing_metadata.get("pair_id", "")
+            or f"{ctx.symbol.lower()}:{ctx.long_venue.value}->{ctx.short_venue.value}"
+        )
+        pending_metadata = {**existing_metadata, "pair_id": pair_id}
         if existing is not None and repost_count == 0:
             repost_count = (
                 getattr(existing, "repost_count", 0)
@@ -527,6 +540,7 @@ class EntrySyncExecutor:
             long_side=Side.BUY,
             short_side=Side.SELL,
             created_at_ms=now_ms,
+            metadata=pending_metadata,
             maker_order_id=maker_order_id,
             hedge_order_id=hedge_order_id,
             maker_client_order_id=maker_req.client_order_id or "",

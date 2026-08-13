@@ -114,7 +114,6 @@ def _ctx() -> MagicMock:
         "_try_abandon_stale_pending_close_reconciliation",
         "_venue_private_position_confirmed",
         "_open_positions_private_confirmation_ready",
-        "_resolve_ws_bbo_close_mid",
         "_resolve_local_l2_mid",
     ):
         setattr(ctx, attr, None)

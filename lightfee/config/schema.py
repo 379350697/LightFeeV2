@@ -8,13 +8,6 @@ from typing import Optional
 
 # V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
 _GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
-ENTRY_READINESS_PROVIDERS = (
-    "local_l2",
-    "rest_top_book",
-    "quote_lease",
-    "ws_top_book",
-    "ws_bbo_quote_lease",
-)
 V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE = 1_000_000.0
 V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE = {
     "bitget": 2_000_000.0,
@@ -213,10 +206,9 @@ class StrategyConfig:
     pending_entry_force_terminal_after_ms: int = 60000
     pending_entry_hard_ceiling_ms: int = 120000
     pending_entry_zero_fill_terminal_cooldown_ms: int = 30000  # V1 default (CONTRACT RECOVERY-004)
-    # Entry book readiness uses entry_local_l2_book_stale_after_ms first, then
-    # local_l2_quiet_book_grace_ms/local_l2_max_age_ms when explicitly set,
-    # and finally a 300s fallback so quiet HOT books do not flap.
-    entry_local_l2_book_stale_after_ms: int = 0
+    # V1's effective entry-local-L2 freshness window is 10 seconds.  Explicit
+    # legacy aliases still override it when supplied.
+    entry_local_l2_book_stale_after_ms: int = 10_000
     local_l2_quiet_book_grace_ms: int = 0
     local_l2_max_age_ms: int = 0
     local_l2_bootstrap_batch_size: int = 4
@@ -235,9 +227,6 @@ class StrategyConfig:
     maker_initial_slice_ratio: float = 0.5
     entry_max_initial_clip_ratio: float = 0.8
     maker_leg_default: str = "buy"
-    entry_readiness_provider: str = "local_l2"
-    entry_quote_lease_ttl_ms: int = 1500
-    entry_ws_bbo_per_venue_budget: int = 10
     entry_volume_floor_default_quote: float = V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE
     entry_volume_floor_quote_by_venue: dict[str, float] = field(
         default_factory=_v1_entry_volume_floor_quote_by_venue

@@ -87,15 +87,8 @@ def _load_strategy(
     runtime: RuntimeConfig | None = None,
 ) -> StrategyConfig:
     cfg = default_strategy()
-    provider_configured = "entry_readiness_provider" in raw
     raw = _normalize_entry_perp_liquidity_thresholds(raw)
     _merge_defaults(cfg, raw)
-    if (
-        runtime is not None
-        and str(getattr(runtime, "mode", "") or "").lower() == "live"
-        and not provider_configured
-    ):
-        cfg.entry_readiness_provider = "ws_bbo_quote_lease"
     return cfg
 
 

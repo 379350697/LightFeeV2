@@ -16,8 +16,13 @@ from lightfee.config.schema import (
     VenueConfig,
 )
 from lightfee.core.domain import AccountFeeSnapshot, Side, Venue
-from lightfee.engine.entry_readiness import EntryReadinessDecision
+from lightfee.engine.entry_local_l2 import (
+    EntryLocalL2SessionState,
+    TrackedOpportunity,
+    TrackedOpportunityClass,
+)
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.state import PendingEntry
 from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
 from lightfee.sidecar.snapshot import CandidateInput, QuoteSnapshot, SidecarSnapshot
 from lightfee.strategy.scoring import price_final_l2_cost
@@ -357,14 +362,16 @@ async def test_live_startup_persists_okx_commission_as_positive_final_l2_cost(tm
 
         now_ms = 10_000
         runtime.state.last_scan = {}
-        _install_hot_book(runtime, "binance", "BTCUSDT", 100.0, 100.0, now_ms)
-        _install_hot_book(runtime, "okx", "BTCUSDT", 100.0, 100.0, now_ms)
-        candidate = _candidate("BTCUSDT", funding_edge_bps=5.0)
+        _install_hot_book(runtime, "binance", "BTCUSDT", 99.9, 100.0, now_ms)
+        _install_hot_book(runtime, "okx", "BTCUSDT", 100.0, 100.1, now_ms)
+        candidate = _candidate("BTCUSDT", funding_edge_bps=-1.0)
+        _track_primary_l2_session(runtime, candidate, now_ms)
 
         assert runtime._reprice_final_l2_candidates([candidate], now_ms) == []
         assert "final_l2_expected_edge_below_floor" in candidate.blocked_reasons
 
-        dual_taker_candidate = _candidate("BTCUSDT", funding_edge_bps=5.0)
+        dual_taker_candidate = _candidate("BTCUSDT", funding_edge_bps=-1.0)
+        _track_primary_l2_session(runtime, dual_taker_candidate, now_ms)
         assert (
             runtime._reprice_final_l2_candidate(
                 dual_taker_candidate,
@@ -602,6 +609,156 @@ def _candidate(symbol: str, funding_edge_bps: float) -> CandidateInput:
     )
 
 
+def _track_primary_l2_session(runtime: LiveRuntime, candidate: CandidateInput, now_ms: int) -> None:
+    """Prepare the same owned session that the live tracked-candidate path creates."""
+    pair_id = runtime._candidate_pair_id(candidate)
+    runtime._tracked_primary_pair_ids.add(pair_id)
+    runtime.entry_l2_sessions.track_opportunity(
+        TrackedOpportunity(
+            pair_id=pair_id,
+            symbol=candidate.symbol,
+            long_venue=candidate.long_venue,
+            short_venue=candidate.short_venue,
+            ranking_edge_bps=candidate.ranking_edge_bps,
+            class_=TrackedOpportunityClass.PRIMARY,
+        ),
+        now_ms,
+    )
+    runtime._refresh_entry_l2_session_readiness(now_ms)
+
+
+def test_final_l2_reprice_requires_the_primary_dual_ready_session_owner(tmp_path):
+    runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={})
+    runtime.state.last_scan = {}
+    now_ms = 10_000
+    candidate = _candidate("BTCUSDT", 10.0)
+    _install_hot_book(runtime, "binance", "BTCUSDT", 99.9, 100.0, now_ms)
+    _install_hot_book(runtime, "okx", "BTCUSDT", 100.1, 100.2, now_ms)
+
+    # A HOT raw book without an owned entry session is not final-cost evidence.
+    assert runtime._reprice_final_l2_candidates([candidate], now_ms) == []
+    assert "final_l2_unavailable" in candidate.blocked_reasons
+
+    _track_primary_l2_session(runtime, candidate, now_ms)
+
+    assert runtime._reprice_final_l2_candidates([candidate], now_ms) == [candidate]
+
+
+@pytest.mark.parametrize(
+    ("session_scope", "stale_leg", "expected_allowed"),
+    [
+        ("unowned", False, False),
+        ("non_primary", False, False),
+        ("primary", True, False),
+        ("primary", False, True),
+    ],
+)
+def test_final_l2_reprice_requires_owned_fresh_dual_ready_session(
+    tmp_path,
+    session_scope,
+    stale_leg,
+    expected_allowed,
+):
+    runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={})
+    runtime.state.last_scan = {}
+    now_ms = 10_000
+    candidate = _candidate("BTCUSDT", 10.0)
+    _install_hot_book(runtime, "binance", "BTCUSDT", 99.9, 100.0, now_ms)
+    _install_hot_book(runtime, "okx", "BTCUSDT", 100.1, 100.2, now_ms)
+
+    if session_scope != "unowned":
+        _track_primary_l2_session(runtime, candidate, now_ms)
+    if session_scope == "non_primary":
+        runtime._tracked_primary_pair_ids.clear()
+    if stale_leg:
+        runtime.local_l2_runtime.get_book("binance", "BTCUSDT").observed_at_ms = (
+            now_ms - runtime._entry_local_l2_stale_after_ms() - 1
+        )
+        runtime._refresh_entry_l2_session_readiness(now_ms)
+
+    assert runtime._reprice_final_l2_candidate(candidate, now_ms) is expected_allowed
+    if not expected_allowed:
+        assert "final_l2_unavailable" in candidate.blocked_reasons
+
+
+@pytest.mark.parametrize(
+    ("degraded", "stale", "crossed", "expected_allowed"),
+    [
+        (True, False, False, True),
+        (True, True, False, False),
+        (True, False, True, False),
+        (False, False, False, True),
+    ],
+)
+def test_final_l2_reprice_uses_valid_degraded_snapshot_and_rejects_invalid_evidence(
+    tmp_path, degraded, stale, crossed, expected_allowed,
+):
+    runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={})
+    runtime.state.last_scan = {}
+    now_ms = 10_000
+    candidate = _candidate("BTCUSDT", 10.0)
+    _install_hot_book(runtime, "binance", "BTCUSDT", 99.9, 100.0, now_ms)
+    _install_hot_book(runtime, "okx", "BTCUSDT", 100.1, 100.2, now_ms)
+    book = runtime.local_l2_runtime.get_book("binance", "BTCUSDT")
+    if degraded:
+        book.transition_to_degraded("transport_failure")
+    if stale:
+        book.observed_at_ms = now_ms - runtime._entry_local_l2_stale_after_ms() - 1
+    if crossed:
+        book.asks[0].price = book.bids[0].price
+
+    _track_primary_l2_session(runtime, candidate, now_ms)
+
+    assert runtime._reprice_final_l2_candidate(candidate, now_ms) is expected_allowed
+    if not expected_allowed:
+        assert "final_l2_unavailable" in candidate.blocked_reasons
+
+
+def test_pending_pair_identity_blocks_primary_promotion_while_executing(tmp_path):
+    """V1 protects the exact persisted pair id, not a re-parsed tuple."""
+    runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={})
+    runtime.config.strategy.primary_min_hold_ms = 0
+    runtime.config.strategy.shadow_promotion_score_delta_bps = 1.0
+    primary = TrackedOpportunity(
+        pair_id="v1:opaque-primary-id",
+        symbol="BTCUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        ranking_edge_bps=10.0,
+        class_=TrackedOpportunityClass.PRIMARY,
+    )
+    shadow = TrackedOpportunity(
+        pair_id="v1:opaque-shadow-id",
+        symbol="ETHUSDT",
+        long_venue="binance",
+        short_venue="okx",
+        ranking_edge_bps=20.0,
+        class_=TrackedOpportunityClass.SHADOW,
+    )
+    runtime._tracked_primary_pair_ids.add(primary.pair_id)
+    runtime.entry_l2_sessions.get_or_create_session(shadow.pair_id).state = (
+        EntryLocalL2SessionState.READY
+    )
+    runtime.state.pending_entries["pending-primary"] = PendingEntry(
+        pending_id="pending-primary",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.OKX,
+        target_quantity=1.0,
+        long_side=Side.BUY,
+        short_side=Side.SELL,
+        created_at_ms=10_000,
+        metadata={"pair_id": primary.pair_id},
+    )
+
+    runtime._apply_shadow_promotion_if_eligible([primary, shadow], now_ms=20_000)
+
+    assert runtime._tracked_pair_is_executing(primary.pair_id)
+    assert primary.class_ == TrackedOpportunityClass.PRIMARY
+    assert shadow.class_ == TrackedOpportunityClass.SHADOW
+    assert runtime._tracked_primary_pair_ids == {primary.pair_id}
+
+
 def test_final_l2_reprice_filters_cost_failures_and_reranks_live_candidates(tmp_path):
     runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={})
     runtime.state.last_scan = {}
@@ -617,6 +774,8 @@ def test_final_l2_reprice_filters_cost_failures_and_reranks_live_candidates(tmp_
 
     _install_hot_book(runtime, "binance", "SECONDUSDT", 99.9, 100.0, now_ms)
     _install_hot_book(runtime, "okx", "SECONDUSDT", 100.1, 100.2, now_ms)
+    for candidate in (good, lower_initial_rank_but_better_final, bad):
+        _track_primary_l2_session(runtime, candidate, now_ms)
 
     repriced = runtime._reprice_final_l2_candidates(
         [good, lower_initial_rank_but_better_final, bad], now_ms
@@ -629,12 +788,7 @@ def test_final_l2_reprice_filters_cost_failures_and_reranks_live_candidates(tmp_
 
 
 def test_final_l2_reprice_is_applied_in_the_final_selection_path(tmp_path):
-    class ReadyCandidate:
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            return EntryReadinessDecision.allow()
-
     runtime = LiveRuntime(_live_config(tmp_path), venue_adapters={})
-    runtime.entry_readiness_provider = ReadyCandidate()
     runtime.journal.open()
     try:
         runtime.state.last_scan = {}
@@ -648,6 +802,7 @@ def test_final_l2_reprice_is_applied_in_the_final_selection_path(tmp_path):
         for candidate in (good, second, bad):
             candidate.first_funding_timestamp_ms = now_ms + 300_000
             candidate.funding_timestamp_ms = now_ms + 300_000
+            _track_primary_l2_session(runtime, candidate, now_ms)
         # Lightweight ranking prefers GOOD before L2 is available; final L2
         # cost must instead rank SECOND first and remove BAD.
         good.ranking_edge_bps = 20.0
@@ -669,138 +824,6 @@ def test_final_l2_reprice_is_applied_in_the_final_selection_path(tmp_path):
     assert runtime.state.last_scan["final_l2_filtered_candidate_count"] == 1
     assert "final_l2_expected_edge_below_floor" in bad.blocked_reasons
 
-
-@pytest.mark.asyncio
-async def test_ws_bbo_tick_activates_candidate_l2_then_reprices_before_dispatch(
-    tmp_path, monkeypatch,
-):
-    """BBO readiness does not suppress the V1 candidate-L2 cost path."""
-    from lightfee.engine.entry import EntryState
-    from lightfee.engine.entry_sync import EntryExecutionResult
-    from lightfee.engine.execution_planner import ExecutionRoute
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-    from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
-
-    class CapturingExecutor:
-        def __init__(self) -> None:
-            self.contexts = []
-
-        async def execute(self, ctx):
-            self.contexts.append(ctx)
-            return EntryExecutionResult(
-                route=ExecutionRoute.PASSIVE_INCREMENTAL,
-                state=EntryState.COMPLETED,
-            )
-
-    now_ms = 10_000
-    config = _live_config(tmp_path)
-    config.runtime.live_scan_recovery_success_count = 1
-    config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-    config.strategy.local_l2_ws_enabled = False
-    config.strategy.entry_window_secs = 480
-    config.strategy.min_scan_minutes_before_funding = 0
-    adapters = {
-        Venue.BINANCE: _AccountFeeAdapter(
-            Venue.BINANCE,
-            AccountFeeSnapshot(Venue.BINANCE, -0.1, 4.0, now_ms, "test"),
-        ),
-        Venue.OKX: _AccountFeeAdapter(
-            Venue.OKX,
-            AccountFeeSnapshot(Venue.OKX, -0.1, 5.0, now_ms, "test"),
-        ),
-    }
-    runtime = LiveRuntime(config, venue_adapters=adapters)
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    executor = CapturingExecutor()
-    runtime.entry_executor = executor
-    candidate = _candidate("BTCUSDT", 15.0)
-    candidate.first_funding_timestamp_ms = now_ms + 300_000
-    candidate.funding_timestamp_ms = now_ms + 300_000
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "binance:BTCUSDT": QuoteSnapshot(
-                venue="binance", symbol="BTCUSDT", bid=99.9, ask=100.0,
-                bid_size=100.0, ask_size=100.0, observed_at_ms=now_ms,
-                volume_24h_quote=10_000_000.0, open_interest=2_000_000.0,
-            ),
-            "okx:BTCUSDT": QuoteSnapshot(
-                venue="okx", symbol="BTCUSDT", bid=100.1, ask=100.2,
-                bid_size=100.0, ask_size=100.0, observed_at_ms=now_ms,
-                volume_24h_quote=10_000_000.0, open_interest=2_000_000.0,
-            ),
-        },
-        candidates=[candidate],
-    )
-    for venue, bid, ask in (
-        ("binance", 99.9, 100.0),
-        ("okx", 100.1, 100.2),
-    ):
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue=venue, symbol="BTCUSDT", bid=bid, ask=ask,
-                bid_size=100.0, ask_size=100.0, observed_at_ms=now_ms,
-                received_at_ms=now_ms, source=f"{venue}_bbo_ws",
-            )
-        )
-
-    async def keep_existing_bbo_quotes(candidates, prewarm_now_ms):
-        del candidates, prewarm_now_ms
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("binance", "BTCUSDT"), ("okx", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 1
-
-    bootstrap_calls = []
-
-    def bootstrap_hot_l2(*, venue, symbols, **_kwargs):
-        bootstrap_calls.append((venue, tuple(symbols)))
-        for symbol in symbols:
-            _install_hot_book(
-                runtime,
-                venue,
-                symbol,
-                99.9 if venue == "binance" else 100.1,
-                100.0 if venue == "binance" else 100.2,
-                now_ms,
-            )
-
-    async def skip_external_l2_sync(**_kwargs):
-        return 0
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_entry_bbo_active_for_candidates",
-        keep_existing_bbo_quotes,
-    )
-    monkeypatch.setattr(
-        runtime.l2_data_plane,
-        "start_background_bootstrap",
-        bootstrap_hot_l2,
-    )
-    monkeypatch.setattr(runtime.l2_data_plane, "sync_snapshots", skip_external_l2_sync)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    assert runtime._local_l2_effective_enabled() is False
-    assert bootstrap_calls == [
-        ("binance", ("BTCUSDT",)),
-        ("okx", ("BTCUSDT",)),
-    ]
-    assert runtime.state.last_scan["final_l2_repriced_candidate_count"] == 1
-    assert runtime.state.last_scan["final_l2_filtered_candidate_count"] == 0
-    assert candidate.entry_liquidity_source_at_entry == "true_l2"
-    assert len(executor.contexts) == 1
 
 
 @pytest.mark.parametrize(
@@ -833,6 +856,7 @@ def test_final_l2_reprice_uses_venue_base_quantity_scale_and_fails_closed(
             [PriceLevel(price=100.1 if side == "bids" else 100.2, quantity=1.0)],
         )
     candidate = _candidate("BTCUSDT", 10.0)
+    _track_primary_l2_session(runtime, candidate, now_ms)
 
     repriced = runtime._reprice_final_l2_candidates([candidate], now_ms)
 
@@ -843,7 +867,7 @@ def test_final_l2_reprice_uses_venue_base_quantity_scale_and_fails_closed(
 @pytest.mark.asyncio
 async def test_live_start_keeps_v1_recovery_available_without_local_l2(tmp_path):
     config = _live_config(tmp_path)
-    config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
+    config.strategy.local_l2_enabled = False
     runtime = LiveRuntime(config, venue_adapters={})
 
     await runtime.start()

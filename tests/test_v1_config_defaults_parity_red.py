@@ -56,9 +56,9 @@ class TestV1ConfigDefaultsParity:
         )
 
     def test_local_l2_entry_book_stale_window_falls_back_to_runtime_default(self):
-        """Production entry-L2 uses a 300s fallback unless explicitly configured."""
+        """V1 effective entry-local-L2 freshness defaults to 10 seconds."""
         cfg = StrategyConfig()
-        assert cfg.entry_local_l2_book_stale_after_ms == 0
+        assert cfg.entry_local_l2_book_stale_after_ms == 10_000
         assert cfg.local_l2_quiet_book_grace_ms == 0
         assert cfg.local_l2_max_age_ms == 0
 

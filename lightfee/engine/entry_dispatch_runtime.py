@@ -99,23 +99,14 @@ class EntryDispatchRuntime:
     def _gate_zero_fill_cooldown(self, *args: Any, **kwargs: Any):
         return self.ctx._gate_zero_fill_cooldown(*args, **kwargs)
 
-    def _entry_quote_lease_max_age_ms(self, *args: Any, **kwargs: Any):
-        return self.ctx._entry_quote_lease_max_age_ms(*args, **kwargs)
-
-    def _quote_lease_blocker_family(self, *args: Any, **kwargs: Any):
-        return self.ctx._quote_lease_blocker_family(*args, **kwargs)
-
-    def _entry_readiness_provider_name(self, *args: Any, **kwargs: Any):
-        return self.ctx._entry_readiness_provider_name(*args, **kwargs)
-
-    def _entry_readiness_provider_uses_quote_lease(self, *args: Any, **kwargs: Any):
-        return self.ctx._entry_readiness_provider_uses_quote_lease(*args, **kwargs)
-
     def _local_l2_effective_enabled(self, *args: Any, **kwargs: Any):
         return self.ctx._local_l2_effective_enabled(*args, **kwargs)
 
-    def _post_only_maker_bbo_guard(self, *args: Any, **kwargs: Any):
-        return self.ctx._post_only_maker_bbo_guard(*args, **kwargs)
+    def _entry_l2_owned_ready_books(self, *args: Any, **kwargs: Any):
+        return self.ctx._entry_l2_owned_ready_books(*args, **kwargs)
+
+    def _post_only_maker_l2_guard(self, *args: Any, **kwargs: Any):
+        return self.ctx._post_only_maker_l2_guard(*args, **kwargs)
 
     def _entry_reject_is_post_only_would_take(self, *args: Any, **kwargs: Any):
         return self.ctx._entry_reject_is_post_only_would_take(*args, **kwargs)
@@ -860,151 +851,6 @@ class EntryDispatchRuntime:
             return "passive_initial_slice"
         return "full_target_quantity"
 
-    def _entry_quote_lease_execution_check(
-        self,
-        candidate,
-        now_ms: int,
-    ) -> tuple[str, object | None, dict]:
-        provider_name = self._entry_readiness_provider_name()
-        evidence = {
-            "provider": provider_name,
-            "source": provider_name,
-            "domain": "quote_lease_execution_gate",
-            "pair_id": self._candidate_pair_id(candidate),
-            "symbol": str(getattr(candidate, "symbol", "")),
-            "long_venue": str(getattr(candidate, "long_venue", "")),
-            "short_venue": str(getattr(candidate, "short_venue", "")),
-            "max_age_ms": self._entry_quote_lease_max_age_ms(),
-        }
-        def blocked(reason: str, lease: object | None):
-            evidence["blocker_family"] = self._quote_lease_blocker_family(reason)
-            return reason, lease, evidence
-
-        if (
-            self.ctx.config.runtime.mode != "live"
-            or not self._entry_readiness_provider_uses_quote_lease()
-        ):
-            return "", None, evidence
-
-        get_lease = getattr(self.ctx.entry_readiness_provider, "get_lease", None)
-        if not callable(get_lease):
-            return blocked("missing_quote_lease_provider", None)
-        lease = get_lease(evidence["pair_id"])
-        if lease is None:
-            return blocked("missing_quote_lease", None)
-
-        evidence.update(
-            {
-                "lease_provider": str(getattr(lease, "provider", "")),
-                "created_at_ms": int(getattr(lease, "created_at_ms", 0) or 0),
-                "expires_at_ms": int(getattr(lease, "expires_at_ms", 0) or 0),
-                "long_observed_at_ms": int(
-                    getattr(lease, "long_observed_at_ms", 0) or 0
-                ),
-                "short_observed_at_ms": int(
-                    getattr(lease, "short_observed_at_ms", 0) or 0
-                ),
-                "long_bid": float(getattr(lease, "long_bid", 0.0) or 0.0),
-                "long_ask": float(getattr(lease, "long_ask", 0.0) or 0.0),
-                "short_bid": float(getattr(lease, "short_bid", 0.0) or 0.0),
-                "short_ask": float(getattr(lease, "short_ask", 0.0) or 0.0),
-            }
-        )
-        if evidence["lease_provider"] != provider_name:
-            return blocked("quote_lease_provider_mismatch", lease)
-        if str(getattr(lease, "symbol", "")) != evidence["symbol"]:
-            return blocked("quote_lease_symbol_mismatch", lease)
-        if str(getattr(lease, "long_venue", "")) != evidence["long_venue"]:
-            return blocked("quote_lease_long_venue_mismatch", lease)
-        if str(getattr(lease, "short_venue", "")) != evidence["short_venue"]:
-            return blocked("quote_lease_short_venue_mismatch", lease)
-
-        expires_at_ms = evidence["expires_at_ms"]
-        if expires_at_ms <= 0 or now_ms >= expires_at_ms:
-            return blocked("expired_quote_lease", lease)
-
-        max_age_ms = int(evidence["max_age_ms"] or 0)
-        quote_age_ms: dict[str, int | None] = {}
-        for leg in ("long", "short"):
-            observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            evidence[f"{leg}_age_ms"] = age_ms
-            quote_age_ms[leg] = age_ms
-        evidence["quote_age_ms"] = quote_age_ms
-        for leg in ("long", "short"):
-            observed_at_ms = int(evidence[f"{leg}_observed_at_ms"] or 0)
-            age_ms = evidence[f"{leg}_age_ms"]
-            if (
-                observed_at_ms <= 0
-                or max_age_ms <= 0
-                or age_ms is None
-                or age_ms > max_age_ms
-            ):
-                return blocked("stale_quote_lease", lease)
-
-        if (
-            evidence["long_bid"] <= 0.0
-            or evidence["long_ask"] <= evidence["long_bid"]
-            or evidence["short_bid"] <= 0.0
-            or evidence["short_ask"] <= evidence["short_bid"]
-        ):
-            return blocked("invalid_quote_lease", lease)
-        return "", lease, evidence
-
-    def _refresh_entry_quote_lease_for_execution(
-        self,
-        candidate,
-        now_ms: int,
-        quote_lease_reason: str,
-        quote_lease: object | None,
-        quote_lease_evidence: dict,
-    ) -> tuple[str, object | None, dict]:
-        if quote_lease_reason not in {"expired_quote_lease", "stale_quote_lease"}:
-            return quote_lease_reason, quote_lease, quote_lease_evidence
-        if self._entry_readiness_provider_name() != "ws_bbo_quote_lease":
-            return quote_lease_reason, quote_lease, quote_lease_evidence
-
-        decide = getattr(self.ctx.entry_readiness_provider, "decide", None)
-        if not callable(decide):
-            return quote_lease_reason, quote_lease, quote_lease_evidence
-
-        refresh_evidence = dict(quote_lease_evidence)
-        refresh_evidence["execution_refresh_attempted"] = True
-        refresh_evidence["execution_refresh_reason"] = quote_lease_reason
-        try:
-            decision = decide(candidate, now_ms)
-        except Exception as exc:
-            refresh_evidence["execution_refresh_error"] = (
-                f"{type(exc).__name__}: {str(exc)[:300]}"
-            )
-            return quote_lease_reason, quote_lease, refresh_evidence
-
-        if not getattr(decision, "allowed", False):
-            refresh_evidence["execution_refresh_block_reason"] = str(
-                getattr(decision, "reason", "")
-            )
-            refresh_evidence["execution_refresh_evidence"] = dict(
-                getattr(decision, "evidence", {}) or {}
-            )
-            return quote_lease_reason, quote_lease, refresh_evidence
-
-        new_reason, new_lease, new_evidence = self._entry_quote_lease_execution_check(
-            candidate,
-            now_ms,
-        )
-        new_evidence = dict(new_evidence)
-        new_evidence["execution_refresh_attempted"] = True
-        new_evidence["execution_refresh_reason"] = quote_lease_reason
-        return new_reason, new_lease, new_evidence
-
-    @staticmethod
-    def _quote_lease_reference_price(lease) -> float:
-        long_ask = float(getattr(lease, "long_ask", 0.0) or 0.0)
-        short_bid = float(getattr(lease, "short_bid", 0.0) or 0.0)
-        if long_ask > 0.0 and short_bid > 0.0:
-            return (long_ask + short_bid) / 2.0
-        return max(long_ask, short_bid, 0.0)
-
     def _entry_final_gate_skew_blocker(
         self,
         candidate,
@@ -1018,8 +864,10 @@ class EntryDispatchRuntime:
             or not self._local_l2_effective_enabled()
         ):
             return None
-        long_book = self.ctx.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
-        short_book = self.ctx.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
+        session_books = self._entry_l2_owned_ready_books(candidate, now_ms)
+        if session_books is None:
+            return None
+        long_book, short_book = session_books
         if long_book is None or short_book is None:
             return None
         long_observed_at_ms = int(getattr(long_book, "observed_at_ms", 0) or 0)
@@ -1144,54 +992,9 @@ class EntryDispatchRuntime:
         candidate,
         now_ms: int,
         price_hint: float,
-    ) -> tuple[float, float, float, Any] | None:
-        quote_lease = None
-        quote_lease_evidence: dict = {}
-        quote_lease_reason, quote_lease, quote_lease_evidence = (
-            self._entry_quote_lease_execution_check(candidate, now_ms)
-        )
-        if quote_lease_reason:
-            quote_lease_reason, quote_lease, quote_lease_evidence = (
-                self._refresh_entry_quote_lease_for_execution(
-                    candidate,
-                    now_ms,
-                    quote_lease_reason,
-                    quote_lease,
-                    quote_lease_evidence,
-                )
-            )
-        if quote_lease_reason:
-            payload = {
-                **quote_lease_evidence,
-                "reason": quote_lease_reason,
-                "ts_ms": now_ms,
-            }
-            self.ctx.journal.append("runtime.entry_blocked_quote_lease", payload)
-            self.ctx.journal.append(
-                "review.candidate_rejected",
-                {
-                    "symbol": candidate.symbol,
-                    "long_venue": candidate.long_venue,
-                    "short_venue": candidate.short_venue,
-                    "rejected_stage": "quote_lease_execution_gate",
-                    "rejected_reason": quote_lease_reason,
-                    "ranking_edge_bps": candidate.ranking_edge_bps,
-                    "expected_edge_bps": candidate.expected_edge_bps,
-                    "funding_edge_bps": candidate.funding_edge_bps,
-                    "ts_ms": now_ms,
-                },
-            )
-            return None
+    ) -> tuple[float, float, float] | None:
         long_order_price_hint = price_hint
         short_order_price_hint = price_hint
-        if quote_lease is not None:
-            price_hint = self._quote_lease_reference_price(quote_lease)
-            long_order_price_hint = float(
-                getattr(quote_lease, "long_ask", 0.0) or 0.0
-            )
-            short_order_price_hint = float(
-                getattr(quote_lease, "short_bid", 0.0) or 0.0
-            )
 
         # V1 price gate: require valid quote before constructing entry context
         if price_hint <= 0 or candidate.entry_notional_quote <= 0:
@@ -1217,7 +1020,7 @@ class EntryDispatchRuntime:
                 },
             )
             return None
-        return price_hint, long_order_price_hint, short_order_price_hint, quote_lease
+        return price_hint, long_order_price_hint, short_order_price_hint
 
     async def _resolve_entry_quantity_steps(
         self,
@@ -1322,128 +1125,20 @@ class EntryDispatchRuntime:
         short_venue: Venue,
         now_ms: int,
     ) -> bool:
-        # V1 local-L2 entry readiness gate: block entry when local-L2 enabled
-        # but either leg's book is not ready (stale, degraded, cold, etc.)
+        # V1 local-L2 entry readiness gate: the candidate's tracked session
+        # owns both-leg readiness; raw global books are not an entry bypass.
         if not self._local_l2_effective_enabled():
             return False
 
-        from lightfee.marketdata.liquidity import execution_liquidity_from_local_l2
-
-        long_book = self.ctx.local_l2_runtime.get_book(long_venue.value, candidate.symbol)
-        short_book = self.ctx.local_l2_runtime.get_book(short_venue.value, candidate.symbol)
-
-        not_ready_reasons: list[str] = []
-        l2_stale_decisions: list[dict] = []
-        max_age_ms = self.ctx.config.strategy.max_liquidity_snapshot_age_ms
-        if long_book is None:
-            not_ready_reasons.append(
-                f"long book missing: {long_venue.value}:{candidate.symbol} "
-                f"max_age_ms={max_age_ms}"
-            )
-            l2_stale_decisions.append({
-                "venue": long_venue.value,
-                "symbol": candidate.symbol,
-                "domain": "execution_l2",
-                "source": "local_l2",
-                "observed_at_ms": 0,
-                "age_ms": 0,
-                "budget_ms": max_age_ms,
-                "decision": "skip_entry",
-                "fallback_source": "none",
-                "reason": "execution_l2_stale",
-                "l2_reason": "missing_book",
-                "blocking": True,
-            })
-        else:
-            liq = execution_liquidity_from_local_l2(
-                long_book, max_age_ms=max_age_ms,
-                now_ms=now_ms, require_ready=True,
-            )
-            long_age_ms = long_book.age_ms(now_ms)
-            if not liq.book_ready:
-                not_ready_reasons.append(
-                    f"long leg not ready: {long_venue.value}:{candidate.symbol} "
-                    f"status={long_book.status.value} pool={long_book.pool.value if hasattr(long_book, 'pool') else 'unknown'} "
-                    f"age={long_age_ms}ms max_age_ms={max_age_ms}"
-                )
-                l2_stale_decisions.append({
-                    "venue": long_venue.value,
-                    "symbol": candidate.symbol,
-                    "domain": "execution_l2",
-                    "source": "local_l2",
-                    "observed_at_ms": int(getattr(long_book, "observed_at_ms", 0) or 0),
-                    "age_ms": int(long_age_ms),
-                    "budget_ms": max_age_ms,
-                    "decision": "skip_entry",
-                    "fallback_source": "none",
-                    "reason": "execution_l2_stale",
-                    "l2_reason": liq.fallback_reason or "book_not_ready",
-                    "book_status": long_book.status.value,
-                    "blocking": True,
-                })
-
-        if short_book is None:
-            not_ready_reasons.append(
-                f"short book missing: {short_venue.value}:{candidate.symbol} "
-                f"max_age_ms={max_age_ms}"
-            )
-            l2_stale_decisions.append({
-                "venue": short_venue.value,
-                "symbol": candidate.symbol,
-                "domain": "execution_l2",
-                "source": "local_l2",
-                "observed_at_ms": 0,
-                "age_ms": 0,
-                "budget_ms": max_age_ms,
-                "decision": "skip_entry",
-                "fallback_source": "none",
-                "reason": "execution_l2_stale",
-                "l2_reason": "missing_book",
-                "blocking": True,
-            })
-        else:
-            liq = execution_liquidity_from_local_l2(
-                short_book, max_age_ms=max_age_ms,
-                now_ms=now_ms, require_ready=True,
-            )
-            short_age_ms = short_book.age_ms(now_ms)
-            if not liq.book_ready:
-                not_ready_reasons.append(
-                    f"short leg not ready: {short_venue.value}:{candidate.symbol} "
-                    f"status={short_book.status.value} pool={short_book.pool.value if hasattr(short_book, 'pool') else 'unknown'} "
-                    f"age={short_age_ms}ms max_age_ms={max_age_ms}"
-                )
-                l2_stale_decisions.append({
-                    "venue": short_venue.value,
-                    "symbol": candidate.symbol,
-                    "domain": "execution_l2",
-                    "source": "local_l2",
-                    "observed_at_ms": int(getattr(short_book, "observed_at_ms", 0) or 0),
-                    "age_ms": int(short_age_ms),
-                    "budget_ms": max_age_ms,
-                    "decision": "skip_entry",
-                    "fallback_source": "none",
-                    "reason": "execution_l2_stale",
-                    "l2_reason": liq.fallback_reason or "book_not_ready",
-                    "book_status": short_book.status.value,
-                    "blocking": True,
-                })
-
-        if not_ready_reasons:
-            pair_id = self._candidate_pair_id(candidate)
-            for payload in l2_stale_decisions:
-                payload = dict(payload)
-                payload["pair_id"] = pair_id
-                payload["ts_ms"] = now_ms
-                self.ctx.journal.append("runtime.snapshot_freshness_decision", payload)
-                self.ctx.journal.append("runtime.execution_l2_stale", payload)
+        if self._entry_l2_owned_ready_books(candidate, now_ms) is None:
             self.ctx.journal.append(
                 "runtime.entry_blocked_local_l2_not_ready",
                 {
                     "symbol": candidate.symbol,
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
-                    "reasons": not_ready_reasons,
+                    "pair_id": self._candidate_pair_id(candidate),
+                    "reason": "entry_local_l2_session_not_ready",
                     "ts_ms": now_ms,
                 },
             )
@@ -1571,6 +1266,7 @@ class EntryDispatchRuntime:
             maker_leg=maker_leg,
             entry_type=entry_type,
             created_at_ms=now_ms,
+            pair_id=self._candidate_pair_id(candidate),
             opportunity_type=opportunity_type,
             funding_timestamp_ms=funding_timestamp_ms,
             first_funding_timestamp_ms=first_funding_timestamp_ms,
@@ -1652,7 +1348,7 @@ class EntryDispatchRuntime:
         price_hint: float,
         maker_venue: Venue,
         maker_leg: Side,
-        maker_bbo_evidence: dict,
+        maker_l2_evidence: dict,
         now_ms: int,
     ) -> bool:
         try:
@@ -1745,7 +1441,7 @@ class EntryDispatchRuntime:
                     venue=maker_venue.value,
                     side=maker_leg.value,
                     price=price_hint,
-                    bbo=maker_bbo_evidence,
+                    quote_evidence=maker_l2_evidence,
                 )
                 self._complete_entry_owner_handoff(
                     now_ms=now_ms,
@@ -1885,7 +1581,7 @@ class EntryDispatchRuntime:
                     venue=maker_venue.value,
                     side=maker_leg.value,
                     price=price_hint,
-                    bbo=maker_bbo_evidence,
+                    quote_evidence=maker_l2_evidence,
                 )
             else:
                 self._record_entry_result_admission_blocks(
@@ -1921,7 +1617,7 @@ class EntryDispatchRuntime:
         price_resolution = self._entry_price_resolution(candidate, now_ms, price_hint)
         if price_resolution is None:
             return False
-        price_hint, long_order_price_hint, short_order_price_hint, quote_lease = price_resolution
+        price_hint, long_order_price_hint, short_order_price_hint = price_resolution
 
         # Resolve venue enums from candidate string fields
         long_venue = Venue.from_str(candidate.long_venue)
@@ -1978,21 +1674,28 @@ class EntryDispatchRuntime:
             maker_leg = Side.BUY if strategy.maker_leg_default == "buy" else Side.SELL
         maker_venue = long_venue if maker_leg == Side.BUY else short_venue
         hedge_venue = short_venue if maker_leg == Side.BUY else long_venue
-        if quote_lease is not None:
+        if self._local_l2_effective_enabled():
+            session_books = self._entry_l2_owned_ready_books(candidate, now_ms)
+            if session_books is None:
+                self.ctx.journal.append(
+                    "runtime.entry_blocked_local_l2_not_ready",
+                    {
+                        "symbol": candidate.symbol,
+                        "long_venue": long_venue.value,
+                        "short_venue": short_venue.value,
+                        "pair_id": self._candidate_pair_id(candidate),
+                        "reason": "entry_local_l2_session_lost_before_submit",
+                        "ts_ms": now_ms,
+                    },
+                )
+                return False
+            long_book, short_book = session_books
             if maker_leg == Side.BUY:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_bid", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_bid", 0.0) or 0.0
-                )
+                long_order_price_hint = float(long_book.best_bid())
+                short_order_price_hint = float(short_book.best_bid())
             else:
-                long_order_price_hint = float(
-                    getattr(quote_lease, "long_ask", 0.0) or 0.0
-                )
-                short_order_price_hint = float(
-                    getattr(quote_lease, "short_ask", 0.0) or 0.0
-                )
+                long_order_price_hint = float(long_book.best_ask())
+                short_order_price_hint = float(short_book.best_ask())
         maker_planner_price = (
             long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
         )
@@ -2122,14 +1825,6 @@ class EntryDispatchRuntime:
             entry_type = EntryType.STANDARD_DUAL_TAKER
             effective_quantity = plan.full_target_quantity
 
-        if quote_lease is not None and entry_type == EntryType.STANDARD_DUAL_TAKER:
-            long_order_price_hint = float(
-                getattr(quote_lease, "long_ask", 0.0) or 0.0
-            )
-            short_order_price_hint = float(
-                getattr(quote_lease, "short_bid", 0.0) or 0.0
-            )
-
         entry_id = f"entry-{now_ms}-{candidate.symbol}"
 
         # --- V1 recovery dedup: check for duplicate entries after restart ---
@@ -2224,35 +1919,36 @@ class EntryDispatchRuntime:
         ):
             return False
 
-        maker_bbo_evidence: dict = {}
+        maker_l2_evidence: dict = {}
         if entry_type in (EntryType.PASSIVE_INCREMENTAL, EntryType.PASSIVE_FALLBACK):
             maker_order_price_hint = (
                 long_order_price_hint if maker_leg == Side.BUY else short_order_price_hint
             )
-            bbo_ok, bbo_reason, maker_bbo_evidence = self._post_only_maker_bbo_guard(
+            l2_ok, l2_reason, maker_l2_evidence = self._post_only_maker_l2_guard(
+                candidate=candidate,
                 venue=maker_venue,
                 symbol=candidate.symbol,
                 side=maker_leg,
                 price=maker_order_price_hint,
                 now_ms=now_ms,
             )
-            if not bbo_ok:
+            if not l2_ok:
                 payload = {
-                    **maker_bbo_evidence,
+                    **maker_l2_evidence,
                     "long_venue": long_venue.value,
                     "short_venue": short_venue.value,
-                    "reason": bbo_reason,
+                    "reason": l2_reason,
                     "ts_ms": now_ms,
                 }
-                self.ctx.journal.append("runtime.entry_blocked_post_only_bbo", payload)
+                self.ctx.journal.append("runtime.entry_blocked_post_only_l2", payload)
                 self.ctx.journal.append(
                     "review.candidate_rejected",
                     {
                         "symbol": candidate.symbol,
                         "long_venue": long_venue.value,
                         "short_venue": short_venue.value,
-                        "rejected_stage": "post_only_bbo_gate",
-                        "rejected_reason": bbo_reason,
+                        "rejected_stage": "post_only_l2_gate",
+                        "rejected_reason": l2_reason,
                         "ranking_edge_bps": candidate.ranking_edge_bps,
                         "expected_edge_bps": candidate.expected_edge_bps,
                         "funding_edge_bps": candidate.funding_edge_bps,
@@ -2261,7 +1957,7 @@ class EntryDispatchRuntime:
                 )
                 return False
             repriced_price = float(
-                maker_bbo_evidence.get("repriced_price", 0.0) or 0.0
+                maker_l2_evidence.get("repriced_price", 0.0) or 0.0
             )
             if repriced_price > 0.0:
                 maker_order_price_hint = repriced_price
@@ -2270,9 +1966,9 @@ class EntryDispatchRuntime:
                 else:
                     short_order_price_hint = repriced_price
                 self.ctx.journal.append(
-                    "runtime.entry_post_only_bbo_repriced",
+                    "runtime.entry_post_only_l2_repriced",
                     {
-                        **maker_bbo_evidence,
+                        **maker_l2_evidence,
                         "long_venue": long_venue.value,
                         "short_venue": short_venue.value,
                         "reason": "post_only_would_cross_repriced",
@@ -2310,7 +2006,7 @@ class EntryDispatchRuntime:
         )
 
         # This must be the final network gate before the executor can submit
-        # the maker order.  Admission, leverage preparation and BBO repricing
+        # the maker order. Admission, leverage preparation and L2 post-only checks
         # can each await; checking earlier leaves their combined latency as an
         # avoidable status-transition window between exchanges.
         if not await self._precheck_live_entry_venue_tradability(
@@ -2330,6 +2026,6 @@ class EntryDispatchRuntime:
             price_hint=price_hint,
             maker_venue=maker_venue,
             maker_leg=maker_leg,
-            maker_bbo_evidence=maker_bbo_evidence,
+            maker_l2_evidence=maker_l2_evidence,
             now_ms=now_ms,
         )

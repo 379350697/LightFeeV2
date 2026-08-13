@@ -65,6 +65,8 @@ class EntryContext:
     maker_fill: Optional[OrderFill] = None
     hedge_fill: Optional[OrderFill] = None
     created_at_ms: int = 0
+    # V1 pair identity must survive into PendingEntry for L2-session ownership.
+    pair_id: str = ""
     # --- V1 maker-event lane repricing ---
     parent_entry_id: Optional[str] = None
     reprice_action: str = ""

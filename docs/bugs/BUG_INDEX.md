@@ -17,7 +17,20 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
-CL-103 WS-BBO candidate L2 final-cost path, 2026-08-13: V2's
+CL-104 Local-L2 ownership/degraded-snapshot parity, 2026-08-13: V2 had three
+related entry-L2 drifts: it discarded V1's persisted pending pair identity,
+rejected a fresh valid retained snapshot solely because its feed was degraded,
+and used a 300-second default instead of V1's effective 10-second window.
+Pending-entry metadata is now the pair-ownership authority; the existing
+Local-L2 session admits HOT/DEGRADED only with a fresh structurally valid book;
+and final pricing uses that same snapshot rule. Missing, suspended, stale,
+crossed, and malformed evidence still blocks. BBO/quote-lease paths are no
+longer part of the entry flow. Local regression is green; deployment and live
+read-only verification remain pending. See
+[daily/2026-08-13.md#cluster-cl-104-local-l2-ownership-degraded-snapshot-parity](daily/2026-08-13.md#cluster-cl-104-local-l2-ownership-degraded-snapshot-parity).
+
+CL-103 WS-BBO candidate L2 final-cost path, 2026-08-13 (historical; superseded
+by CL-104): V2's
 `ws_bbo_quote_lease` profile correctly retained BBO as the entry-readiness and
 passive-maker data plane, but incorrectly used that profile switch to suppress
 candidate-scoped Local L2 entirely. The already-restored final cost repricer

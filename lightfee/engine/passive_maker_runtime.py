@@ -34,14 +34,11 @@ class PassiveMakerRuntime:
     def _local_l2_effective_enabled(self) -> bool:
         return self.ctx._local_l2_effective_enabled()
 
-    def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_ws_bbo()
-
-    def _entry_quote_lease_max_age_ms(self) -> int:
-        return self.ctx._entry_quote_lease_max_age_ms()
-
     def _refresh_entry_l2_session_readiness(self, now_ms: int) -> None:
         self.ctx._refresh_entry_l2_session_readiness(now_ms)
+
+    def _pending_entry_l2_ready_books(self, pending, now_ms: int):
+        return self.ctx._pending_entry_l2_ready_books(pending, now_ms)
 
     def _runtime_method_override(self, method_name: str):
         method = getattr(self.ctx, method_name, None)
@@ -137,8 +134,6 @@ class PassiveMakerRuntime:
         if local_l2_enabled:
             # --- Parity mode: local-L2 event-driven ---
             await self._maybe_tick_maker_event_local_l2(now_ms, pending_passive)
-        elif self._entry_readiness_provider_uses_ws_bbo():
-            await self._maybe_tick_maker_event_ws_bbo(now_ms, pending_passive)
         elif non_parity_mode:
             # --- Explicit non-parity fallback: sidecar mid-price ---
             await self._maybe_tick_maker_event_sidecar(now_ms, pending_passive)
@@ -218,12 +213,14 @@ class PassiveMakerRuntime:
             if not relevant:
                 continue
 
-            # Get current mid price from local-L2 books
-            long_book = self.ctx.local_l2_runtime.get_book(pending.long_venue.value, pending.symbol)
-            short_book = self.ctx.local_l2_runtime.get_book(pending.short_venue.value, pending.symbol)
-
-            long_mid = long_book.mid_price() if long_book else 0.0
-            short_mid = short_book.mid_price() if short_book else 0.0
+            # This execution-owned pending entry must use its exact two-leg
+            # session, never a coincidentally HOT global Local-L2 book.
+            session_books = self._pending_entry_l2_ready_books(pending, now_ms)
+            if session_books is None:
+                continue
+            long_book, short_book = session_books
+            long_mid = long_book.mid_price()
+            short_mid = short_book.mid_price()
             # V1: use the maker venue's mid price, not a single-leg fallback
             # post_only_entry_reprice_price_hint takes from working_market (entry_sync.rs:1475-1481)
             maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
@@ -354,192 +351,6 @@ class PassiveMakerRuntime:
                 "ts_ms": now_ms,
             },
         )
-
-    async def _maybe_tick_maker_event_ws_bbo(
-        self, now_ms: int, pending_passive: list,
-    ) -> None:
-        """WS BBO maker-event lane using the in-situ pending hedge driver."""
-        strategy = self.ctx.config.strategy
-        reprice_threshold_bps = strategy.passive_reprice_threshold_bps
-        cancel_replace_threshold_bps = strategy.passive_cancel_replace_threshold_bps
-
-        from lightfee.engine.entry_sync import _adapter_supports_amend
-        from lightfee.engine.passive_order_manager import (
-            PassiveOrderManager,
-            PassiveOrderManagerDecisionType,
-            PassiveOrderManagerProfile,
-            PassiveOrderDecisionInput,
-            PassiveSkipReason,
-        )
-
-        woke_positions = 0
-        missing_quotes: list[dict[str, Any]] = []
-        venues: set[str] = set()
-        max_quote_age_ms = 0
-        min_quote_age_ms = 1_000_000_000
-
-        for entry_id, pending in pending_passive:
-            maker_leg = self._pending_active_maker_side(pending)
-            maker_venue = pending.long_venue if maker_leg == Side.BUY else pending.short_venue
-            venue_str = maker_venue.value if hasattr(maker_venue, "value") else str(maker_venue)
-            quote = None
-            try:
-                quote = self.ctx.ws_bbo_cache.get_quote(venue_str, pending.symbol)
-            except Exception:
-                quote = None
-            budget_ms = self._entry_quote_lease_max_age_ms()
-            bid = ask = 0.0
-            observed_at_ms = 0
-            if quote is not None:
-                try:
-                    bid = float(getattr(quote, "bid", 0.0) or 0.0)
-                    ask = float(getattr(quote, "ask", 0.0) or 0.0)
-                    observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-                except Exception:
-                    bid = ask = 0.0
-                    observed_at_ms = 0
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            valid = bid > 0.0 and ask > bid
-            fresh = (
-                valid
-                and observed_at_ms > 0
-                and budget_ms > 0
-                and age_ms is not None
-                and age_ms <= budget_ms
-            )
-            if not fresh:
-                missing_quotes.append(
-                    {
-                        "entry_id": entry_id,
-                        "venue": venue_str,
-                        "symbol": pending.symbol,
-                        "reason": (
-                            "stale_quote"
-                            if valid and age_ms is not None and budget_ms > 0 and age_ms > budget_ms
-                            else "missing_or_invalid_quote"
-                        ),
-                        "age_ms": age_ms,
-                        "budget_ms": budget_ms,
-                    }
-                )
-                continue
-
-            mid = (bid + ask) / 2.0
-            stored = self._maker_event_state.get(entry_id)
-            if isinstance(stored, tuple) and len(stored) == 2:
-                manager, stored_price = stored
-            else:
-                profile = PassiveOrderManagerProfile(
-                    max_consecutive_failures=strategy.passive_max_consecutive_failures,
-                    failure_cooldown_ms=strategy.passive_failure_cooldown_ms,
-                    reprice_threshold_bps=reprice_threshold_bps,
-                    cancel_replace_threshold_bps=cancel_replace_threshold_bps,
-                )
-                manager = PassiveOrderManager(profile)
-                stored_price = stored.get("maker_price", 0.0) if isinstance(stored, dict) else 0.0
-                if isinstance(stored, dict) and stored.get("consecutive_failures", 0) > 0:
-                    for _ in range(stored.get("consecutive_failures", 0)):
-                        manager.note_failure(stored.get("last_reprice_ms", now_ms))
-
-            adapter = self.ctx.venue_adapters.get(maker_venue)
-            supports_amend = _adapter_supports_amend(adapter)
-            decision_input = PassiveOrderDecisionInput(
-                tick_size=0.1,
-                reference_mid_price=mid,
-                target_price=mid,
-                current_price=stored_price if stored_price > 0 else None,
-                target_quantity=getattr(pending, "long_quantity", 0) or 0,
-                supports_amend=supports_amend,
-            )
-            decision = manager.decide(decision_input, now_ms)
-            if decision.kind == PassiveOrderManagerDecisionType.PLACE:
-                self._maker_event_state[entry_id] = (manager, mid)
-                continue
-            if decision.kind == PassiveOrderManagerDecisionType.COOLDOWN:
-                continue
-            if decision.kind == PassiveOrderManagerDecisionType.HOLD:
-                if decision.skip_reason == PassiveSkipReason.OPS_BUDGET_EXCEEDED:
-                    self.ctx.journal.append(
-                        "execution.passive_ops_rate_limited",
-                        {
-                            "entry_id": entry_id,
-                            "reason": "ops_budget_exceeded",
-                            "source": "ws_bbo_quote_lease",
-                            "ts_ms": now_ms,
-                        },
-                    )
-                continue
-            if decision.kind == PassiveOrderManagerDecisionType.AMEND:
-                action = "reprice"
-            elif decision.kind == PassiveOrderManagerDecisionType.CANCEL_REPLACE:
-                action = "cancel_replace"
-            else:
-                continue
-            if self.ctx.entry_executor is None:
-                continue
-
-            try:
-                manager.note_operation(now_ms)
-                if action == "cancel_replace":
-                    manager.note_operation(now_ms)
-                result = await self._call_reprice_passive_maker_l2(
-                    pending, mid, stored_price, action, now_ms, entry_id,
-                )
-                manager.note_success(now_ms)
-                self._maker_event_state[entry_id] = (manager, mid)
-                pe = self.ctx.state.pending_entries.get(entry_id)
-                if pe is not None:
-                    pe.maker_price = mid
-                    if result.order_id:
-                        pe.maker_order_id = result.order_id
-                woke_positions += 1
-                venues.add(venue_str)
-                if age_ms is not None:
-                    min_quote_age_ms = min(min_quote_age_ms, age_ms)
-                    max_quote_age_ms = max(max_quote_age_ms, age_ms)
-            except Exception as e:
-                manager.note_failure(now_ms)
-                self._maker_event_state[entry_id] = (manager, stored_price)
-                self.ctx.journal.append(
-                    "runtime.maker_event_reprice_error",
-                    {
-                        "entry_id": entry_id,
-                        "action": action,
-                        "error": str(e),
-                        "source": "ws_bbo_quote_lease",
-                    },
-                )
-
-        if missing_quotes:
-            self.ctx.journal.append(
-                "runtime.maker_event_no_ws_bbo_quote",
-                {
-                    "ts_ms": now_ms,
-                    "pending_passive_total": len(pending_passive),
-                    "missing_quote_count": len(missing_quotes),
-                    "samples": missing_quotes[:8],
-                    "source": "ws_bbo_quote_lease",
-                    "provider": "ws_bbo_quote_lease",
-                    "reason": "missing_stale_or_invalid_ws_bbo_quote",
-                },
-            )
-
-        self._last_maker_event_ms = now_ms
-        if woke_positions > 0:
-            self.ctx.journal.append(
-                "runtime.maker_event_lane_wake",
-                {
-                    "position_count": woke_positions,
-                    "pending_passive_total": len(pending_passive),
-                    "source": "ws_bbo_quote_lease",
-                    "venues": sorted(venues),
-                    "min_quote_age_ms": (
-                        min_quote_age_ms if min_quote_age_ms < 1_000_000_000 else 0
-                    ),
-                    "max_quote_age_ms": max_quote_age_ms,
-                    "ts_ms": now_ms,
-                },
-            )
 
     async def _maybe_tick_maker_event_sidecar(
         self, now_ms: int, pending_passive: list,

@@ -136,7 +136,6 @@ def build_v1_lifecycle_closure_table(
 
     rows: list[V1LifecycleClosureRow] = []
     rows.append(_recovery_truth_row(decision))
-    rows.extend(_entry_quote_lease_rows(state))
     rows.extend(_pending_entry_rows(state, truth))
     rows.extend(_open_position_rows(state, ledger))
     rows.extend(_recovery_work_rows(ledger))
@@ -244,96 +243,6 @@ def _recovery_truth_row(decision: Any) -> V1LifecycleClosureRow:
         details=details,
     )
 
-
-def _entry_quote_lease_rows(local_state: Any) -> list[V1LifecycleClosureRow]:
-    config = _mapping(_get(local_state, "runtime_market_data_config", {}))
-    last_scan = _mapping(_get(local_state, "last_scan", {}))
-    provider = str(config.get("entry_readiness_provider_effective", "") or "")
-    ws_bbo_effective = (
-        provider == "ws_bbo_quote_lease"
-        and config.get("local_l2_effective_enabled") is False
-    )
-    if not ws_bbo_effective and not any(
-        key in last_scan
-        for key in (
-            "quote_revalidate_candidate_scope",
-            "snapshot_freshness_filter_candidate_scope",
-            "candidate_freshness_candidate_scope",
-            "snapshot_freshness_candidate_scope",
-        )
-    ):
-        return []
-
-    scope = _first_text(
-        last_scan.get("quote_revalidate_candidate_scope"),
-        last_scan.get("snapshot_freshness_filter_candidate_scope"),
-        last_scan.get("candidate_freshness_candidate_scope"),
-        last_scan.get("snapshot_freshness_candidate_scope"),
-    )
-    candidate_count = _int(
-        last_scan.get("quote_revalidate_candidate_count"),
-        last_scan.get("snapshot_freshness_filter_candidate_count"),
-        last_scan.get("candidate_freshness_candidate_count"),
-        last_scan.get("snapshot_freshness_candidate_count"),
-    )
-    all_count = _int(
-        last_scan.get("quote_revalidate_all_target_count"),
-        last_scan.get("snapshot_freshness_filter_all_candidate_count"),
-        last_scan.get("candidate_freshness_all_candidate_count"),
-        last_scan.get("snapshot_freshness_all_candidate_count"),
-    )
-    skipped = _int(
-        last_scan.get("quote_revalidate_skipped_untracked_count"),
-        last_scan.get("snapshot_freshness_filter_skipped_untracked_count"),
-        last_scan.get("candidate_freshness_skipped_untracked_count"),
-        last_scan.get("snapshot_freshness_skipped_untracked_count"),
-    )
-    failed = _int(last_scan.get("quote_revalidate_failed_count"))
-    tracked_scope = scope in {"", "v1_primary_shadow"} or (
-        scope == "global_snapshot" and candidate_count == 0
-    )
-    full_universe = bool(
-        ws_bbo_effective
-        and scope
-        and not tracked_scope
-        and candidate_count > 0
-        and skipped == 0
-    )
-    missing_or_stale = failed > 0
-    severity = "critical" if full_universe or missing_or_stale else "info"
-    return [
-        _row(
-            row_key="entry_quote_lease:ws_bbo",
-            phase=V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE,
-            owner_id="ws_bbo_quote_lease",
-            evidence_class="execution_scope" if not missing_or_stale else "quote_evidence_gap",
-            terminality=(
-                "full_universe_scope"
-                if full_universe
-                else "fail_closed_quote_gap"
-                if missing_or_stale
-                else "tracked_scope"
-            ),
-            entry_policy=(
-                "diagnostic_only"
-                if full_universe
-                else "fail_closed_tracked_candidates"
-                if missing_or_stale
-                else "allow_tracked_candidates"
-            ),
-            recovery_policy="diagnostic_regression" if full_universe else "observe",
-            diagnostic_severity=severity,
-            v1_anchor="V1 entry data plane tracks primary plus shadow only",
-            details={
-                "provider": provider,
-                "scope": scope,
-                "candidate_count": candidate_count,
-                "all_count": all_count,
-                "skipped_untracked_count": skipped,
-                "quote_revalidate_failed_count": failed,
-            },
-        )
-    ]
 
 
 def _pending_entry_rows(
@@ -1217,17 +1126,12 @@ _EVENT_KIND_PHASES = {
     "runtime.entry_quote_rewarm_scheduled_after_rest_stale": (
         V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
     ),
-    "runtime.maker_event_no_ws_bbo_quote": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.entry_blocked_gate": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
-    "runtime.entry_quote_evidence_resolved_by_ws_bbo": (
-        V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
-    ),
     "runtime.last_good_revalidated_by_entry_quote_truth": (
         V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value
     ),
     "runtime.order_quote_stale_skipped": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.quote_stale": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
-    "runtime.ws_bbo_dynamic_ws_started": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.snapshot_fallback_last_good": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
     "runtime.candidate_symbol_skipped": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.candidates_tradeable": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
@@ -1255,7 +1159,8 @@ _EVENT_KIND_PHASES = {
     "execution.entry_selected": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.hedge_deadline_started": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.hedge_deadline_breached": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
-    "runtime.entry_post_only_bbo_repriced": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.entry_post_only_l2_repriced": V1LifecycleClosurePhase.PENDING_ENTRY.value,
+    "runtime.entry_blocked_post_only_l2": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "runtime.entry_post_only_reject_cooldown": V1LifecycleClosurePhase.PENDING_ENTRY.value,
     "execution.passive_small_fill_buffering": (
         V1LifecycleClosurePhase.PENDING_ENTRY.value
@@ -1285,10 +1190,6 @@ _EVENT_KIND_PHASES = {
     "review.candidate_shortlisted": V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value,
     "runtime.active_position_tick": V1LifecycleClosurePhase.OPEN_POSITION.value,
     "runtime.close_price_evidence_fallback": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
-    "runtime.close_price_evidence_ws_bbo_used": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
-    "runtime.close_price_evidence_ws_rewarm_succeeded": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
-    "runtime.close_price_evidence_rest_rewarm_succeeded": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
-    "runtime.close_price_evidence_rewarm_failed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.close_price_evidence_stale": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "runtime.passive_close_deadline_fallback_armed": (
         V1LifecycleClosurePhase.PASSIVE_CLOSE.value
@@ -1305,8 +1206,6 @@ _EVENT_KIND_PHASES = {
 }
 
 _EVENT_PREFIX_PHASES = (
-    ("runtime.entry_ws_bbo_", V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value),
-    ("runtime.entry_blocked_ws_bbo", V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value),
     ("runtime.snapshot_freshness", V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value),
     ("order.", V1LifecycleClosurePhase.DIAGNOSTIC_ONLY.value),
     ("passive_maintenance.", V1LifecycleClosurePhase.PENDING_ENTRY.value),

@@ -92,7 +92,7 @@ def _runtime(tmp_path) -> LiveRuntime:
         runtime=RuntimeConfig(
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
+            sidecar_snapshot_max_age_ms=10000,
             max_market_age_ms=5000,
             max_order_quote_age_ms=5000,
             live_scan_last_good_max_age_ms=600000,
@@ -183,7 +183,7 @@ async def test_last_good_market_observed_fallback_is_candidate_scoped_and_non_bl
     assert market_scope["candidate_pair_id"] == "riverusdt:okx->bybit"
     assert market_scope["venue"] == "global"
     assert market_scope["source_age_ms"] == 60000
-    assert market_scope["fallback_duration_ms"] == 55000
+    assert market_scope["fallback_duration_ms"] == 50000
     assert market_scope["blocked"] is False
     assert market_scope["block_reason"] == ""
     assert len(runtime.entry_executor.contexts) == 1

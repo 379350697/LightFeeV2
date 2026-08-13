@@ -38,9 +38,15 @@ def main() -> None:
         if args.once:
             await service.refresh_once()
             return
+        refresh_interval_s = config.runtime.sidecar_refresh_ms / 1000.0
+        loop = asyncio.get_running_loop()
+        next_refresh_at = loop.time()
         while True:
+            delay_s = next_refresh_at - loop.time()
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            next_refresh_at += refresh_interval_s
             await service.refresh_once()
-            await asyncio.sleep(config.runtime.sidecar_refresh_ms / 1000.0)
 
     asyncio.run(_run())
 

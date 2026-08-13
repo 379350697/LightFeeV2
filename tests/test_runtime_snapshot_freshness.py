@@ -5,7 +5,7 @@ from collections import Counter
 
 import pytest
 
-from lightfee.core.domain import Venue
+from lightfee.core.domain import Side, Venue
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
 from lightfee.engine.runtime import LiveRuntime
@@ -52,6 +52,10 @@ class OkxMetadataAdapter:
     async def precheck_entry_tradability(self, symbol: str) -> dict:
         return {"symbol": symbol, "status": "ok"}
 
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float:
+        del symbol
+        return 1.0
+
 
 class BybitMetadataAdapter:
     trading_capability_trusted = True
@@ -65,6 +69,10 @@ class BybitMetadataAdapter:
 
     async def precheck_entry_tradability(self, symbol: str) -> dict:
         return {"symbol": symbol, "status": "ok"}
+
+    def l2_book_quantity_to_base_scale(self, symbol: str) -> float:
+        del symbol
+        return 1.0
 
 
 def _freshness_candidate(symbol: str = "BTCUSDT") -> CandidateInput:
@@ -99,14 +107,17 @@ def _sidecar_liquidity_required_candidate(symbol: str = "BTCUSDT") -> CandidateI
 
 
 def _install_l2_books(runtime: LiveRuntime, candidate: CandidateInput, *, observed_at_ms: int) -> None:
-    for venue in (candidate.long_venue, candidate.short_venue):
+    for venue, bid, ask in (
+        (candidate.long_venue, 100.0, 100.1),
+        (candidate.short_venue, 100.2, 100.3),
+    ):
         runtime.local_l2_runtime.books[
             LocalL2BookKey(venue=venue, symbol=candidate.symbol)
         ] = LocalL2Book(
             venue=venue,
             symbol=candidate.symbol,
-            bids=[PriceLevel(price=100.0, quantity=10.0)],
-            asks=[PriceLevel(price=101.0, quantity=10.0)],
+            bids=[PriceLevel(price=bid, quantity=10.0)],
+            asks=[PriceLevel(price=ask, quantity=10.0)],
             status=L2BookStatus.HOT,
             observed_at_ms=observed_at_ms,
         )
@@ -170,1512 +181,46 @@ def test_runtime_no_tradeable_diagnostics_classifies_edge_window_and_domain():
     ) == "candidate_snapshot_domain_stale"
 
 
-def test_ws_bbo_provider_resolves_stale_sidecar_quote_for_entry_freshness(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(mode="live"),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1_500,
-            local_l2_enabled=False,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    candidate = _freshness_candidate()
-    candidate.pair_id = "btcusdt:okx->bybit"
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 31_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 31_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-    for venue, bid, ask in (
-        ("okx", 100.0, 101.0),
-        ("bybit", 100.2, 101.2),
-    ):
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue=venue,
-                symbol="BTCUSDT",
-                bid=bid,
-                ask=ask,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 100,
-                received_at_ms=now_ms - 100,
-                source=f"{venue}_bbo_ws",
-            )
-        )
-
-    metrics = {}
-    runtime.journal.open()
-    try:
-        filtered = runtime._filter_candidates_by_snapshot_freshness(
-            [candidate],
-            snapshot=snapshot,
-            now_ms=now_ms,
-            metrics=metrics,
-            ages={},
-        )
-    finally:
-        runtime.journal.close()
-
-    assert filtered == [candidate]
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    kinds = [record["kind"] for record in records]
-    assert "runtime.quote_stale" not in kinds
-    resolved = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_evidence_resolved_by_ws_bbo"
-    ]
-    assert len(resolved) == 2
-    assert {payload["venue"] for payload in resolved} == {"okx", "bybit"}
-    assert all(payload["source"] == "ws_bbo_quote_lease" for payload in resolved)
-    assert all(payload["sidecar_reason"] == "quote_stale" for payload in resolved)
-    assert runtime._last_snapshot_freshness_filter_blockers["quote_stale"] == 0
-    assert metrics["okx|BTCUSDT|quote"] == {"fresh": 1, "stale": 0}
-    assert metrics["bybit|BTCUSDT|quote"] == {"fresh": 1, "stale": 0}
-
-
-def test_ws_bbo_provider_does_not_resolve_missing_or_invalid_sidecar_quote(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(mode="live"),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1_500,
-            local_l2_enabled=False,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": QuoteSnapshot(
-                venue="okx",
-                symbol="BTCUSDT",
-                bid=0.0,
-                ask=101.0,
-                bid_size=100.0,
-                ask_size=100.0,
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms,
-                source="sidecar_quote",
-            ),
-        },
-        candidates=[candidate],
-    )
-    for venue, bid, ask in (
-        ("okx", 100.0, 101.0),
-        ("bybit", 100.2, 101.2),
-    ):
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue=venue,
-                symbol="BTCUSDT",
-                bid=bid,
-                ask=ask,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 100,
-                received_at_ms=now_ms - 100,
-                source=f"{venue}_bbo_ws",
-            )
-        )
-
-    runtime.journal.open()
-    try:
-        filtered = runtime._filter_candidates_by_snapshot_freshness(
-            [candidate],
-            snapshot=snapshot,
-            now_ms=now_ms,
-            metrics={},
-            ages={},
-        )
-    finally:
-        runtime.journal.close()
-
-    assert filtered == []
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    resolved = [
-        record for record in records
-        if record["kind"] == "runtime.entry_quote_evidence_resolved_by_ws_bbo"
-    ]
-    reasons = {
-        record["payload"]["reason"]
-        for record in records
-        if record["kind"] == "runtime.snapshot_freshness_decision"
-        and record["payload"].get("domain") == "quote"
-    }
-    assert resolved == []
-    assert reasons == {"invalid_quote", "missing_quote"}
-
-
-def test_ws_bbo_provider_keeps_entry_fail_closed_when_bbo_cannot_resolve_stale_sidecar_quote(tmp_path):
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(mode="live"),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1_500,
-            local_l2_enabled=False,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 31_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 31_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    runtime.journal.open()
-    try:
-        filtered = runtime._filter_candidates_by_snapshot_freshness(
-            [candidate],
-            snapshot=snapshot,
-            now_ms=now_ms,
-            metrics={},
-            ages={},
-        )
-    finally:
-        runtime.journal.close()
-
-    assert filtered == []
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    assert any(record["kind"] == "runtime.quote_stale" for record in records)
-    assert not any(
-        record["kind"] == "runtime.entry_quote_evidence_resolved_by_ws_bbo"
-        for record in records
-    )
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_revalidate_prewarm_resolves_stale_top_candidate(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1_500,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    executor = CapturingEntryExecutor()
-    runtime.entry_executor = executor
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_and_fill_cache(candidates, prewarm_now_ms):
-        symbols = {str(getattr(c, "symbol", "") or "").upper() for c in candidates}
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", symbol) for symbol in symbols
-        } | {("bybit", symbol) for symbol in symbols}
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 8
-        for venue, bid, ask in (
-            ("okx", 100.0, 101.0),
-            ("bybit", 100.2, 101.2),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    bid_size=50.0,
-                    ask_size=60.0,
-                    observed_at_ms=prewarm_now_ms - 25,
-                    received_at_ms=prewarm_now_ms - 25,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_and_fill_cache)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    kinds = [record["kind"] for record in records]
-    assert len(executor.contexts) == 1
-    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
-    assert "runtime.order_quote_stale_skipped" not in kinds
-    assert "runtime.quote_stale" not in kinds
-    assert "runtime.entry_quote_revalidate_targeted" in kinds
-    assert "runtime.entry_quote_revalidate_resolved" in kinds
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_failed_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_ws_bbo_sticky_warm_set_retains_previous_target(
-    tmp_path,
-    monkeypatch,
-):
-    config = AppConfig(
-        runtime=RuntimeConfig(mode="live"),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_ws_bbo_per_venue_budget=4,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    started: list[tuple[str, tuple[str, ...]]] = []
-    pruned: list[set[tuple[str, str]]] = []
-
-    def start_ws_streams(venue, symbols, adapter=None):
-        started.append((venue, tuple(symbols)))
-        return len(symbols)
-
-    async def connect_ws_streams():
-        return 0
-
-    def prune_untracked_quotes(tracked_keys, now_ms, retained_max_age_ms):
-        pruned.append(set(tracked_keys))
-
-    monkeypatch.setattr(runtime.ws_bbo_data_plane, "start_ws_streams", start_ws_streams)
-    monkeypatch.setattr(runtime.ws_bbo_data_plane, "connect_ws_streams", connect_ws_streams)
-    monkeypatch.setattr(runtime.ws_bbo_data_plane, "prune_untracked_quotes", prune_untracked_quotes)
-
-    first = _freshness_candidate("BTCUSDT")
-    second = _freshness_candidate("ETHUSDT")
-
-    runtime.journal.open()
-    try:
-        await runtime._ensure_entry_bbo_active_for_candidates([first], 100_000)
-        started.clear()
-        await runtime._ensure_entry_bbo_active_for_candidates([second], 110_000)
-    finally:
-        runtime.journal.close()
-
-    started_by_venue = {venue: symbols for venue, symbols in started}
-    assert started_by_venue["okx"] == ("ETHUSDT", "BTCUSDT")
-    assert started_by_venue["bybit"] == ("ETHUSDT", "BTCUSDT")
-    assert ("okx", "BTCUSDT") in pruned[-1]
-    assert ("bybit", "BTCUSDT") in pruned[-1]
-    assert ("okx", "ETHUSDT") in runtime._entry_bbo_subscription_budgeted_keys
-
-
-@pytest.mark.asyncio
-async def test_runtime_last_good_top_candidate_requires_entry_quote_truth(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=1_000,
-            max_market_age_ms=1_000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1_500,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    executor = CapturingEntryExecutor()
-    runtime.entry_executor = executor
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms - 20_000,
-        market_observed_at_ms=now_ms - 20_000,
-        acquisition_mode="last_good_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 20_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 20_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_and_fill_cache(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 8
-        for venue, bid, ask in (
-            ("okx", 100.0, 101.0),
-            ("bybit", 100.2, 101.2),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    bid_size=50.0,
-                    ask_size=60.0,
-                    observed_at_ms=prewarm_now_ms - 25,
-                    received_at_ms=prewarm_now_ms - 25,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr(
-        "lightfee.engine.runtime.evaluate_snapshot_freshness",
-        lambda **_kwargs: SnapshotFreshness.LAST_GOOD_FALLBACK,
-    )
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_and_fill_cache)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    kinds = [record["kind"] for record in records]
-    assert len(executor.contexts) == 1
-    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
-    assert "runtime.last_good_revalidated_by_entry_quote_truth" in kinds
-    assert "runtime.quote_stale" not in kinds
-    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 2
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_revalidate_rest_fallback_updates_overlay_and_cache(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    executor = CapturingEntryExecutor()
-    runtime.entry_executor = executor
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_without_quotes(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 8
-
-    class RestOnlyRefresher:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
-
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            self.calls.append((venue, symbol))
-            return TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0 if venue == "okx" else 100.2,
-                ask=101.0 if venue == "okx" else 101.2,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 25,
-                received_at_ms=now_ms - 25,
-                source=f"{venue}_rest_topbook",
-            )
-
-    refresher = RestOnlyRefresher()
-    runtime.ws_bbo_rest_refresher = refresher
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    kinds = [record["kind"] for record in records]
-    resolved_payloads = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_resolved"
-    ]
-
-    assert len(executor.contexts) == 1
-    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
-    assert sorted(refresher.calls) == [("bybit", "BTCUSDT"), ("okx", "BTCUSDT")]
-    assert "runtime.quote_stale" not in kinds
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_failed_count"] == 0
-    assert runtime.state.last_scan["quote_revalidate_sources"] == {
-        "bybit_rest_topbook": 1,
-        "okx_rest_topbook": 1,
-    }
-    assert {payload["source"] for payload in resolved_payloads} == {
-        "bybit_rest_topbook",
-        "okx_rest_topbook",
-    }
-    assert runtime.ws_bbo_cache.get_quote("okx", "BTCUSDT").source == "okx_rest_topbook"
-    assert runtime.ws_bbo_cache.get_quote("bybit", "BTCUSDT").source == "bybit_rest_topbook"
-
-
-@pytest.mark.asyncio
-async def test_runtime_ws_bbo_quote_revalidate_uses_v1_primary_shadow_scope(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-            debug_journal_diagnostics_enabled=True,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-            max_concurrent_positions=2,
-            entry_local_l2_primary_count=2,
-            shadow_entry_opportunity_count=1,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    runtime.entry_executor = CapturingEntryExecutor()
-    candidates = [
-        _freshness_candidate(symbol=f"S{i:02d}USDT")
-        for i in range(50)
-    ]
-    for index, candidate in enumerate(candidates):
-        candidate.ranking_edge_bps = 100.0 - index
-        candidate.funding_edge_bps = 100.0 - index
-        candidate.funding_diff_bps = 100.0 - index
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            f"{venue}:{candidate.symbol}": _quote_with_liquidity(
-                venue,
-                candidate.symbol,
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            )
-            for candidate in candidates
-            for venue in ("okx", "bybit")
-        },
-        candidates=candidates,
-    )
-
-    prewarm_candidate_counts: list[int] = []
-
-    async def prewarm_without_quotes(candidates, prewarm_now_ms):
-        prewarm_candidate_counts.append(len(candidates))
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            (venue, str(candidate.symbol).upper())
-            for candidate in candidates
-            for venue in ("okx", "bybit")
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 10
-
-    class RecordingRestRefresher:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
-
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            self.calls.append((venue, symbol))
-            return TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0,
-                ask=101.0,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 25,
-                received_at_ms=now_ms - 25,
-                source=f"{venue}_rest_topbook",
-            )
-
-    refresher = RecordingRestRefresher()
-    runtime.ws_bbo_rest_refresher = refresher
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    probe = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_probe"
-    ][-1]
-
-    assert prewarm_candidate_counts == [3]
-    assert len(refresher.calls) == 6
-    assert runtime.state.last_scan["quote_revalidate_candidate_scope"] == "v1_primary_shadow"
-    assert runtime.state.last_scan["quote_revalidate_candidate_count"] == 3
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 6
-    assert runtime.state.last_scan["quote_revalidate_skipped_untracked_count"] == 94
-    assert probe["candidate_scope"] == "v1_primary_shadow"
-    assert probe["candidate_count"] == 3
-    assert probe["skipped_untracked_count"] == 94
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_revalidate_budget_excluded_top_candidate_uses_rest(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    executor = CapturingEntryExecutor()
-    runtime.entry_executor = executor
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_budget_excludes_top_candidate(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "ETHUSDT"),
-            ("bybit", "ETHUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_per_venue_budget = 1
-
-    class RestOnlyRefresher:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str]] = []
-
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            self.calls.append((venue, symbol))
-            return TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0 if venue == "okx" else 100.2,
-                ask=101.0 if venue == "okx" else 101.2,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 25,
-                received_at_ms=now_ms - 25,
-                source=f"{venue}_rest_topbook",
-            )
-
-    refresher = RestOnlyRefresher()
-    runtime.ws_bbo_rest_refresher = refresher
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_entry_bbo_active_for_candidates",
-        prewarm_budget_excludes_top_candidate,
-    )
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    kinds = [record["kind"] for record in records]
-    failures = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_failed"
-    ]
-
-    assert len(executor.contexts) == 1
-    assert sorted(refresher.calls) == [("bybit", "BTCUSDT"), ("okx", "BTCUSDT")]
-    assert runtime.state.last_scan["dispatched_candidate_count"] == 1
-    assert "runtime.quote_stale" not in kinds
-    assert not failures
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_failed_count"] == 0
-    assert runtime.state.last_scan["budget_excluded_without_rest_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_revalidate_budget_excluded_without_rest_is_explicit(
-    tmp_path,
-    monkeypatch,
-):
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    executor = CapturingEntryExecutor()
-    runtime.entry_executor = executor
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_budget_excludes_top_candidate(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "ETHUSDT"),
-            ("bybit", "ETHUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_per_venue_budget = 1
-
-    class NoRestCapability:
-        pass
-
-    runtime.ws_bbo_rest_refresher = NoRestCapability()
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_entry_bbo_active_for_candidates",
-        prewarm_budget_excludes_top_candidate,
-    )
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    failures = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_failed"
-    ]
-
-    assert not executor.contexts
-    assert runtime.state.last_scan["dispatched_candidate_count"] == 0
-    assert runtime.state.last_scan["quote_revalidate_target_count"] == 2
-    assert runtime.state.last_scan["quote_revalidate_resolved_count"] == 0
-    assert runtime.state.last_scan["quote_revalidate_failed_count"] == 2
-    assert runtime.state.last_scan["budget_excluded_without_rest_count"] == 2
-    assert runtime.state.last_scan["top_quote_blocker_buckets"] == {
-        "budget_excluded_without_rest": 2
-    }
-    assert {payload["outcome"] for payload in failures} == {
-        "budget_excluded_rest_unavailable"
-    }
-    assert all(payload["source"] == "entry_quote_truth" for payload in failures)
-    assert all(payload["age_ms"] is not None for payload in failures)
-    assert all(payload["budget_ms"] == 100 for payload in failures)
-    assert all(payload["ws_budget_excluded"] is True for payload in failures)
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_revalidate_rest_throttle_is_not_invalid_quote(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import RestTopBookQuoteResult
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.last_scan = {}
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_without_quotes(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-
-    class ThrottledRefresher:
-        def refresh_quote_result(self, venue: str, symbol: str, *, now_ms: int):
-            return RestTopBookQuoteResult(
-                venue=venue,
-                symbol=symbol,
-                venue_symbol=symbol,
-                outcome="throttled",
-                endpoint="rest_topbook",
-                url=f"https://example.invalid/{venue}/{symbol}",
-                attempt_interval_outcome="min_interval_not_elapsed",
-            )
-
-    runtime.ws_bbo_rest_refresher = ThrottledRefresher()
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_entry_bbo_active_for_candidates",
-        prewarm_without_quotes,
-    )
-    monkeypatch.setattr(runtime, "_entry_quote_lease_max_age_ms", lambda: 0)
-
-    runtime.journal.open()
-    try:
-        overlay, stats = await runtime._entry_quote_revalidate_for_candidates(
-            [candidate],
-            snapshot=snapshot,
-            now_ms=now_ms,
-            candidate_scope="v1_primary_shadow",
-        )
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    failures = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_failed"
-    ]
-
-    assert overlay == {}
-    assert stats["rest_throttled_count"] == 2
-    assert {payload["outcome"] for payload in failures} == {"rest_attempt_throttled"}
-    assert {payload["reason_bucket"] for payload in failures} == {"rest_throttled"}
-    assert all(
-        payload["attempt_interval_outcome"] == "min_interval_not_elapsed"
-        for payload in failures
-    )
-    assert "rest_invalid_quote" not in {payload["outcome"] for payload in failures}
-    assert all(payload["rest_error"] == "" for payload in failures)
-    assert all(payload["endpoint"] == "rest_topbook" for payload in failures)
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_revalidate_rest_quote_stale_has_precise_bucket(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import RestTopBookQuoteResult, TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.last_scan = {}
-    candidate = _freshness_candidate()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[candidate],
-    )
-
-    async def prewarm_without_quotes(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-
-    class StaleRestRefresher:
-        def refresh_quote_result(self, venue: str, symbol: str, *, now_ms: int):
-            quote = TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0,
-                ask=101.0,
-                observed_at_ms=now_ms - 250,
-                received_at_ms=now_ms,
-                source="rest_topbook",
-            )
-            return RestTopBookQuoteResult(
-                venue=venue,
-                symbol=symbol,
-                venue_symbol=symbol,
-                outcome="resolved",
-                quote=quote,
-                endpoint="rest_topbook",
-                url=f"https://example.invalid/{venue}/{symbol}",
-                bid=quote.bid,
-                ask=quote.ask,
-                observed_at_ms=quote.observed_at_ms,
-            )
-
-    runtime.ws_bbo_rest_refresher = StaleRestRefresher()
-    monkeypatch.setattr(
-        runtime,
-        "_ensure_entry_bbo_active_for_candidates",
-        prewarm_without_quotes,
-    )
-
-    runtime.journal.open()
-    try:
-        overlay, stats = await runtime._entry_quote_revalidate_for_candidates(
-            [candidate],
-            snapshot=snapshot,
-            now_ms=now_ms,
-            candidate_scope="v1_primary_shadow",
-        )
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    failures = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_failed"
-    ]
-
-    assert overlay == {}
-    assert stats["quote_lease_failure_counts"] == Counter({
-        "rest_resolved_but_stale": 2,
-    })
-    assert {payload["reason_bucket"] for payload in failures} == {
-        "rest_resolved_but_stale"
-    }
-    assert {payload["reason_family"] for payload in failures} == {
-        "rest_invalid_quote"
-    }
-    assert {payload["quote_validation_reject_reason"] for payload in failures} == {
-        "stale"
-    }
-    assert all(payload["rest_quote_observed_at_ms"] == now_ms - 250 for payload in failures)
-    assert all(payload["rest_quote_age_ms"] == 250 for payload in failures)
-    assert all(payload["rest_quote_bid"] == pytest.approx(100.0) for payload in failures)
-    assert all(payload["rest_quote_ask"] == pytest.approx(101.0) for payload in failures)
-    scheduled = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_rewarm_scheduled_after_rest_stale"
-    ]
-    assert {(payload["venue"], payload["symbol"]) for payload in scheduled} == {
-        ("okx", "BTCUSDT"),
-        ("bybit", "BTCUSDT"),
-    }
-    assert set(runtime._entry_bbo_sticky_warm_until_ms) >= {
-        ("okx", "BTCUSDT"),
-        ("bybit", "BTCUSDT"),
-    }
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_probe_diagnostics_are_disabled_by_default(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    runtime.entry_executor = CapturingEntryExecutor()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[_freshness_candidate()],
-    )
-
-    async def prewarm_without_quotes(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 8
-
-    class RestOnlyRefresher:
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            return TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0 if venue == "okx" else 100.2,
-                ask=101.0 if venue == "okx" else 101.2,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 25,
-                received_at_ms=now_ms - 25,
-                source=f"{venue}_rest_topbook",
-            )
-
-    runtime.ws_bbo_rest_refresher = RestOnlyRefresher()
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    assert not any(
-        record["kind"] == "runtime.entry_quote_revalidate_probe"
-        for record in records
-    )
-
-
-@pytest.mark.asyncio
-async def test_runtime_entry_quote_probe_diagnostics_can_be_enabled(
-    tmp_path,
-    monkeypatch,
-):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 100_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            max_market_age_ms=600000,
-            max_order_quote_age_ms=5_000,
-            live_scan_recovery_success_count=1,
-            debug_journal_diagnostics_enabled=True,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=100,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-            min_funding_edge_bps=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(
-        config,
-        venue_adapters={
-            Venue.OKX: OkxMetadataAdapter(),
-            Venue.BYBIT: BybitMetadataAdapter(),
-        },
-    )
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    runtime.entry_executor = CapturingEntryExecutor()
-    snapshot = SidecarSnapshot(
-        published_at_ms=now_ms,
-        market_observed_at_ms=now_ms,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            "okx:BTCUSDT": _quote_with_liquidity(
-                "okx",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-            "bybit:BTCUSDT": _quote_with_liquidity(
-                "bybit",
-                "BTCUSDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-                observed_at_ms=now_ms - 10_000,
-            ),
-        },
-        candidates=[_freshness_candidate()],
-    )
-
-    async def prewarm_without_quotes(candidates, prewarm_now_ms):
-        runtime._entry_bbo_subscription_budgeted_keys = {
-            ("okx", "BTCUSDT"),
-            ("bybit", "BTCUSDT"),
-        }
-        runtime._entry_bbo_subscription_budget_excluded_keys = set()
-        runtime._entry_bbo_subscription_per_venue_budget = 8
-
-    class RestOnlyRefresher:
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            return TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0 if venue == "okx" else 100.2,
-                ask=101.0 if venue == "okx" else 101.2,
-                bid_size=50.0,
-                ask_size=60.0,
-                observed_at_ms=now_ms - 25,
-                received_at_ms=now_ms - 25,
-                source=f"{venue}_rest_topbook",
-            )
-
-    runtime.ws_bbo_rest_refresher = RestOnlyRefresher()
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
-    monkeypatch.setattr(runtime, "_ensure_entry_bbo_active_for_candidates", prewarm_without_quotes)
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    probe = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_quote_revalidate_probe"
-    ][-1]
-
-    assert probe["enabled"] is True
-    assert probe["candidate_count"] == 1
-    assert probe["target_count"] == 2
-    assert probe["budgeted_target_count"] == 2
-    assert probe["budget_exhausted_count"] == 0
-    assert probe["cache_initial_hit_count"] == 0
-    assert probe["cache_wait_hit_count"] == 0
-    assert probe["rest_attempt_count"] == 2
-    assert probe["rest_resolved_count"] == 2
-    assert probe["failed_count"] == 0
-    assert probe["resolved_sources"] == {
-        "bybit_rest_topbook": 1,
-        "okx_rest_topbook": 1,
-    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_snapshot_freshness_decisions_are_rate_limited_by_source_domain(tmp_path):
@@ -1964,170 +509,14 @@ async def test_runtime_snapshot_freshness_observability_avoids_full_candidate_sc
     assert runtime.state.last_scan["no_entry_reason"] == "candidate_edge_insufficient"
 
 
-@pytest.mark.asyncio
-async def test_runtime_snapshot_freshness_filter_uses_v1_primary_shadow_scope(
-    tmp_path,
-    monkeypatch,
-):
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-            sidecar_snapshot_max_age_ms=600000,
-            live_scan_recovery_success_count=1,
-        ),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            max_concurrent_positions=6,
-            entry_local_l2_primary_count=6,
-            shadow_entry_opportunity_count=2,
-            entry_window_secs=600,
-            min_scan_minutes_before_funding=0,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.state.lifecycle = EngineLifecycle.RUNNING
-    runtime.state.risk_mode = GlobalRiskMode.RUNNING
-    runtime.entry_executor = CapturingEntryExecutor()
-    candidates = []
-    for idx in range(64):
-        candidate = _freshness_candidate(symbol=f"SYM{idx}USDT")
-        candidate.pair_id = f"sym{idx}usdt:okx->bybit"
-        candidate.ranking_edge_bps = 100.0 - idx
-        candidates.append(candidate)
-    snapshot = SidecarSnapshot(
-        published_at_ms=69000,
-        market_observed_at_ms=69000,
-        acquisition_mode="fresh_sidecar",
-        quotes={
-            f"okx:SYM{idx}USDT": _quote_with_liquidity(
-                "okx",
-                f"SYM{idx}USDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-            )
-            for idx in range(64)
-        }
-        | {
-            f"bybit:SYM{idx}USDT": _quote_with_liquidity(
-                "bybit",
-                f"SYM{idx}USDT",
-                volume_24h_quote=10_000_000.0,
-                open_interest=2_000_000.0,
-            )
-            for idx in range(64)
-        },
-        candidates=candidates,
-    )
-
-    observed_filter_counts: list[int] = []
-
-    def observe_scope(candidates, **kwargs):
-        observed_filter_counts.append(len(candidates))
-        return []
-
-    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
-    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: 70000)
-    monkeypatch.setattr(
-        runtime,
-        "_filter_candidates_by_snapshot_freshness",
-        observe_scope,
-    )
-
-    runtime.journal.open()
-    try:
-        await runtime.tick()
-    finally:
-        runtime.journal.close()
-
-    assert observed_filter_counts == [8]
-    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_scope"] == (
-        "v1_primary_shadow"
-    )
-    assert runtime.state.last_scan["snapshot_freshness_filter_candidate_count"] == 8
-    assert runtime.state.last_scan["snapshot_freshness_filter_all_candidate_count"] == 64
-    assert runtime.state.last_scan["snapshot_freshness_filter_skipped_untracked_count"] == 56
 
 
-def test_runtime_snapshot_fallback_health_scope_uses_v1_primary_shadow_candidates(
-    tmp_path,
-    monkeypatch,
-):
-    config = AppConfig(
-        runtime=RuntimeConfig(mode="live"),
-        strategy=StrategyConfig(
-            local_l2_enabled=False,
-            entry_readiness_provider="ws_bbo_quote_lease",
-            max_concurrent_positions=6,
-            entry_local_l2_primary_count=6,
-            shadow_entry_opportunity_count=2,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    candidates = []
-    for idx in range(64):
-        candidate = _freshness_candidate(symbol=f"SYM{idx}USDT")
-        candidate.pair_id = f"sym{idx}usdt:okx->bybit"
-        candidate.ranking_edge_bps = 100.0 - idx
-        candidates.append(candidate)
-    snapshot = SidecarSnapshot(
-        published_at_ms=1000,
-        market_observed_at_ms=1000,
-        acquisition_mode="last_good_sidecar",
-        candidates=candidates,
-    )
-    observed_pair_ids: list[str] = []
 
-    def observe_candidate(candidate, **_kwargs):
-        observed_pair_ids.append(candidate.pair_id)
-        return [
-            {
-                "venue": "okx",
-                "symbol": str(getattr(candidate, "symbol", "") or "").upper(),
-                "domain": "quote",
-                "source": "sidecar_quote",
-                "age_ms": 69000,
-                "decision": "skip_entry",
-                "reason": "quote_stale",
-                "blocking": True,
-            }
-        ]
 
-    monkeypatch.setattr(
-        runtime,
-        "_candidate_snapshot_freshness_decisions",
-        observe_candidate,
-    )
-
-    payload = runtime._snapshot_health_payload(
-        snapshot=snapshot,
-        now_ms=70000,
-        max_age_ms=10000,
-        freshness="last_good_fallback",
-    )
-
-    assert observed_pair_ids == [candidate.pair_id for candidate in candidates[:8]]
-    assert payload["candidate_freshness_candidate_scope"] == "v1_primary_shadow"
-    assert payload["candidate_freshness_candidate_count"] == 8
-    assert payload["candidate_freshness_all_candidate_count"] == 64
-    assert payload["candidate_freshness_skipped_untracked_count"] == 56
-    assert {
-        sample["candidate_pair_id"]
-        for sample in payload["candidate_freshness_scope"]
-    } <= {candidate.pair_id for candidate in candidates[:8]}
 
 
 @pytest.mark.asyncio
-async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path, monkeypatch):
+async def test_runtime_passes_sidecar_horizon_to_global_market_freshness(tmp_path, monkeypatch):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -2170,7 +559,80 @@ async def test_runtime_passes_live_scan_last_good_max_age_to_freshness(tmp_path,
         runtime.journal.close()
 
     assert observed["last_good_max_age_ms"] == 600000
-    assert observed["market_max_age_ms"] == 4000
+    # V1 uses the sidecar snapshot horizon for global snapshot market age.
+    # max_market_age_ms is reserved for actual venue market/L2 evidence later
+    # in the flow, not for classifying the sidecar snapshot as last-good.
+    assert observed["market_max_age_ms"] == 10000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("market_age_ms", "expected_freshness", "expected_fallback_duration_ms"),
+    [(5_000, "fresh", None), (10_001, "last_good_fallback", 1)],
+)
+async def test_runtime_classifies_global_sidecar_market_with_sidecar_horizon(
+    tmp_path,
+    monkeypatch,
+    market_age_ms,
+    expected_freshness,
+    expected_fallback_duration_ms,
+):
+    """V1: global sidecar market age uses its own horizon, not execution age."""
+    now_ms = 100_000
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+            sidecar_snapshot_max_age_ms=10_000,
+            max_market_age_ms=4_000,
+            max_order_quote_age_ms=15_000,
+            live_scan_recovery_success_count=1,
+        ),
+        strategy=StrategyConfig(local_l2_enabled=False),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.risk_mode = GlobalRiskMode.RUNNING
+    snapshot = SidecarSnapshot(
+        published_at_ms=now_ms - 1_000,
+        market_observed_at_ms=now_ms - market_age_ms,
+        acquisition_mode="fresh_sidecar",
+    )
+
+    monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
+    monkeypatch.setattr("lightfee.engine.runtime.wall_clock_now_ms", lambda: now_ms)
+
+    runtime.journal.open()
+    try:
+        await runtime.tick()
+    finally:
+        runtime.journal.close()
+
+    assert runtime.state.last_scan["snapshot_freshness"] == expected_freshness
+    scoped_status = runtime.state.last_scan["snapshot_freshness_status"]
+    assert scoped_status[
+        "market|global|*|snapshot.market_observed_at_ms"
+    ]["status"] == (
+        "fresh" if expected_freshness == "fresh" else "stale"
+    )
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    fallbacks = [
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.snapshot_fallback_last_good"
+    ]
+    if expected_fallback_duration_ms is None:
+        assert not fallbacks
+    else:
+        assert fallbacks[-1]["fallback_duration_ms"] == expected_fallback_duration_ms
 
 
 @pytest.mark.asyncio
@@ -2266,7 +728,7 @@ async def test_runtime_skips_entry_price_hints_older_than_max_order_quote_age(tm
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -2660,7 +1122,7 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -2681,6 +1143,8 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=69000)
     snapshot = SidecarSnapshot(
         published_at_ms=65000,
         market_observed_at_ms=65000,
@@ -2705,7 +1169,7 @@ async def test_runtime_treats_coarse_perp_liquidity_stale_as_advisory(tmp_path, 
                 coverage_usable=1,
             ),
         ],
-        candidates=[_freshness_candidate()],
+        candidates=[candidate],
     )
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
@@ -3291,7 +1755,7 @@ async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -3313,6 +1777,7 @@ async def test_runtime_blocks_perp_liquidity_only_when_candidate_sizing_requires
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
     candidate = _sidecar_liquidity_required_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=69000)
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -3384,7 +1849,7 @@ async def test_runtime_blocks_required_sidecar_liquidity_when_current_row_has_no
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -3475,7 +1940,7 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -3497,6 +1962,7 @@ async def test_runtime_does_not_block_required_sidecar_liquidity_for_other_symbo
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
     candidate = _sidecar_liquidity_required_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=69000)
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -3681,19 +2147,12 @@ async def test_runtime_blocks_only_when_execution_l2_needed_by_sizing_is_stale(t
         for line in (tmp_path / "events.jsonl").read_text().splitlines()
         if line.strip()
     ]
-    assert "runtime.execution_l2_stale" in [record["kind"] for record in records]
-    decisions = [
+    blocked = next(
         record["payload"]
         for record in records
-        if record["kind"] == "runtime.snapshot_freshness_decision"
-    ]
-    assert any(
-        d["reason"] == "execution_l2_stale"
-        and d["decision"] == "skip_entry"
-        and d["age_ms"] == 20000
-        and d["budget_ms"] == 5000
-        for d in decisions
+        if record["kind"] == "runtime.entry_blocked_local_l2_not_ready"
     )
+    assert blocked["reason"] == "entry_local_l2_session_not_ready"
 
 
 @pytest.mark.asyncio
@@ -3709,7 +2168,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             live_scan_recovery_success_count=1,
         ),
         strategy=StrategyConfig(
-            local_l2_enabled=False,
+            local_l2_enabled=True,
             entry_window_secs=600,
             min_scan_minutes_before_funding=0,
             min_funding_edge_bps=0,
@@ -3730,6 +2189,8 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     executor = CapturingEntryExecutor()
     runtime.entry_executor = executor
+    candidate = _freshness_candidate()
+    _install_l2_books(runtime, candidate, observed_at_ms=69000)
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -3742,7 +2203,7 @@ async def test_runtime_allows_entry_when_critical_snapshot_domains_are_fresh(tmp
             LiquidityLifecycle(venue="okx", observed_at_ms=69000, symbol_count=1, coverage_usable=1),
             LiquidityLifecycle(venue="bybit", observed_at_ms=69000, symbol_count=1, coverage_usable=1),
         ],
-        candidates=[_freshness_candidate()],
+        candidates=[candidate],
     )
 
     monkeypatch.setattr("lightfee.engine.runtime.load_snapshot", lambda _path: snapshot)
@@ -3831,26 +2292,18 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
     assert len(executor.contexts) == 1
     assert runtime.state.last_scan["dispatched_candidate_count"] == 1
     assert runtime.state.last_scan["no_entry_reason"] is None
-    fallback = next(
-        record["payload"]
+    entry_ctx = executor.contexts[0]
+    assert entry_ctx.maker_leg == Side.BUY
+    assert entry_ctx.long_price_hint == 100.0
+    assert entry_ctx.short_price_hint == 100.2
+    assert not any(
+        record["kind"] == "runtime.entry_blocked_post_only_l2"
         for record in records
-        if record["kind"] == "runtime.snapshot_fallback_last_good"
     )
-    market_scope = next(
-        sample for sample in fallback["candidate_freshness_scope"]
-        if sample["candidate_symbol"] == "BTCUSDT"
-        and sample["domain"] == "market_observed"
-    )
-    assert market_scope["candidate_pair_id"] == "btcusdt:okx->bybit"
-    assert market_scope["venue"] == "global"
-    assert market_scope["source_age_ms"] == 60000
-    assert market_scope["fallback_duration_ms"] == 55000
-    assert market_scope["blocked"] is False
-    assert market_scope["block_reason"] == ""
     scoped_status = runtime.state.last_scan["snapshot_freshness_status"]
     assert scoped_status[
         "market|global|*|snapshot.market_observed_at_ms"
-    ]["status"] == "stale"
+    ]["status"] == "fresh"
     assert scoped_status["quote|okx|BTCUSDT|sidecar_quote"]["status"] == "fresh"
     assert scoped_status["quote|bybit|BTCUSDT|sidecar_quote"]["status"] == "fresh"
     assert not any(
@@ -3860,7 +2313,20 @@ async def test_runtime_does_not_globally_filter_candidate_when_market_observed_s
     )
 
 
-def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "max_age_ms, observed_at_ms, expected_age_ms",
+    [
+        (5_000, 1_000, 6_000),
+        (0, 7_000, 0),
+    ],
+)
+def test_close_price_hint_rejects_stale_hot_local_l2_book(
+    tmp_path,
+    monkeypatch,
+    max_age_ms,
+    observed_at_ms,
+    expected_age_ms,
+):
     from lightfee.core.domain import Venue
     from lightfee.marketdata.l2 import L2BookStatus, LocalL2Book, PriceLevel
     from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
@@ -3870,7 +2336,7 @@ def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch)
             mode="live",
             sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
         ),
-        strategy=StrategyConfig(max_liquidity_snapshot_age_ms=5000),
+        strategy=StrategyConfig(max_liquidity_snapshot_age_ms=max_age_ms),
         persistence=PersistenceConfig(
             event_log_path=str(tmp_path / "events.jsonl"),
             snapshot_path=str(tmp_path / "state.json"),
@@ -3885,12 +2351,19 @@ def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch)
         bids=[PriceLevel(price=100.0, quantity=10.0)],
         asks=[PriceLevel(price=101.0, quantity=10.0)],
         status=L2BookStatus.HOT,
-        observed_at_ms=1000,
+        observed_at_ms=observed_at_ms,
     )
 
     runtime.journal.open()
     try:
         assert runtime._resolve_local_l2_mid(Venue.OKX, "BTCUSDT", now_ms=7000) == 0.0
+        # Passive close price hints must use the same freshness boundary as
+        # aggressive close mids; HOT alone is not executable evidence.
+        assert runtime._resolve_local_l2_quote(
+            Venue.OKX,
+            "BTCUSDT",
+            now_ms=7000,
+        ) is None
     finally:
         runtime.journal.close()
 
@@ -3907,504 +2380,7 @@ def test_close_price_hint_rejects_stale_hot_local_l2_book(tmp_path, monkeypatch)
     assert stale[-1]["venue"] == "okx"
     assert stale[-1]["symbol"] == "BTCUSDT"
     assert stale[-1]["domain"] == "local_l2_book"
-    assert stale[-1]["age_ms"] == 6000
-    assert stale[-1]["budget_ms"] == 5000
+    assert stale[-1]["age_ms"] == expected_age_ms
+    assert stale[-1]["budget_ms"] == max_age_ms
     assert stale[-1]["decision"] == "reject_price_hint"
     assert stale[-1]["fallback_source"] == "none"
-
-
-def test_close_price_hint_uses_fresh_ws_bbo_when_local_l2_missing(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.ws_bbo_cache.update_quote(
-        TopBookQuote(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=100.0,
-            ask=101.0,
-            observed_at_ms=1000,
-            received_at_ms=1001,
-            source="binance_book_ticker",
-        )
-    )
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT", now_ms=2000) == 100.5
-    finally:
-        runtime.journal.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    fallback = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_ws_bbo_used"
-    ]
-    assert fallback[-1]["venue"] == "binance"
-    assert fallback[-1]["symbol"] == "BTCUSDT"
-    assert fallback[-1]["domain"] == "ws_bbo_cache"
-    assert fallback[-1]["age_ms"] == 1000
-    assert fallback[-1]["budget_ms"] == 1500
-    assert fallback[-1]["decision"] == "use_price_hint"
-    assert fallback[-1]["outcome"] == "used_fresh_ws_bbo"
-
-
-@pytest.mark.asyncio
-async def test_close_price_hint_rewarms_stale_ws_bbo_with_rest_top_book(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 3_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1_500,
-            max_liquidity_snapshot_age_ms=300_000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.ws_bbo_cache.update_quote(
-        TopBookQuote(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=90.0,
-            ask=91.0,
-            observed_at_ms=1_000,
-            received_at_ms=1_001,
-            source="binance_book_ticker",
-        )
-    )
-
-    class RestRefresher:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, str, int]] = []
-
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            self.calls.append((venue, symbol, now_ms))
-            return TopBookQuote(
-                venue=venue,
-                symbol=symbol,
-                bid=100.0,
-                ask=101.0,
-                observed_at_ms=now_ms - 25,
-                received_at_ms=now_ms - 25,
-                source=f"{venue}_rest_topbook",
-            )
-
-    refresher = RestRefresher()
-    runtime.ws_bbo_rest_refresher = refresher
-
-    runtime.journal.open()
-    try:
-        overlay = await runtime.close_runtime._rewarm_close_price_evidence(
-            [("binance", "BTCUSDT")],
-            now_ms=now_ms,
-        )
-        assert overlay[("binance", "BTCUSDT")].source == "binance_rest_topbook"
-        assert runtime._resolve_local_l2_mid(
-            Venue.BINANCE, "BTCUSDT", now_ms=now_ms,
-        ) == 100.5
-    finally:
-        runtime.journal.close()
-
-    records = _read_journal_records(tmp_path / "events.jsonl")
-    kinds = [record["kind"] for record in records]
-    assert refresher.calls == [("binance", "BTCUSDT", now_ms)]
-    assert "runtime.close_price_evidence_stale" not in kinds
-    assert "runtime.close_price_evidence_rest_rewarm_succeeded" in kinds
-    used = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_ws_bbo_used"
-    ][-1]
-    assert used["source"] == "binance_rest_topbook"
-    assert used["outcome"] == "used_fresh_ws_bbo"
-
-
-@pytest.mark.asyncio
-async def test_close_price_rewarm_failure_reports_stale_quote_evidence(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    now_ms = 3_000
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1,
-            max_liquidity_snapshot_age_ms=300_000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.ws_bbo_cache.update_quote(
-        TopBookQuote(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=90.0,
-            ask=91.0,
-            observed_at_ms=2_000,
-            received_at_ms=2_001,
-            source="binance_book_ticker",
-        )
-    )
-
-    class EmptyRestRefresher:
-        def refresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-            return None
-
-    runtime.ws_bbo_rest_refresher = EmptyRestRefresher()
-
-    runtime.journal.open()
-    try:
-        overlay = await runtime.close_runtime._rewarm_close_price_evidence(
-            [("binance", "BTCUSDT")],
-            now_ms=now_ms,
-        )
-    finally:
-        runtime.journal.close()
-
-    assert overlay == {}
-    failures = [
-        record["payload"]
-        for record in _read_journal_records(tmp_path / "events.jsonl")
-        if record["kind"] == "runtime.close_price_evidence_rewarm_failed"
-    ]
-    assert failures
-    assert failures[-1]["venue"] == "binance"
-    assert failures[-1]["symbol"] == "BTCUSDT"
-    assert failures[-1]["observed_at_ms"] == 2_000
-    assert failures[-1]["age_ms"] == 1_000
-    assert failures[-1]["budget_ms"] == 1
-    assert failures[-1]["endpoint"] == "rest_topbook"
-    assert failures[-1]["ws_budget_excluded"] is True
-    assert failures[-1]["outcome"] == "rest_topbook_unavailable"
-
-
-def test_ws_bbo_close_price_hint_prefers_ws_bbo_over_hot_local_l2(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.local_l2_runtime.books[
-        LocalL2BookKey(venue="binance", symbol="BTCUSDT")
-    ] = LocalL2Book(
-        venue="binance",
-        symbol="BTCUSDT",
-        bids=[PriceLevel(price=50.0, quantity=10.0)],
-        asks=[PriceLevel(price=51.0, quantity=10.0)],
-        status=L2BookStatus.HOT,
-        observed_at_ms=1990,
-    )
-    runtime.ws_bbo_cache.update_quote(
-        TopBookQuote(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=100.0,
-            ask=101.0,
-            observed_at_ms=1000,
-            received_at_ms=1001,
-            source="binance_book_ticker",
-        )
-    )
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT", now_ms=2000) == 100.5
-    finally:
-        runtime.journal.close()
-
-
-def test_ws_bbo_close_price_hint_missing_does_not_fallback_to_local_l2(tmp_path):
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.local_l2_runtime.books[
-        LocalL2BookKey(venue="binance", symbol="BTCUSDT")
-    ] = LocalL2Book(
-        venue="binance",
-        symbol="BTCUSDT",
-        bids=[PriceLevel(price=50.0, quantity=10.0)],
-        asks=[PriceLevel(price=51.0, quantity=10.0)],
-        status=L2BookStatus.HOT,
-        observed_at_ms=1990,
-    )
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT", now_ms=2000) == 0.0
-    finally:
-        runtime.journal.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    missing = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_missing"
-    ]
-    assert missing[-1]["provider"] == "ws_bbo_quote_lease"
-    assert missing[-1]["domain"] == "ws_bbo_cache"
-    assert missing[-1]["decision"] == "reject_price_hint"
-
-
-def test_close_price_hint_rejects_stale_ws_bbo_fallback(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.ws_bbo_cache.update_quote(
-        TopBookQuote(
-            venue="binance",
-            symbol="BTCUSDT",
-            bid=100.0,
-            ask=101.0,
-            observed_at_ms=1000,
-            received_at_ms=1001,
-            source="binance_book_ticker",
-        )
-    )
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "BTCUSDT", now_ms=3000) == 0.0
-    finally:
-        runtime.journal.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    stale = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_stale"
-    ]
-    assert stale[-1]["venue"] == "binance"
-    assert stale[-1]["symbol"] == "BTCUSDT"
-    assert stale[-1]["domain"] == "ws_bbo_cache"
-    assert stale[-1]["age_ms"] == 2000
-    assert stale[-1]["budget_ms"] == 1500
-    assert stale[-1]["decision"] == "reject_price_hint"
-    assert stale[-1]["fallback_source"] == "none"
-
-
-def test_close_price_hint_records_missing_ws_bbo_fallback_quote(tmp_path):
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_local_l2_mid(Venue.BINANCE, "STEEMUSDT", now_ms=2000) == 0.0
-    finally:
-        runtime.journal.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    missing = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_missing"
-    ]
-    assert missing[-1]["venue"] == "binance"
-    assert missing[-1]["symbol"] == "STEEMUSDT"
-    assert missing[-1]["domain"] == "ws_bbo_cache"
-    assert missing[-1]["reason"] == "missing_quote"
-    assert missing[-1]["budget_ms"] == 1500
-    assert missing[-1]["decision"] == "reject_price_hint"
-
-
-def test_ws_bbo_close_quote_resolver_records_missing_evidence(tmp_path):
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_close_price_hint_quote_with_source(
-            Venue.BINANCE, "STEEMUSDT",
-        ) is None
-    finally:
-        runtime.journal.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    missing = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_missing"
-    ]
-    assert missing[-1]["venue"] == "binance"
-    assert missing[-1]["symbol"] == "STEEMUSDT"
-    assert missing[-1]["domain"] == "ws_bbo_cache"
-    assert missing[-1]["reason"] == "missing_quote"
-    assert missing[-1]["provider"] == "ws_bbo_quote_lease"
-    assert missing[-1]["decision"] == "reject_price_hint"
-
-
-def test_ws_bbo_close_quote_resolver_records_stale_evidence(tmp_path):
-    from lightfee.marketdata.ws_bbo import TopBookQuote
-
-    config = AppConfig(
-        runtime=RuntimeConfig(
-            mode="live",
-            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
-        ),
-        strategy=StrategyConfig(
-            entry_readiness_provider="ws_bbo_quote_lease",
-            entry_quote_lease_ttl_ms=1500,
-            max_liquidity_snapshot_age_ms=300000,
-        ),
-        persistence=PersistenceConfig(
-            event_log_path=str(tmp_path / "events.jsonl"),
-            snapshot_path=str(tmp_path / "state.json"),
-        ),
-    )
-    runtime = LiveRuntime(config)
-    runtime.ws_bbo_cache.update_quote(
-        TopBookQuote(
-            venue="binance",
-            symbol="STEEMUSDT",
-            bid=100.0,
-            ask=101.0,
-            observed_at_ms=1000,
-            received_at_ms=1001,
-            source="binance_book_ticker",
-        )
-    )
-
-    runtime.journal.open()
-    try:
-        assert runtime._resolve_ws_bbo_close_quote(
-            Venue.BINANCE, "STEEMUSDT", now_ms=3000,
-        ) is None
-    finally:
-        runtime.journal.close()
-
-    records = [
-        json.loads(line)
-        for line in (tmp_path / "events.jsonl").read_text().splitlines()
-        if line.strip()
-    ]
-    stale = [
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.close_price_evidence_stale"
-    ]
-    assert stale[-1]["venue"] == "binance"
-    assert stale[-1]["symbol"] == "STEEMUSDT"
-    assert stale[-1]["domain"] == "ws_bbo_cache"
-    assert stale[-1]["age_ms"] == 2000
-    assert stale[-1]["budget_ms"] == 1500
-    assert stale[-1]["provider"] == "ws_bbo_quote_lease"
-    assert stale[-1]["decision"] == "reject_price_hint"

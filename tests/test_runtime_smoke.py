@@ -86,6 +86,36 @@ class TestImportSmoke:
         assert result.returncode == 0
         assert "lightfee-sidecar" in result.stdout
 
+    def test_sidecar_main_does_not_add_a_full_sleep_after_an_overrun(self, monkeypatch):
+        """V1 interval scheduling retries immediately after an overrun."""
+        from lightfee.apps import sidecar
+
+        class StopSidecar(Exception):
+            pass
+
+        starts: list[float] = []
+
+        class SlowService:
+            async def refresh_once(self):
+                starts.append(asyncio.get_running_loop().time())
+                if len(starts) == 3:
+                    raise StopSidecar
+                await asyncio.sleep(0.08)
+
+        config = SimpleNamespace(
+            runtime=SimpleNamespace(sidecar_refresh_ms=80),
+        )
+        monkeypatch.setattr(sidecar, "load_config", lambda _path: config)
+        monkeypatch.setattr(sidecar, "SidecarService", lambda _config: SlowService())
+        monkeypatch.setattr(sys, "argv", ["sidecar", "--config", "ignored.toml"])
+
+        with pytest.raises(StopSidecar):
+            sidecar.main()
+
+        # The old loop waited another 80ms after the 80ms refresh (~160ms).
+        # A V1-style fixed cadence begins the next overrun refresh immediately.
+        assert starts[1] - starts[0] < 0.13
+
     def test_ops_imports(self):
         from lightfee.ops import commands
 
@@ -234,7 +264,6 @@ class TestRuntimeLaneScheduling:
                 sidecar_snapshot_max_age_ms=1000,
             ),
             strategy=StrategyConfig(
-                entry_readiness_provider="ws_bbo_quote_lease",
                 risk_monitor_enabled=False,
                 local_l2_enabled=True,
                 local_l2_ws_enabled=False,
@@ -286,9 +315,9 @@ class TestRuntimeLaneScheduling:
             assert runtime_progress["active_lane"] == "full_tick"
             assert runtime_progress["active_lane_overdue"] is False
             effective = exported["runtime_market_data_config"]
-            assert effective["entry_readiness_provider_effective"] == "ws_bbo_quote_lease"
+            assert effective["entry_l2_readiness_owner"] == "entry_local_l2_session"
             assert effective["local_l2_configured_enabled"] is True
-            assert effective["local_l2_effective_enabled"] is False
+            assert effective["local_l2_effective_enabled"] is True
             runtime._running = False
             await run_task
         finally:

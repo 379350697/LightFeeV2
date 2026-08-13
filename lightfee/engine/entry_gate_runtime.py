@@ -231,23 +231,8 @@ class EntryGateRuntime:
     def _entry_l2_readiness_diagnostics_payload(self):
         return self.ctx._entry_l2_readiness_diagnostics_payload()
 
-    def _entry_readiness_provider_uses_local_l2(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_local_l2()
-
-    def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_ws_bbo()
-
     def _local_l2_effective_enabled(self) -> bool:
         return self.ctx._local_l2_effective_enabled()
-
-    def _entry_readiness_provider_name(self) -> str:
-        return self.ctx._entry_readiness_provider_name()
-
-    def _entry_ws_bbo_subscription_blocker(self, *args: Any, **kwargs: Any):
-        return self.ctx._entry_ws_bbo_subscription_blocker(*args, **kwargs)
-
-    def _ws_bbo_selection_blocker_family(self, *args: Any, **kwargs: Any):
-        return self.ctx._ws_bbo_selection_blocker_family(*args, **kwargs)
 
     def _market_quote_lookup(self, *args: Any, **kwargs: Any):
         return self.ctx._market_quote_lookup(*args, **kwargs)
@@ -1417,7 +1402,6 @@ class EntryGateRuntime:
             "execution_liquidity_blocked_counts",
             "entry_final_gate_blocked_counts",
             "tradeable_selection_blocker_counts",
-            "entry_ws_bbo_blocker_counts",
             "entry_admission_blocker_counts",
             "quote_truth_must_resolve_count",
             "quote_truth_resolved_count",
@@ -1427,7 +1411,6 @@ class EntryGateRuntime:
             "budget_excluded_without_rest_count",
             "quote_revalidate_sources",
             "top_quote_blocker_buckets",
-            "quote_lease_failure_counts",
             "selection_bucket_counts",
             "candidate_stage_blocked_counts",
             "entry_local_l2_primary_ready_filter_active",
@@ -1637,9 +1620,6 @@ class EntryGateRuntime:
             "top_quote_blocker_buckets": dict(
                 last_scan.get("top_quote_blocker_buckets", {}) or {}
             ),
-            "quote_lease_failure_counts": dict(
-                last_scan.get("quote_lease_failure_counts", {}) or {}
-            ),
             "candidate_stage_blocked_counts": {
                 key: value
                 for key, value in candidate_stage_blocked_counts.items()
@@ -1673,7 +1653,7 @@ class EntryGateRuntime:
     @staticmethod
     def _entry_selection_blocker_reason_family(blocker: str) -> str:
         text = str(blocker or "").lower()
-        if "quote" in text or "topbook" in text or "bbo" in text:
+        if "quote" in text or "topbook" in text:
             return "quote"
         if "admission" in text or "terms" in text or "margin" in text:
             return "entry_admission"
@@ -1744,8 +1724,7 @@ class EntryGateRuntime:
                 )
 
         readiness = self._entry_l2_readiness_diagnostics_payload()
-        local_l2_provider_active = self._entry_readiness_provider_uses_local_l2()
-        ws_bbo_provider_active = self._entry_readiness_provider_uses_ws_bbo()
+        local_l2_active = self._local_l2_effective_enabled()
         candidate_samples = []
         for rank, candidate in enumerate(list(tradeable)[:24], start=1):
             pair_id = getattr(candidate, "pair_id", "")
@@ -1782,10 +1761,6 @@ class EntryGateRuntime:
             int(v) for k, v in tradeable_selection_blocker_counts.items()
             if str(k) in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
         )
-        ws_bbo_selection_blocked = sum(
-            int(v) for k, v in tradeable_selection_blocker_counts.items()
-            if str(k).startswith("entry_ws_bbo_quote_lease_")
-        )
         entry_admission_blocked = sum(
             int(v) for k, v in admission_counts.items()
             if (
@@ -1802,7 +1777,6 @@ class EntryGateRuntime:
             if (
                 k not in {"entry_local_l2_waiting_for_primary_tracking"}
                 and str(k) not in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
-                and not str(k).startswith("entry_ws_bbo_quote_lease_")
             )
         )
         selection_bucket_counts = {
@@ -1813,16 +1787,9 @@ class EntryGateRuntime:
             selection_bucket_counts[
                 "lifecycle_selection_blocked"
             ] = lifecycle_selection_blocked
-        if ws_bbo_selection_blocked > 0:
-            selection_bucket_counts["ws_bbo_not_ready"] = ws_bbo_selection_blocked
         if entry_admission_blocked > 0:
             selection_bucket_counts["entry_admission_blocked"] = entry_admission_blocked
 
-        entry_ws_bbo_blocker_counts = {
-            str(k): int(v)
-            for k, v in tradeable_selection_blocker_counts.items()
-            if str(k).startswith("entry_ws_bbo_quote_lease_") and int(v) > 0
-        }
         entry_admission_blocker_counts = {
             str(k): int(v)
             for k, v in admission_counts.items()
@@ -1838,13 +1805,6 @@ class EntryGateRuntime:
                 )
             )
         }
-        entry_ws_bbo_blocker_samples = [
-            sample
-            for sample in candidate_samples
-            if str(sample.get("selection_blocker", "")).startswith(
-                "entry_ws_bbo_quote_lease_"
-            )
-        ][:24]
 
         candidate_stage_blocked_counts = {
             "candidate_universe": sum(int(v) for v in blocked_reason_counts.values()),
@@ -1897,9 +1857,6 @@ class EntryGateRuntime:
             ),
             "top_quote_blocker_buckets": dict(
                 last_scan.get("top_quote_blocker_buckets", {}) or {}
-            ),
-            "quote_lease_failure_counts": dict(
-                last_scan.get("quote_lease_failure_counts", {}) or {}
             ),
         }
         pipeline_counts = {
@@ -1989,13 +1946,9 @@ class EntryGateRuntime:
             "tradeable_selection_blocker_counts": dict(
                 sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
             ),
-            "entry_ws_bbo_blocker_counts": dict(
-                sorted(entry_ws_bbo_blocker_counts.items())
-            ),
             "entry_admission_blocker_counts": dict(
                 sorted(entry_admission_blocker_counts.items())
             ),
-            "entry_ws_bbo_blocker_samples": entry_ws_bbo_blocker_samples,
             **quote_truth_payload,
             "selection_bucket_counts": selection_bucket_counts,
             "candidate_stage_blocked_counts": {
@@ -2006,7 +1959,7 @@ class EntryGateRuntime:
             "candidates": candidate_samples,
             "ts_ms": now_ms,
         }
-        if local_l2_provider_active:
+        if local_l2_active:
             payload.update({
                 "entry_local_l2_primary_ready_filter_active": bool(
                     self._local_l2_effective_enabled() and self._tracked_primary_pair_ids
@@ -2015,8 +1968,6 @@ class EntryGateRuntime:
                 "entry_local_l2_primary_not_ready_reason_totals": readiness["reason_totals"],
                 "entry_local_l2_primary_not_ready_detail_samples": readiness["not_ready"][:24],
             })
-        elif ws_bbo_provider_active:
-            payload["entry_readiness_provider"] = "ws_bbo_quote_lease"
         fingerprint = self._payload_fingerprint({
             "reason": payload["reason"],
             "candidate_count": payload["candidate_count"],
@@ -2034,9 +1985,6 @@ class EntryGateRuntime:
             "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
             "entry_local_l2_primary_not_ready_reason_totals": payload.get(
                 "entry_local_l2_primary_not_ready_reason_totals", {},
-            ),
-            "entry_ws_bbo_blocker_counts": payload.get(
-                "entry_ws_bbo_blocker_counts", {},
             ),
             "entry_admission_blocker_counts": payload.get(
                 "entry_admission_blocker_counts", {},
@@ -2075,9 +2023,6 @@ class EntryGateRuntime:
             ),
             "entry_local_l2_primary_not_ready_reason_keys": sorted(
                 payload.get("entry_local_l2_primary_not_ready_reason_totals", {}).keys()
-            ),
-            "entry_ws_bbo_blocker_keys": sorted(
-                payload.get("entry_ws_bbo_blocker_counts", {}).keys()
             ),
             "entry_admission_blocker_keys": sorted(
                 payload.get("entry_admission_blocker_counts", {}).keys()
@@ -2358,22 +2303,15 @@ class EntryGateRuntime:
                     else None
                 )
             if not blocker:
-                blocker, readiness_evidence = (
-                    self._entry_ws_bbo_subscription_blocker(candidate)
-                )
-                if not blocker:
-                    readiness = self.ctx.entry_readiness_provider.decide(
-                        candidate,
-                        now_ms,
-                        market_quotes=market_quotes,
-                    )
-                    readiness_evidence = dict(getattr(readiness, "evidence", {}) or {})
-                    blocker = None if readiness.allowed else (
-                        readiness.reason or "entry_readiness_provider_denied"
-                    )
+                blocker = self._entry_local_l2_selection_blocker(candidate, now_ms)
+                if blocker:
+                    readiness_evidence = {
+                        "owner": "entry_local_l2_session",
+                        "source": "entry_local_l2_session",
+                        "pair_id": pair_id,
+                    }
             if blocker:
                 blocker_str = str(blocker)
-                ws_bbo_blocker = blocker_str.startswith("entry_ws_bbo_quote_lease_")
                 admission_selection_blocker = blocker_str in exchange_admission_reasons
                 # Admission buckets (not primary tracked) vs readiness failures
                 if blocker_str in admission_reasons:
@@ -2396,8 +2334,6 @@ class EntryGateRuntime:
                         diagnostic_payload["lifecycle_evidence"] = lifecycle_evidence
                     if readiness_evidence:
                         if admission_selection_blocker:
-                            provider_name = self._entry_readiness_provider_name()
-                            readiness_evidence.setdefault("provider", provider_name)
                             readiness_evidence.setdefault("source", "entry_admission")
                             readiness_evidence.setdefault("domain", "entry_admission")
                             readiness_evidence.setdefault(
@@ -2405,44 +2341,17 @@ class EntryGateRuntime:
                                 "exchange_admission",
                             )
                             diagnostic_payload.update({
-                                "provider": provider_name,
                                 "source": "entry_admission",
                                 "domain": "entry_admission",
                                 "blocker_family": "exchange_admission",
-                            })
-                        elif ws_bbo_blocker:
-                            readiness_evidence.setdefault("provider", "ws_bbo_quote_lease")
-                            readiness_evidence.setdefault("source", "ws_bbo_quote_lease")
-                            domain = (
-                                "ws_bbo_subscription"
-                                if blocker_str in {
-                                    "entry_ws_bbo_quote_lease_waiting_for_subscription",
-                                    "entry_ws_bbo_quote_lease_budget_exhausted",
-                                }
-                                else "ws_bbo_cache"
-                            )
-                            readiness_evidence.setdefault("domain", domain)
-                            readiness_evidence.setdefault(
-                                "blocker_family",
-                                self._ws_bbo_selection_blocker_family(blocker_str),
-                            )
-                            diagnostic_payload.update({
-                                "provider": "ws_bbo_quote_lease",
-                                "source": "ws_bbo_quote_lease",
-                                "domain": readiness_evidence["domain"],
-                                "blocker_family": readiness_evidence["blocker_family"],
                             })
                         diagnostic_payload["readiness_evidence"] = readiness_evidence
                     if blocker_str in self._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS:
                         event_kind = "runtime.entry_blocked_lifecycle_selection"
                     elif admission_selection_blocker:
                         event_kind = "runtime.entry_blocked_admission_selection"
-                    elif ws_bbo_blocker:
-                        event_kind = "runtime.entry_blocked_ws_bbo_selection"
-                    elif self._entry_readiness_provider_uses_local_l2():
-                        event_kind = "runtime.entry_blocked_local_l2_selection"
                     else:
-                        event_kind = "runtime.entry_blocked_ws_bbo_selection"
+                        event_kind = "runtime.entry_blocked_local_l2_selection"
                     self._append_runtime_diagnostic_event(
                         event_kind,
                         diagnostic_payload,
@@ -2570,12 +2479,17 @@ class EntryGateRuntime:
         if pair_id not in self._tracked_primary_pair_ids:
             return "entry_local_l2_waiting_for_primary_tracking"
 
-        # Session dual-ready check
-        session = self.ctx.entry_l2_sessions.sessions.get(pair_id)
-        if session is None:
-            return "entry_local_l2_waiting_for_dual_ready"
-
-        if not session.both_legs_ready(now_ms, stale_after_ms=self._entry_local_l2_stale_after_ms()):
+        # The session runtime owns exact candidate/leg matching and dual-ready
+        # state; selection must not duplicate that predicate.
+        ready_legs = self.ctx.entry_l2_sessions.ready_pair_legs(
+            pair_id,
+            long_venue=long_ven,
+            short_venue=short_ven,
+            symbol=str(symbol),
+            now_ms=now_ms,
+            stale_after_ms=self._entry_local_l2_stale_after_ms(),
+        )
+        if ready_legs is None:
             return "entry_local_l2_waiting_for_dual_ready"
 
         return None

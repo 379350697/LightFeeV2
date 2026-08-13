@@ -362,38 +362,6 @@ def test_residual_dust_rows_split_tolerated_and_blocking_abnormal():
     assert rows["dust-bad"]["entry_policy"] == "block_conflicting_new_risk"
 
 
-def test_ws_bbo_scope_flags_full_universe_hot_path_regression():
-    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
-
-    table = build_v1_lifecycle_closure_table(
-        local_state={
-            "runtime_market_data_config": {
-                "entry_readiness_provider_effective": "ws_bbo_quote_lease",
-                "local_l2_effective_enabled": False,
-            },
-            "last_scan": {
-                "quote_revalidate_candidate_scope": "full_shortlist",
-                "quote_revalidate_candidate_count": 50,
-                "quote_revalidate_all_target_count": 100,
-                "quote_revalidate_target_count": 100,
-                "quote_revalidate_skipped_untracked_count": 0,
-            },
-        },
-        exchange_truth=_clean_exchange_truth(),
-        generated_at_ms=1770000000000,
-    )
-
-    payload = table.to_dict()
-    assert payload["performance_scope"]["entry_quote_scope"] == "full_shortlist"
-    assert payload["performance_scope"]["full_universe_hot_path_detected"] is True
-    assert any(
-        row["phase"] == "ENTRY_QUOTE_LEASE"
-        and row["diagnostic_severity"] == "critical"
-        and row["recovery_policy"] == "diagnostic_regression"
-        for row in payload["rows"]
-    )
-
-
 def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     from lightfee.engine.v1_lifecycle_closure import map_lifecycle_event_kind
 
@@ -417,13 +385,11 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "startup.trading_preflight",
         "runtime.entry_quote_revalidate_targeted",
         "runtime.entry_quote_revalidate_failed",
-        "runtime.entry_quote_evidence_resolved_by_ws_bbo",
         "runtime.entry_blocked_gate",
         "runtime.last_good_revalidated_by_entry_quote_truth",
         "runtime.order_quote_stale_skipped",
         "runtime.quote_stale",
         "runtime.perp_liquidity_stale_advisory",
-        "runtime.ws_bbo_dynamic_ws_started",
         "runtime.snapshot_fallback_last_good",
         "runtime.candidate_symbol_skipped",
         "runtime.candidates_tradeable",
@@ -487,11 +453,7 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "review.candidate_shortlisted",
         "runtime.active_position_tick",
         "runtime.close_price_evidence_fallback",
-        "runtime.close_price_evidence_rewarm_failed",
-        "runtime.close_price_evidence_rest_rewarm_succeeded",
         "runtime.close_price_evidence_stale",
-        "runtime.close_price_evidence_ws_bbo_used",
-        "runtime.close_price_evidence_ws_rewarm_succeeded",
         "runtime.passive_close_deadline_fallback_armed",
         "runtime.entry_dispatched",
         "runtime.funding_capture_state_updated",
@@ -507,9 +469,9 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "reconciliation.entry_abandon_retained_unresolved_maker",
         "reconciliation.entry_resolved",
         "review.candidate_rejected",
-        "runtime.entry_post_only_bbo_repriced",
+        "runtime.entry_post_only_l2_repriced",
+        "runtime.entry_blocked_post_only_l2",
         "runtime.entry_post_only_reject_cooldown",
-        "runtime.maker_event_no_ws_bbo_quote",
         "runtime.position_drift_skipped_passive_close_owner",
         "execution.hedge_deadline_breached",
         "exit.compensated",
@@ -766,7 +728,7 @@ def test_production_health_exposes_existing_v1_lifecycle_closure_payload():
 def test_static_runtime_snapshot_refreshes_closure_before_export():
     source = (REPO_ROOT / "lightfee/engine/runtime.py").read_text()
     start = source.index("def _maybe_export_current_state_snapshot")
-    end = source.index("def _entry_quote_lease_max_age_ms")
+    end = source.index("def _pending_entry_l2_ready_books", start)
     body = source[start:end]
 
     assert "_refresh_runtime_market_data_config_state()" in body

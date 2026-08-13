@@ -316,9 +316,8 @@ async def _async_main_with_writer_lease(
         if run_loop_task is not None and not run_loop_task.done():
             runtime._running = False
         await _graceful_shutdown()
-        # Runtime.stop() owns network clients (including BBO streams) and must
-        # close them before generic task cancellation.  Cancelling first races
-        # the BBO client's own stop path and produced misleading timeout logs.
+        # Runtime.stop() owns network clients and must close them before generic
+        # task cancellation to avoid shutdown races and misleading timeout logs.
         await _cancel_runtime_tasks()
 
 

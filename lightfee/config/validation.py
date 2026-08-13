@@ -7,7 +7,6 @@ from typing import Any
 from lightfee.config.compatibility import REMOVED_FIELD_MESSAGES, VALID_OPPORTUNITY_INPUT_MODES
 from lightfee.config.schema import (
     AppConfig,
-    ENTRY_READINESS_PROVIDERS,
     _is_valid_generate_time,
 )
 from lightfee.config.universe import validate_directed_pairs
@@ -133,34 +132,6 @@ def validate_config(config: AppConfig) -> list[str]:
             f"strategy.maker_leg_default must be 'buy' or 'sell', got: {config.strategy.maker_leg_default}"
         )
 
-    provider = str(
-        getattr(config.strategy, "entry_readiness_provider", "local_l2") or ""
-    ).strip().lower()
-    if provider not in ENTRY_READINESS_PROVIDERS:
-        issues.append(
-            "strategy.entry_readiness_provider must be one of "
-            f"{list(ENTRY_READINESS_PROVIDERS)}, got: {provider}"
-        )
-    try:
-        quote_lease_ttl_ms = int(
-            getattr(config.strategy, "entry_quote_lease_ttl_ms", 0) or 0
-        )
-    except (TypeError, ValueError):
-        quote_lease_ttl_ms = 0
-    if (
-        provider in {"quote_lease", "ws_top_book", "ws_bbo_quote_lease"}
-        and quote_lease_ttl_ms <= 0
-    ):
-        issues.append("strategy.entry_quote_lease_ttl_ms must be > 0")
-    try:
-        ws_bbo_per_venue_budget = int(
-            getattr(config.strategy, "entry_ws_bbo_per_venue_budget", 0) or 0
-        )
-    except (TypeError, ValueError):
-        ws_bbo_per_venue_budget = 0
-    if provider == "ws_bbo_quote_lease" and ws_bbo_per_venue_budget <= 0:
-        issues.append("strategy.entry_ws_bbo_per_venue_budget must be > 0")
-
     # V1 local-L2 resource budget validation
     if config.strategy.local_l2_global_max_books <= 0:
         issues.append(
@@ -203,7 +174,7 @@ def validate_config(config: AppConfig) -> list[str]:
 
 
 def check_raw_toml_for_chillybot(raw: dict[str, Any]) -> list[str]:
-    """Scan a parsed TOML dict for removed Chillybot fields. Returns migration errors."""
+    """Scan a parsed TOML dict for removed fields. Returns migration errors."""
     errors: list[str] = []
 
     runtime = raw.get("runtime", {})
@@ -216,5 +187,18 @@ def check_raw_toml_for_chillybot(raw: dict[str, Any]) -> list[str]:
         opp_source = runtime.get("opportunity_source", "")
         if isinstance(opp_source, str) and "chillybot" in opp_source.lower():
             errors.append(REMOVED_FIELD_MESSAGES["opportunity_source"])
+
+    strategy = raw.get("strategy", {})
+    if isinstance(strategy, dict):
+        for field_name in (
+            "entry_readiness_provider",
+            "entry_quote_lease_ttl_ms",
+            "entry_ws_bbo_per_venue_budget",
+        ):
+            if field_name in strategy:
+                errors.append(
+                    f"removed config field: strategy.{field_name}. "
+                    "Entry readiness is owned solely by the Local-L2 session."
+                )
 
     return errors

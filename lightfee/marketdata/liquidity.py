@@ -133,14 +133,15 @@ def execution_liquidity_from_local_l2(
 ) -> ExecutionLiquiditySnapshot:
     """Convert a LocalL2Book to an ExecutionLiquiditySnapshot.
 
-    In parity mode, requires the book to be HOT and fresh.
-    Returns NONE source if the book is not ready.
+    V1's converter accepts a fresh, structurally valid snapshot.  The caller's
+    Local-L2 session owns lifecycle status, so this conversion does not make a
+    second status decision.
     """
     depth = max_depth or book.max_depth or 50
 
     # Check readiness
     if require_ready:
-        if not book.is_ready(max_age_ms, now_ms):
+        if not book.execution_snapshot_is_valid(max_age_ms, now_ms):
             return ExecutionLiquiditySnapshot(
                 symbol=book.symbol,
                 venue=book.venue,
@@ -178,4 +179,3 @@ def execution_liquidity_fallback(
         fallback_reason=reason,
         book_ready=False,
     )
-

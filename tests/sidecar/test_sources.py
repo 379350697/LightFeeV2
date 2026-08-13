@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -185,3 +186,79 @@ class TestSidecarServiceRateLimitWiring:
         assert quote.open_interest_evidence_reason == "timeout_waiting_for_oi"
         assert quote.oi_refresh_attempt_count == 1
         assert quote.oi_timeout_count == 1
+
+    @pytest.mark.asyncio
+    async def test_refresh_once_marks_market_observed_before_independent_liquidity_fetch(
+        self, tmp_path
+    ):
+        """A fresh market view must not inherit independent liquidity latency."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+        from lightfee.sidecar.snapshot import SnapshotFreshness, evaluate_snapshot_freshness
+
+        stage_times: dict[str, int] = {}
+
+        class SlowExchangeSource:
+            async def fetch_all(self, symbols):
+                await asyncio.sleep(0.06)
+                stage_times["market_completed_at_ms"] = int(time.time() * 1000)
+                return {
+                    "binance:BTCUSDT": QuoteSnapshot(
+                        venue="binance",
+                        symbol="BTCUSDT",
+                        bid=100.0,
+                        ask=101.0,
+                        funding_rate_bps=8.0,
+                        funding_timestamp_ms=1_800_000_000_000,
+                    )
+                }
+
+            async def close(self):
+                return None
+
+        class SlowLiquiditySource:
+            async def fetch_perp_liquidity(self, symbols):
+                await asyncio.sleep(0.06)
+                stage_times["liquidity_completed_at_ms"] = int(time.time() * 1000)
+                return {}
+
+            async def close(self):
+                return None
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                sidecar_funding_timeout_s=1.0,
+                sidecar_liquidity_timeout_s=1.0,
+            ),
+            venues=[VenueConfig(venue="binance")],
+        )
+        service = SidecarService(config)
+        service._exchange_sources["binance"] = SlowExchangeSource()
+        service._liquidity_sources["binance"] = SlowLiquiditySource()
+
+        refresh_started_at_ms = int(time.time() * 1000)
+        try:
+            snapshot = await service.refresh_once()
+        finally:
+            await service.close()
+
+        # V1 timestamps market at the end of its fetch, so the following
+        # independent liquidity stage must not be included.  This dynamically
+        # derived budget admits that later stage but rejects the old refresh-
+        # start timestamp, regardless of scheduler jitter.
+        assert snapshot.market_observed_at_ms >= stage_times["market_completed_at_ms"]
+        market_budget_ms = (
+            snapshot.published_at_ms - stage_times["market_completed_at_ms"] + 10
+        )
+        assert (
+            snapshot.published_at_ms - refresh_started_at_ms
+            > market_budget_ms
+        )
+        assert evaluate_snapshot_freshness(
+            snapshot,
+            max_age_ms=1_000,
+            market_max_age_ms=market_budget_ms,
+            now_ms=snapshot.published_at_ms,
+        ) == SnapshotFreshness.FRESH

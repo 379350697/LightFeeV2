@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import binascii
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -508,6 +509,47 @@ class LocalL2Book:
     def is_ready(self, max_age_ms: int, now_ms: int) -> bool:
         """True if book is HOT and within freshness window."""
         return self.status == L2BookStatus.HOT and not self.is_stale(max_age_ms, now_ms)
+
+    def has_valid_execution_structure(self) -> bool:
+        """Whether the retained snapshot satisfies V1 execution-book invariants."""
+        def valid_side(levels: list[PriceLevel], *, descending: bool) -> bool:
+            if not levels:
+                return False
+            previous_price: float | None = None
+            for level in levels:
+                try:
+                    price = float(level.price)
+                    quantity = float(level.quantity)
+                except (AttributeError, TypeError, ValueError):
+                    return False
+                if (
+                    not math.isfinite(price)
+                    or not math.isfinite(quantity)
+                    or price <= 0.0
+                    or quantity <= 0.0
+                ):
+                    return False
+                if previous_price is not None:
+                    ordered = previous_price > price if descending else previous_price < price
+                    if not ordered:
+                        return False
+                previous_price = price
+            return True
+
+        return (
+            valid_side(self.bids, descending=True)
+            and valid_side(self.asks, descending=False)
+            and self.best_bid() < self.best_ask()
+        )
+
+    def execution_snapshot_is_valid(self, max_age_ms: int, now_ms: int) -> bool:
+        """V1 export contract: a fresh, structurally valid L2 snapshot.
+
+        Lifecycle status is owned by the entry Local-L2 session.  A DEGRADED
+        session may consume its last valid snapshot until it becomes stale or
+        structurally invalid.
+        """
+        return not self.is_stale(max_age_ms, now_ms) and self.has_valid_execution_structure()
 
     def age_ms(self, now_ms: int) -> int:
         if self.observed_at_ms <= 0:

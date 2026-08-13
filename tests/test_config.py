@@ -76,31 +76,9 @@ class TestConfigLoading:
         assert config.strategy.max_concurrent_positions == 3
         assert config.runtime.max_order_quote_age_ms == 15_000
 
-    def test_live_missing_entry_provider_defaults_to_ws_bbo_even_with_legacy_local_l2_flag(
-        self, tmp_path
-    ):
-        path = tmp_path / "live.toml"
-        path.write_text(
-            """
-symbols = ["BTCUSDT"]
 
-[runtime]
-mode = "live"
 
-[strategy]
-local_l2_enabled = true
-local_l2_ws_enabled = true
-""",
-            encoding="utf-8",
-        )
-
-        config = load_config(path)
-
-        assert config.strategy.entry_readiness_provider == "ws_bbo_quote_lease"
-        assert config.strategy.local_l2_enabled is True
-        assert config.strategy.local_l2_ws_enabled is True
-
-    def test_live_explicit_local_l2_provider_keeps_v1_local_l2_mode(self, tmp_path):
+    def test_removed_entry_readiness_config_is_rejected(self, tmp_path):
         path = tmp_path / "live.toml"
         path.write_text(
             """
@@ -116,11 +94,10 @@ local_l2_enabled = true
             encoding="utf-8",
         )
 
-        config = load_config(path)
+        with pytest.raises(ConfigError, match="strategy.entry_readiness_provider"):
+            load_config(path)
 
-        assert config.strategy.entry_readiness_provider == "local_l2"
-
-    def test_paper_missing_entry_provider_keeps_schema_default(self, tmp_path):
+    def test_paper_local_l2_config_needs_no_provider(self, tmp_path):
         path = tmp_path / "paper.toml"
         path.write_text(
             """
@@ -137,7 +114,8 @@ local_l2_enabled = true
 
         config = load_config(path)
 
-        assert config.strategy.entry_readiness_provider == "local_l2"
+        assert config.strategy.local_l2_enabled is True
+        assert not hasattr(config.strategy, "entry_readiness_provider")
 
     def test_loads_v1_entry_perp_liquidity_thresholds(self, tmp_path):
         path = tmp_path / "paper.toml"
@@ -265,18 +243,25 @@ class TestConfigValidation:
         assert any("max_market_age_ms" in i for i in issues)
         assert any("max_order_quote_age_ms" in i for i in issues)
 
-    def test_entry_readiness_provider_must_be_known(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "unknown_provider"
-        issues = validate_config(config)
-        assert any("entry_readiness_provider" in i for i in issues)
+    @pytest.mark.parametrize(
+        "field_name, value",
+        [
+            ("entry_readiness_provider", '"rest_top_book"'),
+            ("entry_quote_lease_ttl_ms", "1500"),
+            ("entry_ws_bbo_per_venue_budget", "10"),
+        ],
+    )
+    def test_removed_readiness_fields_are_rejected_from_raw_toml(
+        self, tmp_path, field_name, value
+    ):
+        path = tmp_path / "removed-readiness.toml"
+        path.write_text(
+            f'''\nsymbols = ["BTCUSDT"]\n\n[strategy]\n{field_name} = {value}\n''',
+            encoding="utf-8",
+        )
 
-    def test_quote_lease_ttl_must_be_positive(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 0
-        issues = validate_config(config)
-        assert any("entry_quote_lease_ttl_ms" in i for i in issues)
+        with pytest.raises(ConfigError, match=f"strategy.{field_name}"):
+            load_config(path)
 
     def test_shadow_entry_opportunity_count_default_is_v1_explicit(self):
         assert StrategyConfig().shadow_entry_opportunity_count == 2
@@ -287,41 +272,14 @@ class TestConfigValidation:
         issues = validate_config(config)
         assert len(issues) == 0
 
-    def test_accepts_ws_top_book_entry_readiness_provider(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "ws_top_book"
-        issues = validate_config(config)
-        assert len(issues) == 0
 
-    def test_ws_top_book_ttl_must_be_positive(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "ws_top_book"
-        config.strategy.entry_quote_lease_ttl_ms = 0
-        issues = validate_config(config)
-        assert any("entry_quote_lease_ttl_ms" in i for i in issues)
 
-    def test_accepts_ws_bbo_quote_lease_entry_readiness_provider(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        issues = validate_config(config)
-        assert len(issues) == 0
 
-    def test_ws_bbo_quote_lease_ttl_must_be_positive(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 0
-        issues = validate_config(config)
-        assert any("entry_quote_lease_ttl_ms" in i for i in issues)
 
-    def test_ws_bbo_per_venue_budget_must_be_positive(self):
-        config = AppConfig(symbols=["BTCUSDT"])
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_ws_bbo_per_venue_budget = 0
-        issues = validate_config(config)
-        assert any("entry_ws_bbo_per_venue_budget" in i for i in issues)
 
-    def test_ws_bbo_per_venue_budget_default_is_ten(self):
-        assert StrategyConfig().entry_ws_bbo_per_venue_budget == 10
+
+
+
 
     def test_rejects_empty_symbols(self):
         config = AppConfig(symbols=[])

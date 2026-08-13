@@ -116,6 +116,10 @@ class SidecarService:
         funding_results = await self._fetch_all_venues(
             symbols, timeout_s=self._funding_timeout_s,
         )
+        # V1's market freshness is the completed market-view observation, not
+        # the beginning of the refresh or the later snapshot publication.  The
+        # liquidity stage is independent and must not age market evidence.
+        market_observed_ms = int(time.time() * 1000)
 
         for venue_name, venue_quotes, error, failed_symbols in funding_results:
             if error is not None:
@@ -130,11 +134,11 @@ class SidecarService:
                             q.source = "sidecar_quote"
                         quotes[key] = q
                 funding_lifecycle.append(FundingLifecycle(
-                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
+                    venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=len(fallback),
                     coverage_usable=len(fallback), degraded_reason=str(error),
                 ))
                 market_lifecycle.append(MarketLifecycle(
-                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=len(fallback),
+                    venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=len(fallback),
                     coverage_usable=len(fallback), degraded_reason=str(error),
                 ))
                 continue
@@ -148,18 +152,18 @@ class SidecarService:
             if venue_quotes:
                 for key, q in venue_quotes.items():
                     if int(getattr(q, "observed_at_ms", 0) or 0) <= 0:
-                        q.observed_at_ms = observed_ms
+                        q.observed_at_ms = market_observed_ms
                     if not str(getattr(q, "source", "") or ""):
                         q.source = "sidecar_quote"
                     quotes[key] = q
 
             funding_lifecycle.append(FundingLifecycle(
-                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
+                venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=count,
                 coverage_usable=usable,
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
             market_lifecycle.append(MarketLifecycle(
-                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
+                venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=count,
                 coverage_usable=usable,
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
@@ -241,7 +245,7 @@ class SidecarService:
 
         snapshot = SidecarSnapshot(
             published_at_ms=published_ms,
-            market_observed_at_ms=observed_ms,
+            market_observed_at_ms=market_observed_ms,
             funding_lifecycle=funding_lifecycle,
             market_lifecycle=market_lifecycle,
             transfer_lifecycle=transfer_lifecycle,

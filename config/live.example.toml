@@ -32,6 +32,7 @@ auto_trade_enabled = true
 [strategy]
 entry_window_secs = 480
 entry_local_l2_prewarm_window_secs = 480
+entry_local_l2_book_stale_after_ms = 10000
 entry_min_first_funding_remaining_secs = 60
 entry_notional_cap_quote = 1000.0
 live_entry_notional_cap_quote = 50.0
@@ -50,9 +51,6 @@ risk_monitor_enabled = false
 execution_liquidity_enabled = true
 max_entry_slippage_bps = 25.0
 max_delever_slippage_bps = 50.0
-entry_readiness_provider = "local_l2"  # local_l2 | rest_top_book | quote_lease | ws_top_book | ws_bbo_quote_lease
-entry_quote_lease_ttl_ms = 1500
-entry_ws_bbo_per_venue_budget = 10
 
 [persistence]
 event_log_path = "runtime/events.jsonl"

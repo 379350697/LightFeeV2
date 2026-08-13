@@ -261,7 +261,9 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
     }
 
     arming_statuses = {"bootstrapping", "cold", "rebuilding", "resume_waiting"}
-    faulted_statuses = {"degraded", "suspended"}
+    # V1 keeps a fresh, structurally valid retained snapshot executable while
+    # the feed is DEGRADED.  Only a terminal suspension is a lifecycle fault.
+    faulted_statuses = {"suspended"}
 
     if status_value in arming_statuses:
         # V1 parity: derive specific arming_reason from book's prior fault
@@ -326,7 +328,7 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         # Fallback: check bid/ask directly
         bid = getattr(book, "best_bid", lambda: 0.0)()
         ask = getattr(book, "best_ask", lambda: float("inf"))()
-        is_crossed = bid > ask > 0
+        is_crossed = bid >= ask > 0
     if is_crossed:
         detail = f"best_bid={getattr(book, 'best_bid', lambda: 0.0)()} best_ask={getattr(book, 'best_ask', lambda: 0.0)()}"
         leg.mark_faulted(
@@ -338,10 +340,23 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         diag["detail"] = detail
         return diag
 
-    if status_value == "hot":
-        # HOT book — readiness determined by bid/ask and timestamp (already
-        # checked above).  V1 parity: a healthy HOT book must clear any prior
-        # fault; fault_reason is only meaningful for non-HOT statuses.
+    execution_snapshot_is_valid = getattr(book, "execution_snapshot_is_valid", None)
+    if callable(execution_snapshot_is_valid) and not execution_snapshot_is_valid(
+        stale_after_ms, now_ms,
+    ):
+        detail = "book_invalid_execution_structure"
+        leg.mark_faulted(
+            EntryLocalL2LegFault.RUNTIME_SUSPENDED,
+            detail,
+            seen_at_ms=observed_at_ms,
+        )
+        diag["reason"] = "book_invalid_execution_structure"
+        diag["detail"] = detail
+        return diag
+
+    if status_value in {"hot", "degraded"}:
+        # Lifecycle status has already been admitted; V1 then relies on the
+        # retained snapshot's timestamp and structure.
         bid_fn = getattr(book, "best_bid", None)
         ask_fn = getattr(book, "best_ask", None)
         bid = bid_fn() if callable(bid_fn) else 1.0
@@ -359,7 +374,7 @@ def apply_book_readiness_to_leg(leg, book, now_ms, stale_after_ms):
         leg.mark_ready(observed_at_ms)
         diag["ready"] = True
         diag["reason"] = "ready"
-        diag["detail"] = "local_l2_book_hot_fresh"
+        diag["detail"] = f"local_l2_book_{status_value}_fresh"
         return diag
 
     runtime_fault = str(getattr(book, "fault_reason", "") or "")
@@ -402,12 +417,67 @@ class EntryLocalL2SessionRuntime:
         self, opp: TrackedOpportunity, now_ms: int
     ) -> EntryLocalL2Session:
         """Create or update session legs for a tracked opportunity."""
-        session = self.get_or_create_session(opp.pair_id)
-        session.ensure_leg(opp.long_venue, opp.symbol)
-        session.ensure_leg(opp.short_venue, opp.symbol)
-        if opp.class_ == TrackedOpportunityClass.PRIMARY:
+        return self.track_pair(
+            opp.pair_id,
+            long_venue=opp.long_venue,
+            short_venue=opp.short_venue,
+            symbol=opp.symbol,
+            now_ms=now_ms,
+            primary=opp.class_ == TrackedOpportunityClass.PRIMARY,
+        )
+
+    def track_pair(
+        self,
+        pair_id: str,
+        *,
+        long_venue: str,
+        short_venue: str,
+        symbol: str,
+        now_ms: int,
+        primary: bool = False,
+    ) -> EntryLocalL2Session:
+        """Create or refresh the exact two-leg session for one owned pair.
+
+        Scan-primary pairs and pending-entry execution pairs deliberately share
+        this owner.  The caller's lifecycle decides whether the pair is a
+        primary candidate; readiness itself is always owned by this session.
+        """
+        session = self.get_or_create_session(pair_id)
+        session.ensure_leg(long_venue, symbol)
+        session.ensure_leg(short_venue, symbol)
+        if primary:
             session.primary_assigned_at_ms = now_ms
         return session
+
+    def ready_pair_legs(
+        self,
+        pair_id: str,
+        *,
+        long_venue: str,
+        short_venue: str,
+        symbol: str,
+        now_ms: int,
+        stale_after_ms: int,
+    ) -> tuple[EntryLocalL2LegSession, EntryLocalL2LegSession] | None:
+        """Return the exact ready session legs owned by one pair.
+
+        Session consumers must not treat an unrelated HOT global book as
+        pair readiness.  This is the one session-level ownership check shared
+        by selection, final L2 cost, entry dispatch, and pending recovery.
+        """
+        session = self.sessions.get(pair_id)
+        if session is None or not session.both_legs_ready(now_ms, stale_after_ms):
+            return None
+        long_leg = session.leg_for(long_venue)
+        short_leg = session.leg_for(short_venue)
+        if (
+            long_leg is None
+            or short_leg is None
+            or long_leg.symbol != symbol
+            or short_leg.symbol != symbol
+        ):
+            return None
+        return long_leg, short_leg
 
     def close_session(self, pair_id: str) -> None:
         session = self.sessions.get(pair_id)

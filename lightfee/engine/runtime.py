@@ -283,23 +283,11 @@ class LiveRuntime:
         )
         self.l2_data_plane.hot_stale_after_ms = self._configured_entry_l2_stale_after_ms(config)
 
-        from lightfee.marketdata.ws_bbo import VenueBboCache, VenueBboDataPlane
-        self.ws_bbo_cache = VenueBboCache()
-        self.ws_bbo_data_plane = VenueBboDataPlane(
-            cache=self.ws_bbo_cache,
-            journal=self.journal,
-        )
         self.passive_maker_runtime = PassiveMakerRuntime(self)
-        self._entry_bbo_subscription_budgeted_keys: set[tuple[str, str]] = set()
-        self._entry_bbo_subscription_budget_excluded_keys: set[tuple[str, str]] = set()
-        self._entry_bbo_subscription_per_venue_budget: int = 0
-        self._entry_bbo_sticky_warm_until_ms: dict[tuple[str, str], int] = {}
 
         # V1 entry-local-L2 session runtime (tracked opportunities, readiness)
         from lightfee.engine.entry_local_l2 import EntryLocalL2SessionRuntime
         self.entry_l2_sessions = EntryLocalL2SessionRuntime()
-        from lightfee.engine.entry_readiness import build_entry_readiness_provider
-        self.entry_readiness_provider = build_entry_readiness_provider(self)
         self.market_data_runtime = MarketDataRuntime(self)
         self.entry_gate_runtime = EntryGateRuntime(self)
         self.entry_dispatch_runtime = EntryDispatchRuntime(self)
@@ -961,38 +949,15 @@ class LiveRuntime:
     def get_venue_adapters(self) -> dict[Venue, VenueAdapter]:
         return dict(self._venue_adapters)
 
-    def _entry_readiness_provider_name(self) -> str:
-        return str(
-            getattr(self.config.strategy, "entry_readiness_provider", "local_l2")
-            or "local_l2"
-        ).strip().lower()
-
-    def _entry_readiness_provider_uses_local_l2(self) -> bool:
-        return self._entry_readiness_provider_name() in {"local_l2", "ws_top_book"}
-
-    def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self._entry_readiness_provider_name() == "ws_bbo_quote_lease"
-
-    def _entry_readiness_provider_uses_quote_lease(self) -> bool:
-        return self._entry_readiness_provider_name() in {
-            "quote_lease",
-            "ws_top_book",
-            "ws_bbo_quote_lease",
-        }
-
     def _local_l2_effective_enabled(self) -> bool:
         """Whether Local-L2 data plane is effective for this runtime profile."""
-        return (
-            bool(getattr(self.config.strategy, "local_l2_enabled", False))
-            and self._entry_readiness_provider_uses_local_l2()
-        )
+        return bool(getattr(self.config.strategy, "local_l2_enabled", False))
 
     def _final_l2_candidate_data_enabled(self) -> bool:
         """Whether candidate L2 data is required for final execution-cost repricing.
 
-        WS BBO owns entry-readiness and passive-maker quoting in its profile; it
-        is not a substitute for the independent L2 books consumed by the final
-        candidate cost calculation.
+        Final entry economics always consumes the same Local-L2 sessions that
+        own candidate readiness.
         """
         return bool(getattr(self.config.strategy, "local_l2_enabled", False))
 
@@ -1184,131 +1149,6 @@ class LiveRuntime:
         maybe_export_current_state_snapshot(
             self.state, self.config, export_state, now_ms
         )
-
-    def _entry_quote_lease_max_age_ms(self):
-        return self.market_data_runtime._entry_quote_lease_max_age_ms()
-
-    @staticmethod
-    def _quote_lease_blocker_family(reason: str) -> str:
-        if reason in {"missing_quote_lease_provider", "missing_quote_lease"}:
-            return "waiting_for_subscription"
-        if reason in {"expired_quote_lease", "stale_quote_lease"}:
-            return "stale_quote"
-        if reason in {
-            "quote_lease_provider_mismatch",
-            "quote_lease_symbol_mismatch",
-            "quote_lease_long_venue_mismatch",
-            "quote_lease_short_venue_mismatch",
-            "invalid_quote_lease",
-        }:
-            return "invalid_quote"
-        return "unknown"
-
-    @staticmethod
-    def _ws_bbo_selection_blocker_family(reason: str) -> str:
-        if reason == "entry_ws_bbo_quote_lease_waiting_for_subscription":
-            return "subscription"
-        if reason == "entry_ws_bbo_quote_lease_budget_exhausted":
-            return "subscription_budget"
-        if reason == "entry_ws_bbo_quote_lease_missing_quote":
-            return "missing_quote"
-        if reason == "entry_ws_bbo_quote_lease_stale_quote":
-            return "stale_quote"
-        if reason == "entry_ws_bbo_quote_lease_invalid_quote":
-            return "invalid_quote"
-        return "unknown"
-
-    def _entry_ws_bbo_subscription_blocker(
-        self,
-        candidate: Any,
-    ) -> tuple[str | None, dict[str, Any]]:
-        if (
-            not self._entry_readiness_provider_uses_ws_bbo()
-            or self.config.runtime.mode != "live"
-        ):
-            return None, {}
-
-        symbol = str(getattr(candidate, "symbol", "") or "").strip().upper()
-        long_venue = str(getattr(candidate, "long_venue", "") or "").strip().lower()
-        short_venue = str(getattr(candidate, "short_venue", "") or "").strip().lower()
-        if not symbol or not long_venue or not short_venue:
-            return None, {}
-
-        cache = getattr(self, "ws_bbo_cache", None)
-        data_plane = getattr(self, "ws_bbo_data_plane", None)
-        if data_plane is None or not hasattr(data_plane, "stream_state"):
-            return None, {}
-
-        long_quote = cache.get_quote(long_venue, symbol) if cache is not None else None
-        short_quote = cache.get_quote(short_venue, symbol) if cache is not None else None
-        long_state = data_plane.stream_state(long_venue, symbol)
-        short_state = data_plane.stream_state(short_venue, symbol)
-        missing_long_subscription = (
-            long_quote is None and not bool(long_state.get("tracked"))
-        )
-        missing_short_subscription = (
-            short_quote is None and not bool(short_state.get("tracked"))
-        )
-        if not missing_long_subscription and not missing_short_subscription:
-            return None, {}
-
-        budgeted_keys = getattr(self, "_entry_bbo_subscription_budgeted_keys", set())
-        budget_excluded_keys = getattr(
-            self,
-            "_entry_bbo_subscription_budget_excluded_keys",
-            set(),
-        )
-        per_venue_budget = int(
-            getattr(self, "_entry_bbo_subscription_per_venue_budget", 0) or 0
-        )
-
-        def budget_state(venue: str) -> dict[str, Any]:
-            key = (venue, symbol)
-            return {
-                "venue": venue,
-                "symbol": symbol,
-                "budgeted": key in budgeted_keys,
-                "excluded": key in budget_excluded_keys,
-                "per_venue_budget": per_venue_budget,
-            }
-
-        long_budget = budget_state(long_venue)
-        short_budget = budget_state(short_venue)
-        budget_exhausted = (
-            missing_long_subscription and bool(long_budget["excluded"])
-        ) or (
-            missing_short_subscription and bool(short_budget["excluded"])
-        )
-        reason = (
-            "entry_ws_bbo_quote_lease_budget_exhausted"
-            if budget_exhausted
-            else "entry_ws_bbo_quote_lease_waiting_for_subscription"
-        )
-        coverage_reason = (
-            "subscription_budget_exhausted"
-            if budget_exhausted
-            else "subscription_missing"
-        )
-
-        return reason, {
-            "provider": "ws_bbo_quote_lease",
-            "source": "ws_bbo_quote_lease",
-            "domain": "ws_bbo_subscription",
-            "blocker_family": (
-                "subscription_budget"
-                if budget_exhausted
-                else "subscription"
-            ),
-            "coverage_reason": coverage_reason,
-            "symbol": symbol,
-            "missing_long_subscription": missing_long_subscription,
-            "missing_short_subscription": missing_short_subscription,
-            "long_stream_state": long_state,
-            "short_stream_state": short_state,
-            "per_venue_budget": per_venue_budget,
-            "long_subscription_budget": long_budget,
-            "short_subscription_budget": short_budget,
-        }
 
     def _venue_min_notional(self, venue: Venue, symbol: str) -> float:
         """Return the minimum notional value for a venue/symbol pair.
@@ -3562,9 +3402,6 @@ class LiveRuntime:
     async def _ensure_l2_active_for_candidates(self, candidates, now_ms: int, *, tracked_opportunities=None):
         return await self.market_data_runtime._ensure_l2_active_for_candidates(candidates, now_ms, tracked_opportunities=tracked_opportunities)
 
-    async def _ensure_entry_bbo_active_for_candidates(self, candidates, now_ms: int):
-        return await self.market_data_runtime._ensure_entry_bbo_active_for_candidates(candidates, now_ms)
-
     def _select_v1_entry_tracked_scope(self, candidates) -> tuple[list, list]:
         """Return V1 primary+shadow tracked opportunities and candidates."""
         from lightfee.engine.entry_local_l2 import select_tracked_opportunities
@@ -3597,46 +3434,6 @@ class LiveRuntime:
             if self._candidate_pair_id(candidate) in tracked_pair_ids
         ]
         return tracked, tracked_candidates
-
-    @staticmethod
-    def _entry_quote_truth_empty_stats():
-        return MarketDataRuntime._entry_quote_truth_empty_stats()
-
-    def _entry_quote_truth_record_last_scan(self, stats: dict[str, Any]):
-        return self.market_data_runtime._entry_quote_truth_record_last_scan(stats)
-
-    def _entry_quote_probe_diagnostics_enabled(self):
-        return self.market_data_runtime._entry_quote_probe_diagnostics_enabled()
-
-    def _emit_entry_quote_revalidate_probe(self, *, stats: dict[str, Any], candidate_count: int, now_ms: int):
-        return self.market_data_runtime._emit_entry_quote_revalidate_probe(stats=stats, candidate_count=candidate_count, now_ms=now_ms)
-
-    def _entry_quote_truth_overlay_quote(self, overlay: dict[tuple[str, str], Any] | None, venue: str, symbol: str):
-        return self.market_data_runtime._entry_quote_truth_overlay_quote(overlay, venue, symbol)
-
-    def _entry_quote_truth_market_quotes(self, market_quotes: Any, overlay: dict[tuple[str, str], Any] | None):
-        return self.market_data_runtime._entry_quote_truth_market_quotes(market_quotes, overlay)
-
-    def _entry_quote_truth_price_hint(self, candidate: Any, *, price_hints: dict[str, float], overlay: dict[tuple[str, str], Any] | None):
-        return self.market_data_runtime._entry_quote_truth_price_hint(candidate, price_hints=price_hints, overlay=overlay)
-
-    def _entry_quote_revalidate_need(self, *, snapshot, quote: Any, now_ms: int, fallback_source: str):
-        return self.market_data_runtime._entry_quote_revalidate_need(snapshot=snapshot, quote=quote, now_ms=now_ms, fallback_source=fallback_source)
-
-    def _entry_quote_revalidate_targets(self, candidates: list, *, snapshot, now_ms: int):
-        return self.market_data_runtime._entry_quote_revalidate_targets(candidates, snapshot=snapshot, now_ms=now_ms)
-
-    def _entry_quote_truth_fresh_quote(self, venue: str, symbol: str, *, now_ms: int):
-        return self.market_data_runtime._entry_quote_truth_fresh_quote(venue, symbol, now_ms=now_ms)
-
-    def _entry_quote_truth_refresher(self):
-        return self.market_data_runtime._entry_quote_truth_refresher()
-
-    def _entry_quote_truth_accept_quote(self, quote: Any, *, now_ms: int):
-        return self.market_data_runtime._entry_quote_truth_accept_quote(quote, now_ms=now_ms)
-
-    async def _entry_quote_revalidate_for_candidates(self, candidates: list, *, snapshot, now_ms: int, candidate_scope: str='', skipped_untracked_count: int=0):
-        return await self.market_data_runtime._entry_quote_revalidate_for_candidates(candidates, snapshot=snapshot, now_ms=now_ms, candidate_scope=candidate_scope, skipped_untracked_count=skipped_untracked_count)
 
     async def _refresh_entry_candidate_open_interest_evidence(self, candidates: list, *, snapshot, now_ms: int):
         return await self.market_data_runtime._refresh_entry_candidate_open_interest_evidence(candidates, snapshot=snapshot, now_ms=now_ms)
@@ -3944,17 +3741,6 @@ class LiveRuntime:
         logger.info("shutdown stage=close_network")
         _journal_shutdown_stage("close_network")
 
-        ws_bbo_data_plane = getattr(self, "ws_bbo_data_plane", None)
-        if ws_bbo_data_plane is not None:
-            await _await_shutdown_task(
-                "close_network",
-                "ws_bbo_data_plane.stop_ws_streams",
-                _stop_ws_streams_coro(
-                    ws_bbo_data_plane,
-                    _remaining_shutdown_timeout_s(),
-                ),
-            )
-
         entry_open_interest_refresher = getattr(
             self,
             "entry_open_interest_refresher",
@@ -4061,7 +3847,10 @@ class LiveRuntime:
             now_ms=now_ms,
             last_good=self._last_good_snapshot,
             last_good_max_age_ms=last_good_max_age,
-            market_max_age_ms=self.config.runtime.max_market_age_ms,
+            # V1 classifies both the sidecar file and its global market view
+            # against the sidecar horizon.  Per-venue quote and L2 freshness
+            # remain enforced later with their execution-specific budgets.
+            market_max_age_ms=max_age,
         )
         if freshness == SnapshotFreshness.MISSING:
             self._live_scan_success_streak = 0
@@ -4385,53 +4174,10 @@ class LiveRuntime:
                     len(l2_tracking_tradeable) - len(tracked_candidates),
                     0,
                 )
-            entry_bbo_prewarm_attempted = (
-                self._entry_readiness_provider_uses_ws_bbo()
-                and bool(tracked_candidates)
-            )
-            skipped_untracked_quote_count = 0
-            if entry_bbo_prewarm_attempted:
-                all_quote_targets = self._entry_quote_revalidate_targets(
-                    l2_tracking_tradeable,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                )
-                tracked_quote_targets = self._entry_quote_revalidate_targets(
-                    tracked_candidates,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                )
-                skipped_untracked_quote_count = max(
-                    len(all_quote_targets) - len(tracked_quote_targets),
-                    0,
-                )
-            entry_quote_truth_overlay, _entry_quote_truth_stats = (
-                await self._entry_quote_revalidate_for_candidates(
-                    tracked_candidates,
-                    snapshot=snapshot,
-                    now_ms=now_ms,
-                    candidate_scope=(
-                        "v1_primary_shadow" if entry_bbo_prewarm_attempted else ""
-                    ),
-                    skipped_untracked_count=skipped_untracked_quote_count,
-                )
-            )
-            emit_stale_quote_diagnostics(
-                entry_quote_keys,
-                resolved_quote_keys=set(entry_quote_truth_overlay.keys()),
-            )
-            for quote in entry_quote_truth_overlay.values():
-                symbol = str(getattr(quote, "symbol", "") or "").upper()
-                bid = float(getattr(quote, "bid", 0.0) or 0.0)
-                ask = float(getattr(quote, "ask", 0.0) or 0.0)
-                if symbol and bid > 0.0 and ask > bid:
-                    price_hints[symbol] = (bid + ask) / 2.0
+            emit_stale_quote_diagnostics(entry_quote_keys)
             entry_freshness_filter_candidates = (
                 tracked_candidates
-                if (
-                    self._entry_readiness_provider_uses_ws_bbo()
-                    or self._local_l2_effective_enabled()
-                )
+                if self._local_l2_effective_enabled()
                 else tradeable
             )
             entry_freshness_filter_scope = (
@@ -4467,7 +4213,6 @@ class LiveRuntime:
                 ages=snapshot_freshness_ages,
                 budgets=snapshot_freshness_budgets,
                 publish_intervals=snapshot_freshness_publish_intervals,
-                entry_quote_truth_overlay=entry_quote_truth_overlay,
             )
             self.state.last_scan["tradeable_count"] = len(tradeable)
             self.state.last_scan["selected_candidate_count"] = 0
@@ -4537,16 +4282,6 @@ class LiveRuntime:
                 self._apply_shadow_promotion_if_eligible(
                     tracked, now_ms,
                 )
-            if (
-                self._entry_readiness_provider_uses_ws_bbo()
-                and l2_tracking_tradeable
-                and not entry_bbo_prewarm_attempted
-            ):
-                await self._ensure_entry_bbo_active_for_candidates(
-                    tracked_candidates,
-                    now_ms,
-                )
-
             if tradeable:
                 self.journal.append(
                     "runtime.candidates_tradeable",
@@ -4592,10 +4327,7 @@ class LiveRuntime:
                     remaining_slots=remaining_slots,
                     selection_blocker_counts=selection_blocker_counts,
                     candidate_blockers=candidate_blockers,
-                    market_quotes=self._entry_quote_truth_market_quotes(
-                        snapshot.quotes,
-                        entry_quote_truth_overlay,
-                    ),
+                    market_quotes=snapshot.quotes,
                     admission_blocker_counts=admission_blocker_counts,
                     final_cost_reprice=(
                         self._reprice_final_l2_candidates
@@ -4608,7 +4340,6 @@ class LiveRuntime:
                     finalists,
                     now_ms=now_ms,
                     price_hints=price_hints,
-                    entry_quote_truth_overlay=entry_quote_truth_overlay,
                 )
                 self.state.last_scan.update(self._entry_capacity_snapshot())
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
@@ -4872,13 +4603,6 @@ class LiveRuntime:
         self, now_ms: int, pending_passive: list,
     ) -> None:
         return await self.passive_maker_runtime._maybe_tick_maker_event_local_l2(
-            now_ms, pending_passive
-        )
-
-    async def _maybe_tick_maker_event_ws_bbo(
-        self, now_ms: int, pending_passive: list,
-    ) -> None:
-        return await self.passive_maker_runtime._maybe_tick_maker_event_ws_bbo(
             now_ms, pending_passive
         )
 
@@ -5380,6 +5104,7 @@ class LiveRuntime:
             source_candidate,
             now_ms,
             dual_taker=True,
+            pending_entry=pending,
         )
         candidate = self._apply_terminal_taker_runtime_entry_guards(
             source_candidate,
@@ -5909,15 +5634,38 @@ class LiveRuntime:
             return price
         return fallback_price if fallback_price and fallback_price > 0 else None
 
-    def _pending_entry_passive_best_quote(self, pending) -> tuple[float, float] | None:
-        if self._entry_readiness_provider_uses_ws_bbo():
-            return self._resolve_ws_bbo_close_quote(
-                pending.maker_venue(), pending.symbol,
-            )
-        if self._entry_readiness_provider_uses_local_l2():
-            quote = self._resolve_local_l2_quote(pending.maker_venue(), pending.symbol)
-            if quote is not None:
-                return quote
+    def _pending_entry_passive_best_quote(
+        self,
+        pending,
+        *,
+        now_ms: int | None = None,
+    ) -> tuple[float, float] | None:
+        """Return a maker quote only through the pending entry's L2 session."""
+        if not self._local_l2_effective_enabled():
+            return None
+        if now_ms is None:
+            now_ms = wall_clock_now_ms()
+        session_books = self._pending_entry_l2_ready_books(pending, now_ms)
+        if session_books is None:
+            return None
+        long_book, short_book = session_books
+        maker_book = (
+            long_book
+            if pending.maker_venue() == pending.long_venue
+            else short_book
+        )
+        try:
+            best_bid = float(maker_book.best_bid())
+            best_ask = float(maker_book.best_ask())
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            math.isfinite(best_bid)
+            and math.isfinite(best_ask)
+            and best_bid > 0.0
+            and best_ask > best_bid
+        ):
+            return best_bid, best_ask
         return None
 
     def _pending_entry_passive_ladder_profile(self, venue: Venue) -> tuple[bool, bool]:
@@ -6549,6 +6297,7 @@ class LiveRuntime:
                 zero_fill_candidate,
                 now_ms,
                 forced_entry_maker_leg=alternate_maker_leg,
+                pending_entry=pending,
             )
         zero_fill_candidate = self._apply_terminal_taker_runtime_entry_guards(
             zero_fill_candidate,
@@ -10449,7 +10198,7 @@ class LiveRuntime:
         venue: str = "",
         side: str = "",
         price: float = 0.0,
-        bbo: dict | None = None,
+        quote_evidence: dict | None = None,
     ) -> None:
         cooldown_ms = int(
             getattr(
@@ -10469,7 +10218,7 @@ class LiveRuntime:
         venue = venue or pair_key[1]
         if venue:
             self._post_only_reject_cooldown_until_ms[(pair_key[0], venue)] = until_ms
-        bbo_payload = dict(bbo or {})
+        quote_payload = dict(quote_evidence or {})
         evidence = self._entry_admission_evidence("post_only_would_take")
         self.journal.append(
             "runtime.entry_post_only_reject_cooldown",
@@ -10487,23 +10236,24 @@ class LiveRuntime:
                 "evidence_gap": evidence["evidence_gap"],
                 "long_venue": pair_key[1],
                 "short_venue": pair_key[2],
-                "side": side or bbo_payload.get("side", ""),
-                "price": price or bbo_payload.get("price", 0.0),
-                "best_bid": bbo_payload.get("best_bid"),
-                "best_ask": bbo_payload.get("best_ask"),
-                "book_age_ms": bbo_payload.get("book_age_ms"),
-                "stale_after_ms": bbo_payload.get("stale_after_ms"),
-                "freshness": bbo_payload.get("freshness", "unknown"),
-                "would_cross": bbo_payload.get("would_cross", False),
+                "side": side or quote_payload.get("side", ""),
+                "price": price or quote_payload.get("price", 0.0),
+                "best_bid": quote_payload.get("best_bid"),
+                "best_ask": quote_payload.get("best_ask"),
+                "book_age_ms": quote_payload.get("book_age_ms"),
+                "stale_after_ms": quote_payload.get("stale_after_ms"),
+                "freshness": quote_payload.get("freshness", "unknown"),
+                "would_cross": quote_payload.get("would_cross", False),
                 "cooldown_until_ms": until_ms,
                 "cooldown_until": until_ms,
                 "cooldown_ms": cooldown_ms,
             },
         )
 
-    def _post_only_maker_bbo_guard(
+    def _post_only_maker_l2_guard(
         self,
         *,
+        candidate,
         venue: Venue,
         symbol: str,
         side: Side,
@@ -10525,81 +10275,21 @@ class LiveRuntime:
             "freshness": "not_checked_local_l2_disabled",
             "would_cross": False,
             "source": "local_l2",
-            "provider": self._entry_readiness_provider_name(),
+            "owner": "entry_local_l2_session",
             "domain": "local_l2_book",
-            "blocker_family": "post_only_bbo",
+            "blocker_family": "post_only_l2",
             "repriced_attempted": False,
         }
-        if self._entry_readiness_provider_uses_ws_bbo():
-            stale_after_ms = self._entry_quote_lease_max_age_ms()
-            payload["source"] = "ws_bbo_quote_lease"
-            payload["provider"] = "ws_bbo_quote_lease"
-            payload["domain"] = "ws_bbo_cache"
-            payload["stale_after_ms"] = stale_after_ms
-            quote = self.ws_bbo_cache.get_quote(venue_str, symbol)
-            if quote is None:
-                payload["freshness"] = "missing"
-                return False, "missing_bbo", payload
-            best_bid = float(getattr(quote, "bid", 0.0) or 0.0)
-            best_ask = float(getattr(quote, "ask", 0.0) or 0.0)
-            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else 0
-            fresh = observed_at_ms > 0 and age_ms <= stale_after_ms
-            valid_bbo = best_bid > 0.0 and best_ask > best_bid
-            would_cross = (
-                valid_bbo
-                and price > 0.0
-                and (
-                    (side == Side.BUY and price >= best_ask)
-                    or (side == Side.SELL and price <= best_bid)
-                )
-            )
-            payload.update(
-                {
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "book_age_ms": age_ms,
-                    "observed_at_ms": observed_at_ms,
-                    "freshness": "fresh" if fresh else "stale",
-                    "would_cross": would_cross,
-                }
-            )
-            if not valid_bbo:
-                payload["freshness"] = "invalid_bbo"
-                return False, "invalid_bbo", payload
-            if not fresh:
-                return False, "stale_bbo", payload
-            if would_cross:
-                repriced_price = best_bid if side == Side.BUY else best_ask
-                repriced_would_cross = (
-                    repriced_price > 0.0
-                    and (
-                        (side == Side.BUY and repriced_price >= best_ask)
-                        or (side == Side.SELL and repriced_price <= best_bid)
-                    )
-                )
-                payload.update(
-                    {
-                        "repriced_attempted": True,
-                        "original_price": price,
-                        "repriced_price": repriced_price,
-                        "repriced_would_cross": repriced_would_cross,
-                    }
-                )
-                if repriced_price > 0.0 and not repriced_would_cross:
-                    payload["price"] = repriced_price
-                    payload["would_cross"] = False
-                    return True, "", payload
-                return False, "would_cross_bbo", payload
-            return True, "", payload
-
         if not self._local_l2_effective_enabled():
             return True, "", payload
 
-        book = self.local_l2_runtime.get_book(venue_str, symbol)
-        if book is None:
+        session_books = self._entry_l2_owned_ready_books(candidate, now_ms)
+        if session_books is None:
             payload["freshness"] = "missing"
-            return False, "missing_bbo", payload
+            return False, "missing_l2", payload
+        long_book, short_book = session_books
+        candidate_long_venue = str(getattr(candidate, "long_venue", ""))
+        book = long_book if venue_str == candidate_long_venue else short_book
 
         try:
             best_bid = float(book.best_bid())
@@ -10619,9 +10309,9 @@ class LiveRuntime:
         except Exception:
             stale = age_ms > stale_after_ms
         fresh = status == "hot" and not stale
-        valid_bbo = best_bid > 0.0 and best_ask > best_bid
+        valid_l2 = best_bid > 0.0 and best_ask > best_bid
         would_cross = (
-            valid_bbo
+            valid_l2
             and price > 0.0
             and (
                 (side == Side.BUY and price >= best_ask)
@@ -10638,13 +10328,13 @@ class LiveRuntime:
                 "would_cross": would_cross,
             }
         )
-        if not valid_bbo:
-            payload["freshness"] = "invalid_bbo"
-            return False, "invalid_bbo", payload
+        if not valid_l2:
+            payload["freshness"] = "invalid_l2"
+            return False, "invalid_l2", payload
         if not fresh:
-            return False, "stale_bbo", payload
+            return False, "stale_l2", payload
         if would_cross:
-            return False, "would_cross_bbo", payload
+            return False, "would_cross_l2", payload
         return True, "", payload
 
     def _gate_pending_entry_dedup(self, *args, **kwargs):
@@ -10735,15 +10425,23 @@ class LiveRuntime:
 
     @staticmethod
     def _configured_entry_l2_stale_after_ms(config) -> int:
+        configured_default_ms = 10_000
+        entry_value = int(
+            getattr(config.strategy, "entry_local_l2_book_stale_after_ms", 0) or 0
+        )
+        # A non-default canonical value is authoritative.  When it remains at
+        # the V1 default, retain legacy alias compatibility for existing live
+        # configs that explicitly set one of the older fields.
+        if entry_value > 0 and entry_value != configured_default_ms:
+            return entry_value
         for field_name in (
-            "entry_local_l2_book_stale_after_ms",
             "local_l2_quiet_book_grace_ms",
             "local_l2_max_age_ms",
         ):
             value = int(getattr(config.strategy, field_name, 0) or 0)
             if value > 0:
                 return value
-        return 300_000
+        return entry_value if entry_value > 0 else configured_default_ms
 
     def _snapshot_domain_budget_ms(self, domain: str, row=None):
         return self.market_data_runtime._snapshot_domain_budget_ms(domain, row)
@@ -10929,25 +10627,19 @@ class LiveRuntime:
     def _snapshot_freshness_observability(self, *, snapshot, candidates: list, now_ms: int):
         return self.market_data_runtime._snapshot_freshness_observability(snapshot=snapshot, candidates=candidates, now_ms=now_ms)
 
-    def _candidate_snapshot_freshness_decisions(self, candidate, *, snapshot, now_ms: int, record_liquidity_qualification: bool=False, entry_quote_truth_overlay: dict[tuple[str, str], Any] | None=None):
-        return self.market_data_runtime._candidate_snapshot_freshness_decisions(candidate, snapshot=snapshot, now_ms=now_ms, record_liquidity_qualification=record_liquidity_qualification, entry_quote_truth_overlay=entry_quote_truth_overlay)
+    def _candidate_snapshot_freshness_decisions(self, candidate, *, snapshot, now_ms: int, record_liquidity_qualification: bool = False):
+        return self.market_data_runtime._candidate_snapshot_freshness_decisions(candidate, snapshot=snapshot, now_ms=now_ms, record_liquidity_qualification=record_liquidity_qualification)
 
     @staticmethod
     def _snapshot_quote_evidence(*, quote, observed_at_ms: int, age_ms: int, budget_ms: int):
         return MarketDataRuntime._snapshot_quote_evidence(quote=quote, observed_at_ms=observed_at_ms, age_ms=age_ms, budget_ms=budget_ms)
 
-    def _ws_bbo_entry_quote_resolution(self, *, venue: str, symbol: str, now_ms: int, sidecar_reason: str, sidecar_source: str, sidecar_observed_at_ms: int, sidecar_age_ms: int, sidecar_budget_ms: int, fallback_source: str):
-        return self.market_data_runtime._ws_bbo_entry_quote_resolution(venue=venue, symbol=symbol, now_ms=now_ms, sidecar_reason=sidecar_reason, sidecar_source=sidecar_source, sidecar_observed_at_ms=sidecar_observed_at_ms, sidecar_age_ms=sidecar_age_ms, sidecar_budget_ms=sidecar_budget_ms, fallback_source=fallback_source)
-
-    def _entry_quote_truth_decision(self, *, venue: str, symbol: str, quote: Any | None, now_ms: int, fallback_source: str, sidecar_source: str, sidecar_observed_at_ms: int, sidecar_age_ms: int, sidecar_budget_ms: int, sidecar_reason: str):
-        return self.market_data_runtime._entry_quote_truth_decision(venue=venue, symbol=symbol, quote=quote, now_ms=now_ms, fallback_source=fallback_source, sidecar_source=sidecar_source, sidecar_observed_at_ms=sidecar_observed_at_ms, sidecar_age_ms=sidecar_age_ms, sidecar_budget_ms=sidecar_budget_ms, sidecar_reason=sidecar_reason)
-
     @staticmethod
     def _snapshot_freshness_evidence_fields(decision: dict):
         return MarketDataRuntime._snapshot_freshness_evidence_fields(decision)
 
-    def _candidate_snapshot_freshness_failures(self, candidate, *, snapshot, now_ms: int, entry_quote_truth_overlay: dict[tuple[str, str], Any] | None=None):
-        return self.market_data_runtime._candidate_snapshot_freshness_failures(candidate, snapshot=snapshot, now_ms=now_ms, entry_quote_truth_overlay=entry_quote_truth_overlay)
+    def _candidate_snapshot_freshness_failures(self, candidate, *, snapshot, now_ms: int):
+        return self.market_data_runtime._candidate_snapshot_freshness_failures(candidate, snapshot=snapshot, now_ms=now_ms)
 
     def _snapshot_fallback_duration_ms(self, *, snapshot, now_ms: int, max_age_ms: int | None=None):
         return self.market_data_runtime._snapshot_fallback_duration_ms(snapshot=snapshot, now_ms=now_ms, max_age_ms=max_age_ms)
@@ -10971,8 +10663,8 @@ class LiveRuntime:
     def _append_snapshot_freshness_decision_event(self, *, payload: dict, event_kind: str, now_ms: int):
         return self.market_data_runtime._append_snapshot_freshness_decision_event(payload=payload, event_kind=event_kind, now_ms=now_ms)
 
-    def _filter_candidates_by_snapshot_freshness(self, candidates: list, *, snapshot, now_ms: int, metrics: dict, ages: dict, budgets: dict | None=None, publish_intervals: dict | None=None, entry_quote_truth_overlay: dict[tuple[str, str], Any] | None=None):
-        return self.market_data_runtime._filter_candidates_by_snapshot_freshness(candidates, snapshot=snapshot, now_ms=now_ms, metrics=metrics, ages=ages, budgets=budgets, publish_intervals=publish_intervals, entry_quote_truth_overlay=entry_quote_truth_overlay)
+    def _filter_candidates_by_snapshot_freshness(self, candidates: list, *, snapshot, now_ms: int, metrics: dict, ages: dict, budgets: dict | None=None, publish_intervals: dict | None=None):
+        return self.market_data_runtime._filter_candidates_by_snapshot_freshness(candidates, snapshot=snapshot, now_ms=now_ms, metrics=metrics, ages=ages, budgets=budgets, publish_intervals=publish_intervals)
 
     def _snapshot_health_payload(self, *, snapshot, now_ms: int, max_age_ms: int, freshness: str):
         return self.market_data_runtime._snapshot_health_payload(snapshot=snapshot, now_ms=now_ms, max_age_ms=max_age_ms, freshness=freshness)
@@ -11134,12 +10826,6 @@ class LiveRuntime:
             return "tradeable_candidates_waiting_for_entry_local_l2_prewarm_window"
         if blockers == {"entry_local_l2_waiting_for_dual_ready"}:
             return "tradeable_candidates_waiting_for_entry_local_l2_dual_ready"
-        ws_bbo_blockers = {
-            key for key in blockers
-            if key.startswith("entry_ws_bbo_quote_lease_")
-        }
-        if ws_bbo_blockers and blockers <= ws_bbo_blockers:
-            return "tradeable_candidates_blocked_by_entry_ws_bbo_readiness"
         admission_blockers = {
             key for key in blockers
             if key.endswith("_admission_blocked")
@@ -11273,6 +10959,11 @@ class LiveRuntime:
     def _pending_entry_pair_id(self, pending) -> str:
         from lightfee.engine.entry_local_l2 import make_candidate_pair_id
 
+        metadata = getattr(pending, "metadata", {})
+        if isinstance(metadata, dict):
+            pair_id = metadata.get("pair_id", "")
+            if pair_id:
+                return str(pair_id)
         pair_id = getattr(pending, "pair_id", "")
         if pair_id:
             return str(pair_id)
@@ -11409,18 +11100,10 @@ class LiveRuntime:
 
         V1: tracked_entry_local_l2_is_executing (engine.rs).
         """
-        parts = pair_id.split(":", 2)
-        if len(parts) < 3:
-            return False
-        long_v, short_v, symbol = parts[0], parts[1], parts[2]
-        for pending in self.state.pending_entries.values():
-            if (
-                pending.symbol == symbol
-                and pending.long_venue.value == long_v
-                and pending.short_venue.value == short_v
-            ):
-                return True
-        return False
+        return any(
+            self._pending_entry_pair_id(pending) == pair_id
+            for pending in self.state.pending_entries.values()
+        )
 
     async def _dispatch_selected_entry_candidates(
         self,
@@ -11428,7 +11111,6 @@ class LiveRuntime:
         *,
         now_ms: int,
         price_hints: dict[str, float],
-        entry_quote_truth_overlay: dict[tuple[str, str], Any] | None,
     ) -> int:
         """Dispatch the V1 selection buffer without exceeding capacity."""
         dispatched = 0
@@ -11438,11 +11120,7 @@ class LiveRuntime:
             # entry or retain an unresolved pre-submit owner.
             if int(self._entry_capacity_snapshot()["remaining_slots"]) <= 0:
                 break
-            mid_price = self._entry_quote_truth_price_hint(
-                candidate,
-                price_hints=price_hints,
-                overlay=entry_quote_truth_overlay,
-            )
+            mid_price = float(price_hints.get(str(getattr(candidate, "symbol", "")).upper(), 0.0) or 0.0)
             if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
                 dispatched += 1
         return dispatched
@@ -11500,16 +11178,102 @@ class LiveRuntime:
 
     def _final_l2_book(self, venue: str, symbol: str, now_ms: int):
         book = self.local_l2_runtime.get_book(str(venue), str(symbol))
-        if book is None or not book.is_ready(self._entry_local_l2_stale_after_ms(), now_ms):
-            return None
-        if (
-            book.best_bid() <= 0.0
-            or book.best_ask() <= 0.0
-            or not math.isfinite(book.best_bid())
-            or not math.isfinite(book.best_ask())
+        if book is None or not book.execution_snapshot_is_valid(
+            self._entry_local_l2_stale_after_ms(), now_ms,
         ):
             return None
         return book
+
+    def _entry_l2_session_ready_books(
+        self,
+        *,
+        pair_id: str,
+        long_venue: Venue,
+        short_venue: Venue,
+        symbol: str,
+        now_ms: int,
+    ):
+        """Resolve the two fresh books through their one owned L2 session."""
+        ready_legs = self.entry_l2_sessions.ready_pair_legs(
+            pair_id,
+            long_venue=long_venue.value,
+            short_venue=short_venue.value,
+            symbol=symbol,
+            now_ms=now_ms,
+            stale_after_ms=self._entry_local_l2_stale_after_ms(),
+        )
+        if ready_legs is None:
+            return None
+        long_leg, short_leg = ready_legs
+        long_book = self._final_l2_book(long_leg.venue, long_leg.symbol, now_ms)
+        short_book = self._final_l2_book(short_leg.venue, short_leg.symbol, now_ms)
+        if long_book is None or short_book is None:
+            return None
+        return long_book, short_book
+
+    def _entry_l2_owned_ready_books(self, candidate, now_ms: int):
+        """Return books only from the candidate's ready primary L2 session.
+
+        The entry session is the V1 owner of candidate L2 lifecycle and
+        readiness.  Selection, final cost, and entry dispatch must not bypass
+        it by consuming a coincidentally HOT global book.
+        """
+        pair_id = self._candidate_pair_id(candidate)
+        if pair_id not in self._tracked_primary_pair_ids:
+            return None
+        try:
+            long_venue = Venue.from_str(str(getattr(candidate, "long_venue", "")))
+            short_venue = Venue.from_str(str(getattr(candidate, "short_venue", "")))
+        except (TypeError, ValueError):
+            return None
+        symbol = str(getattr(candidate, "symbol", ""))
+        return self._entry_l2_session_ready_books(
+            pair_id=pair_id,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            symbol=symbol,
+            now_ms=now_ms,
+        )
+
+    def _pending_entry_l2_ready_books(self, pending, now_ms: int):
+        """Return books from the pending entry's own two-leg L2 session.
+
+        A pending entry is an execution-owned lifecycle, not a fresh scan
+        candidate.  V1 keeps both of its books hot while a maker order is
+        active, even after the pair leaves the current primary shortlist.  It
+        still must use this exact session and fail closed if either leg is not
+        ready; it may never borrow an unrelated HOT book.
+        """
+        pair_id = self._pending_entry_pair_id(pending)
+        try:
+            long_venue = Venue.from_str(str(getattr(pending, "long_venue", "")))
+            short_venue = Venue.from_str(str(getattr(pending, "short_venue", "")))
+        except (TypeError, ValueError):
+            return None
+        symbol = str(getattr(pending, "symbol", ""))
+        if not symbol:
+            return None
+        self.entry_l2_sessions.track_pair(
+            pair_id,
+            long_venue=long_venue.value,
+            short_venue=short_venue.value,
+            symbol=symbol,
+            now_ms=now_ms,
+        )
+        self._refresh_entry_l2_session_readiness(now_ms)
+        return self._entry_l2_session_ready_books(
+            pair_id=pair_id,
+            long_venue=long_venue,
+            short_venue=short_venue,
+            symbol=symbol,
+            now_ms=now_ms,
+        )
+
+    def _pending_entry_l2_owned_ready_books(self, pending, candidate, now_ms: int):
+        """Resolve pending L2 only when this reprice refers to the same pair."""
+        if self._candidate_pair_id(candidate) != self._pending_entry_pair_id(pending):
+            return None
+        return self._pending_entry_l2_ready_books(pending, now_ms)
 
     @staticmethod
     def _final_l2_taker_slippage_bps(
@@ -11574,8 +11338,11 @@ class LiveRuntime:
             # Paper-only tests can construct local books without an adapter.
             # A live scan that can trade always owns both venue adapters.
             return 1.0
+        scale_reader = getattr(adapter, "l2_book_quantity_to_base_scale", None)
+        if not callable(scale_reader):
+            return None
         try:
-            raw_scale = adapter.l2_book_quantity_to_base_scale(symbol)
+            raw_scale = scale_reader(symbol)
             scale = float(raw_scale) if raw_scale is not None else float("nan")
         except (ArithmeticError, TypeError, ValueError):
             return None
@@ -11624,8 +11391,9 @@ class LiveRuntime:
         *,
         forced_entry_maker_leg: str | None = None,
         dual_taker: bool = False,
+        pending_entry=None,
     ) -> bool:
-        """Recompute final execution economics from the ready local L2 books."""
+        """Recompute final economics from a primary or pending-owned L2 session."""
         self._final_l2_clear_reprice_blockers(candidate)
         try:
             long_venue = Venue.from_str(str(getattr(candidate, "long_venue", "")))
@@ -11634,10 +11402,18 @@ class LiveRuntime:
             notional_quote = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0)
         except (TypeError, ValueError):
             return self._final_l2_block(candidate, "final_l2_invalid_price")
-        long_book = self._final_l2_book(long_venue.value, symbol, now_ms)
-        short_book = self._final_l2_book(short_venue.value, symbol, now_ms)
-        if long_book is None or short_book is None:
+        session_books = (
+            self._entry_l2_owned_ready_books(candidate, now_ms)
+            if pending_entry is None
+            else self._pending_entry_l2_owned_ready_books(
+                pending_entry,
+                candidate,
+                now_ms,
+            )
+        )
+        if session_books is None:
             return self._final_l2_block(candidate, "final_l2_unavailable")
+        long_book, short_book = session_books
         reference_mid = (long_book.best_ask() + short_book.best_bid()) / 2.0
         if not math.isfinite(reference_mid) or reference_mid <= 0.0:
             return self._final_l2_block(candidate, "final_l2_invalid_price")
@@ -11853,36 +11629,6 @@ class LiveRuntime:
             symbol,
         )
 
-    def _entry_quote_lease_execution_check(
-        self,
-        candidate,
-        now_ms: int,
-    ) -> tuple[str, object | None, dict]:
-        return self.entry_dispatch_runtime._entry_quote_lease_execution_check(
-            candidate,
-            now_ms,
-        )
-
-    def _refresh_entry_quote_lease_for_execution(
-        self,
-        candidate,
-        now_ms: int,
-        quote_lease_reason: str,
-        quote_lease: object | None,
-        quote_lease_evidence: dict,
-    ) -> tuple[str, object | None, dict]:
-        return self.entry_dispatch_runtime._refresh_entry_quote_lease_for_execution(
-            candidate,
-            now_ms,
-            quote_lease_reason,
-            quote_lease,
-            quote_lease_evidence,
-        )
-
-    @staticmethod
-    def _quote_lease_reference_price(lease) -> float:
-        return EntryDispatchRuntime._quote_lease_reference_price(lease)
-
     def _entry_final_gate_skew_blocker(
         self,
         candidate,
@@ -12062,22 +11808,16 @@ class LiveRuntime:
     async def _maybe_process_normal_exits(self, now_ms: int) -> None:
         return await self.close_runtime._maybe_process_normal_exits(now_ms)
 
-    def _resolve_ws_bbo_close_mid(self, venue_value: str, symbol: str, now_ms: int) -> float:
-        return self.close_runtime._resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
-
     def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:
         return self.close_runtime._resolve_local_l2_mid(venue, symbol, now_ms=now_ms)
 
-    def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
-        return self.close_runtime._resolve_local_l2_quote(venue, symbol)
-
-    def _resolve_ws_bbo_close_quote(
+    def _resolve_local_l2_quote(
         self,
         venue,
         symbol: str,
         now_ms: int | None = None,
     ) -> tuple[float, float] | None:
-        return self.close_runtime._resolve_ws_bbo_close_quote(
+        return self.close_runtime._resolve_local_l2_quote(
             venue,
             symbol,
             now_ms=now_ms,

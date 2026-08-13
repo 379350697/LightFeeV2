@@ -221,7 +221,7 @@ class TestLiquiditySourceWiredIntoRefresh:
 
 
 class TestRefreshPublicationSemantics:
-    """Refresh metadata must distinguish market observation from publish time."""
+    """Refresh metadata distinguishes market observation from publication."""
 
     @pytest.mark.asyncio
     async def test_published_at_ms_uses_refresh_completion_time(self, monkeypatch, tmp_path):
@@ -253,15 +253,15 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
-        times = iter([1.0, 7.0])
+        times = iter([1.0, 4.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         snapshot = await svc.refresh_once()
 
-        assert snapshot.market_observed_at_ms == 1000
+        assert snapshot.market_observed_at_ms == 4000
         assert snapshot.published_at_ms == 7000
         assert svc._last_good_at_ms == 7000
-        assert snapshot.quotes["binance:BTCUSDT"].observed_at_ms == 1000
+        assert snapshot.quotes["binance:BTCUSDT"].observed_at_ms == 4000
         assert snapshot.quotes["binance:BTCUSDT"].source == "sidecar_quote"
         assert snapshot.liquidity_lifecycle[0].observed_at_ms == 1000
         assert snapshot.liquidity_lifecycle[0].published_at_ms == 7000
@@ -302,7 +302,7 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = failed_liquidity
-        times = iter([2.0, 7.0])
+        times = iter([2.0, 4.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         failed = await svc.refresh_once()
@@ -312,7 +312,7 @@ class TestRefreshPublicationSemantics:
         assert svc._last_liquidity_publish_at_ms == 1000
 
         svc._fetch_liquidity_all_venues = successful_liquidity
-        times = iter([8.0, 11.0])
+        times = iter([8.0, 9.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         successful = await svc.refresh_once()
@@ -359,7 +359,7 @@ class TestRefreshPublicationSemantics:
 
         svc._fetch_all_venues = fake_fetch_all_venues
         svc._fetch_liquidity_all_venues = mixed_liquidity
-        times = iter([8.0, 11.0])
+        times = iter([8.0, 9.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
         snapshot = await svc.refresh_once()

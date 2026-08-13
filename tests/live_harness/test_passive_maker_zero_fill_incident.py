@@ -14,6 +14,7 @@ from lightfee.core.domain import (
     Side,
     Venue,
 )
+from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.entry_sync import EntrySyncExecutor
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import (
@@ -259,7 +260,6 @@ def _tradeable_frozen_candidate(*, entry_notional_quote: float = 50.0) -> dict:
 
 
 def _install_passive_repost_quote(runtime: LiveRuntime) -> None:
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
     _install_current_final_l2_books(runtime)
 
     async def fake_retry_sleep(_wait_ms: int) -> None:
@@ -268,13 +268,18 @@ def _install_passive_repost_quote(runtime: LiveRuntime) -> None:
     runtime._pending_entry_post_only_retry_sleep = fake_retry_sleep
 
 
-def _install_current_final_l2_books(runtime: LiveRuntime) -> None:
+def _install_current_final_l2_books(
+    runtime: LiveRuntime,
+    *,
+    long_bid: float = 6.99,
+    long_ask: float = 7.00,
+) -> None:
     """Provide the current executable L2 required before a route changes."""
     from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
 
-    now_ms = 1779816048600
+    now_ms = wall_clock_now_ms()
     for venue, bid, ask in (
-        ("okx", 6.99, 7.00),
+        ("okx", long_bid, long_ask),
         ("bybit", 8.00, 8.01),
     ):
         book = runtime.local_l2_runtime.ensure_book(venue, "RIVERUSDT")
@@ -482,6 +487,110 @@ async def test_second_zero_fill_cycle_reposts_until_repost_budget_is_reached(tmp
     assert "passive_maintenance.zero_fill_repost_exhausted" not in kinds
     assert "entry.aborted" not in kinds
     assert runtime.state.risk_mode != GlobalRiskMode.FAIL_CLOSED
+    session = runtime.entry_l2_sessions.sessions[runtime._pending_entry_pair_id(pending)]
+    assert session.state.value == "ready"
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_phase_switch_fails_closed_when_pending_l2_session_is_not_ready(tmp_path):
+    """Pending recovery may not borrow a HOT book outside its own dual-ready session."""
+    from lightfee.marketdata.l2 import L2BookStatus
+
+    config = make_test_config(str(tmp_path))
+    config.strategy.maker_venue_budget_window_ms = 100
+    config.symbols = ["RIVERUSDT"]
+
+    okx = _ZeroFillMakerAdapter(Venue.OKX, PassiveOrderState.CANCELED)
+    bybit = _ZeroFillMakerAdapter(Venue.BYBIT, PassiveOrderState.CANCELED)
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
+    _install_passive_repost_quote(runtime)
+    await runtime.start()
+    pending = _pending_from_fixture()
+    pending.frozen_candidate = _tradeable_frozen_candidate()
+    pending.passive_order.cancel_requested_at_ms = pending.passive_order.accepted_at_ms + 1500
+    pending.passive_order.last_progress_state = PassiveOrderState.CANCELED
+    pending.metadata["passive_zero_fill_retry_pending"] = True
+    pending.metadata["passive_zero_fill_retry_at_ms"] = (
+        pending.passive_order.cancel_requested_at_ms
+        + config.strategy.maker_venue_budget_window_ms
+    )
+    pending.phase_state.zero_fill_cycles_in_phase = (
+        config.strategy.pending_entry_phase_zero_fill_budget
+    )
+    pending.phase_state.cycle_attempt = pending.phase_state.zero_fill_cycles_in_phase
+    runtime.state.pending_entries[pending.pending_id] = pending
+    runtime.local_l2_runtime.get_book("bybit", "RIVERUSDT").status = L2BookStatus.COLD
+
+    retained = await runtime._handle_pending_passive_zero_fill_completion(
+        pending,
+        pending.pending_id,
+        pending.passive_order,
+        okx,
+        pending.passive_order.cancel_requested_at_ms
+        + config.strategy.maker_venue_budget_window_ms,
+    )
+
+    blocked = [
+        record for record in runtime.journal.read_all()
+        if record["kind"] == "execution.direction_drift_blocked"
+    ]
+    assert retained is True
+    assert bybit.submit_passive_order_calls == []
+    assert blocked
+    assert "final_l2_unavailable" in blocked[-1]["payload"]["blocked_reasons"]
+    session = runtime.entry_l2_sessions.sessions[runtime._pending_entry_pair_id(pending)]
+    assert session.state.value != "ready"
+
+
+@pytest.mark.asyncio
+async def test_maker_event_ignores_stale_hot_book_without_pending_session(tmp_path):
+    """Maker event maintenance must not reprice from a raw global L2 book."""
+    from types import SimpleNamespace
+
+    from lightfee.engine.passive_order_manager import (
+        PassiveOrderManager,
+        PassiveOrderManagerProfile,
+    )
+    from lightfee.marketdata.l2 import LocalL2Event, LocalL2EventKind
+
+    config = make_test_config(str(tmp_path))
+    config.strategy.entry_local_l2_book_stale_after_ms = 5_000
+    config.symbols = ["RIVERUSDT"]
+    runtime = LiveRuntime(config, venue_adapters={})
+    await runtime.start()
+    now_ms = 1_000_000
+    _install_current_final_l2_books(runtime)
+    for venue in ("okx", "bybit"):
+        runtime.local_l2_runtime.get_book(venue, "RIVERUSDT").observed_at_ms = (
+            now_ms - 5_001
+        )
+
+    pending = _pending_from_fixture()
+    runtime.state.pending_entries[pending.pending_id] = pending
+    runtime.entry_executor = object()
+    runtime._maker_event_state[pending.pending_id] = (
+        PassiveOrderManager(PassiveOrderManagerProfile()),
+        1.0,
+    )
+    reprice_calls: list[tuple] = []
+
+    async def capture_reprice(*args):
+        reprice_calls.append(args)
+        return SimpleNamespace(order_id="")
+
+    runtime._reprice_passive_maker_l2 = capture_reprice
+    runtime.local_l2_runtime.sync = lambda _now_ms: [
+        LocalL2Event(
+            venue="okx",
+            symbol="RIVERUSDT",
+            event_kind=LocalL2EventKind.MID_PRICE_CHANGED,
+            observed_at_ms=now_ms,
+        )
+    ]
+
+    await runtime._maybe_tick_maker_event(now_ms)
+
+    assert reprice_calls == []
 
 
 @pytest.mark.asyncio
@@ -711,7 +820,8 @@ async def test_terminal_balanced_partial_remainder_reposts_before_finalize(tmp_p
     )
     bybit = _ZeroFillMakerAdapter(Venue.BYBIT, PassiveOrderState.CANCELED)
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    _install_passive_repost_quote(runtime)
+    _install_current_final_l2_books(runtime, long_bid=0.01001, long_ask=0.01209)
 
     async def fake_retry_sleep(_wait_ms: int) -> None:
         return None
@@ -973,7 +1083,8 @@ async def test_zero_fill_repost_retries_post_only_reprice_before_backoff(tmp_pat
         post_only_error="status=429 too many requests retry_after_ms=700 post_only_would_take",
     )
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    _install_passive_repost_quote(runtime)
+    _install_current_final_l2_books(runtime, long_bid=0.01001, long_ask=0.01209)
     sleep_calls: list[int] = []
 
     async def fake_retry_sleep(wait_ms: int) -> None:
@@ -1025,7 +1136,6 @@ async def test_zero_fill_repost_missing_price_hint_finalizes_without_stale_submi
 
     okx = _ZeroFillMakerAdapter(Venue.OKX, PassiveOrderState.CANCELED)
     runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
-    runtime._resolve_local_l2_quote = lambda venue, symbol: None
     await runtime.start()
     pending = _pending_from_fixture()
     pending.passive_order.cancel_requested_at_ms = pending.passive_order.accepted_at_ms + 1500
@@ -1057,7 +1167,7 @@ def test_pending_entry_post_only_price_uses_v1_edge_and_inventory_profile(tmp_pa
     config.strategy.maker_inventory_bias_bps_per_unit = 500.0
     config.strategy.maker_inventory_bias_max_bps = 500.0
     runtime = LiveRuntime(config, venue_adapters={})
-    runtime._resolve_local_l2_quote = lambda venue, symbol: (0.0101, 0.0119)
+    _install_current_final_l2_books(runtime, long_bid=0.01001, long_ask=0.01209)
     pending = _pending_from_fixture()
     pending.frozen_candidate = None
 

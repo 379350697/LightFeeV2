@@ -161,23 +161,12 @@ def okx_fake():
 
 
 def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_journal):
-    from lightfee.engine.entry_readiness import EntryReadinessDecision
     from lightfee.engine.runtime import LiveRuntime
     from lightfee.sidecar.snapshot import CandidateInput
-
-    class ReadinessProvider:
-        def __init__(self):
-            self.calls = []
-
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            self.calls.append((candidate, now_ms))
-            return EntryReadinessDecision.allow()
 
     config.strategy.min_scan_minutes_before_funding = 1
     runtime = LiveRuntime(config, venue_adapters={})
     runtime.journal = tmp_journal
-    readiness_provider = ReadinessProvider()
-    runtime.entry_readiness_provider = readiness_provider
     now_ms = 1_000_000
     candidate = CandidateInput(
         long_venue="binance",
@@ -207,7 +196,6 @@ def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_jour
     assert counts["entry_blocked_first_funding_too_close"] == 1
     pair_id = "btcusdt:binance->bybit"
     assert blockers[pair_id] == "entry_blocked_first_funding_too_close"
-    assert readiness_provider.calls == []
 
     records = [
         json.loads(line)
@@ -237,24 +225,13 @@ def test_select_entry_candidates_blocks_first_funding_too_close(config, tmp_jour
 def test_select_entry_candidates_does_not_own_recovery_ledger_semantics(
     config, tmp_journal
 ):
-    from lightfee.engine.entry_readiness import EntryReadinessDecision
     from lightfee.engine.recovery_ledger import RecoveryLedger
     from lightfee.engine.runtime import LiveRuntime
     from lightfee.sidecar.snapshot import CandidateInput
 
-    class ReadinessProvider:
-        def __init__(self):
-            self.calls = []
-
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            self.calls.append((candidate, now_ms))
-            return EntryReadinessDecision.allow()
-
     config.strategy.min_scan_minutes_before_funding = 0
     runtime = LiveRuntime(config, venue_adapters={})
     runtime.journal = tmp_journal
-    readiness_provider = ReadinessProvider()
-    runtime.entry_readiness_provider = readiness_provider
     runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={"open_positions": [], "pending_entries": []},
         exchange_truth={
@@ -299,7 +276,6 @@ def test_select_entry_candidates_does_not_own_recovery_ledger_semantics(
     assert selected == [candidate]
     assert counts["entry_blocked_recovery_ledger"] == 0
     assert blockers == {}
-    assert readiness_provider.calls == [(candidate, now_ms)]
 
     records = [
         json.loads(line)
@@ -309,132 +285,6 @@ def test_select_entry_candidates_does_not_own_recovery_ledger_semantics(
     kind_counts = Counter(record["kind"] for record in records)
     assert kind_counts["runtime.entry_blocked_lifecycle_selection"] == 0
     assert kind_counts["runtime.entry_blocked_local_l2_selection"] == 0
-
-
-def test_select_entry_candidates_falls_back_to_next_candidate_when_top_is_blocked(
-    config, tmp_journal
-):
-    from lightfee.engine.entry_readiness import EntryReadinessDecision
-    from lightfee.engine.runtime import LiveRuntime
-    from lightfee.sidecar.snapshot import CandidateInput
-
-    class ReadinessProvider:
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            if candidate.symbol == "TOPUSDT":
-                return EntryReadinessDecision.block(
-                    "entry_quote_stale",
-                    evidence={"blocker_family": "stale_quote", "quote_age_ms": 9000},
-                )
-            return EntryReadinessDecision.allow()
-
-    config.strategy.min_scan_minutes_before_funding = 0
-    runtime = LiveRuntime(config, venue_adapters={})
-    runtime.journal = tmp_journal
-    runtime.entry_readiness_provider = ReadinessProvider()
-    now_ms = 1_000_000
-    top_candidate = CandidateInput(
-        long_venue="binance",
-        short_venue="bybit",
-        symbol="TOPUSDT",
-        funding_diff_bps=20.0,
-        funding_edge_bps=20.0,
-        expected_edge_bps=15.0,
-        worst_case_edge_bps=10.0,
-        ranking_edge_bps=20.0,
-        entry_notional_quote=30.0,
-        first_funding_timestamp_ms=now_ms + 300_000,
-        funding_timestamp_ms=now_ms + 300_000,
-    )
-    fallback_candidate = CandidateInput(
-        long_venue="binance",
-        short_venue="bybit",
-        symbol="NEXTUSDT",
-        funding_diff_bps=10.0,
-        funding_edge_bps=10.0,
-        expected_edge_bps=8.0,
-        worst_case_edge_bps=6.0,
-        ranking_edge_bps=10.0,
-        entry_notional_quote=30.0,
-        first_funding_timestamp_ms=now_ms + 300_000,
-        funding_timestamp_ms=now_ms + 300_000,
-    )
-    blockers = {}
-    selection_counts = Counter()
-
-    selected = runtime._select_entry_candidates(
-        [top_candidate, fallback_candidate],
-        now_ms=now_ms,
-        remaining_slots=1,
-        selection_blocker_counts=selection_counts,
-        candidate_blockers=blockers,
-    )
-
-    assert selected == [fallback_candidate]
-    assert blockers["topusdt:binance->bybit"] == "entry_quote_stale"
-    assert "nextusdt:binance->bybit" not in blockers
-    assert selection_counts["entry_quote_stale"] == 1
-
-
-def test_select_entry_candidates_does_not_attach_lifecycle_evidence_to_readiness_block(
-    config, tmp_journal
-):
-    from lightfee.engine.entry_readiness import EntryReadinessDecision
-    from lightfee.engine.runtime import LiveRuntime
-    from lightfee.sidecar.snapshot import CandidateInput
-
-    class DenyProvider:
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            return EntryReadinessDecision.block(
-                "entry_readiness_provider_denied",
-                evidence={"provider": "unit"},
-            )
-
-    config.strategy.min_scan_minutes_before_funding = 0
-    runtime = LiveRuntime(config, venue_adapters={})
-    runtime.journal = tmp_journal
-    runtime.entry_readiness_provider = DenyProvider()
-    now_ms = 1_000_000
-    candidate = CandidateInput(
-        long_venue="binance",
-        short_venue="bybit",
-        symbol="BTCUSDT",
-        funding_diff_bps=10.0,
-        funding_edge_bps=8.0,
-        expected_edge_bps=5.0,
-        worst_case_edge_bps=2.0,
-        ranking_edge_bps=8.0,
-        entry_notional_quote=30.0,
-        first_funding_timestamp_ms=now_ms + 300_000,
-        funding_timestamp_ms=now_ms + 300_000,
-    )
-
-    selected = runtime._select_entry_candidates(
-        [candidate],
-        now_ms=now_ms,
-        remaining_slots=1,
-        selection_blocker_counts=Counter(),
-        candidate_blockers={},
-    )
-
-    assert selected == []
-    records = [
-        json.loads(line)
-        for line in tmp_journal.path.read_text().splitlines()
-        if line.strip()
-    ]
-    assert not [
-        record
-        for record in records
-        if record["kind"] == "runtime.entry_blocked_lifecycle_selection"
-    ]
-    payload = next(
-        record["payload"]
-        for record in records
-        if record["kind"] == "runtime.entry_blocked_local_l2_selection"
-    )
-    assert payload["reason"] == "entry_readiness_provider_denied"
-    assert "lifecycle_evidence" not in payload
-    assert payload["readiness_evidence"] == {"provider": "unit"}
 
 
 def test_v1_tradeable_no_entry_reason_classifies_lifecycle_blockers():
@@ -568,14 +418,12 @@ async def test_scan_dispatch_capacity_counts_pending_entries_and_owner_claims(
         return True
 
     runtime._dispatch_entry = claim_without_local_successor
-    runtime._entry_quote_truth_price_hint = lambda *args, **kwargs: 1.0
     finalists = [SimpleNamespace(symbol=f"TOKEN{index}USDT") for index in range(4)]
 
     dispatched = await runtime._dispatch_selected_entry_candidates(
         finalists,
         now_ms=1_000,
         price_hints={},
-        entry_quote_truth_overlay=None,
     )
 
     assert dispatched == 2
@@ -697,13 +545,8 @@ def test_select_entry_candidates_records_final_selection_skip_reasons(
     config,
     tmp_journal,
 ):
-    from lightfee.engine.entry_readiness import EntryReadinessDecision
     from lightfee.engine.runtime import LiveRuntime
     from lightfee.sidecar.snapshot import CandidateInput
-
-    class ReadinessProvider:
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            return EntryReadinessDecision.allow()
 
     def candidate(symbol: str, ranking: float = 8.0) -> CandidateInput:
         return CandidateInput(
@@ -724,7 +567,6 @@ def test_select_entry_candidates_records_final_selection_skip_reasons(
     config.strategy.min_scan_minutes_before_funding = 0
     runtime = LiveRuntime(config, venue_adapters={})
     runtime.journal = tmp_journal
-    runtime.entry_readiness_provider = ReadinessProvider()
     runtime.state.open_positions["btc-open"] = OpenPosition(
         position_id="btc-open",
         symbol="BTCUSDT",
@@ -786,12 +628,7 @@ def test_select_entry_candidates_records_final_selection_skip_reasons(
 async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_capacity(
     config, tmp_journal
 ):
-    from lightfee.engine.entry_readiness import EntryReadinessDecision
     from lightfee.sidecar.snapshot import CandidateInput
-
-    class ReadinessProvider:
-        def decide(self, candidate, now_ms, *, market_quotes=None):
-            return EntryReadinessDecision.allow()
 
     class CapturingExecutor:
         ctx = None
@@ -810,7 +647,6 @@ async def test_select_and_dispatch_allows_other_symbol_when_active_position_has_
     adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
     runtime = LiveRuntime(config, venue_adapters=adapters)
     runtime.journal = tmp_journal
-    runtime.entry_readiness_provider = ReadinessProvider()
     executor = CapturingExecutor()
     runtime.entry_executor = executor
     runtime.state.lifecycle = EngineLifecycle.RUNNING
@@ -1650,6 +1486,25 @@ class TestPlannerDispatchIntegration:
         self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
 
         candidate = self._candidate()
+        from lightfee.engine.entry_local_l2 import (
+            TrackedOpportunity,
+            TrackedOpportunityClass,
+        )
+
+        pair_id = runtime._candidate_pair_id(candidate)
+        runtime._tracked_primary_pair_ids.add(pair_id)
+        runtime.entry_l2_sessions.track_opportunity(
+            TrackedOpportunity(
+                pair_id=pair_id,
+                symbol=candidate.symbol,
+                long_venue=candidate.long_venue,
+                short_venue=candidate.short_venue,
+                ranking_edge_bps=candidate.ranking_edge_bps,
+                class_=TrackedOpportunityClass.PRIMARY,
+            ),
+            now_ms=5000,
+        )
+        runtime._refresh_entry_l2_session_readiness(5000)
 
         assert await runtime._dispatch_entry(candidate, 5000, price_hint=50000.0) is True
         assert runtime.state.pending_entries == {}
@@ -1670,29 +1525,7 @@ class TestPlannerDispatchIntegration:
         assert payload["post_only"] is True
         assert payload["reduce_only"] is False
 
-    @pytest.mark.asyncio
-    async def test_fresh_bbo_allows_post_only_maker_submit(self, config, tmp_journal):
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.state.tick_count = 77
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
-        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
 
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is True
-
-        assert binance.last_request is not None
-        assert binance.last_request.post_only is True
-        assert binance.last_request.price == 50000.0
-        assert len(runtime.state.pending_entries) == 1
-        pending = next(iter(runtime.state.pending_entries.values()))
-        assert pending.created_cycle == 77
-        assert pending.passive_manager_runtime.consecutive_failures == 0
 
     @pytest.mark.asyncio
     async def test_short_maker_dispatch_keeps_direction_and_durable_pending_successor(
@@ -1713,6 +1546,7 @@ class TestPlannerDispatchIntegration:
         pending = next(iter(runtime.state.pending_entries.values()))
         assert pending.long_side is Side.BUY
         assert pending.short_side is Side.SELL
+        assert pending.metadata["pair_id"] == "btcusdt:binance->okx"
         assert pending.maker_venue() is Venue.OKX
         assert pending.hedge_venue() is Venue.BINANCE
         records = runtime.journal.read_all()
@@ -1734,614 +1568,29 @@ class TestPlannerDispatchIntegration:
         ][-1]
         assert handoff["owner_destination"] == "pending_entry"
 
-    @pytest.mark.asyncio
-    async def test_final_gate_blocks_fresh_bbo_with_excessive_leg_skew(
-        self, config, tmp_journal,
-    ):
-        config.runtime.mode = "live"
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
-        config.strategy.entry_final_gate_max_skew_ms = 100
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        self._install_hot_book(
-            runtime, "binance", "BTCUSDT",
-            bid=50000.0, ask=50010.0, observed_at_ms=5000,
-        )
-        self._install_hot_book(
-            runtime, "okx", "BTCUSDT",
-            bid=49990.0, ask=50000.0, observed_at_ms=4800,
-        )
 
-        dispatched = await runtime._dispatch_entry(
-            self._candidate(),
-            5000,
-            price_hint=50000.0,
-        )
 
-        assert dispatched is False
-        assert binance.last_request is None
-        payload = [
-            record["payload"]
-            for record in tmp_journal.read_all()
-            if record["kind"] == "runtime.entry_blocked_final_gate"
-        ][-1]
-        assert payload["reason"] == "execution_skew"
-        assert payload["skew_ms"] == 200
-        assert payload["max_skew_ms"] == 100
-        assert payload["left_venue"] == "binance"
-        assert payload["right_venue"] == "okx"
 
-    @pytest.mark.asyncio
-    async def test_ws_bbo_provider_dispatch_does_not_require_local_l2_books(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        candidate = self._candidate()
-        for venue, bid, ask in (
-            ("binance", 50000.0, 50010.0),
-            ("okx", 49990.0, 50000.0),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    observed_at_ms=5000,
-                    received_at_ms=5000,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
-        assert readiness.allowed
 
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5000,
-            price_hint=50000.0,
-        )
 
-        assert dispatched is True
-        assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
-        assert binance.last_request is not None
-        assert binance.last_request.post_only is True
-        assert len(runtime.state.pending_entries) == 1
 
-    @pytest.mark.asyncio
-    async def test_ws_bbo_provider_maker_event_uses_in_situ_reprice_not_new_entry(
-        self,
-        config,
-        tmp_journal,
-        monkeypatch,
-    ):
-        from lightfee.engine.passive_order_manager import (
-            PassiveOrderManager,
-            PassiveOrderManagerProfile,
-        )
-        from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.runtime.mode = "live"
-        config.runtime.maker_event_lane_enabled = True
-        config.runtime.maker_event_lane_min_wake_interval_ms = 0
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.local_l2_enabled = True
-        config.strategy.passive_reprice_threshold_bps = 1.0
-        config.strategy.passive_cancel_replace_threshold_bps = 100.0
-        runtime = LiveRuntime(
-            config,
-            venue_adapters={
-                Venue.BINANCE: FakeVenueAdapter(Venue.BINANCE),
-                Venue.OKX: FakeVenueAdapter(Venue.OKX),
-            },
-        )
-        runtime.journal = tmp_journal
-        pending = PendingEntry(
-            pending_id="pe-ws-bbo",
-            symbol="BTCUSDT",
-            long_venue=Venue.BINANCE,
-            short_venue=Venue.OKX,
-            target_quantity=0.01,
-            long_side=Side.BUY,
-            short_side=Side.SELL,
-            created_at_ms=1000,
-            entry_type="passive_incremental",
-            maker_price=50000.0,
-            long_quantity=0.01,
-            short_quantity=0.01,
-            maker_leg="long",
-        )
-        runtime.state.pending_entries[pending.pending_id] = pending
-        profile = PassiveOrderManagerProfile(
-            max_consecutive_failures=3,
-            failure_cooldown_ms=0,
-            reprice_threshold_bps=1.0,
-            cancel_replace_threshold_bps=100.0,
-        )
-        runtime._maker_event_state[pending.pending_id] = (
-            PassiveOrderManager(profile),
-            50000.0,
-        )
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="binance",
-                symbol="BTCUSDT",
-                bid=50020.0,
-                ask=50030.0,
-                observed_at_ms=5000,
-                received_at_ms=5000,
-                source="binance_bbo_ws",
-            )
-        )
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="okx",
-                symbol="BTCUSDT",
-                bid=49990.0,
-                ask=50000.0,
-                observed_at_ms=5000,
-                received_at_ms=5000,
-                source="okx_bbo_ws",
-            )
-        )
 
-        class RejectNewEntryExecutor:
-            async def execute(self, ctx):
-                raise AssertionError("WS BBO maker-event must not start a new entry flow")
 
-        calls: list[tuple[float, float, str, str]] = []
 
-        async def fake_reprice(pending_arg, new_price, old_price, action, now_ms, entry_id):
-            calls.append((new_price, old_price, action, entry_id))
-            return SimpleNamespace(order_id="amended-maker-1")
 
-        runtime.entry_executor = RejectNewEntryExecutor()
-        monkeypatch.setattr(runtime, "_reprice_passive_maker_l2", fake_reprice)
 
-        await runtime._maybe_tick_maker_event(5000)
 
-        assert calls == [(50025.0, 50000.0, "cancel_replace", pending.pending_id)]
-        assert runtime.local_l2_runtime.get_book("binance", "BTCUSDT") is None
-        assert runtime.state.pending_entries[pending.pending_id].maker_order_id == "amended-maker-1"
-        records = tmp_journal.read_all()
-        assert any(
-            record["kind"] == "runtime.maker_event_lane_wake"
-            and record["payload"]["source"] == "ws_bbo_quote_lease"
-            for record in records
-        )
-        assert all(
-            not str(record["kind"]).startswith("runtime.local_l2_")
-            for record in records
-        )
 
-    @pytest.mark.asyncio
-    async def test_ws_bbo_provider_dispatch_requires_selected_quote_lease(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.runtime.mode = "live"
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        for venue, bid, ask in (
-            ("binance", 50000.0, 50010.0),
-            ("okx", 49990.0, 50000.0),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    observed_at_ms=5000,
-                    received_at_ms=5000,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
 
-        dispatched = await runtime._dispatch_entry(
-            self._candidate(),
-            5000,
-            price_hint=50000.0,
-        )
 
-        assert dispatched is False
-        assert binance.last_request is None
-        payload = [
-            record["payload"]
-            for record in tmp_journal.read_all()
-            if record["kind"] == "runtime.entry_blocked_quote_lease"
-        ][-1]
-        assert payload["reason"] == "missing_quote_lease"
-        assert payload["provider"] == "ws_bbo_quote_lease"
 
-    def test_ws_bbo_provider_stale_execution_lease_records_both_leg_ages(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
 
-        config.runtime.mode = "live"
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        runtime = LiveRuntime(config)
-        runtime.journal = tmp_journal
-        candidate = self._candidate()
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="binance",
-                symbol="BTCUSDT",
-                bid=50000.0,
-                ask=50010.0,
-                observed_at_ms=1000,
-                received_at_ms=1000,
-                source="binance_bbo_ws",
-            )
-        )
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="okx",
-                symbol="BTCUSDT",
-                bid=49990.0,
-                ask=50000.0,
-                observed_at_ms=2500,
-                received_at_ms=2500,
-                source="okx_bbo_ws",
-            )
-        )
-        readiness = runtime.entry_readiness_provider.decide(candidate, 2500)
-        assert readiness.allowed
 
-        reason, _lease, evidence = runtime._entry_quote_lease_execution_check(
-            candidate,
-            3001,
-        )
 
-        assert reason == "stale_quote_lease"
-        assert evidence["blocker_family"] == "stale_quote"
-        assert evidence["quote_age_ms"] == {"long": 2001, "short": 501}
-        assert evidence["long_age_ms"] == 2001
-        assert evidence["short_age_ms"] == 501
 
-    @pytest.mark.asyncio
-    async def test_ws_bbo_provider_dispatch_uses_selected_quote_lease_prices(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
-
-        config.runtime.mode = "live"
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        candidate = self._candidate()
-        for venue, bid, ask in (
-            ("binance", 50000.0, 50010.0),
-            ("okx", 49990.0, 50000.0),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    observed_at_ms=5000,
-                    received_at_ms=5000,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
-        assert readiness.allowed
-
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5000,
-            price_hint=12345.0,
-        )
-
-        assert dispatched is True
-        assert binance.last_request is not None
-        assert binance.last_request.post_only is True
-        assert binance.last_request.price == 50000.0
-
-    @pytest.mark.asyncio
-    async def test_ws_bbo_post_only_guard_reprices_crossing_maker_quote_once(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
-
-        config.runtime.mode = "live"
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        candidate = self._candidate()
-        for venue, bid, ask in (
-            ("binance", 50000.0, 50010.0),
-            ("okx", 49990.0, 50000.0),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    observed_at_ms=5000,
-                    received_at_ms=5000,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
-        assert readiness.allowed
-
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="binance",
-                symbol="BTCUSDT",
-                bid=49980.0,
-                ask=49990.0,
-                observed_at_ms=5100,
-                received_at_ms=5100,
-                source="binance_bbo_ws",
-            )
-        )
-
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            5100,
-            price_hint=12345.0,
-        )
-
-        assert dispatched is True
-        assert binance.last_request is not None
-        assert binance.last_request.post_only is True
-        assert binance.last_request.price == 49980.0
-        assert not [
-            record for record in tmp_journal.read_all()
-            if record["kind"] == "runtime.entry_blocked_post_only_bbo"
-        ]
-
-    @pytest.mark.asyncio
-    async def test_ws_bbo_provider_dispatch_refreshes_expired_quote_lease(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
-
-        config.runtime.mode = "live"
-        config.runtime.max_market_age_ms = 30_000
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        candidate = self._candidate()
-        for venue, bid, ask in (
-            ("binance", 50000.0, 50010.0),
-            ("okx", 49990.0, 50000.0),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    observed_at_ms=5000,
-                    received_at_ms=5000,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-        readiness = runtime.entry_readiness_provider.decide(candidate, 5000)
-        assert readiness.allowed
-
-        for venue, bid, ask in (
-            ("binance", 50020.0, 50030.0),
-            ("okx", 50005.0, 50015.0),
-        ):
-            runtime.ws_bbo_cache.update_quote(
-                TopBookQuote(
-                    venue=venue,
-                    symbol="BTCUSDT",
-                    bid=bid,
-                    ask=ask,
-                    observed_at_ms=7001,
-                    received_at_ms=7001,
-                    source=f"{venue}_bbo_ws",
-                )
-            )
-
-        dispatched = await runtime._dispatch_entry(
-            candidate,
-            7001,
-            price_hint=12345.0,
-        )
-
-        assert dispatched is True
-        assert binance.last_request is not None
-        assert binance.last_request.post_only is True
-        assert binance.last_request.price == 50020.0
-        blocked = [
-            record for record in tmp_journal.read_all()
-            if record["kind"] == "runtime.entry_blocked_quote_lease"
-        ]
-        assert blocked == []
-
-    @pytest.mark.asyncio
-    async def test_ws_bbo_post_only_guard_uses_quote_lease_age_budget(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
-
-        config.runtime.mode = "live"
-        config.runtime.max_market_age_ms = 3000
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        runtime = LiveRuntime(config)
-        runtime.journal = tmp_journal
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="binance",
-                symbol="BTCUSDT",
-                bid=50000.0,
-                ask=50010.0,
-                observed_at_ms=5000,
-                received_at_ms=5000,
-                source="binance_bbo_ws",
-            )
-        )
-
-        ok, reason, payload = runtime._post_only_maker_bbo_guard(
-            venue=Venue.BINANCE,
-            symbol="BTCUSDT",
-            side=Side.BUY,
-            price=50000.0,
-            now_ms=7001,
-        )
-
-        assert ok is False
-        assert reason == "stale_bbo"
-        assert payload["stale_after_ms"] == 1500
-
-    @pytest.mark.asyncio
-    async def test_ws_bbo_provider_dispatch_blocks_stale_post_only_quote(
-        self,
-        config,
-        tmp_journal,
-    ):
-        from lightfee.marketdata.ws_bbo import TopBookQuote
-
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_readiness_provider = "ws_bbo_quote_lease"
-        config.strategy.entry_quote_lease_ttl_ms = 1500
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        runtime.ws_bbo_cache.update_quote(
-            TopBookQuote(
-                venue="binance",
-                symbol="BTCUSDT",
-                bid=50000.0,
-                ask=50010.0,
-                observed_at_ms=3000,
-                received_at_ms=3000,
-                source="binance_bbo_ws",
-            )
-        )
-
-        dispatched = await runtime._dispatch_entry(
-            self._candidate(),
-            5000,
-            price_hint=50000.0,
-        )
-
-        assert dispatched is False
-        assert binance.last_request is None
-        payload = [
-            record["payload"]
-            for record in tmp_journal.read_all()
-            if record["kind"] == "runtime.entry_blocked_post_only_bbo"
-        ][-1]
-        assert payload["reason"] == "stale_bbo"
-        assert payload["source"] == "ws_bbo_quote_lease"
-
-    @pytest.mark.asyncio
-    async def test_stale_bbo_blocks_post_only_maker_submit(self, config, tmp_journal):
-        config.strategy.local_l2_enabled = True
-        config.strategy.max_liquidity_snapshot_age_ms = 5000
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=3000)
-        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
-
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50000.0) is False
-
-        assert binance.last_request is None
-        assert runtime.state.pending_entries == {}
-        kinds = [record["kind"] for record in tmp_journal.read_all()]
-        assert "runtime.entry_blocked_post_only_bbo" in kinds
-
-    @pytest.mark.asyncio
-    async def test_crossing_bbo_blocks_post_only_maker_submit(self, config, tmp_journal):
-        config.strategy.local_l2_enabled = True
-        config.strategy.entry_local_l2_book_stale_after_ms = 1000
-        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
-        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
-        adapters = {Venue.BINANCE: binance, Venue.OKX: okx}
-        runtime = LiveRuntime(config, venue_adapters=adapters)
-        runtime.journal = tmp_journal
-        runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=tmp_journal)
-        self._install_hot_book(runtime, "binance", "BTCUSDT", bid=50000.0, ask=50010.0, observed_at_ms=5000)
-        self._install_hot_book(runtime, "okx", "BTCUSDT", bid=49990.0, ask=50000.0, observed_at_ms=5000)
-
-        assert await runtime._dispatch_entry(self._candidate(), 5000, price_hint=50010.0) is False
-
-        assert binance.last_request is None
-        payload = [
-            record["payload"]
-            for record in tmp_journal.read_all()
-            if record["kind"] == "runtime.entry_blocked_post_only_bbo"
-        ][-1]
-        assert payload["reason"] == "would_cross_bbo"
-        assert payload["would_cross"] is True
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_uses_planner_route(self, config, tmp_journal):

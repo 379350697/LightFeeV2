@@ -183,12 +183,10 @@ class TestCurrentStateExportV1Semantics:
             risk_mode=GlobalRiskMode.RUNNING,
         )
         state.runtime_market_data_config = {
-            "entry_readiness_provider_effective": "ws_bbo_quote_lease",
+            "entry_l2_readiness_owner": "entry_local_l2_session",
             "local_l2_configured_enabled": True,
-            "local_l2_effective_enabled": False,
-            "local_l2_effective_disabled_reason": (
-                "ws_bbo_quote_lease_overrides_legacy_local_l2_flag"
-            ),
+            "local_l2_effective_enabled": True,
+            "local_l2_effective_disabled_reason": "",
         }
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -201,11 +199,11 @@ class TestCurrentStateExportV1Semantics:
 
             effective = data["runtime_market_data_config"]
             assert (
-                effective["entry_readiness_provider_effective"]
-                == "ws_bbo_quote_lease"
+                effective["entry_l2_readiness_owner"]
+                == "entry_local_l2_session"
             )
             assert effective["local_l2_configured_enabled"] is True
-            assert effective["local_l2_effective_enabled"] is False
+            assert effective["local_l2_effective_enabled"] is True
         finally:
             os.unlink(path)
 

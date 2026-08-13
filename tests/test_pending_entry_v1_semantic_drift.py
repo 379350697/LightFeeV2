@@ -2268,7 +2268,7 @@ async def test_entry_dispatch_retains_pre_submit_owner_when_executor_has_no_loca
         price_hint=1.0,
         maker_venue=Venue.OKX,
         maker_leg=Side.BUY,
-        maker_bbo_evidence={},
+        maker_l2_evidence={},
         now_ms=3000,
     )
 

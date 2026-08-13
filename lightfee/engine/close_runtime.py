@@ -6,7 +6,6 @@ from LiveRuntime. Keep journal events, payload keys, and close semantics stable.
 
 from __future__ import annotations
 
-import asyncio
 import math
 from typing import Any
 
@@ -34,15 +33,6 @@ class CloseRuntime:
 
     def _flush_adapter_order_diagnostics(self, adapter) -> None:
         return self.ctx._flush_adapter_order_diagnostics(adapter)
-
-    def _entry_readiness_provider_uses_local_l2(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_local_l2()
-
-    def _entry_readiness_provider_uses_ws_bbo(self) -> bool:
-        return self.ctx._entry_readiness_provider_uses_ws_bbo()
-
-    def _entry_quote_lease_max_age_ms(self) -> int:
-        return self.ctx._entry_quote_lease_max_age_ms()
 
     def _runtime_method_override(self, method_name: str):
         method = getattr(self.ctx, method_name, None)
@@ -89,189 +79,17 @@ class CloseRuntime:
             return override(*args, **kwargs)
         return self._apply_pending_close_reconciliation_backoff(*args, **kwargs)
 
-    def _call_resolve_ws_bbo_close_mid(self, *args, **kwargs) -> float:
-        override = self._runtime_method_override("_resolve_ws_bbo_close_mid")
-        if override is not None:
-            return override(*args, **kwargs)
-        return self._resolve_ws_bbo_close_mid(*args, **kwargs)
-
     def _call_resolve_local_l2_mid(self, *args, **kwargs) -> float:
         override = self._runtime_method_override("_resolve_local_l2_mid")
         if override is not None:
             return override(*args, **kwargs)
         return self._resolve_local_l2_mid(*args, **kwargs)
 
-    def _call_resolve_ws_bbo_close_quote(self, *args, **kwargs):
-        override = self._runtime_method_override("_resolve_ws_bbo_close_quote")
-        if override is not None:
-            return override(*args, **kwargs)
-        return self._resolve_ws_bbo_close_quote(*args, **kwargs)
-
     def _call_resolve_local_l2_quote(self, *args, **kwargs):
         override = self._runtime_method_override("_resolve_local_l2_quote")
         if override is not None:
             return override(*args, **kwargs)
         return self._resolve_local_l2_quote(*args, **kwargs)
-
-    async def _rewarm_close_price_evidence(
-        self,
-        keys: list[tuple[str, str]],
-        *,
-        now_ms: int,
-    ) -> dict[tuple[str, str], Any]:
-        """Refresh active close WS BBO quotes before passive-close price hints."""
-        overlay: dict[tuple[str, str], Any] = {}
-        if (
-            not keys
-            or not self._entry_readiness_provider_uses_ws_bbo()
-            or self.ctx.config.runtime.mode == "paper"
-        ):
-            return overlay
-
-        budget_ms = self._entry_quote_lease_max_age_ms()
-        if budget_ms <= 0:
-            return overlay
-
-        unique_targets: list[tuple[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for venue, symbol in keys:
-            key = (str(venue or "").lower(), str(symbol or "").upper())
-            if not key[0] or not key[1] or key in seen:
-                continue
-            seen.add(key)
-            unique_targets.append(key)
-
-        unresolved = set(unique_targets)
-
-        def collect_fresh_from_cache(stage: str) -> None:
-            cache = self.ctx.ws_bbo_cache
-            if cache is None or not hasattr(cache, "fresh_quote"):
-                return
-            for key in list(unresolved):
-                quote = cache.fresh_quote(
-                    key[0],
-                    key[1],
-                    now_ms=now_ms,
-                    max_age_ms=budget_ms,
-                )
-                if quote is None:
-                    continue
-                overlay[key] = quote
-                unresolved.discard(key)
-                if stage != "initial":
-                    self.ctx.journal.append(
-                        "runtime.close_price_evidence_ws_rewarm_succeeded",
-                        {
-                            "venue": key[0],
-                            "symbol": key[1],
-                            "source": str(getattr(quote, "source", "") or "ws_bbo_cache"),
-                            "observed_at_ms": int(getattr(quote, "observed_at_ms", 0) or 0),
-                            "age_ms": max(
-                                now_ms - int(getattr(quote, "observed_at_ms", 0) or 0),
-                                0,
-                            ),
-                            "budget_ms": budget_ms,
-                            "outcome": "ws_bbo_rewarm_succeeded",
-                            "ts_ms": now_ms,
-                        },
-                    )
-
-        def cached_quote_evidence(key: tuple[str, str]) -> dict[str, Any]:
-            cache = self.ctx.ws_bbo_cache
-            quote = None
-            if cache is not None and hasattr(cache, "get_quote"):
-                try:
-                    quote = cache.get_quote(key[0], key[1])
-                except Exception:  # pragma: no cover - defensive telemetry
-                    quote = None
-            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            bid = float(getattr(quote, "bid", 0.0) or 0.0)
-            ask = float(getattr(quote, "ask", 0.0) or 0.0)
-            ws_budget_excluded = (
-                observed_at_ms <= 0
-                or age_ms is None
-                or age_ms > budget_ms
-                or bid <= 0.0
-                or ask <= bid
-            )
-            return {
-                "observed_at_ms": observed_at_ms,
-                "age_ms": age_ms,
-                "stale_quote_source": str(getattr(quote, "source", "") or ""),
-                "ws_budget_excluded": ws_budget_excluded,
-            }
-
-        collect_fresh_from_cache("initial")
-        wait_budget_ms = min(budget_ms, 750)
-        elapsed_ms = 0
-        while unresolved and elapsed_ms < wait_budget_ms:
-            await asyncio.sleep(0.05)
-            elapsed_ms += 50
-            collect_fresh_from_cache("wait")
-
-        refresher_factory = getattr(self.ctx, "_entry_quote_truth_refresher", None)
-        refresher = refresher_factory() if callable(refresher_factory) else None
-        refresh_quote = getattr(refresher, "refresh_quote", None)
-        accept_quote = getattr(self.ctx, "_entry_quote_truth_accept_quote", None)
-        for key in list(unresolved):
-            rest_error = ""
-            refreshed = None
-            if callable(refresh_quote):
-                try:
-                    refreshed = refresh_quote(key[0], key[1], now_ms=now_ms)
-                except Exception as exc:  # pragma: no cover - defensive telemetry
-                    rest_error = f"{type(exc).__name__}: {exc}"[:240]
-            accepted = (
-                bool(accept_quote(refreshed, now_ms=now_ms))
-                if callable(accept_quote)
-                else False
-            )
-            if accepted:
-                cache = self.ctx.ws_bbo_cache
-                if cache is not None and hasattr(cache, "update_quote"):
-                    cache.update_quote(refreshed)
-                overlay[key] = refreshed
-                unresolved.discard(key)
-                self.ctx.journal.append(
-                    "runtime.close_price_evidence_rest_rewarm_succeeded",
-                    {
-                        "venue": key[0],
-                        "symbol": key[1],
-                        "source": str(getattr(refreshed, "source", "") or "rest_topbook"),
-                        "observed_at_ms": int(getattr(refreshed, "observed_at_ms", 0) or 0),
-                        "age_ms": max(
-                            now_ms - int(getattr(refreshed, "observed_at_ms", 0) or 0),
-                            0,
-                        ),
-                        "budget_ms": budget_ms,
-                        "wait_budget_ms": wait_budget_ms,
-                        "endpoint": "rest_topbook",
-                        "outcome": "rest_topbook_rewarm_succeeded",
-                        "ts_ms": now_ms,
-                    },
-                )
-                continue
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_rewarm_failed",
-                {
-                    "venue": key[0],
-                    "symbol": key[1],
-                    "source": "ws_bbo_quote_lease",
-                    **cached_quote_evidence(key),
-                    "budget_ms": budget_ms,
-                    "wait_budget_ms": wait_budget_ms,
-                    "endpoint": "rest_topbook",
-                    "rest_error": rest_error,
-                    "outcome": (
-                        "rest_topbook_unavailable"
-                        if callable(refresh_quote)
-                        else "rest_topbook_capability_unavailable"
-                    ),
-                    "ts_ms": now_ms,
-                },
-            )
-        return overlay
 
     @staticmethod
     def _venue_from_close_reconciliation(value: Any) -> Venue | None:
@@ -1610,23 +1428,6 @@ class CloseRuntime:
             if normal_close_reason_uses_passive_maker_taker(reason_str):
                 # Route to passive close
                 if self.ctx.passive_close_executor is not None:
-                    await self._rewarm_close_price_evidence(
-                        [
-                            (
-                                position.long_venue.value
-                                if hasattr(position.long_venue, "value")
-                                else str(position.long_venue),
-                                position.symbol,
-                            ),
-                            (
-                                position.short_venue.value
-                                if hasattr(position.short_venue, "value")
-                                else str(position.short_venue),
-                                position.symbol,
-                            ),
-                        ],
-                        now_ms=now_ms,
-                    )
                     self.ctx.journal.append(
                         "runtime.normal_close_routing_passive",
                         {
@@ -1666,317 +1467,87 @@ class CloseRuntime:
                         short_price_hint=self._call_resolve_local_l2_mid(position.short_venue, position.symbol, now_ms=now_ms),
                         state=self.ctx.state,
                     )
-    def _resolve_ws_bbo_close_mid(self, venue_value: str, symbol: str, now_ms: int) -> float:
-        """Resolve a close price hint from the active WS BBO quote provider."""
-        if not self._entry_readiness_provider_uses_ws_bbo():
-            return 0.0
+    def _fresh_local_l2_book(
+        self,
+        venue,
+        symbol: str,
+        *,
+        now_ms: int,
+    ):
+        """Return one fresh HOT local-L2 book, or reject its price evidence.
 
-        budget_ms = self._entry_quote_lease_max_age_ms()
-        if budget_ms <= 0:
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_missing",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "reason": "quote_lease_budget_unavailable",
-                    "budget_ms": budget_ms,
-                    "decision": "reject_price_hint",
-                    "fallback_source": "none",
-                    "provider": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
-            return 0.0
-
+        Close price hints and passive close repricing share this boundary.  A
+        HOT status alone is lifecycle state, not proof that a price is still
+        usable for an order.
+        """
+        if not self.ctx._local_l2_effective_enabled():
+            return None
+        venue_value = venue.value if hasattr(venue, "value") else str(venue)
+        budget_ms = int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0)
         try:
-            cache = self.ctx.ws_bbo_cache
-            if cache is None or not hasattr(cache, "get_quote"):
-                self.ctx.journal.append(
-                    "runtime.close_price_evidence_missing",
-                    {
-                        "venue": venue_value,
-                        "symbol": symbol,
-                        "domain": "ws_bbo_cache",
-                        "reason": "cache_unavailable",
-                        "budget_ms": budget_ms,
-                        "decision": "reject_price_hint",
-                        "fallback_source": "none",
-                        "provider": "ws_bbo_quote_lease",
-                        "ts_ms": now_ms,
-                    },
-                )
-                return 0.0
-            quote = cache.get_quote(venue_value, symbol)
-            if quote is None:
-                self.ctx.journal.append(
-                    "runtime.close_price_evidence_missing",
-                    {
-                        "venue": venue_value,
-                        "symbol": symbol,
-                        "domain": "ws_bbo_cache",
-                        "reason": "missing_quote",
-                        "budget_ms": budget_ms,
-                        "decision": "reject_price_hint",
-                        "fallback_source": "none",
-                        "provider": "ws_bbo_quote_lease",
-                        "ts_ms": now_ms,
-                    },
-                )
-                return 0.0
-
-            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            bid = float(getattr(quote, "bid", 0.0) or 0.0)
-            ask = float(getattr(quote, "ask", 0.0) or 0.0)
-            if (
-                observed_at_ms <= 0
-                or age_ms is None
-                or age_ms > budget_ms
-                or bid <= 0.0
-                or ask <= bid
-            ):
+            book = self.ctx.local_l2_runtime.get_book(venue_value, symbol)
+            if book is None or book.status.value != "hot":
+                return None
+            age_ms = book.age_ms(now_ms)
+            # V1 treats a non-positive execution-liquidity TTL as unavailable;
+            # it must never turn a HOT status into indefinitely valid price
+            # evidence.
+            if budget_ms <= 0 or book.is_stale(budget_ms, now_ms):
                 self.ctx.journal.append(
                     "runtime.close_price_evidence_stale",
                     {
                         "venue": venue_value,
                         "symbol": symbol,
-                        "domain": "ws_bbo_cache",
+                        "domain": "local_l2_book",
                         "age_ms": age_ms,
                         "budget_ms": budget_ms,
                         "decision": "reject_price_hint",
                         "fallback_source": "none",
-                        "provider": "ws_bbo_quote_lease",
                         "ts_ms": now_ms,
                     },
                 )
-                return 0.0
+                return None
+            return book
+        except Exception:
+            return None
 
-            mid = (bid + ask) / 2.0
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_ws_bbo_used",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "source": str(getattr(quote, "source", "") or "ws_bbo_cache"),
-                    "bid": bid,
-                    "ask": ask,
-                    "mid": mid,
-                    "observed_at_ms": observed_at_ms,
-                    "age_ms": age_ms,
-                    "budget_ms": budget_ms,
-                    "decision": "use_price_hint",
-                    "outcome": "used_fresh_ws_bbo",
-                    "provider": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
-            return mid
-        except Exception as exc:
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_missing",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "reason": "fallback_error",
-                    "error": f"{type(exc).__name__}: {exc}"[:240],
-                    "budget_ms": budget_ms,
-                    "decision": "reject_price_hint",
-                    "fallback_source": "none",
-                    "provider": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
-            return 0.0
     def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:
-        """Get mid price from local L2 book or active close-price fallback for venue+symbol."""
+        """Get a fresh mid price from the local L2 owner for venue+symbol."""
         if now_ms is None:
             now_ms = wall_clock_now_ms()
-        venue_value = venue.value if hasattr(venue, 'value') else str(venue)
-        if self._entry_readiness_provider_uses_ws_bbo():
-            return self._call_resolve_ws_bbo_close_mid(venue_value, symbol, now_ms)
-        budget_ms = int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0)
+        book = self._fresh_local_l2_book(venue, symbol, now_ms=now_ms)
+        if book is None:
+            return 0.0
         try:
-            book = self.ctx.local_l2_runtime.get_book(venue_value, symbol)
-            if book is not None and book.status.value == "hot":
-                age_ms = book.age_ms(now_ms)
-                if budget_ms > 0 and book.is_stale(budget_ms, now_ms):
-                    self.ctx.journal.append(
-                        "runtime.close_price_evidence_stale",
-                        {
-                            "venue": venue_value,
-                            "symbol": symbol,
-                            "domain": "local_l2_book",
-                            "age_ms": age_ms,
-                            "budget_ms": budget_ms,
-                            "decision": "reject_price_hint",
-                            "fallback_source": "none",
-                            "ts_ms": now_ms,
-                        },
-                    )
-                    return 0.0
-                mid = book.mid_price()
-                if mid and mid > 0:
-                    return mid
+            mid = book.mid_price()
+            if mid and mid > 0:
+                return mid
         except Exception:
             pass
         return 0.0
-    def _resolve_local_l2_quote(self, venue, symbol: str) -> tuple[float, float] | None:
-        """Get best bid/ask from the local L2 book for passive tick inference."""
-        if self._entry_readiness_provider_uses_ws_bbo():
-            return self._call_resolve_ws_bbo_close_quote(venue, symbol)
-        if not self._entry_readiness_provider_uses_local_l2():
-            return None
-        try:
-            book = self.ctx.local_l2_runtime.get_book(
-                venue.value if hasattr(venue, "value") else str(venue),
-                symbol,
-            )
-            if book is not None and book.status.value == "hot":
-                best_bid = book.best_bid()
-                best_ask = book.best_ask()
-                if best_bid > 0 and best_ask > best_bid:
-                    return best_bid, best_ask
-        except Exception:
-            pass
-        return None
-    def _resolve_ws_bbo_close_quote(
+    def _resolve_local_l2_quote(
         self,
         venue,
         symbol: str,
         now_ms: int | None = None,
     ) -> tuple[float, float] | None:
-        if not self._entry_readiness_provider_uses_ws_bbo():
-            return None
+        """Get a fresh best bid/ask from the local L2 owner."""
         if now_ms is None:
             now_ms = wall_clock_now_ms()
-        venue_value = venue.value if hasattr(venue, "value") else str(venue)
-        budget_ms = self._entry_quote_lease_max_age_ms()
-        if budget_ms <= 0:
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_missing",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "reason": "quote_lease_budget_unavailable",
-                    "budget_ms": budget_ms,
-                    "decision": "reject_price_hint",
-                    "fallback_source": "none",
-                    "provider": "ws_bbo_quote_lease",
-                    "source": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
+        book = self._fresh_local_l2_book(venue, symbol, now_ms=now_ms)
+        if book is None:
             return None
         try:
-            quote = self.ctx.ws_bbo_cache.get_quote(venue_value, symbol)
-        except Exception as exc:
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_missing",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "reason": "fallback_error",
-                    "error": f"{type(exc).__name__}: {exc}"[:240],
-                    "budget_ms": budget_ms,
-                    "decision": "reject_price_hint",
-                    "fallback_source": "none",
-                    "provider": "ws_bbo_quote_lease",
-                    "source": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
-            return None
-        if quote is None:
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_missing",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "reason": "missing_quote",
-                    "budget_ms": budget_ms,
-                    "decision": "reject_price_hint",
-                    "fallback_source": "none",
-                    "provider": "ws_bbo_quote_lease",
-                    "source": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
-            return None
-        try:
-            observed_at_ms = int(getattr(quote, "observed_at_ms", 0) or 0)
-            age_ms = max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
-            bid = float(getattr(quote, "bid", 0.0) or 0.0)
-            ask = float(getattr(quote, "ask", 0.0) or 0.0)
-        except Exception as exc:
-            self.ctx.journal.append(
-                "runtime.close_price_evidence_missing",
-                {
-                    "venue": venue_value,
-                    "symbol": symbol,
-                    "domain": "ws_bbo_cache",
-                    "reason": "quote_parse_error",
-                    "error": f"{type(exc).__name__}: {exc}"[:240],
-                    "budget_ms": budget_ms,
-                    "decision": "reject_price_hint",
-                    "fallback_source": "none",
-                    "provider": "ws_bbo_quote_lease",
-                    "source": "ws_bbo_quote_lease",
-                    "ts_ms": now_ms,
-                },
-            )
-            return None
-        if (
-            observed_at_ms > 0
-            and age_ms is not None
-            and budget_ms > 0
-            and age_ms <= budget_ms
-            and bid > 0.0
-            and ask > bid
-        ):
-            return bid, ask
-        self.ctx.journal.append(
-            "runtime.close_price_evidence_stale",
-            {
-                "venue": venue_value,
-                "symbol": symbol,
-                "domain": "ws_bbo_cache",
-                "reason": (
-                    "quote_stale"
-                    if age_ms is not None and age_ms > budget_ms
-                    else "invalid_quote"
-                ),
-                "observed_at_ms": observed_at_ms,
-                "age_ms": age_ms,
-                "budget_ms": budget_ms,
-                "decision": "reject_price_hint",
-                "fallback_source": "none",
-                "provider": "ws_bbo_quote_lease",
-                "source": "ws_bbo_quote_lease",
-                "ts_ms": now_ms,
-            },
-        )
+            best_bid = book.best_bid()
+            best_ask = book.best_ask()
+            if best_bid > 0 and best_ask > best_bid:
+                return best_bid, best_ask
+        except Exception:
+            pass
         return None
     def _resolve_close_price_hint_mid_with_source(self, venue, symbol: str):
-        if self._entry_readiness_provider_uses_ws_bbo():
-            now_ms = wall_clock_now_ms()
-            venue_value = venue.value if hasattr(venue, "value") else str(venue)
-            return (
-                self._call_resolve_ws_bbo_close_mid(venue_value, symbol, now_ms),
-                "ws_bbo_quote_lease",
-            )
         return self._call_resolve_local_l2_mid(venue, symbol), "local_l2"
     def _resolve_close_price_hint_quote_with_source(self, venue, symbol: str):
-        if self._entry_readiness_provider_uses_ws_bbo():
-            quote = self._call_resolve_ws_bbo_close_quote(venue, symbol)
-            if quote is None:
-                return None
-            return quote[0], quote[1], "ws_bbo_quote_lease"
         quote = self._call_resolve_local_l2_quote(venue, symbol)
         if quote is None:
             return None
