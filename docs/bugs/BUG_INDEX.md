@@ -25,8 +25,9 @@ Pending-entry metadata is now the pair-ownership authority; the existing
 Local-L2 session admits HOT/DEGRADED only with a fresh structurally valid book;
 and final pricing uses that same snapshot rule. Missing, suspended, stale,
 crossed, and malformed evidence still blocks. BBO/quote-lease paths are no
-longer part of the entry flow. Local regression is green; deployment and live
-read-only verification remain pending. See
+longer part of the entry flow. The targeted Local-L2 regression is green; the
+full suite was interrupted while waiting on external-network tests. Cloud
+deployment and read-only service health verification are green. See
 [daily/2026-08-13.md#cluster-cl-104-local-l2-ownership-degraded-snapshot-parity](daily/2026-08-13.md#cluster-cl-104-local-l2-ownership-degraded-snapshot-parity).
 
 CL-103 WS-BBO candidate L2 final-cost path, 2026-08-13 (historical; superseded
