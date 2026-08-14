@@ -5123,6 +5123,277 @@ class TestAckOnlyResponses:
 
 class TestV1PassiveBusinessFlowParity:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("reduce_only", [False, True])
+    async def test_aster_v3_market_ioc_omits_time_in_force_on_wire(self, reduce_only):
+        """V1 Aster MARKET hedge/close semantics: IOC is not a V3 wire field."""
+        captured: dict[str, str] = {}
+        position_mode_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal position_mode_calls
+            if request.url.path == "/fapi/v3/positionSide/dual":
+                position_mode_calls += 1
+                return httpx.Response(200, json={"dualSidePosition": False})
+            assert request.url.path == "/fapi/v3/order"
+            captured.update(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": "aster-market-close-1",
+                    "clientOrderId": "aster-ioc-close",
+                    "executedQty": "21",
+                    "avgPrice": "0.123",
+                },
+            )
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = AsterV3Client(
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+            ),
+            http_client=http_client,
+        )
+        try:
+            fill = await client.place_order(
+                OrderRequest(
+                    venue=Venue.ASTER,
+                    symbol="CYSUSDT",
+                    side=Side.BUY,
+                    quantity=21.0,
+                    reduce_only=reduce_only,
+                    time_in_force=TimeInForce.IOC,
+                    client_order_id="aster-ioc-close",
+                )
+            )
+        finally:
+            await http_client.aclose()
+
+        assert fill.quantity == 21.0
+        assert captured["type"] == "MARKET"
+        if reduce_only:
+            assert captured["reduceOnly"] == "true"
+        else:
+            assert "reduceOnly" not in captured
+        assert "timeInForce" not in captured
+        assert captured["newOrderRespType"] == "RESULT"
+        assert position_mode_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hedge_mode", "side", "reduce_only", "position_side"),
+        [
+            (False, Side.BUY, False, None),
+            (False, Side.SELL, True, None),
+            (True, Side.BUY, False, "LONG"),
+            (True, Side.SELL, False, "SHORT"),
+            (True, Side.SELL, True, "LONG"),
+            (True, Side.BUY, True, "SHORT"),
+        ],
+    )
+    async def test_aster_v3_market_order_uses_cached_position_mode_on_wire(
+        self,
+        hedge_mode,
+        side,
+        reduce_only,
+        position_side,
+    ):
+        """Real V3 wire path must follow Aster's One-way/Hedge order contract."""
+        calls: list[tuple[str, str, dict[str, str]]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            params = dict(request.url.params)
+            calls.append((request.method, request.url.path, params))
+            if request.url.path == "/fapi/v3/positionSide/dual":
+                return httpx.Response(200, json={"dualSidePosition": hedge_mode})
+            assert request.url.path == "/fapi/v3/order"
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": f"aster-mode-{len(calls)}",
+                    "clientOrderId": "aster-position-mode",
+                    "executedQty": "21",
+                    "avgPrice": "0.123",
+                },
+            )
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = AsterV3Client(
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+            ),
+            http_client=http_client,
+        )
+        request = OrderRequest(
+            venue=Venue.ASTER,
+            symbol="CYSUSDT",
+            side=side,
+            quantity=21.0,
+            reduce_only=reduce_only,
+            time_in_force=TimeInForce.IOC,
+            client_order_id="aster-position-mode",
+        )
+        try:
+            await client.place_order(request)
+            await client.place_order(request)
+        finally:
+            await http_client.aclose()
+
+        mode_calls = [call for call in calls if call[1] == "/fapi/v3/positionSide/dual"]
+        order_calls = [call for call in calls if call[1] == "/fapi/v3/order"]
+        assert len(mode_calls) == 1
+        assert len(order_calls) == 2
+        for _, _, params in order_calls:
+            assert params["type"] == "MARKET"
+            assert params["newOrderRespType"] == "RESULT"
+            assert "timeInForce" not in params
+            if hedge_mode:
+                assert params["positionSide"] == position_side
+                assert "reduceOnly" not in params
+            elif reduce_only:
+                assert params["reduceOnly"] == "true"
+                assert "positionSide" not in params
+            else:
+                assert "reduceOnly" not in params
+                assert "positionSide" not in params
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_passive_hedge_order_uses_position_side_without_reduce_only(self):
+        """Passive V3 orders share mode mapping but retain the existing ACK workflow."""
+        captured: dict[str, str] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/fapi/v3/positionSide/dual":
+                return httpx.Response(200, json={"dualSidePosition": True})
+            assert request.url.path == "/fapi/v3/order"
+            captured.update(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "orderId": "aster-passive-hedge",
+                    "clientOrderId": "aster-passive-hedge",
+                    "status": "NEW",
+                    "price": "0.123",
+                    "origQty": "21",
+                },
+            )
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = AsterV3Client(
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+            ),
+            http_client=http_client,
+        )
+        try:
+            ack = await client.submit_passive_order(
+                OrderRequest(
+                    venue=Venue.ASTER,
+                    symbol="CYSUSDT",
+                    side=Side.BUY,
+                    quantity=21.0,
+                    price=0.123,
+                    reduce_only=True,
+                    post_only=True,
+                    client_order_id="aster-passive-hedge",
+                )
+            )
+        finally:
+            await http_client.aclose()
+
+        assert ack.order_id == "aster-passive-hedge"
+        assert captured["type"] == "LIMIT"
+        assert captured["timeInForce"] == "GTX"
+        assert captured["positionSide"] == "SHORT"
+        assert "reduceOnly" not in captured
+        assert "newOrderRespType" not in captured
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_rejects_order_when_position_mode_evidence_is_invalid(self):
+        """A missing V3 mode field must block the order before any submit attempt."""
+        order_attempted = False
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal order_attempted
+            if request.url.path == "/fapi/v3/positionSide/dual":
+                return httpx.Response(200, json={})
+            order_attempted = True
+            raise AssertionError("order must not be submitted without position mode truth")
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = AsterV3Client(
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+            ),
+            http_client=http_client,
+        )
+        try:
+            with pytest.raises(OrderSubmitError, match="position mode") as exc:
+                await client.place_order(
+                    OrderRequest(
+                        venue=Venue.ASTER,
+                        symbol="CYSUSDT",
+                        side=Side.BUY,
+                        quantity=21.0,
+                    )
+                )
+        finally:
+            await http_client.aclose()
+
+        assert exc.value.class_ == SubmitFailureClass.REJECTED
+        assert order_attempted is False
+
+    @pytest.mark.asyncio
+    async def test_aster_v3_position_truth_nets_hedge_rows_per_symbol(self):
+        """V1-compatible reconciliation must not select only one Hedge-mode row."""
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/fapi/v3/positionRisk"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "symbol": "CYSUSDT",
+                        "positionSide": "LONG",
+                        "positionAmt": "21",
+                        "entryPrice": "0.123",
+                    },
+                    {
+                        "symbol": "CYSUSDT",
+                        "positionSide": "SHORT",
+                        "positionAmt": "8",
+                        "entryPrice": "0.124",
+                    },
+                    {
+                        "symbol": "OTHERUSDT",
+                        "positionSide": "SHORT",
+                        "positionAmt": "5",
+                        "entryPrice": "1.0",
+                    },
+                ],
+            )
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = AsterV3Client(
+            credential=LiveCredential(
+                api_secret="0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1"
+            ),
+            http_client=http_client,
+        )
+        try:
+            position = await client.fetch_position("CYSUSDT")
+            all_positions = await client.fetch_all_positions()
+        finally:
+            await http_client.aclose()
+
+        assert position.side == Side.BUY
+        assert position.quantity == pytest.approx(13.0)
+        by_symbol = {item.symbol: item for item in all_positions}
+        assert set(by_symbol) == {"CYSUSDT", "OTHERUSDT"}
+        assert by_symbol["CYSUSDT"].side == Side.BUY
+        assert by_symbol["CYSUSDT"].quantity == pytest.approx(13.0)
+        assert by_symbol["OTHERUSDT"].side == Side.SELL
+        assert by_symbol["OTHERUSDT"].quantity == pytest.approx(5.0)
+
+    @pytest.mark.asyncio
     async def test_aster_live_private_passive_submit_fails_closed_without_exchange_rules(self):
         from lightfee.venues.aster import AsterAdapter
         from lightfee.venues.symbol_rules import get_symbol_rules_cache
@@ -5249,6 +5520,8 @@ class TestV1PassiveBusinessFlowParity:
                 }]
             if path == "/fapi/v3/openOrders":
                 return []
+            if path == "/fapi/v3/positionSide/dual":
+                return {"dualSidePosition": False}
             return {
                 "orderId": "aster-oid-1",
                 "clientOrderId": (params or {}).get("newClientOrderId", ""),
@@ -5503,6 +5776,8 @@ class TestV1PassiveBusinessFlowParity:
                 }]
             if path == "/fapi/v3/openOrders":
                 return []
+            if path == "/fapi/v3/positionSide/dual":
+                return {"dualSidePosition": False}
             raise TransportError(
                 TransportErrorCategory.REQUEST_REJECTED,
                 "HTTP 400: max notional",
@@ -5535,6 +5810,11 @@ class TestV1PassiveBusinessFlowParity:
                 "GET",
                 "/fapi/v3/openOrders",
                 {"symbol": "GUAUSDT"},
+            ),
+            (
+                "GET",
+                "/fapi/v3/positionSide/dual",
+                {},
             ),
             (
                 "POST",
@@ -7381,6 +7661,8 @@ class TestAsterAdapterSymbolCatalog:
                 }])
             if request.url.path == "/fapi/v3/openOrders":
                 return httpx.Response(200, json=[])
+            if request.url.path == "/fapi/v3/positionSide/dual":
+                return httpx.Response(200, json={"dualSidePosition": False})
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 
@@ -7444,6 +7726,8 @@ class TestAsterAdapterSymbolCatalog:
                 }])
             if request.url.path == "/fapi/v3/openOrders":
                 return httpx.Response(200, json=[])
+            if request.url.path == "/fapi/v3/positionSide/dual":
+                return httpx.Response(200, json={"dualSidePosition": False})
             assert request.url.path == "/fapi/v3/order"
             return httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
 

@@ -343,6 +343,7 @@ class TestV1RateLimitDefaults:
             "DELETE /fapi/v3/order": (1, "order"),
             "GET /fapi/v3/openOrders": (1, "account"),
             "GET /fapi/v3/positionRisk": (5, "account"),
+            "GET /fapi/v3/positionSide/dual": (30, "account"),
             "GET /fapi/v3/accountWithJoinMargin": (5, "account"),
             "POST /fapi/v3/leverage": (1, "order"),
             "GET /fapi/v3/leverageBracket": (1, "account"),

@@ -7,6 +7,7 @@ an EIP-712 signature payload.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import time
@@ -51,6 +52,7 @@ ASTER_V3_DOC_URL = (
 ASTER_V3_ORDER_PATH = "/fapi/v3/order"
 ASTER_V3_OPEN_ORDERS_PATH = "/fapi/v3/openOrders"
 ASTER_V3_POSITION_PATH = "/fapi/v3/positionRisk"
+ASTER_V3_POSITION_MODE_PATH = "/fapi/v3/positionSide/dual"
 ASTER_V3_ACCOUNT_PATH = "/fapi/v3/accountWithJoinMargin"
 ASTER_V3_LEVERAGE_PATH = "/fapi/v3/leverage"
 ASTER_V3_LEVERAGE_BRACKET_PATH = "/fapi/v3/leverageBracket"
@@ -178,6 +180,13 @@ def _order_state(raw_status: Any, filled_qty: float = 0.0) -> PassiveOrderState:
     return PassiveOrderState.UNKNOWN
 
 
+def _aster_hedge_position_side(side: Side, reduce_only: bool) -> str:
+    """Map the V2 signed side into Aster's documented Hedge-mode position side."""
+    if reduce_only:
+        return "SHORT" if side == Side.BUY else "LONG"
+    return "LONG" if side == Side.BUY else "SHORT"
+
+
 class AsterV3Client:
     """Private Aster Pro API V3 client isolated from Binance HMAC transport."""
 
@@ -209,6 +218,10 @@ class AsterV3Client:
         )
         self._owns_client = http_client is None
         self._rate_limiter = rate_limiter
+        # Aster documents this as account-level state.  Query it once on the
+        # private order path, then retain the V1-style client-lifetime cache.
+        self._position_mode_is_hedge: bool | None = None
+        self._position_mode_lock = asyncio.Lock()
 
     @property
     def signer_address(self) -> str:
@@ -417,15 +430,37 @@ class AsterV3Client:
         raw = await self._request("GET", ASTER_V3_OPEN_ORDERS_PATH, params=params)
         return _extract_rows(raw)
 
+    async def _position_mode_hedge(self) -> bool:
+        cached = self._position_mode_is_hedge
+        if cached is not None:
+            return cached
+        async with self._position_mode_lock:
+            cached = self._position_mode_is_hedge
+            if cached is not None:
+                return cached
+            raw = await self._request("GET", ASTER_V3_POSITION_MODE_PATH)
+            data = raw.get("data", raw) if isinstance(raw, dict) else raw
+            value = data.get("dualSidePosition") if isinstance(data, dict) else None
+            if not isinstance(value, bool):
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "aster_v3 position mode response missing boolean dualSidePosition",
+                    body=json.dumps(raw, ensure_ascii=False),
+                )
+            self._position_mode_is_hedge = value
+            return value
+
     async def fetch_all_positions(self) -> list[PositionSnapshot]:
         raw = await self._request("GET", ASTER_V3_POSITION_PATH)
         now_ms = int(time.time() * 1000)
-        positions: list[PositionSnapshot] = []
+        rows_by_symbol: dict[str, list[dict[str, Any]]] = {}
         for row in _extract_rows(raw):
             symbol = str(row.get("symbol", "") or "")
-            if not symbol:
-                continue
-            pos = _parse_binance_like_position(row, symbol, now_ms, venue=Venue.ASTER)
+            if symbol:
+                rows_by_symbol.setdefault(symbol, []).append(row)
+        positions: list[PositionSnapshot] = []
+        for symbol, rows in rows_by_symbol.items():
+            pos = _parse_binance_like_position(rows, symbol, now_ms, venue=Venue.ASTER)
             if abs(pos.quantity) > 1e-9:
                 positions.append(pos)
         return positions
@@ -436,10 +471,7 @@ class AsterV3Client:
         )
         now_ms = int(time.time() * 1000)
         rows = _extract_rows(raw)
-        data = rows[0] if rows else raw if isinstance(raw, dict) else {}
-        if not isinstance(data, dict):
-            data = {}
-        return _parse_binance_like_position(data, symbol, now_ms, venue=Venue.ASTER)
+        return _parse_binance_like_position(rows, symbol, now_ms, venue=Venue.ASTER)
 
     async def precheck_order_admission(self, request: OrderRequest) -> dict[str, Any]:
         """Prove an Aster V3 opening order fits current documented capacity.
@@ -693,6 +725,7 @@ class AsterV3Client:
         request: OrderRequest,
         *,
         passive: bool,
+        hedge_mode: bool,
     ) -> dict[str, Any]:
         use_limit = passive or (
             request.price is not None and request.time_in_force != TimeInForce.IOC
@@ -715,9 +748,14 @@ class AsterV3Client:
                 if passive or request.post_only or request.time_in_force == TimeInForce.POST_ONLY
                 else "GTC"
             )
-        elif request.time_in_force == TimeInForce.IOC:
-            params["timeInForce"] = "IOC"
-        if request.reduce_only:
+        # Aster V3 rejects timeInForce on MARKET orders. IOC remains domain
+        # execution intent for the close/hedge callers, not a MARKET wire field.
+        if hedge_mode:
+            # Hedge Mode requires positionSide and rejects reduceOnly.
+            params["positionSide"] = _aster_hedge_position_side(
+                request.side, request.reduce_only
+            )
+        elif request.reduce_only:
             params["reduceOnly"] = "true"
         if request.client_order_id:
             params["newClientOrderId"] = request.client_order_id
@@ -769,8 +807,14 @@ class AsterV3Client:
         )
 
     async def place_order(self, request: OrderRequest) -> OrderFill:
-        params = self._order_params(request, passive=False)
         try:
+            params = self._order_params(
+                request,
+                passive=False,
+                hedge_mode=await self._position_mode_hedge(),
+            )
+            # V3 defaults to ACK, which cannot prove the fill parsed below.
+            params["newOrderRespType"] = "RESULT"
             raw = await self._request("POST", ASTER_V3_ORDER_PATH, params=params)
         except TransportError as exc:
             if exc.category in (
@@ -786,8 +830,12 @@ class AsterV3Client:
         return self._parse_order_fill(raw, request, int(time.time() * 1000))
 
     async def submit_passive_order(self, request: OrderRequest) -> PassiveOrderAck:
-        params = self._order_params(request, passive=True)
         try:
+            params = self._order_params(
+                request,
+                passive=True,
+                hedge_mode=await self._position_mode_hedge(),
+            )
             raw = await self._request("POST", ASTER_V3_ORDER_PATH, params=params)
         except TransportError as exc:
             if exc.category in (

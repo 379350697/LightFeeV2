@@ -17,6 +17,33 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-108 Aster V3 position-mode, market-result, and Hedge-position-truth
+contract, 2026-08-15: V3 private orders bypassed the V1-compatible mode cache
+left in the legacy transport, so Hedge accounts could omit mandatory
+`positionSide` and send forbidden `reduceOnly`; V3 position reads also chose
+only the first Hedge row.  The V3 client now caches the documented V3 account
+mode once under its official weight-30 account limiter, fails closed when that
+truth is invalid, applies V1 side mapping for taker and passive paths, and
+nets all LONG/SHORT rows per symbol.  Taker MARKET orders now explicitly ask
+for `RESULT`, matching their fill parser; passive `LIMIT/GTX` acknowledgement
+behavior is unchanged.  Real signed HTTP-path and adapter/contract/rate-limit
+regressions pass locally (`651`); cloud verification remains required. See
+[daily/2026-08-15.md#cluster-cl-108-aster-v3-position-mode-and-market-result-contract](daily/2026-08-15.md#cluster-cl-108-aster-v3-position-mode-and-market-result-contract).
+
+CL-107 Aster V3 MARKET IOC wire contract and trigger causality, 2026-08-14:
+the CYSUSDT recovered passive-close dual-taker fallback sent Aster V3 a
+`MARKET` reduce-only request with `timeInForce=IOC`, which Aster rejected as
+`400/-1106`.  V1's market builder has no such field.  V2 now preserves IOC as
+domain intent while emitting the field only for `LIMIT` requests; passive
+`GTX` and regular `GTC` behavior are unchanged.  The latent builder defect was
+introduced in `dc056068`; a correct deletion in divergent `b1ace220` never
+reached `main`; and the latest passive-close repair `002ed90` triggered it by
+driving the recovery fallback.  Incident documentation now records introducing,
+unmerged-fix, and triggering changes rather than incorrectly calling a
+triggering deployment unrelated.  Local production-client wire regression
+passes after the repair; cloud verification remains required. See
+[daily/2026-08-14.md#cluster-cl-107-aster-v3-market-ioc-wire-contract-and-trigger-causality](daily/2026-08-14.md#cluster-cl-107-aster-v3-market-ioc-wire-contract-and-trigger-causality).
+
 CL-105 Local-L2 decision-time/Aster-overlap/primary-ownership repair,
 2026-08-14: an awaited scan reused its start time for Local-L2 decisions, so a
 fresh WS book could look future-dated and rebuild; Aster's V1-covered `U..u`

@@ -90,6 +90,8 @@ def _aster_opening_admission_fixture(path: str):
         }]
     if path == "/fapi/v3/openOrders":
         return []
+    if path == "/fapi/v3/positionSide/dual":
+        return {"dualSidePosition": False}
     return None
 
 
@@ -548,10 +550,11 @@ class TestAsterOrderRequestShape:
             req = OrderRequest(venue=Venue.ASTER, symbol="BTCUSDT",
                               side=Side.SELL, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 4
+            assert len(captured_url) == 5
             assert "/fapi/v1/exchangeInfo?symbol=BTCUSDT" in captured_url[0]
             assert "/fapi/v3/positionRisk" in captured_url[1]
             assert "/fapi/v3/openOrders" in captured_url[2]
+            assert "/fapi/v3/positionSide/dual" in captured_url[3]
             url = [item for item in captured_url if "/fapi/v3/order" in item][0]
             assert "https://fapi.asterdex.com/fapi/v3/order" in url
             assert "signer=" in url, f"Missing signer in URL: {url}"
