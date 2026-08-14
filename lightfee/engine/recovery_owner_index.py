@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any, Iterable, Mapping
 
 from lightfee.engine.recovery_ledger import ExchangeArtifact, RecoveryOwner
@@ -265,7 +266,7 @@ class RecoveryOwnerIndex:
         symbol = _symbol_for_venue(artifact)
         side = _side(_get(artifact, "side", ""))
         quantity = _float(_get(artifact, "quantity", 0.0))
-        if not symbol or not side or quantity <= 0.0:
+        if not symbol or not side or not isfinite(quantity) or quantity <= 0.0:
             return None
         venue = _venue(artifact)
         if not venue:
@@ -279,7 +280,14 @@ class RecoveryOwnerIndex:
                 continue
             if fact_side != side:
                 continue
-            if abs(fact_quantity - quantity) > 1e-9:
+            # Exchange quantity steps can normalize a submitted quantity before
+            # the local handoff is persisted.  This claim is already scoped by
+            # venue, canonical symbol, and side; accept only a <=1% step delta.
+            if (
+                not isfinite(fact_quantity)
+                or fact_quantity <= 0.0
+                or abs(fact_quantity - quantity) > fact_quantity * 0.01
+            ):
                 continue
             return owner
         return None

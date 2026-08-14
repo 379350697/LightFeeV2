@@ -2199,12 +2199,20 @@ class PendingEntryRuntime:
         pending_symbol = str(symbol or getattr(pending, "symbol", "") or "").upper()
         if pending is None and not pending_symbol:
             return
-        source_symbols = self.ctx._truth_required_recovery_probe_symbol_sources(
-            [pending_symbol] if pending_symbol else []
-        )
         self.ctx._remove_pending_entry_after_terminal_decision(entry_id, reason=reason)
         if not self.ctx._pending_entry_terminal_needs_recovery_core_refresh():
             return
+        startup_terminal_symbols = getattr(
+            self.ctx,
+            "_startup_pending_entry_terminal_symbols",
+            None,
+        )
+        if startup_terminal_symbols is not None and pending_symbol:
+            startup_terminal_symbols.add(pending_symbol)
+            return
+        source_symbols = self.ctx._truth_required_recovery_probe_symbol_sources(
+            [pending_symbol] if pending_symbol else []
+        )
         await self.ctx._refresh_recovery_core_after_pending_entry_terminal(
             reason=reason,
             symbol=pending_symbol,

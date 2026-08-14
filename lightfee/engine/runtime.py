@@ -322,6 +322,7 @@ class LiveRuntime:
         self._recovery_dedup_index: dict[str, str] = {}
         self.recovery_ledger: RecoveryLedger | None = None
         self._last_recovery_exchange_truth: dict[str, Any] | None = None
+        self._startup_pending_entry_terminal_symbols: set[str] | None = None
 
         # V1 entry gate cooldown state
         self._venue_cooldown_until_ms: dict[str, int] = {}
@@ -1778,22 +1779,37 @@ class LiveRuntime:
             # V1: finalize_startup_position_recovery — ordered recovery sequence
             now_ms = wall_clock_now_ms()
 
-            # 1. reconcile_open_positions (force_reconcile — ignore backoff)
-            await self._reconcile_pending_entries_force(now_ms)
+            # 1–2. Keep V1 recovery order, but defer duplicate ledger refreshes
+            # until every terminal pending entry in this startup batch is gone.
+            self._startup_pending_entry_terminal_symbols = set()
+            try:
+                # reconcile_open_positions (force_reconcile — ignore backoff)
+                await self._reconcile_pending_entries_force(now_ms)
 
-            # 2. process pending_entry_hedges — re-drive any uncertain maker orders
-            await self._recover_pending_entry_hedges(now_ms)
+                # process pending_entry_hedges — re-drive uncertain maker orders
+                await self._recover_pending_entry_hedges(now_ms)
+            finally:
+                terminal_symbols = self._startup_pending_entry_terminal_symbols
+                self._startup_pending_entry_terminal_symbols = None
 
-            # 3. process pending_passive_closes — resume passive close cycles
-            await self._maybe_tick_passive_close(now_ms)
+            if terminal_symbols:
+                source_symbols = self._truth_required_recovery_probe_symbol_sources(
+                    sorted(terminal_symbols)
+                )
+                await self._refresh_recovery_core_after_pending_entry_terminal(
+                    reason="startup_pending_entry_terminal_batch",
+                    symbol="",
+                    source_symbols=source_symbols,
+                    now_ms=wall_clock_now_ms(),
+                )
 
-            # 4. process pending_close_reconciliations
+            # 3. process pending_close_reconciliations
             # (already handled by _reconcile_pending_state in housekeeping)
 
-            # 5. residual repairs
+            # 4. residual repairs
             await self._recover_residual_repairs(now_ms)
 
-            # 6. manage_open_positions — if still over max, enter fail_closed
+            # 5. manage_open_positions — if still over max, enter fail_closed
             max_positions = self.config.strategy.max_concurrent_positions
             if len(self.state.open_positions) > max_positions:
                 enter_fail_closed(self.state)

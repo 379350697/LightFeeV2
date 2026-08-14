@@ -758,7 +758,7 @@ def test_journal_owned_order_is_owned_pending_entry_when_local_pending_is_absent
     assert ledger.allows_new_entry(SimpleNamespace(symbol="BTCUSDT")) is True
 
 
-def test_unhanded_entry_submission_blocks_matching_live_position_after_restart():
+def test_unhanded_entry_submission_owns_step_normalized_live_position_after_restart():
     owner_index = RecoveryOwnerIndex.from_state_and_journal(
         {"pending_entries": [], "open_positions": []},
         [
@@ -766,13 +766,13 @@ def test_unhanded_entry_submission_blocks_matching_live_position_after_restart()
                 "kind": "runtime.entry_owner_claimed",
                 "payload": {
                     "entry_id": "entry-home",
-                    "symbol": "HOMEUSDT",
+                    "symbol": "2ZUSDT",
                     "long_venue": "binance",
                     "short_venue": "bybit",
                     "long_side": "buy",
                     "short_side": "sell",
-                    "long_quantity": 1600.0,
-                    "short_quantity": 1600.0,
+                    "long_quantity": 462.696,
+                    "short_quantity": 462.696,
                 },
             }
         ],
@@ -784,9 +784,9 @@ def test_unhanded_entry_submission_blocks_matching_live_position_after_restart()
             "positions": [
                 {
                     "venue": "bybit",
-                    "symbol": "HOMEUSDT",
+                    "symbol": "2ZUSDT",
                     "side": "sell",
-                    "quantity": 1600.0,
+                    "quantity": 462.0,
                     "entry_price": 0.0285,
                 }
             ],

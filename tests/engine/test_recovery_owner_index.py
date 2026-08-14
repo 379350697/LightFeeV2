@@ -319,6 +319,57 @@ def test_unhanded_entry_submission_claim_owns_matching_live_position():
     assert owner.evidence["position_scope"] == "journal_entry_submission"
 
 
+def test_unhanded_entry_submission_claim_allows_one_percent_quantity_step_delta():
+    index = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []},
+        [{
+            "kind": "runtime.entry_owner_claimed",
+            "payload": {
+                "entry_id": "entry-2z",
+                "symbol": "2ZUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "long_side": "buy",
+                "short_side": "sell",
+                "long_quantity": 462.696,
+                "short_quantity": 462.696,
+            },
+        }],
+    )
+
+    normalized_owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="2ZUSDT",
+            side="sell",
+            quantity=462.0,
+        )
+    )
+    boundary_owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="2ZUSDT",
+            side="sell",
+            quantity=462.696 * 0.99,
+        )
+    )
+    outside_owner = index.owner_for_position(
+        ExchangeArtifact(
+            kind="position",
+            venue="bybit",
+            symbol="2ZUSDT",
+            side="sell",
+            quantity=462.696 * 0.9899,
+        )
+    )
+
+    assert normalized_owner.owner_type == "journal_entry_submission"
+    assert boundary_owner.owner_type == "journal_entry_submission"
+    assert outside_owner.confidence == "orphan"
+
+
 def test_short_maker_claim_uses_canonical_long_buy_short_sell_positions():
     index = RecoveryOwnerIndex.from_state_and_journal(
         {"pending_entries": [], "open_positions": []},

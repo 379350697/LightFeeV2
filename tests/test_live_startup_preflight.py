@@ -26,6 +26,7 @@ from lightfee.engine.bootstrap import (
     wall_clock_now_ms,
 )
 from lightfee.engine.runtime import LiveRuntime
+from lightfee.engine.recovery import build_persistent_state_view
 from lightfee.engine.recovery_decision_core import (
     LIVE_ARTIFACT_BLOCK_REASONS,
     RecoveryDecisionKind,
@@ -176,6 +177,68 @@ class TestRuntimePreflight:
             runtime = LiveRuntime(config)
             await runtime.start()
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_startup_batches_terminal_pending_entry_ledger_refresh(self):
+        """A restart with several terminal zero-fill entries probes ledger truth once."""
+
+        class FlatAdapter(FakeVenueAdapter):
+            async def fetch_open_orders(self, symbol: str | None):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["AAAUSDT", "BBBUSDT"]
+            config.strategy.pending_entry_hard_ceiling_ms = 1_000
+            config.strategy.pending_entry_force_terminal_after_ms = 1_000
+
+            persisted = LiveRuntime(config)
+            persisted.state.lifecycle = EngineLifecycle.RISK_ONLY
+            persisted.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            persisted.state.recovery_blocked_reason = (
+                "exchange_truth_recovery_ledger_blocked"
+            )
+            persisted.state.recovery_blocked_at_ms = 1
+            for entry_id, symbol in (
+                ("entry-startup-batch-a", "AAAUSDT"),
+                ("entry-startup-batch-b", "BBBUSDT"),
+            ):
+                persisted.state.pending_entries[entry_id] = PendingEntry(
+                    pending_id=entry_id,
+                    symbol=symbol,
+                    long_venue=Venue.BINANCE,
+                    short_venue=Venue.BYBIT,
+                    target_quantity=10.0,
+                    long_side=Side.BUY,
+                    short_side=Side.SELL,
+                    created_at_ms=1,
+                    uncertain_outcome=True,
+                )
+            SnapshotStore(config.persistence.snapshot_path).write(
+                build_persistent_state_view(persisted.state)
+            )
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={
+                    Venue.BINANCE: FlatAdapter(Venue.BINANCE),
+                    Venue.BYBIT: FlatAdapter(Venue.BYBIT),
+                },
+            )
+            await runtime.start()
+
+            terminal_refreshes = [
+                event["payload"]
+                for event in runtime.journal.read_all()
+                if event["kind"] == "recovery.pending_entry_terminal_core_refresh"
+            ]
+            assert len(terminal_refreshes) == 1
+            assert terminal_refreshes[0]["reason"] == (
+                "startup_pending_entry_terminal_batch"
+            )
+            assert terminal_refreshes[0]["symbols"] == ["AAAUSDT", "BBBUSDT"]
+            assert runtime.state.pending_entries == {}
+            await runtime.stop()
 
     @pytest.mark.asyncio
     async def test_startup_journals_run_id(self):
@@ -2281,6 +2344,42 @@ class TestRuntimePreflight:
             pos = next(iter(runtime.state.open_positions.values()))
             assert pos.symbol == "BTCUSDT"
             assert pos.matched_quantity == pytest.approx(0.03)
+
+    @pytest.mark.asyncio
+    async def test_runtime_live_recovery_waits_for_inflight_entry_owner_handoff(self):
+        """A pre-submit owner reservation is not a false-clean runtime state."""
+
+        class CountingFlatPositionAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.fetch_all_positions_call_count = 0
+
+            async def fetch_all_positions(self) -> list[PositionSnapshot]:
+                self.fetch_all_positions_call_count += 1
+                return []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            bybit = CountingFlatPositionAdapter(Venue.BYBIT)
+            runtime = LiveRuntime(config, venue_adapters={Venue.BYBIT: bybit})
+            runtime.journal.open()
+            try:
+                runtime._reserve_entry_capacity_slot("entry-2z")
+
+                await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+                assert bybit.fetch_all_positions_call_count == 0
+                assert runtime._last_private_position_probe_ms == 0
+
+                runtime._release_entry_capacity_slot("entry-2z")
+                await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+                assert bybit.fetch_all_positions_call_count == 1
+            finally:
+                runtime.journal.close()
 
     @pytest.mark.asyncio
     async def test_runtime_live_recovery_clears_stale_pending_without_open_block(self):

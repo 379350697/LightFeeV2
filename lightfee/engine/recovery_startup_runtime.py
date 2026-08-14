@@ -1235,6 +1235,10 @@ class RecoveryStartupRuntime:
             self.ctx.state.open_positions
             or self.ctx.state.pending_entries
             or self.ctx.state.pending_closes
+            # A durable owner claim is locally in flight from reservation until
+            # it gains an open/pending successor or is proven rejected.  Do
+            # not race that handoff with a false-clean account reconstruction.
+            or getattr(self.ctx, "_entry_capacity_reservations", ())
         ):
             return
 
