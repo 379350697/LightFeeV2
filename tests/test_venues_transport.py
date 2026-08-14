@@ -20,6 +20,7 @@ from lightfee.core.domain import (
     OrderFill,
     OrderRequest,
     PassiveOrderAmendRequest,
+    PassiveOrderState,
     PositionSnapshot,
     Side,
     TimeInForce,
@@ -10715,34 +10716,35 @@ class TestCancelAbsentOrderDetection:
 
     @pytest.mark.asyncio
     async def test_bybit_query_passive_order_progress_uses_realtime_endpoint(self):
-        """Bybit V5 order lookup is GET /v5/order/realtime, not GET /v5/order/create."""
+        """Bybit V5 merges realtime order state with execution history."""
         from lightfee.venues.transport import VenueTransport
         from lightfee.venues.specs import bybit_spec
 
         transport = VenueTransport(bybit_spec(), mode="paper")
         transport.mode = "live"
-        seen = {}
+        calls = []
         transport.private_order_progress = Mock(return_value=None)
 
         async def fake_request(method, path, **kwargs):
-            seen["method"] = method
-            seen["path"] = path
-            seen["kwargs"] = kwargs
-            return {
-                "retCode": 0,
-                "retMsg": "OK",
-                "result": {
-                    "orderId": "oid-1",
-                    "orderLinkId": "cid-1",
-                    "orderStatus": "New",
-                    "side": "Buy",
-                    "cumExecQty": "0",
-                    "avgPrice": "0",
-                    "price": "1.23",
-                    "qty": "2",
-                    "updatedTime": "1779450000000",
-                },
-            }
+            calls.append((method, path, kwargs))
+            if path == "/v5/order/realtime":
+                return {
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": [{
+                        "orderId": "oid-1",
+                        "orderLinkId": "cid-1",
+                        "orderStatus": "New",
+                        "side": "Buy",
+                        "cumExecQty": "0",
+                        "avgPrice": "0",
+                        "price": "1.23",
+                        "qty": "2",
+                        "updatedTime": "1779450000000",
+                    }]},
+                }
+            assert path == "/v5/execution/list"
+            return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
 
         transport._request = fake_request
         progress = await transport.query_passive_order_progress(
@@ -10753,11 +10755,157 @@ class TestCancelAbsentOrderDetection:
         )
 
         assert progress is not None
-        assert seen["method"] == "GET"
-        assert seen["path"] == "/v5/order/realtime"
-        assert seen["kwargs"]["params"]["category"] == "linear"
-        assert seen["kwargs"]["params"]["symbol"] == "ALTUSDT"
-        assert seen["kwargs"]["params"]["orderId"] == "oid-1"
+        assert [path for _, path, _ in calls] == [
+            "/v5/order/realtime", "/v5/execution/list",
+        ]
+        assert calls[0][0] == "GET"
+        assert calls[0][2]["params"]["category"] == "linear"
+        assert calls[0][2]["params"]["symbol"] == "ALTUSDT"
+        assert calls[0][2]["params"]["orderId"] == "oid-1"
+
+    @pytest.mark.asyncio
+    async def test_bybit_passive_progress_does_not_trust_stale_private_rejected_zero_fill(self):
+        """A private rejected/0 update cannot hide a later Bybit execution."""
+        from lightfee.marketdata.private_ws import CumulativeOrderProgress
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(bybit_spec(), mode="paper")
+        transport.mode = "live"
+        transport.private_order_progress = Mock(return_value=CumulativeOrderProgress(
+            order_id="oid-2",
+            client_order_id="cid-2",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.REJECTED,
+            updated_at_ms=1779450000000,
+        ))
+        calls = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs))
+            if path == "/v5/order/realtime":
+                return {
+                    "retCode": 0,
+                    "retMsg": "OK",
+                    "result": {"list": [{
+                        "orderId": "oid-2",
+                        "orderLinkId": "cid-2",
+                        "orderStatus": "Rejected",
+                        "side": "Buy",
+                        "cumExecQty": "0",
+                        "avgPrice": "0",
+                        "cumExecFee": "0",
+                        "updatedTime": "1779450000000",
+                    }]},
+                }
+            assert path == "/v5/execution/list"
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {"list": [{
+                    "orderId": "oid-2",
+                    "orderLinkId": "cid-2",
+                    "side": "Buy",
+                    "execQty": "0.429",
+                    "execPrice": "1.234",
+                    "execFee": "0.001",
+                    "execTime": "1779450000100",
+                }]},
+            }
+
+        transport._request = fake_request
+        progress = await transport.query_passive_order_progress(
+            symbol="ALTUSDT",
+            order_id="oid-2",
+            client_order_id="cid-2",
+            side=Side.BUY,
+        )
+
+        assert progress is not None
+        assert progress.state == PassiveOrderState.REJECTED
+        assert progress.cumulative_quantity == pytest.approx(0.429)
+        assert progress.average_price == pytest.approx(1.234)
+        assert progress.fee_quote == pytest.approx(0.001)
+        assert progress.last_fill_time_ms == 1779450000100
+        assert [path for _, path, _ in calls] == [
+            "/v5/order/realtime", "/v5/execution/list",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_bybit_private_rejected_zero_without_rest_row_stays_open_for_truth(self):
+        """No realtime row plus private Rejected/0 is not a terminal zero-fill fact."""
+        from lightfee.marketdata.private_ws import CumulativeOrderProgress
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(bybit_spec(), mode="paper")
+        transport.mode = "live"
+        transport.private_order_progress = Mock(return_value=CumulativeOrderProgress(
+            order_id="oid-3",
+            client_order_id="cid-3",
+            cumulative_quantity=0.0,
+            state=PassiveOrderState.REJECTED,
+        ))
+        calls = []
+
+        async def fake_request(method, path, **kwargs):
+            calls.append(path)
+            if path == "/v5/order/realtime":
+                return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
+            assert path == "/v5/execution/list"
+            return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
+
+        transport._request = fake_request
+        progress = await transport.query_passive_order_progress(
+            symbol="ALTUSDT",
+            order_id="oid-3",
+            client_order_id="cid-3",
+            side=Side.BUY,
+        )
+
+        assert progress is not None
+        assert progress.state == PassiveOrderState.OPEN
+        assert progress.cumulative_quantity == 0.0
+        assert calls == ["/v5/order/realtime", "/v5/execution/list"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("order_status", ("PendingCancel", "Deactivated"))
+    async def test_bybit_passive_progress_maps_pending_cancel_as_terminal_cancel(self, order_status):
+        """V1 maps Bybit cancel-transition statuses to canceled after REST confirms."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bybit_spec
+
+        transport = VenueTransport(bybit_spec(), mode="paper")
+        transport.mode = "live"
+        transport.private_order_progress = Mock(return_value=None)
+
+        async def fake_request(method, path, **kwargs):
+            del method, kwargs
+            if path == "/v5/order/realtime":
+                return {"retCode": 0, "retMsg": "OK", "result": {"list": [{
+                    "orderId": "oid-pending-cancel",
+                    "orderLinkId": "cid-pending-cancel",
+                    "orderStatus": order_status,
+                    "side": "Sell",
+                    "cumExecQty": "0",
+                    "avgPrice": "0",
+                    "cumExecFee": "0",
+                    "updatedTime": "1779450000000",
+                }]}}
+            assert path == "/v5/execution/list"
+            return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
+
+        transport._request = fake_request
+        progress = await transport.query_passive_order_progress(
+            symbol="ALTUSDT",
+            order_id="oid-pending-cancel",
+            client_order_id="cid-pending-cancel",
+            side=Side.SELL,
+        )
+
+        assert progress is not None
+        assert progress.state == PassiveOrderState.CANCELED
+        assert progress.cumulative_quantity == 0.0
 
     @pytest.mark.asyncio
     async def test_hyperliquid_client_order_query_uses_historical_orders_first(self):

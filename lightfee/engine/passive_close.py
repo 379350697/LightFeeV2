@@ -107,6 +107,64 @@ PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES = 3
 PASSIVE_CLOSE_MANAGER_COOLDOWN_MS = 30_000
 PASSIVE_CLOSE_DEFAULT_AMEND_THRESHOLD_BPS = 5.0
 PASSIVE_CLOSE_DEFAULT_CANCEL_REPLACE_THRESHOLD_BPS = 20.0
+PASSIVE_CLOSE_POST_ONLY_LADDER_FRACTIONS = (0.0, 0.5, 0.75, 1.0)
+PASSIVE_CLOSE_POST_ONLY_ATTEMPT_LIMIT = 7
+PASSIVE_CLOSE_POST_ONLY_RETRY_BACKOFF_MS = (500, 1_000, 2_000, 4_000, 6_000, 8_000, 10_000)
+
+
+def _passive_close_post_only_attempt_limit() -> int:
+    """V1's seven-attempt post-only retry cap."""
+    return PASSIVE_CLOSE_POST_ONLY_ATTEMPT_LIMIT
+
+
+def _is_initial_passive_requote_error(venue: Venue, error: OrderSubmitError) -> bool:
+    """V1 post-only rejects are retryable only for the venue-specific signatures."""
+    message = str(error).lower()
+    if "local_post_only_crosses_market" in message:
+        return True
+    if venue == Venue.BINANCE:
+        return (
+            ("-5022" in message and ("post only" in message or "post_only" in message))
+            or "gtx_order_reject" in message
+            or (
+                "status=429" in message
+                and (
+                    "too many requests" in message
+                    or "rate limited" in message
+                    or "retry_after" in message
+                )
+            )
+        )
+    if venue == Venue.GATE:
+        return "order_poc_immediate" in message
+    if venue == Venue.OKX:
+        return (
+            "maker order timed out waiting for passive fill" in message
+            and ("post only" in message or "post_only" in message)
+        )
+    return False
+
+
+def _passive_close_post_only_retry_wait_ms(error: OrderSubmitError, attempt: int) -> int:
+    """V1 retry schedule, honoring a transport-provided retry-after when present."""
+    fallback_ms = PASSIVE_CLOSE_POST_ONLY_RETRY_BACKOFF_MS[
+        min(attempt, len(PASSIVE_CLOSE_POST_ONLY_RETRY_BACKOFF_MS) - 1)
+    ]
+    marker = "retry_after_ms="
+    message = str(error).lower()
+    start = message.find(marker)
+    if start < 0:
+        return fallback_ms
+    digits = []
+    for char in message[start + len(marker):]:
+        if not char.isdigit():
+            break
+        digits.append(char)
+    try:
+        retry_after_ms = int("".join(digits))
+    except ValueError:
+        return fallback_ms
+    return max(fallback_ms, retry_after_ms) if retry_after_ms > 0 else fallback_ms
 
 
 def _is_okx_amend_invalid_request_type_error(error: Exception) -> bool:
@@ -1777,6 +1835,8 @@ class PassiveCloseExecutor:
         maker_leg_label: str,
         price_hint: float,
         chunk_quantity: float,
+        *,
+        post_only_requote_attempt: int = 0,
     ) -> bool:
         """Submit the initial GTC post-only reduce-only maker order.
 
@@ -1906,6 +1966,66 @@ class PassiveCloseExecutor:
                 endpoint="",
                 request_context=req_ctx,
             )
+            if _is_initial_passive_requote_error(maker_venue, e):
+                next_requote_attempt = post_only_requote_attempt + 1
+                wait_ms = _passive_close_post_only_retry_wait_ms(
+                    e,
+                    post_only_requote_attempt,
+                )
+                self._journal.append(
+                    "execution.passive_close_requote_retry",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "maker_venue": maker_venue.value,
+                        "maker_leg": maker_leg_label,
+                        "phase": pending.phase_state.phase.value,
+                        "cycle_attempt": pending.phase_state.cycle_attempt,
+                        "attempt": next_requote_attempt,
+                        "wait_ms": wait_ms,
+                        "error": str(e),
+                        "exchange_error": evidence.to_dict(),
+                        "remaining_quantity": chunk_quantity,
+                        "price_hint": aligned_price,
+                    },
+                )
+                await asyncio.sleep(wait_ms / 1000.0)
+                if next_requote_attempt < _passive_close_post_only_attempt_limit():
+                    requote_price_hint = self._post_only_requote_price_hint(
+                        maker_venue,
+                        position.symbol,
+                        maker_side,
+                        next_requote_attempt,
+                        fallback_price=price_hint,
+                    )
+                    return await self._submit_maker_order(
+                        state,
+                        pending,
+                        position,
+                        maker_venue,
+                        maker_side,
+                        maker_leg_label,
+                        requote_price_hint,
+                        chunk_quantity,
+                        post_only_requote_attempt=next_requote_attempt,
+                    )
+
+                self._journal.append(
+                    "exit.passive_close_maker_requote_exhausted",
+                    {
+                        "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "maker_venue": maker_venue.value,
+                        "maker_leg": maker_leg_label,
+                        "attempts": _passive_close_post_only_attempt_limit(),
+                        "error": str(e),
+                        "exchange_error": evidence.to_dict(),
+                        "decision": "dual_taker",
+                    },
+                )
+                pending.phase_state.phase = PassiveExecutionPhase.DUAL_TAKER
+                return False
+
             if e.is_rejected:
                 if _is_bybit_terminal_zero_qty_reduce_only_error(
                     e,
@@ -6815,6 +6935,35 @@ class PassiveCloseExecutor:
         """Resolve best bid/ask from injected local-L2 resolver."""
         quote, _source = self._resolve_local_l2_quote_with_source(venue, symbol)
         return quote
+
+    def _post_only_requote_price_hint(
+        self,
+        venue: Venue,
+        symbol: str,
+        side: Side,
+        attempt: int,
+        *,
+        fallback_price: float,
+    ) -> float:
+        """Reprice from current Local-L2 within V1's bounded retry contract."""
+        quote = self._resolve_local_l2_quote(venue, symbol)
+        if quote is None:
+            return fallback_price
+        best_bid, best_ask = quote
+        closest = (
+            max(best_bid, math.nextafter(best_ask, -math.inf))
+            if side == Side.BUY
+            else min(best_ask, math.nextafter(best_bid, math.inf))
+        )
+        fraction = PASSIVE_CLOSE_POST_ONLY_LADDER_FRACTIONS[
+            min(attempt, len(PASSIVE_CLOSE_POST_ONLY_LADDER_FRACTIONS) - 1)
+        ]
+        price = (
+            best_bid + (closest - best_bid) * fraction
+            if side == Side.BUY
+            else best_ask - (best_ask - closest) * fraction
+        )
+        return price if math.isfinite(price) and price > 0.0 else fallback_price
 
     def _resolve_local_l2_quote_with_source(
         self,

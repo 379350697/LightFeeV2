@@ -17,6 +17,8 @@ residuals, and live-flat cleanup.
 - `entry.cleanup_leg_exposure`
 - `runtime.passive_close_tick_error` with
   `"'dict' object has no attribute 'append'"`
+- `execution.passive_close_requote_retry`
+- `exit.passive_close_maker_requote_exhausted`
 - Recurrence shape: local pending passive close/open state keeps retrying while exchange truth is already flat, while terminal maker/under-min branches need V1 compensation, or while Bybit reduce-only close admission reports `110017/orderQty will be truncated to zero`.
 
 ## Current Effective Rule
@@ -87,6 +89,49 @@ processing, supervisor venue coverage, and entry-conflict gating.
 - An accepted taker hedge ACK without fill confirmation is not a terminal close
   fill. It must carry order-truth probe paths and stay in reconcile/live-truth
   flow before passive close can advance or clear.
+- Binance post-only `-5022` / `GTX_ORDER_REJECT` is not a reduce-only or
+  position-terminal rejection. V1 retries the current Local-L2 book with its
+  bounded seven-attempt passive ladder before arming taker fallback. V2 must
+  keep ordinary rejects such as `-2022` on their existing immediate terminal
+  path.
+- For Bybit passive orders, private WS is one source, never final zero-fill
+  truth. Every order identity is merged from `/v5/order/realtime`, private WS,
+  and `/v5/execution/list`; highest cumulative fill wins. If realtime has no
+  row and execution has no fill, a private `Rejected/0` remains `OPEN` for
+  truth polling rather than advancing the zero-fill phase.
+
+## 2026-08-14 Root Repair: Post-only Requote and Bybit Fill Truth
+
+Authoritative V1 paths are `src/engine/exit.rs:1903-2067` for the bounded
+post-only retry and `src/live/bybit.rs:2370-2511` for passive progress merge.
+
+Two observed production mechanisms were repaired together at their earliest
+shared boundaries:
+
+1. V2 sent Binance `-5022` directly to `DUAL_TAKER`; it now keeps V2's
+   existing first quote and Local-L2 pricing model, but restores V1's
+   seven-attempt, tick-aligned retry cap and backoff
+   (`500, 1000, 2000, 4000, 6000, 8000, 10000` ms) before arming taker.
+2. V2 returned a private Bybit `Rejected/0` before querying REST/executions.
+   It now uses the V1 three-source merge, so a delayed execution is applied
+   before passive-close terminality can act on a zero-fill status.
+
+Counterexamples retained by regression:
+
+| Case | Required result |
+|---|---|
+| Binance `-5022` then maker ACK | second request is repriced from Local-L2; no immediate taker phase |
+| Binance repeated `-5022` | exactly seven attempts, then `DUAL_TAKER` |
+| Binance ordinary `-2022` | existing immediate terminal/reduce-only path unchanged |
+| Bybit private `Rejected/0`, later execution fill | merged positive fill/fee/time reaches the close engine and its opposite-leg hedge |
+| Bybit private `Rejected/0`, no realtime row or execution | remains `OPEN`; no premature terminal-zero advance |
+| Bybit REST `PendingCancel` / `Deactivated` | V1 cancellation terminal mapping is retained |
+
+This repair deliberately does not change the separate historical accounting
+evidence debt: once exchange positions/orders are flat, V1's bounded
+reconciliation contract may leave missing real fee/PnL evidence provisional.
+That is an accounting-owner decision, not a cause of maker rejection or
+one-sided close exposure.
 - OKX amend `50115 Invalid request type` from the amend-order endpoint is an
   amend-path capability failure for that call. Route through cancel-replace and
   keep the existing double-order guard.
@@ -112,6 +157,7 @@ processing, supervisor venue coverage, and entry-conflict gating.
 | 2026-08-04 | Recovered close lost order identity and retry/escalation budget | root correction local; deploy pending | The deployed HOMEUSDT recovery exposed that snapshots kept only aggregate maker/hedge fields. The correction round-trips all passive close execution legs, independent position snapshot, and phase retry/escalation counters; recovered known IDs enter reconciliation while a near-threshold L2 failure escalates without replaying maker retries. Truly identity-less legacy evidence still emits a conservative provisional terminal without fabricated PnL. |
 | 2026-08-12 | Bitget successful null pending-order response | deployed; target cloud verified | CLUSDT recovery showed Classic `code=00000` plus `data.entrustedList=null`; the shared raw-truth parser accepts only that exact successful nullable collection as empty and keeps business errors/missing codes fail-closed. Cloud `c48f59a` consumed the owner through normal live-flat recovery; missing accounting identity remains a visible evidence debt. |
 | 2026-08-12 | Unattributed recovered pair accounting | local fix; deploy blocked by concurrent V1 | A `live-recovered:*` pair with no V2 order identity is an external recovery observation, not a V2 PnL owner. The strict reclassification audit clears only that old debt; any `entry-*`, V2-identified, or malformed owner remains fail-closed. |
+| 2026-08-14 | Binance post-only rejection + Bybit private terminal-zero drift | local root fix; deploy pending | Restored V1 bounded Local-L2 requote and Bybit realtime/private/execution merge, including `PendingCancel`/`Deactivated` terminal mapping. RED/GREEN production-path regression plus full touched suites: `620 passed`; no production mutation in this repair step. |
 
 ## Recurrences
 
@@ -132,6 +178,12 @@ processing, supervisor venue coverage, and entry-conflict gating.
 ## Regression Harness
 
 - `tests/test_passive_close.py`
+- `tests/test_passive_close.py::TestReduceOnlyRejectedEscalation::test_binance_post_only_rejection_requotes_in_real_passive_close_drive`
+- `tests/test_passive_close.py::TestReduceOnlyRejectedEscalation::test_binance_post_only_requote_exhaustion_is_bounded_before_dual_taker`
+- `tests/test_passive_close.py::TestReduceOnlyRejectedEscalation::test_rejected_progress_with_merged_fill_hedges_before_terminal_advance`
+- `tests/test_venues_transport.py::TestCancelAbsentOrderDetection::test_bybit_passive_progress_does_not_trust_stale_private_rejected_zero_fill`
+- `tests/test_venues_transport.py::TestCancelAbsentOrderDetection::test_bybit_private_rejected_zero_without_rest_row_stays_open_for_truth`
+- `tests/test_venues_transport.py::TestCancelAbsentOrderDetection::test_bybit_passive_progress_maps_pending_cancel_as_terminal_cancel`
 - `tests/test_exit_decisions.py::TestPassiveCloseFallbackDue`
 - `tests/test_runtime_entry_flow.py::TestPlannerDispatchIntegration::test_pending_passive_close_overdue_arms_dual_taker_despite_future_retry`
 - `tests/test_passive_close.py::TestPassiveCloseMakerLegLiveTruthPrecheck`

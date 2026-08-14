@@ -7266,6 +7266,96 @@ class TestReduceOnlyRejectedEscalation:
         assert reconciled[0]["payload"]["terminal_state"] == "rejected"
         assert reconciled[0]["payload"]["truth_order_id"] == "late-fill-maker"
 
+    def test_rejected_progress_with_merged_fill_hedges_before_terminal_advance(self):
+        """Bybit merged execution fill is hedged even when REST status is Rejected."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BYBIT)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BYBIT,
+            side=Side.SELL,
+            order_id="bybit-rejected-maker",
+            client_order_id="bybit-rejected-client",
+            cumulative_quantity=0.429,
+            average_price=50_000.0,
+            fee_quote=0.1,
+            state=PassiveOrderState.REJECTED,
+        ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock()
+        hedge_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        hedge_adapter.place_order = AsyncMock(return_value=_make_order_fill(
+            venue=Venue.BINANCE,
+            side=Side.BUY,
+            quantity=0.429,
+            price=50_000.0,
+        ))
+        maker_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.571,
+            entry_price=50_000.0,
+            observed_at_ms=2_500,
+        ))
+        hedge_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=0.571,
+            entry_price=50_000.0,
+            observed_at_ms=2_500,
+        ))
+        executor = PassiveCloseExecutor(
+            {Venue.BYBIT: maker_adapter, Venue.BINANCE: hedge_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+
+        state = EngineState()
+        position = _make_position(
+            long_venue=Venue.BYBIT,
+            short_venue=Venue.BINANCE,
+            matched_quantity=1.0,
+            long_quantity=1.0,
+            short_quantity=1.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="bybit-rejected-maker",
+                maker_client_order_id="bybit-rejected-client",
+                maker_resting_limit_price=50_000.0,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(asyncio.wait_for(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            ),
+            timeout=0.1,
+        ))
+
+        assert result is False
+        assert pending.maker_fill.quantity == pytest.approx(0.429)
+        assert pending.hedge_fill.quantity == pytest.approx(0.429)
+        maker_adapter.fetch_order_fill_reconciliation.assert_not_awaited()
+        hedge_adapter.place_order.assert_awaited_once()
+        hedge_request = hedge_adapter.place_order.await_args.args[0]
+        assert hedge_request.quantity == pytest.approx(0.429)
+        assert hedge_request.reduce_only is True
+        assert any(
+            event["kind"] == "exit.passive_close_maker_terminal_no_fill"
+            and event["payload"]["cumulative_quantity"] == pytest.approx(0.429)
+            for event in journal.read_all()
+        )
+
     def test_filled_zero_progress_with_zero_execution_truth_is_retained(self):
         """Contradictory terminal status must not initiate a second close leg."""
         journal = _open_journal()
@@ -7366,6 +7456,118 @@ class TestReduceOnlyRejectedEscalation:
         # Must have escalated to DUAL_TAKER
         assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER, (
             f"Expected DUAL_TAKER after reduce-only rejection, got {pending.phase_state.phase}"
+        )
+
+    def test_binance_post_only_rejection_requotes_in_real_passive_close_drive(self):
+        """V1 path: Binance -5022 retries a fresh local-L2 price before taker fallback."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        post_only_reject = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "Binance API error: code=-5022, msg=GTX_ORDER_REJECT post only would execute.",
+        )
+        maker_adapter.submit_passive_order = AsyncMock(side_effect=[
+            post_only_reject,
+            _make_passive_ack(
+                venue=Venue.BINANCE,
+                order_id="requote-accepted",
+                client_order_id="requote-cid",
+                price=101.0,
+            ),
+        ])
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=None)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 100.0)
+        executor.set_l2_quote_resolver(lambda venue, symbol: (100.0, 102.0))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        with patch.object(passive_close_module.asyncio, "sleep", new=AsyncMock()):
+            result = asyncio.run(asyncio.wait_for(
+                executor.drive_pending_passive_close(
+                    state, position.position_id, wait_until_terminal=False,
+                ),
+                timeout=0.1,
+            ))
+
+        assert result is False
+        assert maker_adapter.submit_passive_order.await_count >= 2
+        first_request, second_request = [
+            call.args[0] for call in maker_adapter.submit_passive_order.await_args_list[:2]
+        ]
+        # The retained V2 retry ladder uses a 50% candidate; V1's safe-price
+        # and mandatory sell-side tick alignment round it to 102 rather than
+        # risking an order at the 100 bid.
+        assert first_request.price == pytest.approx(100.0)
+        assert second_request.price == pytest.approx(102.0)
+        assert pending.phase_state.phase == PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER
+        assert pending.phase_state.maker_order_id == "requote-accepted"
+        assert any(
+            event["kind"] == "execution.passive_close_requote_retry"
+            for event in journal.read_all()
+        )
+
+    def test_binance_post_only_requote_exhaustion_is_bounded_before_dual_taker(self):
+        """V1's post-only ladder is finite; exhaustion is the only direct taker path."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        post_only_reject = OrderSubmitError(
+            SubmitFailureClass.REJECTED,
+            "Binance API error: code=-5022, msg=GTX_ORDER_REJECT post only would execute.",
+        )
+        maker_adapter.submit_passive_order = AsyncMock(side_effect=post_only_reject)
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            journal,
+        )
+        executor.set_l2_quote_resolver(lambda venue, symbol: (100.0, 102.0))
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+
+        with patch.object(passive_close_module.asyncio, "sleep", new=AsyncMock()) as sleep:
+            asyncio.run(executor._submit_maker_order(
+                state, pending, position,
+                Venue.BINANCE, Side.SELL, "long", 100.0, 1.0,
+            ))
+
+        assert maker_adapter.submit_passive_order.await_count == 7
+        assert sleep.await_count == 7
+        assert sleep.await_args_list[-1].args == (10.0,)
+        assert pending.phase_state.phase == PassiveExecutionPhase.DUAL_TAKER
+        assert any(
+            event["kind"] == "exit.passive_close_maker_requote_exhausted"
+            for event in journal.read_all()
         )
 
     def test_order_submit_error_uncertain_backs_off_with_escalation(self):

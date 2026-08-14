@@ -45,6 +45,7 @@ from lightfee.marketdata.private_ws import (
     lookup_or_wait_private_order,
     lookup_or_wait_private_order_progress,
     merge_passive_progress_sources,
+    should_fetch_passive_reconciliation,
 )
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.venues.common import normalize_venue_quantity
@@ -6819,8 +6820,7 @@ class VenueTransport(MarketDataClient):
         """Query cumulative progress for a resting passive order.
 
         V1 semantics:
-        - Bitget: REST detail + private progress + reconciliation → merge
-          (V1 bitget.rs:2483 fetch_passive_order_progress).
+        - Bybit and Bitget: REST detail + private progress + reconciliation → merge.
         - Other venues: private-first with REST fallback.
         """
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState
@@ -6835,6 +6835,10 @@ class VenueTransport(MarketDataClient):
         # Bitget: full V1 REST+private+reconciliation merge
         if spec.venue_id == Venue.BITGET:
             return await self._query_passive_order_progress_bitget(
+                symbol, venue_sym, order_id, client_order_id, side, now_ms,
+            )
+        if spec.venue_id == Venue.BYBIT:
+            return await self._query_passive_order_progress_bybit(
                 symbol, venue_sym, order_id, client_order_id, side, now_ms,
             )
 
@@ -6874,13 +6878,6 @@ class VenueTransport(MarketDataClient):
                     params["ordId"] = order_id
                 elif client_order_id:
                     params["clOrdId"] = client_order_id
-            elif spec.venue_id == Venue.BYBIT:
-                params["category"] = "linear"
-                params["symbol"] = venue_sym
-                if order_id:
-                    params["orderId"] = order_id
-                elif client_order_id:
-                    params["orderLinkId"] = client_order_id
             elif spec.venue_id == Venue.GATE:
                 if order_id:
                     params["order_id"] = order_id
@@ -6921,6 +6918,166 @@ class VenueTransport(MarketDataClient):
         except Exception:
             return None
 
+    async def _query_passive_order_progress_bybit(
+        self,
+        symbol: str,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: Optional[str],
+        side: "Side | None",
+        now_ms: int,
+    ) -> Optional[Any]:
+        """V1 Bybit passive progress: realtime order + private WS + executions.
+
+        A private ``Rejected/0`` event is only a transient source.  It cannot
+        independently prove a passive order had no fills because Bybit can send
+        duplicated or reordered private order notifications around a fill.
+        """
+        from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side as DomainSide
+
+        private_progress = self.private_order_progress(
+            client_order_id=client_order_id,
+            order_id=order_id,
+            max_age_ms=15_000,
+        )
+        detail_data: Optional[dict[str, Any]] = None
+        params: dict[str, Any] = {"category": "linear", "symbol": venue_sym}
+        if order_id:
+            params["orderId"] = order_id
+        elif client_order_id:
+            params["orderLinkId"] = client_order_id
+
+        try:
+            raw = await self._request(
+                "GET", "/v5/order/realtime", params=params, private=True,
+            )
+            self._require_bybit_reconciliation_success(raw, "bybit passive order realtime")
+            result = raw.get("result", {})
+            if isinstance(result, dict):
+                if "list" in result:
+                    rows = result.get("list")
+                    candidate = rows[0] if isinstance(rows, list) and rows else None
+                else:
+                    candidate = result
+                if isinstance(candidate, dict) and candidate:
+                    detail_data = candidate
+        except _BybitOrderNotFound:
+            detail_data = None
+
+        if detail_data is None:
+            detail_progress = CumulativeOrderProgress.from_position_snapshot(
+                order_id=order_id or None,
+                client_order_id=client_order_id,
+                cumulative_quantity=0.0,
+                average_price=None,
+                fee_quote=None,
+                updated_at_ms=None,
+            )
+        else:
+            raw_updated_at = detail_data.get("updatedTime", now_ms)
+            try:
+                updated_at_ms = int(raw_updated_at)
+            except (TypeError, ValueError):
+                updated_at_ms = now_ms
+            detail_progress = CumulativeOrderProgress.from_position_snapshot(
+                order_id=str(detail_data.get("orderId", "") or order_id) or None,
+                client_order_id=(
+                    str(detail_data.get("orderLinkId", "") or client_order_id or "")
+                    or None
+                ),
+                cumulative_quantity=_safe_float(detail_data.get("cumExecQty", "0")),
+                average_price=(
+                    _safe_float(detail_data.get("avgPrice", "0")) or None
+                ),
+                fee_quote=(
+                    abs(_safe_float(detail_data.get("cumExecFee", "0"))) or None
+                ),
+                updated_at_ms=updated_at_ms,
+            )
+
+        reconciliation = None
+        if should_fetch_passive_reconciliation(detail_progress, private_progress):
+            reconciliation = await self._fetch_order_status_bybit(
+                venue_sym,
+                detail_progress.order_id or order_id,
+                detail_progress.client_order_id or client_order_id or "",
+                now_ms,
+            )
+
+        merged = merge_passive_progress_sources(
+            detail_progress,
+            reconciliation,
+            private_progress,
+        )
+        if detail_data is None:
+            if private_progress is None and reconciliation is None:
+                return None
+            state = (
+                PassiveOrderState.PARTIALLY_FILLED
+                if merged.cumulative_quantity > 0.0
+                else PassiveOrderState.OPEN
+            )
+            resolved_side = side or DomainSide.BUY
+        else:
+            side_raw = str(detail_data.get("side", "")).strip()
+            if side_raw == "Buy":
+                resolved_side = DomainSide.BUY
+            elif side_raw == "Sell":
+                resolved_side = DomainSide.SELL
+            else:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    f"bybit passive order has invalid/missing side value {side_raw!r}",
+                )
+            state = self._bybit_passive_order_state(
+                str(detail_data.get("orderStatus", "")),
+                merged.cumulative_quantity,
+            )
+
+        return PassiveOrderProgress(
+            venue=Venue.BYBIT,
+            symbol=symbol,
+            side=resolved_side,
+            order_id=merged.order_id or order_id,
+            client_order_id=merged.client_order_id or client_order_id or "",
+            cumulative_quantity=merged.cumulative_quantity,
+            average_price=merged.average_price or 0.0,
+            fee_quote=merged.fee_quote or 0.0,
+            last_fill_time_ms=merged.last_fill_at_ms or 0,
+            state=state,
+            observed_at_ms=now_ms,
+        )
+
+    @staticmethod
+    def _bybit_passive_order_state(status: str, cumulative_quantity: float) -> Any:
+        """V1 Bybit terminal-state mapping after the three-source fill merge."""
+        from lightfee.core.domain import PassiveOrderState
+
+        normalized = status.lower()
+        if normalized == "filled":
+            return PassiveOrderState.FILLED
+        if normalized == "partiallyfilled":
+            return PassiveOrderState.PARTIALLY_FILLED
+        if normalized in ("new", "created", "untriggered"):
+            return (
+                PassiveOrderState.PARTIALLY_FILLED
+                if cumulative_quantity > 0.0
+                else PassiveOrderState.OPEN
+            )
+        if normalized in ("cancelled", "canceled", "pendingcancel", "deactivated"):
+            return (
+                PassiveOrderState.PARTIALLY_FILLED
+                if cumulative_quantity > 0.0
+                else PassiveOrderState.CANCELED
+            )
+        if normalized == "rejected":
+            return PassiveOrderState.REJECTED
+        return (
+            PassiveOrderState.PARTIALLY_FILLED
+            if cumulative_quantity > 0.0
+            else PassiveOrderState.UNKNOWN
+        )
+
     async def _query_passive_order_progress_bitget(
         self, symbol: str, venue_sym: str, order_id: str,
         client_order_id: Optional[str], side: "Side | None", now_ms: int,
@@ -6935,11 +7092,6 @@ class VenueTransport(MarketDataClient):
         which lacks Bitget-specific field names for fee/timestamp/quantity).
         """
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side as DomainSide
-        from lightfee.marketdata.private_ws import (
-            CumulativeOrderProgress,
-            merge_passive_progress_sources,
-            should_fetch_passive_reconciliation,
-        )
 
         spec = self._spec
         detail_data: Optional[dict[str, Any]] = None
