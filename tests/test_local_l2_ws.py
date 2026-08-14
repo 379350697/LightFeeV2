@@ -7,11 +7,14 @@ and ingest_external_update() bridging from WS→runtime.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
+import lightfee.marketdata.local_l2_ws as local_l2_ws_module
 from lightfee.marketdata.l2 import (
     L2BookStatus,
+    L2PoolAssignment,
     LocalL2BookKey,
     LocalL2Update,
     LocalL2UpdateKind,
@@ -166,14 +169,24 @@ class TestLocalL2WsFreshnessEvidence:
         try:
             book = rt.ensure_book("bybit", "BTCUSDT")
             book.status = L2BookStatus.HOT
+            book.pool = L2PoolAssignment.HOT_EXEC
             book.observed_at_ms = 1_000
             book.bids = [PriceLevel(100.0, 1.0)]
             book.asks = [PriceLevel(101.0, 1.0)]
             client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+            dp.start_worker(LocalL2BookKey("bybit", "BTCUSDT"), client)
 
             await client._handle_message('{"op":"subscribe","success":true,"ret_msg":"subscribe"}')
 
             assert book.observed_at_ms > 1_000
+            records = journal.read_all()
+            confirmed = [
+                record for record in records
+                if record["kind"] == "runtime.local_l2_ws_transport"
+                and record["payload"]["event"] == "subscription_confirmed"
+            ]
+            assert len(confirmed) == 1
+            assert confirmed[0]["payload"]["ws_stream"]["subscription_mode"] == "unknown"
         finally:
             journal.close()
 
@@ -187,12 +200,21 @@ class TestLocalL2WsFreshnessEvidence:
             book.bids = [PriceLevel(100.0, 1.0)]
             book.asks = [PriceLevel(101.0, 1.0)]
             client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+            dp.start_worker(LocalL2BookKey("bybit", "BTCUSDT"), client)
 
             await client._handle_message(
                 '{"event":"subscribe","success":false,"error":"subscribe failed"}'
             )
 
             assert book.observed_at_ms == 1_000
+            records = journal.read_all()
+            rejection = [
+                record for record in records
+                if record["kind"] == "runtime.local_l2_ws_transport"
+                and record["payload"]["event"] == "subscription_rejected"
+            ]
+            assert len(rejection) == 1
+            assert rejection[0]["payload"]["ws_stream"]["client_state"] == "disconnected"
         finally:
             journal.close()
 
@@ -210,6 +232,176 @@ class TestLocalL2WsFreshnessEvidence:
             await client._handle_message('{"op":"pong"}')
 
             assert book.observed_at_ms > 1_000
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_failure_records_reconnect_evidence(self, monkeypatch):
+        """The real WS loop must journal failures before it backs off and retries."""
+        dp, _rt, journal = _make_data_plane()
+        attempted = asyncio.Event()
+
+        class FailingConnect:
+            async def __aenter__(self):
+                attempted.set()
+                raise ConnectionRefusedError("test connection refused")
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+        dp.start_worker(LocalL2BookKey("bybit", "BTCUSDT"), client)
+        monkeypatch.setattr(
+            local_l2_ws_module.websockets,
+            "connect",
+            lambda *args, **kwargs: FailingConnect(),
+        )
+        try:
+            await client.start()
+            await asyncio.wait_for(attempted.wait(), timeout=1)
+            await asyncio.sleep(0)
+            await client.stop()
+
+            records = journal.read_all()
+            events = [
+                record["payload"] for record in records
+                if record["kind"] == "runtime.local_l2_ws_transport"
+            ]
+            connect_error = next(item for item in events if item["event"] == "connect_error")
+            retry = next(item for item in events if item["event"] == "reconnect_scheduled")
+            assert connect_error["ws_stream"]["error_count"] == 1
+            assert "ConnectionRefusedError" in connect_error["ws_stream"]["last_error"]
+            assert retry["reconnect_delay_ms"] == 1000
+        finally:
+            await client.stop()
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_aster_url_subscription_records_connected_generation(self, monkeypatch):
+        """Aster's URL-auto subscription has no JSON acknowledgement to preserve."""
+        dp, _rt, journal = _make_data_plane()
+        connected = asyncio.Event()
+        hold_read_loop = asyncio.Event()
+
+        class HoldingConnect:
+            close_code = None
+            close_reason = ""
+
+            async def __aenter__(self):
+                connected.set()
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await hold_read_loop.wait()
+                raise StopAsyncIteration
+
+        client = AsterL2WsClient(venue="aster", symbol="BTCUSDT", data_plane=dp)
+        dp.start_worker(LocalL2BookKey("aster", "BTCUSDT"), client)
+        monkeypatch.setattr(
+            local_l2_ws_module.websockets,
+            "connect",
+            lambda *args, **kwargs: HoldingConnect(),
+        )
+        try:
+            await client.start()
+            await asyncio.wait_for(connected.wait(), timeout=1)
+            await asyncio.sleep(0)
+            await client.stop()
+
+            records = journal.read_all()
+            events = [
+                record["payload"] for record in records
+                if record["kind"] == "runtime.local_l2_ws_transport"
+            ]
+            connected_event = next(item for item in events if item["event"] == "connected")
+            auto_subscribed = next(item for item in events if item["event"] == "url_auto_subscribed")
+            assert connected_event["ws_stream"]["stream_generation"] == 1
+            assert auto_subscribed["ws_stream"]["subscription_mode"] == "url_auto"
+        finally:
+            await client.stop()
+            journal.close()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("client_type", "venue"),
+        [(BinanceL2WsClient, "binance"), (AsterL2WsClient, "aster")],
+    )
+    async def test_sequence_gap_evidence_carries_receipt_and_stream_state(self, client_type, venue):
+        """A production WS message that causes a gap keeps both sides of the evidence."""
+        dp, rt, journal = _make_data_plane()
+        try:
+            book = rt.ensure_book(venue, "BTCUSDT")
+            book.status = L2BookStatus.HOT
+            book.sequence = 100
+            book.last_update_id = 100
+            book.bids = [PriceLevel(100.0, 1.0)]
+            book.asks = [PriceLevel(101.0, 1.0)]
+            client = client_type(venue=venue, symbol="BTCUSDT", data_plane=dp)
+            client._state = "connected"
+            dp.start_worker(LocalL2BookKey(venue, "BTCUSDT"), client)
+
+            await client._handle_message(json.dumps({
+                "e": "depthUpdate", "E": 1_000, "s": "BTCUSDT",
+                "U": 106, "u": 110, "pu": 105,
+                "b": [["100.0", "1.0"]], "a": [["101.0", "1.0"]],
+            }))
+
+            records = journal.read_all()
+            gap = next(
+                record["payload"] for record in records
+                if record["kind"] == "runtime.local_l2_sequence_gap_rebuild"
+            )
+            stream = gap["ws_stream"]
+            assert stream["client_state"] == "connected"
+            assert stream["message_count"] == 1
+            assert stream["last_raw_U"] == 106
+            assert stream["last_raw_u"] == 110
+            assert stream["last_raw_pu"] == 105
+            assert gap["raw_U"] == 106
+            assert gap["raw_u"] == 110
+            assert gap["raw_pu"] == 105
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_hot_stale_evidence_carries_ws_transport_state(self):
+        dp, rt, journal = _make_data_plane()
+        try:
+            book = rt.ensure_book("bybit", "BTCUSDT")
+            book.status = L2BookStatus.HOT
+            book.pool = L2PoolAssignment.HOT_EXEC
+            book.observed_at_ms = 1_000
+            book.bids = [PriceLevel(100.0, 1.0)]
+            book.asks = [PriceLevel(101.0, 1.0)]
+            client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+            client._state = "connected"
+            client._ws = object()
+            client._message_count = 3
+            client._error_count = 2
+            client._last_message_ms = 1_000
+            client._last_error = "ConnectionResetError: prior reset"
+            dp.start_worker(LocalL2BookKey("bybit", "BTCUSDT"), client)
+            dp.hot_stale_after_ms = 100
+
+            await dp.sync_snapshots({}, now_ms=1_101)
+
+            records = journal.read_all()
+            stale = next(
+                record["payload"] for record in records
+                if record["kind"] == "runtime.local_l2_hot_stale_rebuild"
+            )
+            stream = stale["ws_stream"]
+            assert stream["connected"] is True
+            assert stream["message_count"] == 3
+            assert stream["error_count"] == 2
+            assert stream["last_message_ms"] == 1_000
+            assert stream["last_error"] == "ConnectionResetError: prior reset"
         finally:
             journal.close()
 

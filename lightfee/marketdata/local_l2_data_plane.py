@@ -607,11 +607,22 @@ class LocalL2DataPlane:
         key = LocalL2BookKey(venue=str(venue), symbol=str(symbol))
         client = self._ws_clients.get(key)
         state = self._freshness_states.get(key)
+        client_diagnostics = {}
+        snapshot = getattr(client, "diagnostics_snapshot", None) if client is not None else None
+        if callable(snapshot):
+            client_diagnostics = snapshot()
         return {
             "venue": key.venue,
             "symbol": key.symbol,
             "registered": client is not None,
             "connected": bool(client is not None and getattr(client, "is_connected", False)),
+            "client_state": str(
+                client_diagnostics.get(
+                    "client_state",
+                    getattr(client, "state", "unregistered" if client is None else "unknown"),
+                )
+            ),
+            "stream_generation": int(self._stream_generations.get(f"{key.venue}:{key.symbol}", 0)),
             "freshness_state_present": state is not None,
             "last_subscription_confirmed_ms": (
                 int(state.last_subscription_confirmed_ms) if state is not None else 0
@@ -623,7 +634,44 @@ class LocalL2DataPlane:
             "last_book_confirmation_ms": (
                 int(state.last_book_confirmation_ms) if state is not None else 0
             ),
+            "message_count": int(client_diagnostics.get("message_count", 0) or 0),
+            "error_count": int(client_diagnostics.get("error_count", 0) or 0),
+            "connect_attempt_count": int(client_diagnostics.get("connect_attempt_count", 0) or 0),
+            "last_message_ms": int(client_diagnostics.get("last_message_ms", 0) or 0),
+            "last_connected_ms": int(client_diagnostics.get("last_connected_ms", 0) or 0),
+            "last_disconnected_ms": int(client_diagnostics.get("last_disconnected_ms", 0) or 0),
+            "last_disconnect_reason": str(client_diagnostics.get("last_disconnect_reason", "") or ""),
+            "last_error": str(client_diagnostics.get("last_error", "") or ""),
+            "reconnect_delay_ms": int(client_diagnostics.get("reconnect_delay_ms", 0) or 0),
+            "subscription_mode": str(client_diagnostics.get("subscription_mode", "unknown") or "unknown"),
+            "last_update_kind": str(client_diagnostics.get("last_update_kind", "") or ""),
+            "last_raw_U": int(client_diagnostics.get("last_raw_U", 0) or 0),
+            "last_raw_u": int(client_diagnostics.get("last_raw_u", 0) or 0),
+            "last_raw_pu": int(client_diagnostics.get("last_raw_pu", 0) or 0),
+            "last_update_event_time_ms": int(
+                client_diagnostics.get("last_update_event_time_ms", 0) or 0
+            ),
         }
+
+    def record_ws_transport_event(
+        self,
+        venue: str,
+        symbol: str,
+        event: str,
+        *,
+        now_ms: int,
+        **extra: object,
+    ) -> None:
+        """Persist a bounded WS lifecycle event with the stream state at that instant."""
+        payload = {
+            "venue": str(venue),
+            "symbol": str(symbol),
+            "event": str(event),
+            "ts_ms": int(now_ms),
+            "ws_stream": self.ws_stream_state(venue, symbol),
+        }
+        payload.update(extra)
+        self._journal.append("runtime.local_l2_ws_transport", payload)
 
     def _effective_hot_freshness_ms(
         self,
@@ -1432,6 +1480,7 @@ class LocalL2DataPlane:
                         "policy_bridge_mode": policy.bridge_mode.value,
                         "reason": reason,
                         "reason_class": reason,
+                        "ws_stream": self.ws_stream_state(key.venue, key.symbol),
                     },
                     now_ms,
                     reason=reason,
@@ -1883,6 +1932,7 @@ class LocalL2DataPlane:
             "snapshot_seq": snapshot_seq,
             "reason_class": reason_class,
             "policy_bridge_mode": policy.bridge_mode.value,
+            "ws_stream": self.ws_stream_state(venue, symbol),
         }
         payload.update(extra)
         return payload

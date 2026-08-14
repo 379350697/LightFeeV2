@@ -127,6 +127,16 @@ class LocalL2WsClient(ABC):
     _error_count: int = field(default=0, init=False)
     _last_message_ms: int = field(default=0, init=False)
     _last_error: str = field(default="", init=False)
+    _connect_attempt_count: int = field(default=0, init=False)
+    _last_connected_ms: int = field(default=0, init=False)
+    _last_disconnected_ms: int = field(default=0, init=False)
+    _last_disconnect_reason: str = field(default="", init=False)
+    _subscription_mode: str = field(default="unknown", init=False)
+    _last_update_kind: str = field(default="", init=False)
+    _last_raw_U: int = field(default=0, init=False)
+    _last_raw_u: int = field(default=0, init=False)
+    _last_raw_pu: int = field(default=0, init=False)
+    _last_update_event_time_ms: int = field(default=0, init=False)
 
     # ------------------------------------------------------------------
     # Public API
@@ -150,6 +160,7 @@ class LocalL2WsClient(ABC):
                 pass
             self._task = None
         await self._close_ws()
+        self._record_transport_event("stopped", int(time.time() * 1000))
 
     @property
     def state(self) -> str:
@@ -167,6 +178,61 @@ class LocalL2WsClient(ABC):
     @property
     def message_count(self) -> int:
         return self._message_count
+
+    def diagnostics_snapshot(self) -> dict[str, object]:
+        """Return the latest receipt and transport evidence for one WS stream."""
+        return {
+            "client_state": self._state,
+            "message_count": self._message_count,
+            "error_count": self._error_count,
+            "connect_attempt_count": self._connect_attempt_count,
+            "last_message_ms": self._last_message_ms,
+            "last_connected_ms": self._last_connected_ms,
+            "last_disconnected_ms": self._last_disconnected_ms,
+            "last_disconnect_reason": self._last_disconnect_reason,
+            "last_error": self._last_error,
+            "reconnect_delay_ms": int(self._reconnect_delay_s * 1000),
+            "subscription_mode": self._subscription_mode,
+            "last_update_kind": self._last_update_kind,
+            "last_raw_U": self._last_raw_U,
+            "last_raw_u": self._last_raw_u,
+            "last_raw_pu": self._last_raw_pu,
+            "last_update_event_time_ms": self._last_update_event_time_ms,
+        }
+
+    @staticmethod
+    def _error_text(error: Exception) -> str:
+        return f"{type(error).__name__}: {error}"[:500]
+
+    def _record_transport_event(
+        self,
+        event: str,
+        now_ms: int,
+        **extra: object,
+    ) -> None:
+        try:
+            self.data_plane.record_ws_transport_event(
+                self.venue,
+                self.symbol,
+                event,
+                now_ms=now_ms,
+                **extra,
+            )
+        except Exception:
+            # Diagnostics must not break the market-data stream they observe.
+            pass
+
+    def _record_error(self, error: Exception) -> str:
+        self._error_count += 1
+        self._last_error = self._error_text(error)
+        return self._last_error
+
+    def _remember_update(self, update: LocalL2Update) -> None:
+        self._last_update_kind = update.update_kind.value
+        self._last_raw_U = int(update.first_sequence or 0)
+        self._last_raw_u = int(update.sequence or 0)
+        self._last_raw_pu = int(update.previous_sequence or 0)
+        self._last_update_event_time_ms = int(update.event_time_ms or 0)
 
     # ------------------------------------------------------------------
     # Subclass hooks
@@ -200,11 +266,28 @@ class LocalL2WsClient(ABC):
         while self._state not in (WsClientState.CLOSED,):
             try:
                 await self._connect_and_read()
+                if self._state != WsClientState.CLOSED:
+                    now_ms = int(time.time() * 1000)
+                    self._last_disconnected_ms = now_ms
+                    self._last_disconnect_reason = "read_loop_ended"
+                    self._record_transport_event(
+                        "read_loop_ended",
+                        now_ms,
+                        close_code=getattr(self._ws, "close_code", None),
+                        close_reason=str(getattr(self._ws, "close_reason", "") or "")[:500],
+                    )
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self._error_count += 1
-                self._last_error = f"{type(e).__name__}: {e}"
+                now_ms = int(time.time() * 1000)
+                error = self._record_error(e)
+                self._last_disconnected_ms = now_ms
+                self._last_disconnect_reason = error
+                self._record_transport_event(
+                    "connect_error" if self._state == WsClientState.CONNECTING else "read_error",
+                    now_ms,
+                    error=error,
+                )
 
             if self._state == WsClientState.CLOSED:
                 break
@@ -212,6 +295,11 @@ class LocalL2WsClient(ABC):
             # Reconnect backoff
             self._state = WsClientState.RECONNECTING
             delay = self._reconnect_delay_s or self.reconnect_delay_initial_s
+            self._record_transport_event(
+                "reconnect_scheduled",
+                int(time.time() * 1000),
+                reconnect_delay_ms=int(delay * 1000),
+            )
             await asyncio.sleep(delay)
             self._reconnect_delay_s = min(
                 delay * 2, self.reconnect_delay_max_s
@@ -226,6 +314,12 @@ class LocalL2WsClient(ABC):
         """
         url = self.websocket_url()
         self._state = WsClientState.CONNECTING
+        self._connect_attempt_count += 1
+        self._record_transport_event(
+            "connect_attempt",
+            int(time.time() * 1000),
+            connect_attempt=self._connect_attempt_count,
+        )
 
         async with websockets.connect(
             url,
@@ -237,15 +331,24 @@ class LocalL2WsClient(ABC):
             self._ws = ws
             self._state = WsClientState.CONNECTED
             self._reconnect_delay_s = 0  # reset on successful connect
+            self._last_connected_ms = int(time.time() * 1000)
 
             # Subscribe to depth channel (skip if venue auto-subscribes)
             sub_msg = self.build_subscribe_message()
             if sub_msg is not None:
                 await ws.send(json.dumps(sub_msg))
+                self._subscription_mode = "explicit"
+            else:
+                self._subscription_mode = "url_auto"
 
             # Notify data plane: new WS stream → advance generation, clear old buffers
             # V1: on_connect closure calling reset_binance_local_l2_bootstrap_stream_state_for_instance
             self.data_plane.reset_stream_state(self.venue, [self.symbol])
+            self._record_transport_event("connected", self._last_connected_ms)
+            self._record_transport_event(
+                "subscription_sent" if sub_msg is not None else "url_auto_subscribed",
+                int(time.time() * 1000),
+            )
 
             # Read loop
             async for raw_msg in ws:
@@ -257,14 +360,37 @@ class LocalL2WsClient(ABC):
             if isinstance(raw_msg, bytes):
                 raw_msg = raw_msg.decode("utf-8")
             payload = json.loads(raw_msg)
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            error_text = self._record_error(error)
+            self._record_transport_event(
+                "decode_error",
+                int(time.time() * 1000),
+                error=error_text,
+                raw_size=len(raw_msg),
+            )
             return
 
         now_ms = int(time.time() * 1000)
+        if self._is_subscription_failure(payload):
+            self._record_transport_event(
+                "subscription_rejected",
+                now_ms,
+                error=str(payload.get("error", "") or payload.get("ret_msg", ""))[:500],
+                code=next(
+                    (
+                        payload.get(field)
+                        for field in ("code", "retCode", "sCode")
+                        if payload.get(field) not in (None, "", 0, "0")
+                    ),
+                    None,
+                ),
+            )
+            return
         if self._is_subscription_confirmation(payload):
             self.data_plane.note_ws_subscription_confirmed(
                 self.venue, self.symbol, now_ms=now_ms,
             )
+            self._record_transport_event("subscription_confirmed", now_ms)
             return
         if self._is_keepalive_message(payload):
             self.data_plane.note_ws_keepalive(
@@ -273,17 +399,24 @@ class LocalL2WsClient(ABC):
             return
 
         # Venue-specific parsing
-        update = self.parse_depth_message(payload)
+        try:
+            update = self.parse_depth_message(payload)
+        except Exception as error:
+            error_text = self._record_error(error)
+            self._record_transport_event("parse_error", now_ms, error=error_text)
+            raise
         if update is None:
             return
 
         self._message_count += 1
         self._last_message_ms = now_ms
+        self._remember_update(update)
 
         try:
             self.data_plane.ingest_external_update(update, now_ms)
-        except Exception:
-            self._error_count += 1
+        except Exception as error:
+            error_text = self._record_error(error)
+            self._record_transport_event("ingest_error", now_ms, error=error_text)
 
     def _is_subscription_confirmation(self, payload: dict) -> bool:
         event = str(payload.get("event", "")).lower()
