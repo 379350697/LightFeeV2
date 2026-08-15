@@ -69,6 +69,7 @@ Last-good / quote fallback rules:
 | 2026-06-08 | Whole-snapshot stale quote noise split | local RED/GREEN, deploy pending | CL-056 limits stale quote entry blockers to admission-filtered candidate-leg quote keys and emits non-candidate or admission-blocked stale quote volume as rate-limited `runtime.order_quote_stale_health_summary` with `blocking=false`. |
 | 2026-08-14 | Decision-time/Aster-overlap/primary-owner repair | locally validated; cloud pending | CL-105 restores V1's Aster covered-range acceptance, uses decision-time for Local-L2 readiness, and prevents normal rank churn from resetting an existing primary's hold/session owner. |
 | 2026-08-15 | WS-ready REST bridge boundary | locally validated; cloud pending | CL-110 makes the per-symbol pre-snapshot WS receiver readiness explicit, rejects snapshots across registration/reconnect boundaries, and wakes/cleans waiters on worker stop or prune.  It changes no sequence acceptance rule, strategy threshold, or unrelated venue policy. |
+| 2026-08-15 | CL-110 production rollout (`4d03ad7`) | deployed; safety verified, dynamic bridge unobserved | Manifest and both services verified; local/exchange truth was flat and consistent. The runtime had no target pair, so no dynamic WS/REST bridge was started in the observation window. This is a coverage waiver only; the deterministic dynamic DataPlane+WS regressions remain required evidence. |
 
 ## Recurrences
 

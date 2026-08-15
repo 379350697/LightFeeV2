@@ -33,7 +33,10 @@ DataPlane now owns one per-symbol readiness/generation boundary, with no added
 exchange request or cross-symbol serialization.  Real DataPlane+WS regressions
 cover URL-auto, ACK, reconnect, registration, direct-bootstrap, and prune
 paths; Local-L2 profile `355` and V1 incident/replay/policy `24` pass locally.
-Deployment and read-only runtime confirmation remain required. See
+Commit `4d03ad7` is deployed and post-deploy safety verification is green.
+The dynamic bridge remained unobserved because there was no target pair in the
+window; that is an explicit coverage waiver, not a claim of live activation.
+See
 [daily/2026-08-15.md#cluster-cl-110-local-l2-ws-rest-bootstrap-bridge-readiness](daily/2026-08-15.md#cluster-cl-110-local-l2-ws-rest-bootstrap-bridge-readiness).
 
 CL-109 passive-close/entry boundary contracts, 2026-08-15: V2 started the
