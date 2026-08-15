@@ -1008,6 +1008,33 @@ class TestEngineStateFieldCompleteness:
 
         assert state.pending_close_reconciliations == [enriched]
 
+    def test_pending_close_reconciliation_order_id_ignores_missing_client_id(self):
+        state = EngineState()
+        first = {
+            "position_id": "entry-1780771924982-ORDER-ID",
+            "symbol": "ORDERIDUSDT",
+            "kind": "final",
+            "long_legs": [{
+                "venue": "binance",
+                "order_id": "binance-close-1",
+                "client_order_id": "client-close-1",
+            }],
+            "short_legs": [],
+        }
+        same_exchange_order = {
+            **first,
+            "long_legs": [{
+                "venue": "binance",
+                "order_id": "binance-close-1",
+                "client_order_id": "",
+            }],
+        }
+
+        state.enqueue_pending_close_reconciliation(first)
+        state.enqueue_pending_close_reconciliation(same_exchange_order)
+
+        assert state.pending_close_reconciliations == [first]
+
     def test_pending_close_reconciliation_does_not_replace_complete_legs_with_partial_legs(
         self,
     ):

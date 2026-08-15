@@ -26,6 +26,25 @@ semantic contract before changing the V2 implementation.
 - For bugs involving live exchange state, exchange truth outranks local recovered
   state.
 
+## Execution Authorization
+
+The user has standing authorization for in-scope repository, Git, SSH, and
+production deployment work when they explicitly request that work. Do not
+repeatedly ask for, initiate, or simulate tool-permission escalation for that
+standing authority.
+
+- Run scoped commands directly; do not attach an escalation request merely
+  because a command uses network or SSH.
+- Keep unrelated command classes out of one command invocation, especially do
+  not combine local inspection and remote SSH behind one permission boundary.
+- If the execution platform itself blocks a direct command, record the exact
+  error and use a safe available path. Ask the user only when the requested
+  business action or destructive target is genuinely outside the existing
+  scope, not because of a tool-sandbox prompt.
+- Never change Codex, sandbox, approval, or permission configuration as part of
+  application, probe, test, or deployment work unless the user explicitly asks
+  for that configuration change.
+
 ## GitNexus
 
 The actual GitNexus repo name for this project is `LightFeeV2`.

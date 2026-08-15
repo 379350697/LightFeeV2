@@ -2445,9 +2445,10 @@ class TestPrivateBaseUrl:
         )
 
     @pytest.mark.asyncio
-    async def test_order_placement_uses_private_base(self):
+    async def test_order_placement_uses_private_base(self, monkeypatch):
         from lightfee.venues.specs import VenueSpec, AuthScheme
         from lightfee.venues.base import VenueAccountContract
+        from lightfee.venues.symbol_rules import SymbolRule
         saved_urls = []
 
         spec = VenueSpec(
@@ -2472,6 +2473,21 @@ class TestPrivateBaseUrl:
         )
         cred = LiveCredential(api_key="k", api_secret="s")
         transport = VenueTransport(spec=spec, mode="live", credential=cred)
+
+        class FakeRulesCache:
+            async def get(self, *_args):
+                return SymbolRule(
+                    tick_size=0.01,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
 
         saved_urls = []
 
@@ -5001,7 +5017,17 @@ class TestAckOnlyResponses:
     and return PassiveOrderAck in submit_passive_order."""
 
     @pytest.mark.asyncio
-    async def test_binance_place_order_refreshes_hedge_mode_position_side(self):
+    async def test_binance_place_order_refreshes_hedge_mode_position_side(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(0.01, 0.001, 0.001, 5.0, "exchangeInfo")
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
         transport = VenueTransport(binance_spec(), mode="paper")
         transport.mode = "live"
         calls = []
@@ -5036,7 +5062,17 @@ class TestAckOnlyResponses:
         assert "reduceOnly" not in params
 
     @pytest.mark.asyncio
-    async def test_binance_place_order_one_way_omits_position_side(self):
+    async def test_binance_place_order_one_way_omits_position_side(self, monkeypatch):
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                return SymbolRule(0.01, 0.001, 0.001, 5.0, "exchangeInfo")
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
         transport = VenueTransport(binance_spec(), mode="paper")
         transport.mode = "live"
         calls = []
@@ -12064,6 +12100,66 @@ class TestBinanceAsterPrecisionFix:
         normalized_below_min = await transport.normalize_quantity("HIGHUSDT", 0.5)
         assert normalized_below_min == 0.0
 
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_binance_live_ioc_uses_dynamic_tick_for_low_price_symbol(self, monkeypatch):
+        """HOMEUSDT IOC must not be rejected by Binance's coarse static tick."""
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BINANCE
+                assert venue_symbol == "HOMEUSDT"
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=1.0,
+                    min_qty=1.0,
+                    min_notional=5.0,
+                    rule_source="exchangeInfo",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+        transport = VenueTransport(
+            binance_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="key", api_secret="secret"),
+        )
+        calls: list[tuple[str, str, dict[str, object]]] = []
+
+        async def fake_request(method, path, *, params=None, **_kwargs):
+            calls.append((method, path, dict(params or {})))
+            if path == "/fapi/v1/positionSide/dual":
+                return {"dualSidePosition": False}
+            assert path == "/fapi/v1/order"
+            return {
+                "symbol": "HOMEUSDT",
+                "side": "BUY",
+                "status": "FILLED",
+                "executedQty": "4500",
+                "avgPrice": "0.009793",
+                "orderId": 987654,
+            }
+
+        transport._request = fake_request
+        fill = await transport.place_order(OrderRequest(
+            venue=Venue.BINANCE,
+            symbol="HOMEUSDT",
+            side=Side.BUY,
+            quantity=4500.0,
+            price=0.009793,
+            time_in_force=TimeInForce.IOC,
+        ))
+
+        order_params = [call[2] for call in calls if call[1] == "/fapi/v1/order"][0]
+        assert fill.order_id == "987654"
+        assert order_params["type"] == "MARKET"
+        assert order_params["quantity"] == "4500"
+        assert "price" not in order_params
+        assert transport.order_diagnostics[-1]["payload"]["tick_size"] == pytest.approx(0.000001)
         await transport.close()
 
     @pytest.mark.asyncio

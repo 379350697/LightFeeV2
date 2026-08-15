@@ -119,9 +119,21 @@ def test_exit_reconciled_payload_suppresses_duplicate_close_leg_fills():
         filled_at_ms=1781531700100,
     )
 
+    duplicate_long_without_cid = OrderFill(
+        venue=Venue.BINANCE,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=10.0,
+        price=1.1,
+        order_id="binance-close-1",
+        client_order_id=None,
+        fee_quote=0.01,
+        filled_at_ms=1781531700000,
+    )
+
     payload = runtime._exit_reconciled_payload_from_leg_fills(
         reconciliation,
-        [duplicate_long, duplicate_long],
+        [duplicate_long, duplicate_long_without_cid],
         [short_fill],
         now_ms=1781531700200,
     )
@@ -134,7 +146,7 @@ def test_exit_reconciled_payload_suppresses_duplicate_close_leg_fills():
             "leg": "long",
             "venue": "binance",
             "order_id": "binance-close-1",
-            "client_order_id": "client-close-1",
+            "client_order_id": "",
             "quantity": 10.0,
             "average_price": 1.1,
             "filled_at_ms": 1781531700000,

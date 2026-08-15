@@ -24,6 +24,15 @@ class PendingEntryLifecycleAction:
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
+def has_pending_entry_zero_fill_retry(pending: Any) -> bool:
+    """Whether maintenance has scheduled this zero-fill entry to repost."""
+
+    metadata = getattr(pending, "metadata", None)
+    return isinstance(metadata, dict) and bool(
+        metadata.get("passive_zero_fill_retry_pending")
+    )
+
+
 def ensure_pending_entry_phase_state(pending: Any, now_ms: int = 0) -> PendingEntryPassivePhaseState:
     """V1: `PendingEntryHedge::ensure_phase_state_mut` for entry cycles."""
 

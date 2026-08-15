@@ -16,6 +16,7 @@ from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalDecision,
     PendingEntryTerminalizer,
 )
+from lightfee.engine.pending_entry_lifecycle import has_pending_entry_zero_fill_retry
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import RuntimeContext
 from lightfee.risk.modes import EngineLifecycle
@@ -78,6 +79,11 @@ class PendingEntryRuntime:
         # --- Process pending entries: reconcile + drive missing hedge ---
         resolved_entry_ids: list[str] = []
         for entry_id, pending in list(self.ctx.state.pending_entries.items()):
+            # A zero-fill cycle already scheduled its own V1 repost.  Its
+            # terminal decision belongs to that cycle, not reconciliation.
+            if has_pending_entry_zero_fill_retry(pending):
+                continue
+
             if getattr(pending, "outcome", "") == "rejected":
                 if not pending.has_any_fill():
                     self.ctx.journal.append(

@@ -301,6 +301,10 @@ class HedgeDeltaResult:
     truth_gap: bool = False
     accepted_order_id: str = ""
     accepted_client_order_id: str = ""
+    hedge_submit_started_at_ms: int = 0
+    hedge_submit_completed_at_ms: int = 0
+    hedge_submit_quantity: float = 0.0
+    hedge_submit_reconciled: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -484,18 +488,17 @@ class PassiveCloseExecutor:
         position: OpenPosition,
         now_ms: int,
         *,
+        hedge_submit_started_at_ms: int = 0,
+        hedge_submit_quantity: float = 0.0,
         reconciled: bool = False,
     ) -> dict[str, Any]:
-        """V1 exit_hedge_deadline_decision for pending passive-close hedge gaps."""
+        """V1 deadline measured from one actual hedge submit attempt."""
         unhedged_gap = max(pending.maker_fill.quantity - pending.hedge_fill.quantity, 0.0)
-        if unhedged_gap <= 1e-9:
+        attempted_quantity = max(float(hedge_submit_quantity or 0.0), 0.0)
+        if attempted_quantity <= 1e-9:
             return {"hard_breached": False, "unhedged_gap": 0.0}
 
-        started_at_ms = (
-            pending.maker_fill.last_fill_time_ms
-            or pending.phase_state.cycle_started_at_ms
-            or pending.multi_phase_started_at_ms
-        )
+        started_at_ms = int(hedge_submit_started_at_ms or 0)
         if started_at_ms <= 0 or now_ms <= 0:
             return {"hard_breached": False, "unhedged_gap": unhedged_gap}
         if not self._deadline_clock_domains_match(started_at_ms, now_ms):
@@ -516,7 +519,7 @@ class PassiveCloseExecutor:
         base_hard_ms = max(int(self._config.maker_hedge_deadline_ms or 0), 1)
         extension_ms = self._exit_deadline_extension_ms(
             base_hard_deadline_ms=base_hard_ms,
-            notional_quote=unhedged_gap * max(price_hint, 0.0),
+            notional_quote=attempted_quantity * max(price_hint, 0.0),
             quote_fresh=price_hint > 0.0,
             has_execution_progress=pending.hedge_fill.quantity > 1e-9,
             reconciled=reconciled,
@@ -532,9 +535,44 @@ class PassiveCloseExecutor:
             "hedge_side": hedge_side,
             "hedge_leg": hedge_leg,
             "unhedged_gap": unhedged_gap,
+            "hedge_submit_quantity": attempted_quantity,
             "price_hint": price_hint,
             "reconciled": reconciled,
         }
+
+    async def _enforce_passive_close_hedge_submit_deadline(
+        self,
+        state: EngineState,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        result: HedgeDeltaResult,
+        *,
+        source: str,
+    ) -> bool:
+        """Apply the V1 deadline only after a concrete hedge submit returns."""
+        if (
+            result.hedge_submit_started_at_ms <= 0
+            or result.hedge_submit_completed_at_ms <= 0
+        ):
+            return False
+        deadline = self._passive_close_hedge_deadline_decision(
+            pending,
+            position,
+            result.hedge_submit_completed_at_ms,
+            hedge_submit_started_at_ms=result.hedge_submit_started_at_ms,
+            hedge_submit_quantity=result.hedge_submit_quantity,
+            reconciled=result.hedge_submit_reconciled,
+        )
+        if not deadline.get("hard_breached"):
+            return False
+        await self._enter_passive_close_hedge_fail_closed(
+            state,
+            pending,
+            position,
+            deadline,
+            source=source,
+        )
+        return True
 
     def _passive_close_fallback_deadline_decision(
         self,
@@ -608,7 +646,7 @@ class PassiveCloseExecutor:
             "deadline_ms": decision.get("hard_deadline_ms", 0),
             "soft_deadline_ms": decision.get("soft_deadline_ms", 0),
             "has_execution_progress": pending.hedge_fill.quantity > 1e-9,
-            "hedge_notional_quote": decision.get("unhedged_gap", 0.0)
+            "hedge_notional_quote": decision.get("hedge_submit_quantity", 0.0)
             * max(decision.get("price_hint", 0.0), 0.0),
             "reconciled": bool(decision.get("reconciled", False)),
             "maker_order_id": str(
@@ -1309,6 +1347,14 @@ class PassiveCloseExecutor:
                         pending = state.pending_passive_closes.get(position_id)
                         if pending is None:
                             return True
+                        if await self._enforce_passive_close_hedge_submit_deadline(
+                            state,
+                            pending,
+                            position,
+                            result,
+                            source="terminal_maker_filled_hedge_submit",
+                        ):
+                            return False
                         if result.truth_gap:
                             return await self._handle_hedge_truth_gap_result(
                                 state,
@@ -1369,17 +1415,6 @@ class PassiveCloseExecutor:
                             return False
                         # Hedge not caught up — record unhedged residual, retry
                         unhedged = pending.maker_fill.quantity - pending.hedge_fill.quantity
-                        deadline = self._passive_close_hedge_deadline_decision(
-                            pending, position, now_ms,
-                        )
-                        if deadline.get("hard_breached"):
-                            return await self._enter_passive_close_hedge_fail_closed(
-                                state,
-                                pending,
-                                position,
-                                deadline,
-                                source="terminal_maker_filled_unhedged_retry",
-                            )
                         self._journal.append(
                             "exit.passive_close_unhedged_residual",
                             {
@@ -1423,17 +1458,6 @@ class PassiveCloseExecutor:
 
             unhedged_gap = pending.maker_fill.quantity - pending.hedge_fill.quantity
             if unhedged_gap > 1e-9:
-                deadline = self._passive_close_hedge_deadline_decision(
-                    pending, position, now_ms,
-                )
-                if deadline.get("hard_breached"):
-                    return await self._enter_passive_close_hedge_fail_closed(
-                        state,
-                        pending,
-                        position,
-                        deadline,
-                        source="drive_unhedged_gap",
-                    )
                 # --- V1 small-fill buffer: avoid submitting hedge below min-notional ---
                 # Compute hedge price hint for notional check
                 if maker_leg == ActiveMakerLeg.LONG:
@@ -1575,10 +1599,18 @@ class PassiveCloseExecutor:
                     state, pending, position, unhedged_gap,
                     maker_terminal=maker_terminal,
                 )
+                pending = state.pending_passive_closes.get(position_id)
+                if pending is None:
+                    return True
+                if await self._enforce_passive_close_hedge_submit_deadline(
+                    state,
+                    pending,
+                    position,
+                    result,
+                    source="drive_unhedged_gap_submit",
+                ):
+                    return False
                 if not result.success:
-                    pending = state.pending_passive_closes.get(position_id)
-                    if pending is None:
-                        return True
                     if result.truth_gap:
                         return await self._handle_hedge_truth_gap_result(
                             state,
@@ -2232,7 +2264,7 @@ class PassiveCloseExecutor:
         *,
         leg_label: str,
         operation: str,
-    ) -> None:
+    ) -> int:
         """Persist a close-order lookup key before its first network await.
 
         A client order ID is the recovery handle for the ambiguous interval
@@ -2289,6 +2321,7 @@ class PassiveCloseExecutor:
                 ),
             },
         )
+        return submit_started_at_ms
 
     @staticmethod
     def _serialize_close_order_fill(fill: OrderFill | None) -> dict[str, Any] | None:
@@ -2402,6 +2435,31 @@ class PassiveCloseExecutor:
                 leg.fill = fill
                 if not leg.submit_started_at_ms:
                     leg.submit_started_at_ms = submitted_at_ms
+                return
+        for leg in legs:
+            existing = leg.fill
+            if existing is None:
+                continue
+            existing_order_id = str(existing.order_id or "")
+            fill_order_id = str(fill.order_id or "")
+            same_identity = (
+                existing.venue == fill.venue
+                and (
+                    (bool(fill_order_id) and existing_order_id == fill_order_id)
+                    or (
+                        not fill_order_id
+                        and bool(client_order_id)
+                        and leg.client_order_id == client_order_id
+                    )
+                )
+            )
+            if (
+                same_identity
+                and abs(existing.quantity - fill.quantity) <= 1e-12
+                and abs(existing.price - fill.price) <= 1e-12
+                and abs(float(existing.fee_quote or 0.0) - float(fill.fee_quote or 0.0)) <= 1e-12
+                and int(existing.filled_at_ms or 0) == int(fill.filled_at_ms or 0)
+            ):
                 return
         legs.append(
             PersistedCloseExecutionLeg(
@@ -2651,7 +2709,33 @@ class PassiveCloseExecutor:
             client_order_id=hedge_cid,
         )
 
+        hedge_submit_started_at_ms = 0
+        hedge_submit_completed_at_ms = 0
+        hedge_submit_quantity = normalized_delta
+
+        def with_hedge_submit_timing(
+            result: HedgeDeltaResult,
+            *,
+            reconciled: bool = False,
+        ) -> HedgeDeltaResult:
+            nonlocal hedge_submit_completed_at_ms
+            if hedge_submit_started_at_ms > 0:
+                # A submit attempt is not terminal until any required order
+                # reconciliation has returned.  V1 applies its deadline at
+                # this same boundary.
+                hedge_submit_completed_at_ms = self._now_ms()
+            return replace(
+                result,
+                hedge_submit_started_at_ms=hedge_submit_started_at_ms,
+                hedge_submit_completed_at_ms=hedge_submit_completed_at_ms,
+                hedge_submit_quantity=hedge_submit_quantity,
+                hedge_submit_reconciled=reconciled,
+            )
+
         def record_hedge_fill(fill: OrderFill) -> None:
+            nonlocal hedge_submit_completed_at_ms
+            if hedge_submit_started_at_ms > 0:
+                hedge_submit_completed_at_ms = self._now_ms()
             fill_client_order_id = fill.client_order_id or hedge_cid
             previous_qty = pending.hedge_fill.quantity
             new_qty = previous_qty + fill.quantity
@@ -2671,8 +2755,32 @@ class PassiveCloseExecutor:
                 leg_label=hedge_leg_label,
                 fill=fill,
                 client_order_id=fill_client_order_id,
-                submitted_at_ms=self._now_ms(),
+                submitted_at_ms=hedge_submit_started_at_ms or self._now_ms(),
             )
+
+            maker_fill_at_ms = int(pending.maker_fill.last_fill_time_ms or 0)
+            submit_started_at_ms = int(hedge_submit_started_at_ms or 0)
+            submit_completed_at_ms = int(hedge_submit_completed_at_ms or 0)
+            maker_to_submit_ms = 0
+            if (
+                maker_fill_at_ms > 0
+                and submit_started_at_ms > 0
+                and self._deadline_clock_domains_match(maker_fill_at_ms, submit_started_at_ms)
+            ):
+                maker_to_submit_ms = max(submit_started_at_ms - maker_fill_at_ms, 0)
+            submit_elapsed_ms = 0
+            if (
+                submit_started_at_ms > 0
+                and submit_completed_at_ms > 0
+                and self._deadline_clock_domains_match(
+                    submit_started_at_ms,
+                    submit_completed_at_ms,
+                )
+            ):
+                submit_elapsed_ms = max(
+                    submit_completed_at_ms - submit_started_at_ms,
+                    0,
+                )
 
             self._journal.append(
                 "exit.passive_close_hedge_filled",
@@ -2685,6 +2793,11 @@ class PassiveCloseExecutor:
                     "cumulative_hedge": pending.hedge_fill.quantity,
                     "cumulative_maker": pending.maker_fill.quantity,
                     "chunk_index": pending.active_chunk_index,
+                    "maker_fill_at_ms": maker_fill_at_ms,
+                    "hedge_submit_started_at_ms": submit_started_at_ms,
+                    "hedge_submit_completed_at_ms": submit_completed_at_ms,
+                    "maker_fill_to_hedge_submit_ms": maker_to_submit_ms,
+                    "hedge_submit_elapsed_ms": submit_elapsed_ms,
                 },
             )
 
@@ -2843,7 +2956,7 @@ class PassiveCloseExecutor:
                 accepted_client_order_id=accepted_client_order_id,
             )
 
-        self._claim_close_order_intent(
+        hedge_submit_started_at_ms = self._claim_close_order_intent(
             pending,
             position,
             request,
@@ -2945,14 +3058,14 @@ class PassiveCloseExecutor:
                             "classification": duplicate_reconcile.classification,
                         },
                     )
-                    return HedgeDeltaResult(
+                    return with_hedge_submit_timing(HedgeDeltaResult(
                         requested=delta,
                         filled=recon_fill_qty,
                         residual=residual,
                         success=residual < 1e-12,
                         error=None if residual < 1e-12 else "partial_fill",
                         order_id=duplicate_reconcile.order_id,
-                    )
+                    ), reconciled=True)
 
                 if duplicate_reconcile.should_retry_with_new_client_id:
                     retry_quantity = duplicate_reconcile.remaining_qty
@@ -2973,13 +3086,14 @@ class PassiveCloseExecutor:
                         time_in_force=TimeInForce.IOC,
                         client_order_id=retry_cid,
                     )
-                    self._claim_close_order_intent(
+                    hedge_submit_started_at_ms = self._claim_close_order_intent(
                         pending,
                         position,
                         retry_request,
                         leg_label=hedge_leg_label,
                         operation="place_order_duplicate_retry",
                     )
+                    hedge_submit_quantity = retry_quantity
                     try:
                         retry_fill = await adapter.place_order(retry_request)
                     except Exception as retry_error:
@@ -2999,14 +3113,14 @@ class PassiveCloseExecutor:
                                 "error": str(retry_error),
                             },
                         )
-                        return HedgeDeltaResult(
+                        return with_hedge_submit_timing(HedgeDeltaResult(
                             requested=delta,
                             filled=recon_fill_qty,
                             residual=residual,
                             success=False,
                             error="duplicate_client_order_id_retry_failed",
                             order_id=duplicate_reconcile.order_id,
-                        )
+                        ), reconciled=True)
                     if retry_fill.quantity > 0:
                         retry_fill = replace(
                             retry_fill,
@@ -3029,14 +3143,14 @@ class PassiveCloseExecutor:
                             "residual": residual,
                         },
                     )
-                    return HedgeDeltaResult(
+                    return with_hedge_submit_timing(HedgeDeltaResult(
                         requested=delta,
                         filled=total_filled,
                         residual=residual,
                         success=residual < 1e-12,
                         error=None if residual < 1e-12 else "partial_fill",
                         order_id=retry_fill.order_id or duplicate_reconcile.order_id,
-                    )
+                    ), reconciled=True)
 
                 self._journal.append(
                     "exit.passive_close_hedge_duplicate_client_order_pending_reconcile",
@@ -3050,14 +3164,14 @@ class PassiveCloseExecutor:
                         "error": str(e),
                     },
                 )
-                return HedgeDeltaResult(
+                return with_hedge_submit_timing(HedgeDeltaResult(
                     requested=delta,
                     filled=recon_fill_qty,
                     residual=max(delta - recon_fill_qty, 0.0),
                     success=False,
                     error="duplicate_client_order_id_backoff",
                     order_id=duplicate_reconcile.order_id,
-                )
+                ), reconciled=True)
 
             should_reconcile = isinstance(e, OrderSubmitError) or is_bybit_duplicate
             fill_reconciliation_attempted = False
@@ -3185,14 +3299,14 @@ class PassiveCloseExecutor:
                             "original_error": str(e),
                         },
                     )
-                    return HedgeDeltaResult(
+                    return with_hedge_submit_timing(HedgeDeltaResult(
                         requested=delta,
                         filled=fill.quantity,
                         residual=residual,
                         success=success,
                         error=None if success else "partial_fill",
                         order_id=fill.order_id,
-                    )
+                    ), reconciled=True)
 
                 if is_bybit_duplicate:
                     self._journal.append(
@@ -3284,7 +3398,7 @@ class PassiveCloseExecutor:
                     "exit.passive_close_hedge_ack_pending_reconcile",
                     hedge_error_payload,
                 )
-                return HedgeDeltaResult(
+                return with_hedge_submit_timing(HedgeDeltaResult(
                     requested=delta,
                     filled=0.0,
                     residual=delta,
@@ -3293,15 +3407,15 @@ class PassiveCloseExecutor:
                     truth_gap=True,
                     accepted_order_id=accepted_order_id,
                     accepted_client_order_id=accepted_client_order_id,
-                )
+                ), reconciled=True)
             self._journal.append(
                 "exit.passive_close_hedge_error",
                 hedge_error_payload,
             )
-            return HedgeDeltaResult(
+            return with_hedge_submit_timing(HedgeDeltaResult(
                 requested=delta, filled=0.0, residual=delta, success=False,
                 error=str(e),
-            )
+            ))
 
         filled_qty = fill.quantity if fill.quantity > 0 else 0.0
         ack_order_id = str(getattr(fill, "order_id", "") or "")
@@ -3403,14 +3517,14 @@ class PassiveCloseExecutor:
                         "terminal_without_truth": truth_decision.terminal_without_truth,
                     },
                 )
-                return HedgeDeltaResult(
+                return with_hedge_submit_timing(HedgeDeltaResult(
                     requested=delta,
                     filled=fill.quantity,
                     residual=residual,
                     success=success,
                     error=None if success else "partial_fill",
                     order_id=fill.order_id,
-                )
+                ), reconciled=True)
             self._journal.append(
                 "exit.passive_close_hedge_ack_unconfirmed",
                 {
@@ -3455,10 +3569,10 @@ class PassiveCloseExecutor:
                 },
             )
 
-        return HedgeDeltaResult(
+        return with_hedge_submit_timing(HedgeDeltaResult(
             requested=delta, filled=filled_qty, residual=residual,
             success=success, error=None if success else "partial_fill" if filled_qty > 0 else "zero_fill",
-        )
+        ))
 
     # ------------------------------------------------------------------
     # Maintain maker order (hold / amend / cancel-replace)
@@ -4489,10 +4603,13 @@ class PassiveCloseExecutor:
         seen: set[tuple[str, str, str]] = set()
 
         def add_record(target: list[dict[str, Any]], record: dict[str, Any]) -> None:
+            venue = str(record.get("venue") or "")
+            order_id = str(record.get("order_id") or "")
+            client_order_id = str(record.get("client_order_id") or "")
             key = (
-                str(record.get("venue") or ""),
-                str(record.get("order_id") or ""),
-                str(record.get("client_order_id") or ""),
+                venue,
+                order_id,
+                "" if order_id else client_order_id,
             )
             has_identity = bool(key[1] or key[2])
             has_fill = float(record.get("quantity") or 0.0) > 1e-12
@@ -6351,6 +6468,14 @@ class PassiveCloseExecutor:
             pending = state.pending_passive_closes.get(pending.position_id)
             if pending is None:
                 return True
+            if await self._enforce_passive_close_hedge_submit_deadline(
+                state,
+                pending,
+                position,
+                result,
+                source="fallback_unhedged_hedge_submit",
+            ):
+                return False
             if not result.success:
                 if result.truth_gap:
                     return await self._handle_hedge_truth_gap_result(
@@ -6380,17 +6505,6 @@ class PassiveCloseExecutor:
                         },
                     ):
                         return True
-                deadline = self._passive_close_hedge_deadline_decision(
-                    pending, position, self._now_ms(),
-                )
-                if deadline.get("hard_breached"):
-                    return await self._enter_passive_close_hedge_fail_closed(
-                        state,
-                        pending,
-                        position,
-                        deadline,
-                        source="fallback_unhedged_failed",
-                    )
                 pending.next_retry_at_ms = self._now_ms() + 5_000
                 return False
             paired_residual = max(pending.current_chunk_quantity() - pending.maker_fill.quantity, 0.0)

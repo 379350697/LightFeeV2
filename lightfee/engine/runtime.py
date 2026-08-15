@@ -92,6 +92,7 @@ from lightfee.engine.pending_entry_lifecycle import (
     candidate_for_terminal_taker_fallback,
     decide_terminal_taker_fallback,
     ensure_pending_entry_phase_state,
+    has_pending_entry_zero_fill_retry,
     note_pending_entry_passive_cycle_accepted,
     note_pending_entry_remainder_repost_accepted,
     note_passive_operation,
@@ -6766,6 +6767,22 @@ class LiveRuntime:
         if self.state.open_positions.get(pos_id) is not None:
             return False  # still active, don't abandon
 
+        metadata = pending.metadata if isinstance(pending.metadata, dict) else {}
+        if has_pending_entry_zero_fill_retry(pending):
+            self.journal.append(
+                "reconciliation.entry_abandon_retained_zero_fill_retry",
+                {
+                    "entry_id": entry_id,
+                    "symbol": pending.symbol,
+                    "retry_at_ms": int(
+                        metadata.get("passive_zero_fill_retry_at_ms")
+                        or pending.next_progress_poll_ms
+                        or 0
+                    ),
+                },
+            )
+            return False
+
         # Probe both venues for live position size
         try:
             from lightfee.core.domain import Venue as VenueEnum
@@ -7626,6 +7643,9 @@ class LiveRuntime:
 
         resolved_ids: list[str] = []
         for entry_id, pending in list(self.state.pending_entries.items()):
+            if has_pending_entry_zero_fill_retry(pending):
+                continue
+
             if getattr(pending, "outcome", "") == "rejected" and pending.has_any_fill():
                 if await self._maybe_finalize_rejected_pending_with_fill(
                     pending,
@@ -7913,6 +7933,9 @@ class LiveRuntime:
         force_terminal_after_ms = strategy.pending_entry_force_terminal_after_ms
 
         for entry_id, pending in list(self.state.pending_entries.items()):
+            if has_pending_entry_zero_fill_retry(pending):
+                continue
+
             if await self._maybe_finalize_rejected_pending_with_fill(
                 pending,
                 entry_id,

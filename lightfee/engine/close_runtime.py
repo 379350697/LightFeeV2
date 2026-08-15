@@ -105,7 +105,9 @@ class CloseRuntime:
     def _close_reconciliation_leg_identity(leg: Any) -> tuple[str, str]:
         if not isinstance(leg, dict):
             return "", ""
-        return str(leg.get("order_id") or ""), str(leg.get("client_order_id") or "")
+        order_id = str(leg.get("order_id") or "")
+        client_order_id = str(leg.get("client_order_id") or "")
+        return order_id, "" if order_id else client_order_id
     @classmethod
     def _has_close_reconciliation_leg_identity(cls, legs: Any) -> bool:
         if not isinstance(legs, list):
@@ -151,10 +153,15 @@ class CloseRuntime:
             return None
 
         fills: list[Any] = []
+        seen: set[tuple[str, str]] = set()
         for leg in legs:
             order_id, client_order_id = self._close_reconciliation_leg_identity(leg)
             if not order_id and not client_order_id:
                 return None
+            identity = (order_id, client_order_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
             fill = await fetch(symbol, order_id, client_order_id)
             self._flush_adapter_order_diagnostics(adapter)
             if fill is None:
@@ -614,12 +621,14 @@ class CloseRuntime:
         quantity = CloseRuntime._close_reconciliation_fill_qty(fill)
         price = _recon_fill_price(fill)
         venue = getattr(getattr(fill, "venue", ""), "value", getattr(fill, "venue", ""))
+        order_id = str(getattr(fill, "order_id", "") or "")
+        client_order_id = str(getattr(fill, "client_order_id", None) or "")
         return (
             str(position_id or ""),
             str(leg or ""),
             str(venue or "").lower(),
-            str(getattr(fill, "order_id", "") or ""),
-            str(getattr(fill, "client_order_id", None) or ""),
+            order_id,
+            "" if order_id else client_order_id,
             f"{quantity:.12g}",
             f"{price:.12g}",
             str(int(getattr(fill, "filled_at_ms", 0) or 0)),
@@ -978,7 +987,12 @@ class CloseRuntime:
                     any_unavailable = True
                     continue
                 venue_key = venue.value if isinstance(venue, Venue) else str(venue)
-                identity = (order_id, client_order_id, venue_key)
+                client_order_id = "" if order_id else client_order_id
+                identity = (
+                    order_id,
+                    client_order_id,
+                    venue_key,
+                )
                 if identity in probed:
                     continue
                 probed.add(identity)

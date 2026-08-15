@@ -4084,7 +4084,7 @@ class VenueTransport(MarketDataClient):
                     )
                 request = replace(request, quantity=wire_qty, price=limit_px)
             else:
-                if spec.venue_id == Venue.ASTER:
+                if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
                     request, preflight, symbol_rule = await self.prepare_order_request(
                         request,
                         require_exchange_rules=self.mode == "live",

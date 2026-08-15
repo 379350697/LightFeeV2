@@ -64,6 +64,13 @@ deadline. Once the deadline is hard-breached, V2 must stop passive retry
 backoff, enter fail-closed, compensate any unhedged gap when possible, and
 probe live flat truth before clearing local state.
 
+The exit-hedge deadline covers one concrete hedge submission: from immediately
+before its order request to that attempt's returned result or reconciliation.
+Its completion timestamp is captured only after that reconciliation ends; a
+full reconciled fill does not bypass the deadline decision.
+Maker-fill-to-submit delay is separately recorded evidence; it is not a reason
+to fail-close before an order request has actually been made.
+
 The pending-close reconciliation queue is part of the terminal-flat contract.
 It must be normalized before passive-close cleanup emits terminal lifecycle or
 drift-correction events. A cleanup path must not journal terminal-flat evidence
@@ -158,6 +165,7 @@ one-sided close exposure.
 | 2026-08-12 | Bitget successful null pending-order response | deployed; target cloud verified | CLUSDT recovery showed Classic `code=00000` plus `data.entrustedList=null`; the shared raw-truth parser accepts only that exact successful nullable collection as empty and keeps business errors/missing codes fail-closed. Cloud `c48f59a` consumed the owner through normal live-flat recovery; missing accounting identity remains a visible evidence debt. |
 | 2026-08-12 | Unattributed recovered pair accounting | local fix; deploy blocked by concurrent V1 | A `live-recovered:*` pair with no V2 order identity is an external recovery observation, not a V2 PnL owner. The strict reclassification audit clears only that old debt; any `entry-*`, V2-identified, or malformed owner remains fail-closed. |
 | 2026-08-14 | Binance post-only rejection + Bybit private terminal-zero drift | local root fix; deploy pending | Restored V1 bounded Local-L2 requote and Bybit realtime/private/execution merge, including `PendingCancel`/`Deactivated` terminal mapping. RED/GREEN production-path regression plus full touched suites: `620 passed`; no production mutation in this repair step. |
+| 2026-08-15 | Hedge deadline scope and duplicate close execution identity | local green; deploy pending | Restored V1's submit-duration deadline, records maker-to-submit separately, and makes exchange order ID authoritative over a missing CID across persistence and reconciliation. |
 
 ## Recurrences
 
@@ -174,6 +182,7 @@ one-sided close exposure.
 | 2026-06-08 | ACK-only timeout/order-truth evidence for production issue 10 | `89e2b93` / `74475c5` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
 | 2026-08-12 | `CLUSDT` OKX/Bitget | `c48f59a` | target closed: both venues flat/no-open-orders and normal recovery cleared local open/passive state; accounting evidence debt retained | [daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth](../daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth) |
+| 2026-08-15 | passive close / reconciliation | working tree | local green; deploy and read-only live verification pending | [daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts](../daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts) |
 
 ## Regression Harness
 
@@ -187,6 +196,7 @@ one-sided close exposure.
 - `tests/test_exit_decisions.py::TestPassiveCloseFallbackDue`
 - `tests/test_runtime_entry_flow.py::TestPlannerDispatchIntegration::test_pending_passive_close_overdue_arms_dual_taker_despite_future_retry`
 - `tests/test_passive_close.py::TestPassiveCloseMakerLegLiveTruthPrecheck`
+- `tests/test_passive_close.py -k "hedge_submit_over_deadline or delayed_hedge_dispatch or slow_hedge_reconciliation"`
 - `tests/live_harness/test_opgusdt_passive_close_stuck_incident.py`
 - `tests/live_harness/test_20260529_jct_parti_regressions.py`
 - `tests/live_harness/test_historical_passive_close_incidents.py`

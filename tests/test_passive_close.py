@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -6115,8 +6116,8 @@ class TestNonTerminalPartialFillHedgeGapClosure:
     through drive_pending_passive_close.
     """
 
-    def test_unhedged_gap_past_v1_hedge_deadline_enters_fail_closed(self):
-        """V1: passive close hedge hard breach enters fail-closed and compensates."""
+    def test_delayed_hedge_dispatch_does_not_consume_v1_submit_deadline(self):
+        """V1 starts the hedge deadline at submit, not at maker-fill observation."""
         from lightfee.engine.close_executor import CloseExecutor
         from lightfee.risk.modes import GlobalRiskMode
 
@@ -6125,7 +6126,13 @@ class TestNonTerminalPartialFillHedgeGapClosure:
         maker_adapter.query_passive_order_progress = AsyncMock(return_value=None)
         hedge_adapter = _mock_adapter_with_tick(Venue.OKX)
         hedge_adapter.place_order = AsyncMock(
-            side_effect=AssertionError("hard-breached hedge gap must not submit another hedge")
+            return_value=_make_order_fill(
+                venue=Venue.OKX,
+                side=Side.BUY,
+                quantity=0.3,
+                price=50000.0,
+                order_id="hedge-after-delayed-dispatch",
+            )
         )
 
         close_executor = MagicMock(spec=CloseExecutor)
@@ -6177,13 +6184,197 @@ class TestNonTerminalPartialFillHedgeGapClosure:
         )
 
         assert result is False
-        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
-        assert pending.next_retry_at_ms == 0
-        hedge_adapter.place_order.assert_not_called()
-        close_executor.compensate_failed_full_close.assert_awaited_once()
+        assert state.risk_mode != GlobalRiskMode.FAIL_CLOSED
+        hedge_adapter.place_order.assert_awaited_once()
+        close_executor.compensate_failed_full_close.assert_not_awaited()
         kinds = [record["kind"] for record in journal.read_all()]
-        assert "execution.hedge_deadline_breached" in kinds
-        assert "exit.passive_close_hedge_incomplete" not in kinds
+        assert "execution.hedge_deadline_breached" not in kinds
+
+    def test_hedge_submit_over_deadline_enters_fail_closed_after_submit(self):
+        """The same V1 deadline still fail-closes a genuinely slow hedge submit."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.risk.modes import GlobalRiskMode
+
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=None)
+        hedge_adapter = _mock_adapter_with_tick(Venue.OKX)
+        clock = [1_801]
+
+        async def slow_zero_fill(_request):
+            clock[0] = 2_702
+            return _make_order_fill(
+                venue=Venue.OKX,
+                side=Side.BUY,
+                quantity=0.0,
+                price=50000.0,
+                order_id="slow-zero-fill",
+            )
+
+        hedge_adapter.place_order = AsyncMock(side_effect=slow_zero_fill)
+        close_executor = MagicMock(spec=CloseExecutor)
+        close_executor.compensate_failed_full_close = AsyncMock()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"maker_hedge_deadline_ms": 800},
+        )
+        executor.set_close_executor(close_executor)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor._now_ms = lambda: clock[0]
+
+        state = EngineState()
+        position = _make_position(
+            matched_quantity=1.0,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=50000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=0.4,
+                average_price=50000.0,
+                last_fill_time_ms=1_000,
+            ),
+            hedge_fill=PendingPassiveLegFill(quantity=0.1, average_price=50000.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is False
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        hedge_adapter.place_order.assert_awaited_once()
+        close_executor.compensate_failed_full_close.assert_awaited_once()
+        assert any(
+            record["kind"] == "execution.hedge_deadline_breached"
+            and record["payload"]["hedge_elapsed_ms"] == 901
+            for record in journal.read_all()
+        )
+
+    @pytest.mark.parametrize(
+        ("reconciled_quantity", "order_id"),
+        [(0.3, "reconciled-full-hedge"), (0.1, "reconciled-partial-hedge")],
+    )
+    def test_slow_hedge_reconciliation_consumes_v1_submit_deadline(
+        self,
+        reconciled_quantity,
+        order_id,
+    ):
+        """V1 counts a submit-error reconciliation in the same hedge attempt."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.risk.modes import GlobalRiskMode
+
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_passive_ok(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=None)
+        hedge_adapter = _mock_adapter_with_tick(Venue.OKX)
+        clock = [1_801]
+        hedge_adapter.place_order = AsyncMock(side_effect=OrderSubmitError(
+            SubmitFailureClass.UNCERTAIN,
+            "submit timed out after exchange acceptance",
+        ))
+
+        async def slow_reconciliation(*_args):
+            clock[0] = 2_702
+            return OrderFillReconciliation(
+                venue=Venue.OKX,
+                symbol="BTCUSDT",
+                side=Side.BUY,
+                quantity=reconciled_quantity,
+                average_price=50000.0,
+                order_id=order_id,
+                metadata={
+                    "evidence_source": "okx_fills_history",
+                    "queried_endpoints": ["/api/v5/trade/fills-history"],
+                    "response_classification": "filled",
+                },
+            )
+
+        hedge_adapter.fetch_order_fill_reconciliation = AsyncMock(
+            side_effect=slow_reconciliation,
+        )
+        close_executor = MagicMock(spec=CloseExecutor)
+        close_executor.compensate_failed_full_close = AsyncMock()
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+            config_overrides={"maker_hedge_deadline_ms": 800},
+        )
+        executor.set_close_executor(close_executor)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
+        executor._now_ms = lambda: clock[0]
+
+        state = EngineState()
+        position = _make_position(
+            matched_quantity=1.0,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            active_chunk_index=0,
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                maker_order_id="oid-maker",
+                maker_client_order_id="cid-maker",
+                maker_resting_limit_price=50000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=0.4,
+                average_price=50000.0,
+                last_fill_time_ms=1_000,
+            ),
+            hedge_fill=PendingPassiveLegFill(quantity=0.1, average_price=50000.0),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(
+            executor.drive_pending_passive_close(state, position.position_id, wait_until_terminal=False)
+        )
+
+        assert result is False
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        hedge_adapter.place_order.assert_awaited_once()
+        hedge_adapter.fetch_order_fill_reconciliation.assert_awaited_once()
+        close_executor.compensate_failed_full_close.assert_awaited_once()
+        assert any(
+            record["kind"] == "execution.hedge_deadline_breached"
+            and record["payload"]["hedge_elapsed_ms"] == 901
+            and record["payload"]["hedge_notional_quote"] == pytest.approx(15_000.0)
+            and record["payload"]["reconciled"] is True
+            for record in journal.read_all()
+        )
+        assert any(
+            record["kind"] == "exit.passive_close_hedge_filled"
+            and record["payload"]["hedge_submit_elapsed_ms"] == 901
+            for record in journal.read_all()
+        )
 
     def test_partial_fill_hedge_gap_repeated_until_closed(self):
         """First drive: maker=0.004, hedge gets 0.002 → gap 0.002 remains.
@@ -8246,3 +8437,50 @@ class TestCloseOrderIntentDurability:
             "confirmed-intent-cid",
             "unresolved-intent-cid",
         ]
+
+    def test_close_reconciliation_records_prefer_order_id_over_missing_cid(self):
+        """One exchange order must remain one lookup target when a replay drops CID."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        position = _make_position(position_id="entry-close-order-id-dedupe")
+        fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol=position.symbol,
+            side=Side.SELL,
+            quantity=position.matched_quantity,
+            price=50_000.0,
+            order_id="binance-close-order",
+            client_order_id="close-cid",
+            filled_at_ms=1_000,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(active_maker_leg=ActiveMakerLeg.LONG),
+            long_legs=[
+                PersistedCloseExecutionLeg(fill=fill, client_order_id="close-cid"),
+                PersistedCloseExecutionLeg(
+                    fill=replace(fill, client_order_id=None),
+                    client_order_id="",
+                ),
+            ],
+        )
+
+        long_records, short_records = executor._pending_close_reconciliation_records(
+            pending,
+            position,
+            extra=None,
+        )
+
+        assert short_records == []
+        assert long_records == [{
+            "venue": Venue.BINANCE.value,
+            "order_id": "binance-close-order",
+            "client_order_id": "close-cid",
+            "quantity": position.matched_quantity,
+            "average_price": 50_000.0,
+            "fee_quote": 0.0,
+        }]

@@ -953,7 +953,7 @@ def _reconciliation_identity_keys(item: Any) -> set[tuple[str, str]]:
             order_id = str(leg.get("order_id") or "")
             client_order_id = str(leg.get("client_order_id") or "")
             if order_id or client_order_id:
-                keys.add((order_id, client_order_id))
+                keys.add((order_id, "" if order_id else client_order_id))
     return keys
 
 

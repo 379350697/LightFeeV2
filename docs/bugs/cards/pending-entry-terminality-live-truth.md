@@ -101,6 +101,12 @@ is terminal no-fill. A nonterminal maker order with zero fill keeps the pending
 entry unresolved, and a later stale zero reconciliation must not erase a
 previously confirmed positive fill.
 
+After a terminal zero-fill cycle schedules a repost, that marker makes passive
+maintenance the sole lifecycle owner until it reposts or makes its own terminal
+decision. Normal reconciliation, startup force recovery, and stale abandonment
+must retain the pending entry; a delayed/failed repost remains owned work rather
+than becoming synthetic flat truth.
+
 A rejected/retained pending entry with positive fill evidence must not remain
 as a local false-flat loop. Startup/runtime recovery must either hydrate and
 finalize the live quantity into managed state, create deterministic residual or
@@ -295,6 +301,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-06-08 | production issues 8-9 live mismatch post-cleanup truth | `89e2b93` | deployed/cloud verified | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-06-10 | `SUSHIUSDT`, `MEUSDT` Bybit terminal no-fill maker open orders | `66a3688` | fixed, deployed, cloud verified | [daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention](../daily/2026-06-10.md#cluster-cl-064-pending-entry-terminal-no-fill-maker-open-order-owner-retention) |
 | 2026-06-10 | Hyperliquid configured account 18 nonzero positions hidden by signer-address flat probe | working tree | fixed locally, deploy pending | [daily/2026-06-10.md#cluster-cl-065-hyperliquid-exchange-truth-account-identity-false-green](../daily/2026-06-10.md#cluster-cl-065-hyperliquid-exchange-truth-account-identity-false-green) |
+| 2026-08-15 | Zero-fill repost owner raced by same-tick reconciliation/startup recovery | local green; deploy pending | One shared retry predicate retains the owner in all three alternate removal paths until maintenance reposts or terminalizes it. |
 
 ## Regression Harness
 
@@ -309,6 +316,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 - `tests/engine/test_recovery_decision_core.py`
 - `tests/test_live_startup_preflight.py`
 - `tests/live_harness/test_exchange_truth_recovery_ledger_incidents.py`
+- `tests/live_harness/test_passive_maker_zero_fill_incident.py::test_zero_fill_retry_survives_same_tick_housekeeping_then_reposts`
 - `tests/live_harness`
 - `scripts/diagnose_live.py --venues ...`
 

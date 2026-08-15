@@ -16,6 +16,7 @@ from lightfee.core.domain import (
 )
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.entry_sync import EntrySyncExecutor
+from lightfee.engine.reconciliation import PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
 from lightfee.engine.state import (
     PendingEntry,
@@ -413,6 +414,59 @@ async def test_recovered_terminal_zero_fill_pending_reposts_without_stalling(tmp
     assert pending.passive_attempt_count == 1
     assert pending.phase_state is not None
     assert pending.phase_state.zero_fill_cycles_in_phase == 1
+
+
+@pytest.mark.asyncio
+async def test_zero_fill_retry_survives_same_tick_housekeeping_then_reposts(tmp_path):
+    """Maintenance schedules V1 retry before housekeeping's stale-entry probe."""
+    config = make_test_config(str(tmp_path))
+    config.strategy.maker_entry_progress_poll_ms = 100
+    config.strategy.maker_venue_budget_window_ms = 100
+    config.strategy.maker_entry_rest_timeout_ms = 6000
+    config.strategy.maker_entry_max_reposts = 2
+    config.strategy.maker_cycle_retry_delays_ms = [500, 1000, 1000]
+    config.symbols = ["RIVERUSDT"]
+
+    okx = _ZeroFillMakerAdapter(Venue.OKX, PassiveOrderState.CANCELED)
+    bybit = _ZeroFillMakerAdapter(Venue.BYBIT, PassiveOrderState.CANCELED)
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
+
+    class FlatReconciler:
+        async def reconcile_position(self, **_kwargs):
+            return PositionReconciliationResult(
+                position_id=pending.pending_id,
+                symbol=pending.symbol,
+                long_status="uncertain",
+                short_status="uncertain",
+                is_flat=True,
+            )
+
+    _install_passive_repost_quote(runtime)
+    await runtime.start()
+    _install_current_final_l2_books(runtime)
+    pending = _pending_from_fixture()
+    pending.reconcile_attempt = 1
+    pending.passive_order.cancel_requested_at_ms = pending.passive_order.accepted_at_ms + 1500
+    pending.passive_order.last_progress_state = PassiveOrderState.CANCELED
+    same_tick_now_ms = (
+        pending.passive_order.cancel_requested_at_ms
+        + config.strategy.maker_venue_budget_window_ms
+    )
+    retry_at_ms = same_tick_now_ms + 500
+    pending.next_progress_poll_ms = retry_at_ms
+    pending.metadata["passive_zero_fill_retry_pending"] = True
+    pending.metadata["passive_zero_fill_retry_at_ms"] = retry_at_ms
+    runtime.state.pending_entries[pending.pending_id] = pending
+    runtime.reconciler = FlatReconciler()
+
+    await runtime._post_tick_housekeeping(same_tick_now_ms)
+
+    assert pending.pending_id in runtime.state.pending_entries
+
+    await runtime._maintain_pending_entry_passive_orders(retry_at_ms)
+
+    assert okx.submit_passive_order_calls
+    assert pending.pending_id in runtime.state.pending_entries
 
 
 @pytest.mark.asyncio

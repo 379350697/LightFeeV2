@@ -17,6 +17,19 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-109 passive-close/entry boundary contracts, 2026-08-15: V2 started the
+passive-close hedge deadline at maker fill instead of a real hedge submit,
+duplicated a close execution when an order-ID observation lacked its CID,
+allowed same-tick/startup paths to erase a scheduled zero-fill repost, and used
+Binance's static fallback tick before live IOC submission. The local repair
+restores the V1 submit-duration boundary, makes order ID authoritative with CID
+fallback only, makes passive maintenance own marked retries, and reuses the
+existing Binance dynamic-rule preflight. Local regression/harness/static gates
+are green; deployment and read-only live verification are still required. The
+observed 1.7 s dispatch delay and Local-L2 rebuilds remain separately
+instrumented/unresolved. See
+[daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts](daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts).
+
 CL-108 Aster V3 position-mode, market-result, and Hedge-position-truth
 contract, 2026-08-15: V3 private orders bypassed the V1-compatible mode cache
 left in the legacy transport, so Hedge accounts could omit mandatory
