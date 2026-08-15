@@ -164,7 +164,7 @@ class TestBinanceL2WsClientParsing:
 
 class TestLocalL2WsFreshnessEvidence:
     @pytest.mark.asyncio
-    async def test_subscription_confirmation_refreshes_hot_book_without_depth_change(self):
+    async def test_bybit_subscription_confirmation_does_not_refresh_hot_book(self):
         dp, rt, journal = _make_data_plane()
         try:
             book = rt.ensure_book("bybit", "BTCUSDT")
@@ -178,7 +178,7 @@ class TestLocalL2WsFreshnessEvidence:
 
             await client._handle_message('{"op":"subscribe","success":true,"ret_msg":"subscribe"}')
 
-            assert book.observed_at_ms > 1_000
+            assert book.observed_at_ms == 1_000
             records = journal.read_all()
             confirmed = [
                 record for record in records
@@ -219,7 +219,7 @@ class TestLocalL2WsFreshnessEvidence:
             journal.close()
 
     @pytest.mark.asyncio
-    async def test_keepalive_refreshes_hot_book_without_depth_change(self):
+    async def test_bybit_keepalive_does_not_refresh_hot_book(self):
         dp, rt, journal = _make_data_plane()
         try:
             book = rt.ensure_book("bybit", "ETHUSDT")
@@ -231,7 +231,53 @@ class TestLocalL2WsFreshnessEvidence:
 
             await client._handle_message('{"op":"pong"}')
 
-            assert book.observed_at_ms > 1_000
+            assert book.observed_at_ms == 1_000
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_bybit_sequence_gap_requests_existing_client_reconnect(self):
+        """A real Bybit delta continuity fault must close this symbol's WS session."""
+        dp, rt, journal = _make_data_plane()
+
+        class CloseableWs:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+
+        try:
+            book = rt.ensure_book("bybit", "BTCUSDT")
+            book.status = L2BookStatus.HOT
+            book.sequence = 100
+            book.last_update_id = 100
+            book.observed_at_ms = 1_000
+            book.bids = [PriceLevel(100.0, 1.0)]
+            book.asks = [PriceLevel(101.0, 1.0)]
+            ws = CloseableWs()
+            client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+            client._state = "connected"
+            client._ws = ws
+            dp.start_worker(LocalL2BookKey("bybit", "BTCUSDT"), client)
+
+            await client._handle_message(json.dumps({
+                "topic": "orderbook.50.BTCUSDT",
+                "type": "delta",
+                "data": {
+                    "s": "BTCUSDT", "b": [], "a": [], "u": 105, "pu": 103,
+                },
+            }))
+            await asyncio.sleep(0)
+
+            assert book.status == L2BookStatus.REBUILDING
+            assert ws.close_calls == 1
+            records = journal.read_all()
+            assert any(
+                record["kind"] == "runtime.local_l2_ws_transport"
+                and record["payload"]["event"] == "reconnect_requested"
+                for record in records
+            )
         finally:
             journal.close()
 
@@ -328,6 +374,58 @@ class TestLocalL2WsFreshnessEvidence:
             journal.close()
 
     @pytest.mark.asyncio
+    async def test_bybit_connection_uses_json_application_heartbeat(self, monkeypatch):
+        """Bybit V5 requires its JSON ping; RFC control pings are disabled there."""
+        dp, _rt, journal = _make_data_plane()
+        received_ping = asyncio.Event()
+        release_read_loop = asyncio.Event()
+        sent_messages = []
+        connect_kwargs = {}
+
+        class HoldingConnect:
+            close_code = None
+            close_reason = ""
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def send(self, raw):
+                message = json.loads(raw)
+                sent_messages.append(message)
+                if message == {"op": "ping"}:
+                    received_ping.set()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await release_read_loop.wait()
+                raise StopAsyncIteration
+
+        def connect(*args, **kwargs):
+            connect_kwargs.update(kwargs)
+            return HoldingConnect()
+
+        client = BybitL2WsClient(venue="bybit", symbol="BTCUSDT", data_plane=dp)
+        client.ping_interval_s = 0.01
+        dp.start_worker(LocalL2BookKey("bybit", "BTCUSDT"), client)
+        monkeypatch.setattr(local_l2_ws_module.websockets, "connect", connect)
+        try:
+            await client.start()
+            await asyncio.wait_for(received_ping.wait(), timeout=1)
+
+            assert connect_kwargs["ping_interval"] is None
+            assert {"op": "subscribe", "args": ["orderbook.50.BTCUSDT"]} in sent_messages
+            assert {"op": "ping"} in sent_messages
+        finally:
+            release_read_loop.set()
+            await client.stop()
+            journal.close()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("client_type", "venue"),
         [(BinanceL2WsClient, "binance"), (AsterL2WsClient, "aster")],
@@ -394,7 +492,7 @@ class TestLocalL2WsFreshnessEvidence:
             records = journal.read_all()
             stale = next(
                 record["payload"] for record in records
-                if record["kind"] == "runtime.local_l2_hot_stale_rebuild"
+                if record["kind"] == "runtime.local_l2_hot_stale_awaiting_ws_delta"
             )
             stream = stale["ws_stream"]
             assert stream["connected"] is True

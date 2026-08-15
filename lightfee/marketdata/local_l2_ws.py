@@ -234,6 +234,20 @@ class LocalL2WsClient(ABC):
         self._last_raw_pu = int(update.previous_sequence or 0)
         self._last_update_event_time_ms = int(update.event_time_ms or 0)
 
+    def request_reconnect(self, reason: str) -> bool:
+        """Close this symbol's live stream so the existing loop reconnects it."""
+        if not self.is_connected:
+            return False
+        now_ms = int(time.time() * 1000)
+        self._last_disconnect_reason = str(reason or "rebuild_required")
+        self._record_transport_event(
+            "reconnect_requested",
+            now_ms,
+            reason=self._last_disconnect_reason,
+        )
+        asyncio.create_task(self._close_ws())
+        return True
+
     # ------------------------------------------------------------------
     # Subclass hooks
     # ------------------------------------------------------------------
@@ -252,6 +266,14 @@ class LocalL2WsClient(ABC):
         """
         ...
 
+    def build_application_heartbeat(self) -> Optional[dict]:
+        """Return an exchange-native heartbeat frame, if RFC control pings are insufficient."""
+        return None
+
+    def control_message_confirms_book(self) -> bool:
+        """Whether subscription/pong control frames may refresh quote age."""
+        return True
+
     @abstractmethod
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:
         """Parse a raw WS message into a LocalL2Update, or None if not a depth update."""
@@ -269,7 +291,8 @@ class LocalL2WsClient(ABC):
                 if self._state != WsClientState.CLOSED:
                     now_ms = int(time.time() * 1000)
                     self._last_disconnected_ms = now_ms
-                    self._last_disconnect_reason = "read_loop_ended"
+                    if not self._last_disconnect_reason:
+                        self._last_disconnect_reason = "read_loop_ended"
                     self._record_transport_event(
                         "read_loop_ended",
                         now_ms,
@@ -313,6 +336,7 @@ class LocalL2WsClient(ABC):
         V1: reset_binance_local_l2_bootstrap_stream_state_for_instance in on_connect closure.
         """
         url = self.websocket_url()
+        application_heartbeat = self.build_application_heartbeat()
         self._state = WsClientState.CONNECTING
         self._connect_attempt_count += 1
         self._record_transport_event(
@@ -323,7 +347,7 @@ class LocalL2WsClient(ABC):
 
         async with websockets.connect(
             url,
-            ping_interval=self.ping_interval_s,
+            ping_interval=None if application_heartbeat is not None else self.ping_interval_s,
             open_timeout=self.OPEN_TIMEOUT_SECONDS,
             close_timeout=5,
             max_size=2**20,  # 1MB
@@ -331,6 +355,7 @@ class LocalL2WsClient(ABC):
             self._ws = ws
             self._state = WsClientState.CONNECTED
             self._reconnect_delay_s = 0  # reset on successful connect
+            self._last_disconnect_reason = ""
             self._last_connected_ms = int(time.time() * 1000)
 
             # Subscribe to depth channel (skip if venue auto-subscribes)
@@ -350,9 +375,21 @@ class LocalL2WsClient(ABC):
                 int(time.time() * 1000),
             )
 
-            # Read loop
-            async for raw_msg in ws:
-                await self._handle_message(raw_msg)
+            heartbeat_task: asyncio.Task | None = None
+            if application_heartbeat is not None:
+                heartbeat_task = asyncio.create_task(
+                    self._send_application_heartbeats(ws, application_heartbeat),
+                )
+            try:
+                async for raw_msg in ws:
+                    await self._handle_message(raw_msg)
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
 
     async def _handle_message(self, raw_msg: str | bytes) -> None:
         """Parse a single WS message and ingest into the data plane."""
@@ -388,13 +425,19 @@ class LocalL2WsClient(ABC):
             return
         if self._is_subscription_confirmation(payload):
             self.data_plane.note_ws_subscription_confirmed(
-                self.venue, self.symbol, now_ms=now_ms,
+                self.venue,
+                self.symbol,
+                now_ms=now_ms,
+                refresh_book=self.control_message_confirms_book(),
             )
             self._record_transport_event("subscription_confirmed", now_ms)
             return
         if self._is_keepalive_message(payload):
             self.data_plane.note_ws_keepalive(
-                self.venue, self.symbol, now_ms=now_ms,
+                self.venue,
+                self.symbol,
+                now_ms=now_ms,
+                refresh_book=self.control_message_confirms_book(),
             )
             return
 
@@ -435,6 +478,25 @@ class LocalL2WsClient(ABC):
         if channel in {"subscriptionresponse", "subscription_response"}:
             return True
         return False
+
+    async def _send_application_heartbeats(self, ws: Any, message: dict) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.ping_interval_s)
+                await ws.send(json.dumps(message))
+                self._record_transport_event(
+                    "application_ping_sent",
+                    int(time.time() * 1000),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            error_text = self._record_error(error)
+            self._record_transport_event(
+                "application_ping_error",
+                int(time.time() * 1000),
+                error=error_text,
+            )
 
     @staticmethod
     def _is_subscription_failure(payload: dict) -> bool:
@@ -604,6 +666,14 @@ class BybitL2WsClient(LocalL2WsClient):
             "op": "subscribe",
             "args": [f"orderbook.50.{self.symbol}"],
         }
+
+    def build_application_heartbeat(self) -> Optional[dict]:
+        # Bybit V5 public WS specifies an application JSON ping every 20 seconds.
+        return {"op": "ping"}
+
+    def control_message_confirms_book(self) -> bool:
+        # Pong/subscribe success proves transport liveness, not an executable book.
+        return False
 
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:
         topic = raw.get("topic", "")

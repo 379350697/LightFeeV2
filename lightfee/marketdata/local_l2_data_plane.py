@@ -532,11 +532,14 @@ class LocalL2DataPlane:
         field_name: str,
         event_name: str,
         observed_at_ms: int = 0,
+        *,
+        refresh_book: bool = True,
     ) -> None:
         evidence_ms = int(observed_at_ms or now_ms or time.time() * 1000)
         state = self._freshness_state(venue, symbol)
         setattr(state, field_name, max(int(getattr(state, field_name, 0) or 0), evidence_ms))
-        self._mark_book_fresh_from_evidence(venue, symbol, evidence_ms)
+        if refresh_book:
+            self._mark_book_fresh_from_evidence(venue, symbol, evidence_ms)
         self._append_rate_limited_state_event(
             "runtime.local_l2_freshness_state",
             {
@@ -570,9 +573,11 @@ class LocalL2DataPlane:
         *,
         now_ms: int,
         observed_at_ms: int = 0,
+        refresh_book: bool = True,
     ) -> None:
         self._record_freshness_evidence(
             venue, symbol, now_ms, "last_ws_keepalive_ms", "ws_keepalive", observed_at_ms,
+            refresh_book=refresh_book,
         )
 
     def note_ws_book_confirmation(
@@ -593,10 +598,27 @@ class LocalL2DataPlane:
         symbol: str,
         *,
         now_ms: int,
+        refresh_book: bool = True,
     ) -> None:
         self._record_freshness_evidence(
             venue, symbol, now_ms, "last_subscription_confirmed_ms", "subscription_confirmed",
+            refresh_book=refresh_book,
         )
+
+    def _request_ws_snapshot_reconnect(
+        self,
+        update: LocalL2Update,
+        reason: str,
+    ) -> None:
+        """Reconnect only a WS-snapshot-authoritative stream after real bad data."""
+        if policy_for_venue(update.venue).bridge_mode is not BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+            return
+        client = self._ws_clients.get(
+            LocalL2BookKey(venue=update.venue, symbol=update.symbol),
+        )
+        request_reconnect = getattr(client, "request_reconnect", None)
+        if callable(request_reconnect):
+            request_reconnect(reason or "rebuild_required")
 
     def _ws_client_connected(self, key: LocalL2BookKey) -> bool:
         client = self._ws_clients.get(key)
@@ -900,6 +922,11 @@ class LocalL2DataPlane:
                     update.symbol,
                     now_ms=now_ms,
                 )
+            elif result.rebuild_required:
+                self._request_ws_snapshot_reconnect(
+                    update,
+                    result.fault_reason or "rebuild_required",
+                )
             return result.events
 
         if book is not None and book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
@@ -937,6 +964,10 @@ class LocalL2DataPlane:
             # incremental failure before the next rebuild can begin.
             self._initial_snapshot_overlap_sequences.pop(
                 LocalL2BookKey(update.venue, update.symbol), None,
+            )
+            self._request_ws_snapshot_reconnect(
+                update,
+                result.fault_reason or "rebuild_required",
             )
         elif result.applied:
             self._initial_snapshot_overlap_sequences.pop(
@@ -1441,15 +1472,55 @@ class LocalL2DataPlane:
                     )
                 )
                 if stale_after_ms <= 0 or not effective_stale:
-                    self._mark_book_fresh_from_evidence(
-                        key.venue,
-                        key.symbol,
-                        effective_freshness_ms,
-                    )
+                    # Bybit transport control frames prove the session is alive,
+                    # but do not update the executable orderbook.  Preserve their
+                    # liveness evidence without extending this quote's age.
+                    if policy.bridge_mode is not BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+                        self._mark_book_fresh_from_evidence(
+                            key.venue,
+                            key.symbol,
+                            effective_freshness_ms,
+                        )
                     continue
                 reason = self._classify_hot_stale_reason(
                     key, book, now_ms, stale_after_ms, policy,
                 )
+                # Bybit's orderbook.50 sequence is WS-authoritative.  A quote-age
+                # timeout must reject this execution snapshot, not destroy the
+                # sequence anchor and force an incompatible REST recovery.  V1
+                # keeps the book intact until the next valid WS delta/snapshot.
+                if (
+                    policy.bridge_mode is BridgeMode.WS_SNAPSHOT_AUTHORITATIVE
+                    and self._ws_client_connected(key)
+                    and reason != "clock_skew"
+                ):
+                    self._append_rate_limited_state_event(
+                        "runtime.local_l2_hot_stale_awaiting_ws_delta",
+                        {
+                            "venue": key.venue,
+                            "symbol": key.symbol,
+                            "book_status": self._status_value(book.status),
+                            "pool": self._status_value(book.pool),
+                            "age_ms": book.age_ms(now_ms),
+                            "effective_age_ms": (
+                                now_ms - effective_freshness_ms
+                                if effective_freshness_ms > 0 else 0
+                            ),
+                            "observed_at_ms": book.observed_at_ms,
+                            "effective_freshness_ms": effective_freshness_ms,
+                            "stale_after_ms": stale_after_ms,
+                            "last_update_id": book.last_update_id,
+                            "sequence": book.sequence,
+                            "ts_ms": now_ms,
+                            "policy_bridge_mode": policy.bridge_mode.value,
+                            "reason": reason,
+                            "semantic_action": "preserve_ws_sequence_anchor",
+                            "ws_stream": self.ws_stream_state(key.venue, key.symbol),
+                        },
+                        now_ms,
+                        reason=reason,
+                    )
+                    continue
                 status_before = book.status.value if hasattr(book.status, "value") else str(book.status)
                 pool_before = book.pool.value if hasattr(book.pool, "value") else str(book.pool)
                 book.fault_reason = f"stale_hot_book:{reason}"

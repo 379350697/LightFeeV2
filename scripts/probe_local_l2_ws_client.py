@@ -42,6 +42,7 @@ def _rebuild_events(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "runtime.local_l2_sequence_gap_rebuild",
             "runtime.local_l2_buffered_replay_rebuild",
             "runtime.local_l2_hot_stale_rebuild",
+            "runtime.local_l2_hot_stale_awaiting_ws_delta",
         }
     ]
 
