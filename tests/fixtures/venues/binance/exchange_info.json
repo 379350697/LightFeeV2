@@ -1,0 +1,12 @@
+{
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "filters": [
+        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+        {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+        {"filterType": "MIN_NOTIONAL", "notional": "5"}
+      ]
+    }
+  ]
+}

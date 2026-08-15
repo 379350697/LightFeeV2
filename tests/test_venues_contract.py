@@ -30,6 +30,7 @@ from lightfee.venues.bitget import BitgetAdapter
 from lightfee.venues.gate import GateAdapter
 from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.hyperliquid import HyperliquidAdapter
+from lightfee.venues.symbol_rules import get_symbol_rules_cache
 from lightfee.venues.transport import LiveCredential, TransportError, TransportErrorCategory
 
 ADAPTERS = [
@@ -350,6 +351,17 @@ class TestFixtureDrivenOrderSuccess:
     ):
         fixture = _load_fixture(fixture_name, "place_order_success")
         mock = _build_mock_transport(fixture)
+        if venue_id == Venue.BINANCE:
+            exchange_info = _load_fixture("binance", "exchange_info")
+            get_symbol_rules_cache().clear()
+
+            def binance_handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path == "/fapi/v1/exchangeInfo":
+                    assert request.url.params["symbol"] == symbol
+                    return httpx.Response(200, json=exchange_info)
+                return httpx.Response(200, json=fixture)
+
+            mock = httpx.MockTransport(binance_handler)
         if venue_id == Venue.ASTER:
             def aster_handler(request: httpx.Request) -> httpx.Response:
                 admission = _aster_opening_admission_fixture(request.url.path)
@@ -424,6 +436,8 @@ class TestFixtureDrivenOrderSuccess:
             assert fill.quantity > 0.0, f"{fixture_name}: expected filled qty > 0"
         finally:
             await transport.close()
+            if venue_id == Venue.BINANCE:
+                get_symbol_rules_cache().clear()
 
 
 @pytest.mark.parametrize("fixture_name,venue_id,adapter_cls,symbol", VENUE_FIXTURE_TABLE)
@@ -477,10 +491,15 @@ class TestBinanceOrderRequestShape:
     @pytest.mark.asyncio
     async def test_post_order_has_timestamp_and_signature_in_url(self):
         fixture = _load_fixture("binance", "place_order_success")
+        exchange_info = _load_fixture("binance", "exchange_info")
         captured_url = []
+        get_symbol_rules_cache().clear()
 
         def handler(request: httpx.Request) -> httpx.Response:
             captured_url.append(str(request.url))
+            if request.url.path == "/fapi/v1/exchangeInfo":
+                assert request.url.params["symbol"] == "BTCUSDT"
+                return httpx.Response(200, json=exchange_info)
             if request.url.path.endswith("/positionSide/dual"):
                 return httpx.Response(200, json={"dualSidePosition": False})
             return httpx.Response(200, json=fixture)
@@ -496,14 +515,16 @@ class TestBinanceOrderRequestShape:
             req = OrderRequest(venue=Venue.BINANCE, symbol="BTCUSDT",
                               side=Side.BUY, quantity=0.01)
             await adapter.place_order(req)
-            assert len(captured_url) == 2
-            assert "/fapi/v1/positionSide/dual" in captured_url[0]
-            url = captured_url[1]
+            assert len(captured_url) == 3
+            assert "/fapi/v1/exchangeInfo?symbol=BTCUSDT" in captured_url[0]
+            assert "/fapi/v1/positionSide/dual" in captured_url[1]
+            url = captured_url[2]
             assert "/fapi/v1/order" in url
             assert "timestamp=" in url, f"Missing timestamp in URL: {url}"
             assert "signature=" in url, f"Missing signature in URL: {url}"
         finally:
             await transport.close()
+            get_symbol_rules_cache().clear()
 
 
 class TestAsterOrderRequestShape:

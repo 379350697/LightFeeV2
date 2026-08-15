@@ -164,6 +164,294 @@ class TestBinanceL2WsClientParsing:
 
 class TestLocalL2WsFreshnessEvidence:
     @pytest.mark.asyncio
+    async def test_explicit_subscription_confirmation_releases_bridge_snapshot(self):
+        """An explicitly subscribed bridge stream is ready only after its ack."""
+        dp, _rt, journal = _make_data_plane()
+        client = OkxL2WsClient(
+            venue="okx",
+            symbol="BTCUSDT",
+            venue_symbol="BTC-USDT-SWAP",
+            data_plane=dp,
+        )
+        client._state = "connected"
+        client._ws = object()
+        dp.start_worker(LocalL2BookKey("okx", "BTCUSDT"), client)
+        try:
+            ready = asyncio.create_task(dp.wait_for_ws_stream_ready("okx", "BTCUSDT"))
+            await asyncio.sleep(0)
+            assert not ready.done()
+
+            await client._handle_message('{"event":"subscribe"}')
+
+            assert await asyncio.wait_for(ready, timeout=1) == 1
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_bridge_snapshot_drops_result_when_ws_generation_changes(self):
+        """A REST response cannot cross a reconnect that cleared its delta buffer."""
+        dp, rt, journal = _make_data_plane()
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+
+        class ConnectedClient:
+            is_connected = True
+
+        class BlockingSnapshotAdapter:
+            calls = 0
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                self.calls += 1
+                snapshot_started.set()
+                await release_snapshot.wait()
+                return LocalL2Update(
+                    venue="binance",
+                    symbol=symbol,
+                    bids=[PriceLevel(100.0, 1.0)],
+                    asks=[PriceLevel(101.0, 1.0)],
+                    sequence=100,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        adapter = BlockingSnapshotAdapter()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        dp._ws_clients[LocalL2BookKey("binance", "BTCUSDT")] = ConnectedClient()
+        dp.note_ws_stream_ready("binance", "BTCUSDT")
+        generation = await dp.wait_for_ws_stream_ready("binance", "BTCUSDT")
+        try:
+            bootstrap = asyncio.create_task(dp.bootstrap_book(
+                "binance", "BTCUSDT", adapter,
+                now_ms=1_000,
+                required_ws_generation=generation,
+            ))
+            await asyncio.wait_for(snapshot_started.wait(), timeout=1)
+            dp.reset_stream_state("binance", ["BTCUSDT"])
+            release_snapshot.set()
+
+            assert not await asyncio.wait_for(bootstrap, timeout=1)
+            assert adapter.calls == 1
+            assert book.status == L2BookStatus.BOOTSTRAPPING
+            assert book.sequence == 0
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_bridge_snapshot_drops_result_when_ws_registers_during_fetch(self):
+        """A REST snapshot that began before WS registration has no safe delta buffer."""
+        dp, rt, journal = _make_data_plane()
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+
+        class ConnectedClient:
+            is_connected = True
+
+        class BlockingSnapshotAdapter:
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                snapshot_started.set()
+                await release_snapshot.wait()
+                return LocalL2Update(
+                    venue="binance",
+                    symbol=symbol,
+                    bids=[PriceLevel(100.0, 1.0)],
+                    asks=[PriceLevel(101.0, 1.0)],
+                    sequence=100,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        try:
+            bootstrap = asyncio.create_task(dp.bootstrap_book(
+                "binance", "BTCUSDT", BlockingSnapshotAdapter(), now_ms=1_000,
+            ))
+            await asyncio.wait_for(snapshot_started.wait(), timeout=1)
+            dp._ws_clients[LocalL2BookKey("binance", "BTCUSDT")] = ConnectedClient()
+            dp.note_ws_stream_ready("binance", "BTCUSDT")
+            release_snapshot.set()
+
+            assert not await asyncio.wait_for(bootstrap, timeout=1)
+            assert book.status == L2BookStatus.BOOTSTRAPPING
+            assert book.sequence == 0
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_registered_bridge_stream_defers_direct_rest_snapshot_until_ready(self):
+        """Periodic callers share the same ready boundary as background bootstrap."""
+        dp, rt, journal = _make_data_plane()
+
+        class ConnectedClient:
+            is_connected = True
+
+        class RecordingAdapter:
+            calls = 0
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                self.calls += 1
+                return LocalL2Update(
+                    venue="binance",
+                    symbol=symbol,
+                    bids=[PriceLevel(100.0, 1.0)],
+                    asks=[PriceLevel(101.0, 1.0)],
+                    sequence=100,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        adapter = RecordingAdapter()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        key = LocalL2BookKey("binance", "BTCUSDT")
+        dp._ws_clients[key] = ConnectedClient()
+        try:
+            assert not await dp.bootstrap_book(
+                "binance", "BTCUSDT", adapter, now_ms=1_000,
+            )
+            assert adapter.calls == 0
+            assert book.status == L2BookStatus.BOOTSTRAPPING
+
+            dp.note_ws_stream_ready("binance", "BTCUSDT")
+            assert await dp.bootstrap_book(
+                "binance", "BTCUSDT", adapter, now_ms=1_000,
+            )
+            assert adapter.calls == 1
+            assert book.status == L2BookStatus.HOT
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_buffered_replay_bootstrap_waits_for_url_auto_ws_before_rest_fetch(
+        self, monkeypatch,
+    ):
+        """The dynamic WS-start/bootstrap order must not race the REST snapshot."""
+        dp, rt, journal = _make_data_plane()
+        connect_allowed = asyncio.Event()
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        messages = asyncio.Queue()
+
+        class BlockingSnapshotAdapter:
+            calls = 0
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                self.calls += 1
+                snapshot_started.set()
+                await release_snapshot.wait()
+                return LocalL2Update(
+                    venue="binance",
+                    symbol=symbol,
+                    bids=[PriceLevel(100.0, 1.0)],
+                    asks=[PriceLevel(101.0, 1.0)],
+                    sequence=100,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        class DelayedConnect:
+            close_code = None
+            close_reason = ""
+
+            async def __aenter__(self):
+                await connect_allowed.wait()
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                message = await messages.get()
+                if message is None:
+                    raise StopAsyncIteration
+                return message
+
+        adapter = BlockingSnapshotAdapter()
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        monkeypatch.setattr(
+            local_l2_ws_module.websockets,
+            "connect",
+            lambda *args, **kwargs: DelayedConnect(),
+        )
+        try:
+            dp.start_ws_streams("binance", ["BTCUSDT"], adapter=adapter)
+            dp.start_background_bootstrap(
+                "binance", ["BTCUSDT"], adapter,
+                batch_size=1,
+                jitter_ms=0,
+                retry_backoff_ms=10,
+            )
+            await dp.connect_ws_streams()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+            assert not snapshot_started.is_set()
+
+            connect_allowed.set()
+            await asyncio.wait_for(snapshot_started.wait(), timeout=1)
+            await messages.put(json.dumps({
+                "e": "depthUpdate",
+                "E": 1_001,
+                "s": "BTCUSDT",
+                "U": 101,
+                "u": 101,
+                "b": [["100.0", "2.0"]],
+                "a": [],
+            }))
+            await asyncio.sleep(0)
+            release_snapshot.set()
+            await asyncio.wait_for(dp._bootstrap_tasks["binance"], timeout=1)
+
+            assert adapter.calls == 1
+            assert book.status == L2BookStatus.HOT
+            assert book.sequence == 101
+        finally:
+            await dp.stop_ws_streams()
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_pruned_waiting_bridge_bootstrap_never_recreates_book(self):
+        """Pruning a not-yet-ready stream releases its bootstrap slot without REST I/O."""
+        dp, rt, journal = _make_data_plane()
+
+        class RecordingSnapshotAdapter:
+            calls = 0
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50):
+                self.calls += 1
+                raise AssertionError("a pruned book must not fetch a snapshot")
+
+        adapter = RecordingSnapshotAdapter()
+        key = LocalL2BookKey("binance", "BTCUSDT")
+        book = rt.ensure_book("binance", "BTCUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        try:
+            dp.start_ws_streams("binance", ["BTCUSDT"], adapter=adapter)
+            dp.start_background_bootstrap(
+                "binance", ["BTCUSDT"], adapter,
+                batch_size=1,
+                jitter_ms=0,
+                retry_backoff_ms=10,
+            )
+            for _ in range(10):
+                if key in dp._ws_ready_events:
+                    break
+                await asyncio.sleep(0)
+            assert key in dp._ws_ready_events
+            assert adapter.calls == 0
+
+            assert dp.prune_untracked_books(set(), now_ms=1_001)
+            await asyncio.wait_for(dp._bootstrap_tasks["binance"], timeout=1)
+
+            assert adapter.calls == 0
+            assert rt.get_book("binance", "BTCUSDT") is None
+            assert key not in dp._ws_ready_events
+        finally:
+            await dp.stop_ws_streams()
+            journal.close()
+
+    @pytest.mark.asyncio
     async def test_bybit_subscription_confirmation_does_not_refresh_hot_book(self):
         dp, rt, journal = _make_data_plane()
         try:

@@ -22,6 +22,10 @@ Classify as official when:
   cover the next expected local sequence.
 - Binance/Aster update range proves a real skipped update.
 - REST snapshot boundary is not bridged by buffered updates.
+- For a `REST_SNAPSHOT_BUFFERED_REPLAY` venue, the registered bridge stream
+  must be ready to receive before REST starts.  A direct or periodic snapshot
+  must defer while that stream is not ready, and a response spanning stream
+  registration or a reconnect generation must be discarded and retried.
 - OKX `prevSeqId/seqId` proves previous-link mismatch or sequence reset.
 - OKX checksum mismatch is present while checksum is still meaningful for the wire channel.
 
@@ -64,6 +68,7 @@ Last-good / quote fallback rules:
 | 2026-06-08 | Structural open-interest degraded evidence | local RED/GREEN, deploy pending | CL-052 adds endpoint, source, floor/current value, fallback source, and targeted revalidate scope to `perp_open_interest_structural` payloads. This is diagnostic evidence only and does not relax Local-L2 sequence continuity or entry dispatch truth requirements. |
 | 2026-06-08 | Whole-snapshot stale quote noise split | local RED/GREEN, deploy pending | CL-056 limits stale quote entry blockers to admission-filtered candidate-leg quote keys and emits non-candidate or admission-blocked stale quote volume as rate-limited `runtime.order_quote_stale_health_summary` with `blocking=false`. |
 | 2026-08-14 | Decision-time/Aster-overlap/primary-owner repair | locally validated; cloud pending | CL-105 restores V1's Aster covered-range acceptance, uses decision-time for Local-L2 readiness, and prevents normal rank churn from resetting an existing primary's hold/session owner. |
+| 2026-08-15 | WS-ready REST bridge boundary | locally validated; cloud pending | CL-110 makes the per-symbol pre-snapshot WS receiver readiness explicit, rejects snapshots across registration/reconnect boundaries, and wakes/cleans waiters on worker stop or prune.  It changes no sequence acceptance rule, strategy threshold, or unrelated venue policy. |
 
 ## Recurrences
 
@@ -75,11 +80,13 @@ Last-good / quote fallback rules:
 | 2026-05-31 | current run high-volume rebuild/snapshot family across active candidates | no Local-L2 semantic change selected | production state and exchange truth stayed flat/no-open-orders; evidence is insufficient to relax official continuity | [daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck](../daily/2026-05-31.md#cluster-cl-025-post-ae4bd9c-passive-close-maker-leg-live-flat-precheck) |
 | 2026-06-08 | production issue 11 snapshot/OI degraded evidence | working tree | local RED/GREEN and full pytest green; deploy pending | [daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening](../daily/2026-06-08.md#cluster-cl-052-production-issues-3-11-root-closure-evidence-hardening) |
 | 2026-08-14 | Aster overlap, stale tick clock, rank-churn primary sessions | working tree | deterministic runtime/DataPlane harness and Local-L2 profile green; cloud pending | [daily/2026-08-14.md#cluster-cl-105-local-l2-decision-time-aster-overlap-primary-ownership](../daily/2026-08-14.md#cluster-cl-105-local-l2-decision-time-aster-overlap-primary-ownership) |
+| 2026-08-15 | bridge WS/REST startup race, reconnect during REST, and prune during wait | working tree | deterministic real DataPlane+WS harness and Local-L2 profile green; cloud pending | [daily/2026-08-15.md#cluster-cl-110-local-l2-ws-rest-bootstrap-bridge-readiness](../daily/2026-08-15.md#cluster-cl-110-local-l2-ws-rest-bootstrap-bridge-readiness) |
 
 ## Regression Harness
 
 - `tests/live_harness/test_local_l2_incident_replay.py`
 - `tests/test_local_l2_replay_harness.py`
+- `tests/test_local_l2_ws.py::TestLocalL2WsFreshnessEvidence`
 - `tests/test_diagnose_live.py`
 - `scripts/probe_local_l2_rebuilds.py --venue <venue> --symbol <symbol>`
 

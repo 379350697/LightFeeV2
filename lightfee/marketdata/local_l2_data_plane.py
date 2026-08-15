@@ -128,6 +128,10 @@ class LocalL2DataPlane:
         self._journal = journal
         self._snap_states: dict[LocalL2BookKey, _BookSnapshotState] = {}
         self._ws_clients: dict[LocalL2BookKey, "LocalL2WsClient"] = {}
+        # A bridge snapshot may start only after its registered WS stream can
+        # receive deltas.  The event is per symbol so dynamic activation does
+        # not serialise unrelated books.
+        self._ws_ready_events: dict[LocalL2BookKey, asyncio.Event] = {}
 
         # Pre-snapshot buffers: keyed by "venue:symbol" → deque of _BufferedUpdate
         # V1: binance_local_l2_pre_snapshot_buffers()
@@ -172,6 +176,7 @@ class LocalL2DataPlane:
         adapter,  # VenueAdapter — provides fetch_l2_snapshot()
         depth: int = 50,
         now_ms: int = 0,
+        required_ws_generation: int | None = None,
     ) -> bool:
         """Bootstrap a single book with a REST snapshot via the adapter.
 
@@ -185,6 +190,24 @@ class LocalL2DataPlane:
         if ss is None:
             ss = _BookSnapshotState(venue=venue, symbol=symbol)
             self._snap_states[key] = ss
+
+        policy = policy_for_venue(venue)
+        bridge_generation = required_ws_generation
+        if (
+            bridge_generation is None
+            and policy.replay_rest_snapshot_with_ws_deltas
+            and key in self._ws_clients
+        ):
+            bridge_generation = self._ws_stream_ready_generation(venue, symbol)
+        if (
+            (policy.replay_rest_snapshot_with_ws_deltas and key in self._ws_clients
+             and bridge_generation is None)
+            or (
+                bridge_generation is not None
+                and self._ws_stream_ready_generation(venue, symbol) != bridge_generation
+            )
+        ):
+            return False
 
         water_level_ms = max(1, ss.snapshot_cooldown_ms)
         if ss.snapshot_in_flight:
@@ -200,7 +223,20 @@ class LocalL2DataPlane:
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
 
-            policy = policy_for_venue(venue)
+            # A reconnect clears the old delta buffer and advances its generation.
+            # A REST snapshot fetched across that boundary cannot be safely bridged.
+            if (
+                policy.replay_rest_snapshot_with_ws_deltas
+                and (
+                    (bridge_generation is None and key in self._ws_clients)
+                    or (
+                        bridge_generation is not None
+                        and self._ws_stream_ready_generation(venue, symbol) != bridge_generation
+                    )
+                )
+            ):
+                return False
+
             book = self._runtime.get_book(venue, symbol)
 
             # V1: binance_local_l2_snapshot_is_stale — reject older snapshots. Equal
@@ -465,6 +501,55 @@ class LocalL2DataPlane:
             self._freshness_states[key] = state
         return state
 
+    def _ws_ready_event(self, key: LocalL2BookKey) -> asyncio.Event:
+        event = self._ws_ready_events.get(key)
+        if event is None:
+            event = asyncio.Event()
+            self._ws_ready_events[key] = event
+        return event
+
+    def note_ws_stream_ready(self, venue: str, symbol: str) -> None:
+        """Mark a registered stream able to buffer deltas for its current generation."""
+        self._ws_ready_event(LocalL2BookKey(venue=venue, symbol=symbol)).set()
+
+    def note_ws_stream_unready(self, venue: str, symbol: str) -> None:
+        """Clear readiness as soon as a stream disconnects or starts reconnecting."""
+        event = self._ws_ready_events.get(LocalL2BookKey(venue=venue, symbol=symbol))
+        if event is not None:
+            event.clear()
+
+    def _ws_stream_ready_generation(self, venue: str, symbol: str) -> int | None:
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        event = self._ws_ready_events.get(key)
+        client = self._ws_clients.get(key)
+        if (
+            event is None
+            or not event.is_set()
+            or client is None
+            or not bool(getattr(client, "is_connected", False))
+        ):
+            return None
+        return self._current_stream_generation(venue, symbol)
+
+    async def wait_for_ws_stream_ready(self, venue: str, symbol: str) -> int | None:
+        """Wait for an already-registered bridge stream, preserving REST fallback otherwise."""
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        if key not in self._ws_clients:
+            return None
+
+        event = self._ws_ready_event(key)
+        while True:
+            await event.wait()
+            generation = self._ws_stream_ready_generation(venue, symbol)
+            if generation is not None:
+                return generation
+            # A pruning/worker-stop path can remove the client while this task is
+            # waiting.  stop_worker() sets the event so this check cannot leave a
+            # bootstrap semaphore slot blocked on an orphaned stream.
+            if key not in self._ws_clients:
+                return None
+            event.clear()
+
     def _append_rate_limited_state_event(
         self,
         kind: str,
@@ -600,6 +685,7 @@ class LocalL2DataPlane:
         now_ms: int,
         refresh_book: bool = True,
     ) -> None:
+        self.note_ws_stream_ready(venue, symbol)
         self._record_freshness_evidence(
             venue, symbol, now_ms, "last_subscription_confirmed_ms", "subscription_confirmed",
             refresh_book=refresh_book,
@@ -1631,6 +1717,7 @@ class LocalL2DataPlane:
             self._pre_snapshot_buffers.pop(f"{key.venue}:{key.symbol}", None)
             self._stream_generations.pop(f"{key.venue}:{key.symbol}", None)
             self._initial_snapshot_overlap_sequences.pop(key, None)
+            self._ws_ready_events.pop(key, None)
 
         self._journal.append(
             "runtime.local_l2_books_pruned",
@@ -1658,7 +1745,8 @@ class LocalL2DataPlane:
         Does NOT block — the worker runs as a background asyncio task.
         Call cancel_background_bootstrap(venue) to abort.
         """
-        if policy_for_venue(venue).bridge_mode is BridgeMode.STREAM_ONLY:
+        policy = policy_for_venue(venue)
+        if policy.bridge_mode is BridgeMode.STREAM_ONLY:
             self._journal.append(
                 "runtime.local_l2_stream_only_bootstrap_skipped",
                 {"venue": venue, "symbol_count": len(symbols)},
@@ -1713,11 +1801,28 @@ class LocalL2DataPlane:
                     if book.status not in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.DEGRADED):
                         book.transition_to_bootstrapping(now_ms)
 
+                    required_ws_generation = None
+                    if policy.replay_rest_snapshot_with_ws_deltas:
+                        required_ws_generation = await self.wait_for_ws_stream_ready(
+                            venue, symbol,
+                        )
+                        # The stream may have been unregistered while readiness
+                        # was pending (for example, a dropped candidate was
+                        # pruned).  Never recreate that book with a late REST
+                        # snapshot after the owner removed it.
+                        book = self._runtime.get_book(venue, symbol)
+                        if book is None or book.status in (
+                            L2BookStatus.HOT,
+                            L2BookStatus.SUSPENDED,
+                        ):
+                            return
+
                     success = await self.bootstrap_book(
                         venue=venue, symbol=symbol,
                         adapter=adapter,
                         depth=book.max_depth,
                         now_ms=now_ms,
+                        required_ws_generation=required_ws_generation,
                     )
                     if success:
                         return
@@ -1857,6 +1962,7 @@ class LocalL2DataPlane:
                 client._state = "closed"
                 client._ws = None
         self._ws_clients.clear()
+        self._ws_ready_events.clear()
 
     @property
     def active_ws_stream_count(self) -> int:
@@ -1880,6 +1986,9 @@ class LocalL2DataPlane:
         client = self._ws_clients.pop(key, None)
         if client is None:
             return False
+        event = self._ws_ready_events.get(key)
+        if event is not None:
+            event.set()
         # Fire-and-forget stop — caller should have an async context or use stop_ws_streams()
         if client._task is not None and not client._task.done():
             client._task.cancel()
@@ -1896,6 +2005,7 @@ class LocalL2DataPlane:
                 count += 1
             client._ws = None
         self._ws_clients.clear()
+        self._ws_ready_events.clear()
         return count
 
     # ------------------------------------------------------------------

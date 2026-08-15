@@ -17,6 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-111 Binance live-order fixture dynamic-rule contract, 2026-08-15: two
+fixture-driven Binance success tests mocked every request with an order payload
+after CL-109 made exchange-backed rules mandatory.  The production path
+correctly rejected that incomplete `exchangeInfo` as static fallback.  The
+fixture now supplies the documented rule filters and asserts `exchangeInfo`
+precedes position-mode and signed-order requests; no production guard was
+relaxed.  The full contract file passes `135` tests. See
+[daily/2026-08-15.md#cluster-cl-111-binance-live-order-fixture-dynamic-rule-contract](daily/2026-08-15.md#cluster-cl-111-binance-live-order-fixture-dynamic-rule-contract).
+
+CL-110 Local-L2 WS/REST bootstrap bridge readiness, 2026-08-15: V2 could start
+a buffered REST snapshot before the dynamic bridge WS was able to receive, or
+apply a response across reconnect/registration boundary.  The existing
+DataPlane now owns one per-symbol readiness/generation boundary, with no added
+exchange request or cross-symbol serialization.  Real DataPlane+WS regressions
+cover URL-auto, ACK, reconnect, registration, direct-bootstrap, and prune
+paths; Local-L2 profile `355` and V1 incident/replay/policy `24` pass locally.
+Deployment and read-only runtime confirmation remain required. See
+[daily/2026-08-15.md#cluster-cl-110-local-l2-ws-rest-bootstrap-bridge-readiness](daily/2026-08-15.md#cluster-cl-110-local-l2-ws-rest-bootstrap-bridge-readiness).
+
 CL-109 passive-close/entry boundary contracts, 2026-08-15: V2 started the
 passive-close hedge deadline at maker fill instead of a real hedge submit,
 duplicated a close execution when an order-ID observation lacked its CID,

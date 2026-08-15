@@ -311,6 +311,8 @@ class LocalL2WsClient(ABC):
                     now_ms,
                     error=error,
                 )
+            finally:
+                self.data_plane.note_ws_stream_unready(self.venue, self.symbol)
 
             if self._state == WsClientState.CLOSED:
                 break
@@ -374,6 +376,8 @@ class LocalL2WsClient(ABC):
                 "subscription_sent" if sub_msg is not None else "url_auto_subscribed",
                 int(time.time() * 1000),
             )
+            if sub_msg is None:
+                self.data_plane.note_ws_stream_ready(self.venue, self.symbol)
 
             heartbeat_task: asyncio.Task | None = None
             if application_heartbeat is not None:
@@ -454,6 +458,7 @@ class LocalL2WsClient(ABC):
         self._message_count += 1
         self._last_message_ms = now_ms
         self._remember_update(update)
+        self.data_plane.note_ws_stream_ready(self.venue, self.symbol)
 
         try:
             self.data_plane.ingest_external_update(update, now_ms)
