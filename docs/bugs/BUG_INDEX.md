@@ -23,9 +23,11 @@ fees could become zero through entry, normal close, and passive close paths.
 Passive progress also added cumulative fees repeatedly.  V2 now preserves
 ACK-only uncertainty, carries missing fees as evidence gaps, restores V1
 cumulative fee/delta semantics, and registers durable reconciliation rather
-than booking a terminal bill from incomplete facts.  Focused suites (`903`) and
-the full validation profile (10/10) are green; cloud deployment and read-only
-verification remain required. See
+than booking a terminal bill from incomplete facts. Focused suites (`903`) and
+the full validation profile (10/10) are green. `cf31c16` is deployed; its
+manifest, singleton, production verifier, and high-confidence seven-venue
+flat/no-order probe are green. No new execution occurred in that short window.
+See
 [daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract](daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract).
 
 CL-111 Binance live-order fixture dynamic-rule contract, 2026-08-15: two

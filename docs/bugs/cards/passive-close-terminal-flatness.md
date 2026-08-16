@@ -175,7 +175,7 @@ one-sided close exposure.
 | 2026-08-12 | Unattributed recovered pair accounting | local fix; deploy blocked by concurrent V1 | A `live-recovered:*` pair with no V2 order identity is an external recovery observation, not a V2 PnL owner. The strict reclassification audit clears only that old debt; any `entry-*`, V2-identified, or malformed owner remains fail-closed. |
 | 2026-08-14 | Binance post-only rejection + Bybit private terminal-zero drift | local root fix; deploy pending | Restored V1 bounded Local-L2 requote and Bybit realtime/private/execution merge, including `PendingCancel`/`Deactivated` terminal mapping. RED/GREEN production-path regression plus full touched suites: `620 passed`; no production mutation in this repair step. |
 | 2026-08-15 | Hedge deadline scope and duplicate close execution identity | local green; deploy pending | Restored V1's submit-duration deadline, records maker-to-submit separately, and makes exchange order ID authoritative over a missing CID across persistence and reconciliation. |
-| 2026-08-16 | ACK-only synthetic fill and cumulative-fee accounting | local full gate green; deploy pending | CL-112 preserves ACK-only uncertainty, represents absent fees explicitly, restores V1 cumulative passive-fee deltas, and defers billing rather than writing fabricated PnL. |
+| 2026-08-16 | ACK-only synthetic fill and cumulative-fee accounting | deployed; cloud health/truth verified | CL-112 preserves ACK-only uncertainty, represents absent fees explicitly, restores V1 cumulative passive-fee deltas, and defers billing rather than writing fabricated PnL. |
 
 ## Recurrences
 
@@ -193,7 +193,7 @@ one-sided close exposure.
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
 | 2026-08-12 | `CLUSDT` OKX/Bitget | `c48f59a` | target closed: both venues flat/no-open-orders and normal recovery cleared local open/passive state; accounting evidence debt retained | [daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth](../daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth) |
 | 2026-08-15 | passive close / reconciliation | working tree | local green; deploy and read-only live verification pending | [daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts](../daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts) |
-| 2026-08-16 | ACK-only execution evidence and passive/normal close fees | working tree | local full gate green; deploy and read-only live verification pending | [daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract](../daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract) |
+| 2026-08-16 | ACK-only execution evidence and passive/normal close fees | `cf31c16` | deployed; manifest/singleton/health and seven-venue flat/no-order truth verified | [daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract](../daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract) |
 
 ## Regression Harness
 
