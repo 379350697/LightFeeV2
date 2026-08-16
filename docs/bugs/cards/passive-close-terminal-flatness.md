@@ -27,9 +27,18 @@ A normal passive close with confirmed fills is not complete merely because its
 operational `exit.passive_close_resolved` record exists. Once both local legs
 are zero and no residual task was created, it must write exactly one standard
 terminal billing event: `exit.closed` with complete accounting and close-fill
-evidence, or `exit.billing_evidence_unavailable` when entry-fee evidence is
-not final. The operational event remains separate so it cannot silently close
-a ledger without bill evidence.
+evidence.  An absent fee is not zero: zero is acceptable only when the exchange
+explicitly reports it.  If an entry or exit price/fee fact is missing, the
+operational close may clear only after durable reconciliation registration; it
+must not book PnL/fees or write `exit.closed`. The operational event remains
+separate so it cannot silently close a ledger without bill evidence.
+
+Passive maker progress uses V1 cumulative semantics. Its aggregate fee is the
+latest cumulative fee, not a sum of every observation; a per-interval fee is
+the difference only when both adjacent cumulative observations have complete,
+monotonic fee evidence. A missing earlier interval remains unknown even if a
+later cumulative total is known, because allocating that total would fabricate
+accounting evidence.
 
 When exchange truth proves both positions and open orders flat but no close
 order/client-order identity exists for venue reconciliation, lifecycle cleanup
@@ -166,6 +175,7 @@ one-sided close exposure.
 | 2026-08-12 | Unattributed recovered pair accounting | local fix; deploy blocked by concurrent V1 | A `live-recovered:*` pair with no V2 order identity is an external recovery observation, not a V2 PnL owner. The strict reclassification audit clears only that old debt; any `entry-*`, V2-identified, or malformed owner remains fail-closed. |
 | 2026-08-14 | Binance post-only rejection + Bybit private terminal-zero drift | local root fix; deploy pending | Restored V1 bounded Local-L2 requote and Bybit realtime/private/execution merge, including `PendingCancel`/`Deactivated` terminal mapping. RED/GREEN production-path regression plus full touched suites: `620 passed`; no production mutation in this repair step. |
 | 2026-08-15 | Hedge deadline scope and duplicate close execution identity | local green; deploy pending | Restored V1's submit-duration deadline, records maker-to-submit separately, and makes exchange order ID authoritative over a missing CID across persistence and reconciliation. |
+| 2026-08-16 | ACK-only synthetic fill and cumulative-fee accounting | local full gate green; deploy pending | CL-112 preserves ACK-only uncertainty, represents absent fees explicitly, restores V1 cumulative passive-fee deltas, and defers billing rather than writing fabricated PnL. |
 
 ## Recurrences
 
@@ -183,6 +193,7 @@ one-sided close exposure.
 | 2026-06-15 | `HOMEUSDT` OKX/Bybit | `2eb14b7`, verified again under `fd1579d` | closed: local RED/GREEN targeted regressions passed; cloud manifest, singleton, production verifier, and since-deploy diagnose passed with flat/no-open-orders truth | [daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift](../daily/2026-06-15.md#cluster-cl-083-bybit-110017-submit-time-terminal-zero-qty-close-drift) |
 | 2026-08-12 | `CLUSDT` OKX/Bitget | `c48f59a` | target closed: both venues flat/no-open-orders and normal recovery cleared local open/passive state; accounting evidence debt retained | [daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth](../daily/2026-08-12.md#cluster-cl-100-bitget-success-null-open-order-truth) |
 | 2026-08-15 | passive close / reconciliation | working tree | local green; deploy and read-only live verification pending | [daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts](../daily/2026-08-15.md#cluster-cl-109-close-entry-boundary-contracts) |
+| 2026-08-16 | ACK-only execution evidence and passive/normal close fees | working tree | local full gate green; deploy and read-only live verification pending | [daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract](../daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract) |
 
 ## Regression Harness
 
@@ -203,6 +214,7 @@ one-sided close exposure.
 - `tests/persistence/test_v1_state_snapshot_semantics.py -k "pending_close_reconciliation"`
 - `tests/test_passive_close.py -k "live_flat_cleanup"`
 - `tests/test_pending_entry_v1_semantic_drift.py tests/test_supervisor_execution.py -k "pending_close_reconciliation"`
+- `tests/test_passive_close.py -k "missing_cumulative_fee or without_fee_evidence"`
 
 ## Next Recurrence Checklist
 

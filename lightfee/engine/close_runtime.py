@@ -587,7 +587,7 @@ class CloseRuntime:
             fee = None
             try:
                 candidate_fee = float(getattr(fill, "fee_quote", None))
-                if math.isfinite(candidate_fee):
+                if math.isfinite(candidate_fee) and candidate_fee >= 0.0:
                     fee = candidate_fee
             except (TypeError, ValueError):
                 pass
@@ -714,7 +714,9 @@ class CloseRuntime:
         short_qty = float(short["quantity"])
         long_entry = float(snapshot.get("long_entry_price") or 0.0)
         short_entry = float(snapshot.get("short_entry_price") or 0.0)
-        funding_quote = float(snapshot.get("captured_funding_quote") or 0.0)
+        funding_quote = float(snapshot.get("captured_funding_quote") or 0.0) + float(
+            snapshot.get("second_stage_funding_quote") or 0.0
+        )
         entry_fee = 0.0
         entry_fee_source = "unavailable"
         entry_fee_evidence_complete = False
@@ -740,6 +742,12 @@ class CloseRuntime:
                     entry_fee_evidence_complete = True
             except (TypeError, ValueError):
                 pass
+        entry_price_evidence_complete = (
+            math.isfinite(long_entry)
+            and long_entry > 0.0
+            and math.isfinite(short_entry)
+            and short_entry > 0.0
+        )
         price_pnl = ((float(long["average_price"]) - long_entry) * long_qty) + (
             (short_entry - float(short["average_price"])) * short_qty
         )
@@ -753,8 +761,20 @@ class CloseRuntime:
             except (TypeError, ValueError):
                 exit_fee_evidence_complete = False
                 break
-            if not math.isfinite(fee):
+            if not math.isfinite(fee) or fee < 0.0:
                 exit_fee_evidence_complete = False
+                break
+        close_price_evidence_complete = True
+        for fill in [*long_fills, *short_fills]:
+            if self._close_reconciliation_fill_qty(fill) <= 1e-12:
+                continue
+            try:
+                price = float(getattr(fill, "price", None))
+            except (TypeError, ValueError):
+                close_price_evidence_complete = False
+                break
+            if not math.isfinite(price) or price <= 0.0:
+                close_price_evidence_complete = False
                 break
         expected_long_qty = float(snapshot.get("long_quantity") or snapshot.get("matched_quantity") or 0.0)
         expected_short_qty = float(snapshot.get("short_quantity") or snapshot.get("matched_quantity") or 0.0)
@@ -766,6 +786,8 @@ class CloseRuntime:
         )
         complete = (
             close_quantity_evidence_complete
+            and entry_price_evidence_complete
+            and close_price_evidence_complete
             and entry_fee_evidence_complete
             and exit_fee_evidence_complete
         )
@@ -793,8 +815,10 @@ class CloseRuntime:
             "entry_fee_quote": entry_fee,
             "entry_fee_source": entry_fee_source,
             "entry_fee_evidence_complete": entry_fee_evidence_complete,
+            "entry_price_evidence_complete": entry_price_evidence_complete,
             "exit_fee_quote": exit_fee,
             "exit_fee_evidence_complete": exit_fee_evidence_complete,
+            "close_price_evidence_complete": close_price_evidence_complete,
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
             "net_quote_status": "final" if complete else "provisional",
             "expected_long_closed_qty": expected_long_qty,

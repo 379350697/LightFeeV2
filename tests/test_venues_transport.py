@@ -3241,7 +3241,7 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert result["reject_reason"] == "contract_qty_zero"
 
     @pytest.mark.asyncio
-    async def test_okx_taker_sends_contract_quantity_after_base_conversion(self, monkeypatch):
+    async def test_okx_taker_ack_preserves_contract_quantity_for_reconciliation(self, monkeypatch):
         from lightfee.venues.symbol_rules import SymbolRule
 
         class FakeRulesCache:
@@ -3284,20 +3284,24 @@ class TestOrderSubmitDiagnosticsAndQuantization:
 
         transport._request = fake_request
 
-        fill = await transport.place_order(
-            OrderRequest(
-                venue=Venue.OKX,
-                symbol="UBUSDT",
-                side=Side.BUY,
-                quantity=100.0,
-                price_hint=0.01,
-                client_order_id="ubvalid100",
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await transport.place_order(
+                OrderRequest(
+                    venue=Venue.OKX,
+                    symbol="UBUSDT",
+                    side=Side.BUY,
+                    quantity=100.0,
+                    price_hint=0.01,
+                    client_order_id="ubvalid100",
+                )
             )
-        )
 
         assert sent[-1]["path"] == "/api/v5/trade/order"
         assert sent[-1]["body"]["sz"] == "1"
-        assert fill.quantity == pytest.approx(100.0)
+        error = exc_info.value
+        assert error.class_ == SubmitFailureClass.UNCERTAIN
+        assert error.accepted_order_id == "okx-contract-1"
+        assert error.accepted_client_order_id == "ubvalid100"
 
     @pytest.mark.asyncio
     async def test_okx_normalize_quantity_terminalizes_below_contract_min(self):
@@ -3694,7 +3698,7 @@ class TestOrderSubmitDiagnosticsAndQuantization:
         assert "key-secret" not in serialized
 
     @pytest.mark.asyncio
-    async def test_okx_reduce_only_converts_base_quantity_and_ack_returns_fill(self, monkeypatch):
+    async def test_okx_reduce_only_ack_requires_fill_reconciliation(self, monkeypatch):
         from lightfee.venues.symbol_rules import SymbolRule
 
         class FakeRulesCache:
@@ -3745,17 +3749,18 @@ class TestOrderSubmitDiagnosticsAndQuantization:
             observed_at_ms=123456,
         )
 
-        fill = await transport.place_order(req)
+        with pytest.raises(OrderSubmitError) as exc_info:
+            await transport.place_order(req)
 
         assert sent[-1]["path"] == spec.order_path
         assert sent[-1]["body"]["instId"] == "STABLE-USDT-SWAP"
         assert sent[-1]["body"]["reduceOnly"] == "true"
         assert sent[-1]["body"]["sz"] == "5"
-        assert fill.venue == Venue.OKX
-        assert fill.quantity == pytest.approx(500.0)
-        assert fill.price == pytest.approx(0.049)
-        assert fill.order_id == "okx_ack_1"
-        assert fill.client_order_id == "okx-close-stable"
+        error = exc_info.value
+        assert error.class_ == SubmitFailureClass.UNCERTAIN
+        assert error.order_ack_only is True
+        assert error.accepted_order_id == "okx_ack_1"
+        assert error.accepted_client_order_id == "okx-close-stable"
         attempt = next(e["payload"] for e in transport.order_diagnostics if e["kind"] == "order.submit_attempt")
         assert attempt["ct_val"] == 100.0
         assert attempt["base_qty"] == 500.0

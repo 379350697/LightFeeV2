@@ -391,6 +391,10 @@ class PendingEntry:
     # --- Fill quantities per leg ---
     maker_leg_filled: float = 0.0
     hedge_leg_filled: float = 0.0
+    # Exact cumulative fees from order/fill reconciliation.  None means the
+    # fee is still unknown; 0.0 is an explicitly confirmed zero fee.
+    maker_fee_quote: float | None = None
+    hedge_fee_quote: float | None = None
     # --- Deadline for timeout-based fallback (Rust V1 deadline/timeout) ---
     deadline_ms: int = 0
     # --- Fallback route (Rust V1 passive_fallback / standard_taker) ---
@@ -761,6 +765,9 @@ class PendingPassiveLegFill:
     quantity: float = 0.0
     average_price: float = 0.0
     fee_quote: float = 0.0
+    # Keep absence of exchange fee evidence distinct from a confirmed zero.
+    # Old snapshots omit this key and therefore recover fail-closed.
+    fee_evidence_complete: bool = False
     last_fill_time_ms: int = 0
     order_id: str = ""
     client_order_id: str = ""
@@ -770,6 +777,10 @@ class PendingPassiveLegFill:
 class PersistedCloseExecutionLeg:
     """V1 PersistedCloseExecutionLeg: serializable close leg for passive close."""
     fill: Optional[OrderFill] = None
+    # ``False`` is an explicit evidence gap. ``None`` preserves the behavior
+    # of in-memory test fixtures that predate this field; recovered snapshots
+    # always materialize a boolean and therefore fail closed when absent.
+    fee_evidence_complete: bool | None = None
     client_order_id: str = ""
     submit_started_at_ms: int = 0
     latency_ms: int = 0
@@ -1692,6 +1703,8 @@ class EngineState:
                     "hedge_client_order_id": p.hedge_client_order_id,
                     "maker_leg_filled": p.maker_leg_filled,
                     "hedge_leg_filled": p.hedge_leg_filled,
+                    "maker_fee_quote": p.maker_fee_quote,
+                    "hedge_fee_quote": p.hedge_fee_quote,
                     "deadline_ms": p.deadline_ms,
                     "fallback_route": p.fallback_route,
                     "uncertain_outcome": p.uncertain_outcome,
@@ -1814,6 +1827,7 @@ class EngineState:
                         "quantity": ppc.maker_fill.quantity,
                         "average_price": ppc.maker_fill.average_price,
                         "fee_quote": ppc.maker_fill.fee_quote,
+                        "fee_evidence_complete": ppc.maker_fill.fee_evidence_complete,
                         "last_fill_time_ms": ppc.maker_fill.last_fill_time_ms,
                         "order_id": ppc.maker_fill.order_id,
                         "client_order_id": ppc.maker_fill.client_order_id,
@@ -1822,6 +1836,7 @@ class EngineState:
                         "quantity": ppc.hedge_fill.quantity,
                         "average_price": ppc.hedge_fill.average_price,
                         "fee_quote": ppc.hedge_fill.fee_quote,
+                        "fee_evidence_complete": ppc.hedge_fill.fee_evidence_complete,
                         "last_fill_time_ms": ppc.hedge_fill.last_fill_time_ms,
                         "order_id": ppc.hedge_fill.order_id,
                         "client_order_id": ppc.hedge_fill.client_order_id,

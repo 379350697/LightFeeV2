@@ -9478,6 +9478,7 @@ class LiveRuntime:
             before_qty = float(getattr(pending, f"{label}_leg_filled", 0.0) or 0.0)
             before_price = float(getattr(pending, f"{label}_fill_price", 0.0) or 0.0)
             before_order_id = getattr(pending, f"{label}_order_id", "") or ""
+            before_fee = getattr(pending, f"{label}_fee_quote", None)
             if math.isfinite(qty) and (qty > 0.0 or before_qty <= 0.0):
                 setattr(pending, f"{label}_leg_filled", qty)
             elif math.isfinite(qty) and qty <= 0.0 and before_qty > 0.0:
@@ -9500,13 +9501,21 @@ class LiveRuntime:
                 setattr(pending, f"{label}_fill_price", avg_price)
             if reconciled_order_id:
                 setattr(pending, f"{label}_order_id", reconciled_order_id)
+            try:
+                reconciled_fee = float(getattr(reconciliation, "fee_quote", None))
+            except (TypeError, ValueError):
+                reconciled_fee = None
+            if reconciled_fee is not None and math.isfinite(reconciled_fee):
+                setattr(pending, f"{label}_fee_quote", reconciled_fee)
             after_qty = float(getattr(pending, f"{label}_leg_filled", 0.0) or 0.0)
             after_price = float(getattr(pending, f"{label}_fill_price", 0.0) or 0.0)
             after_order_id = getattr(pending, f"{label}_order_id", "") or ""
+            after_fee = getattr(pending, f"{label}_fee_quote", None)
             if (
                 abs(after_qty - before_qty) > 1e-12
                 or abs(after_price - before_price) > 1e-12
                 or after_order_id != before_order_id
+                or after_fee != before_fee
             ):
                 self.journal.append(
                     "pending_entry.finalize_fill_reconciled",
@@ -9521,6 +9530,8 @@ class LiveRuntime:
                         "after_price": after_price,
                         "before_order_id": before_order_id,
                         "after_order_id": after_order_id,
+                        "before_fee_quote": before_fee,
+                        "after_fee_quote": after_fee,
                     },
                 )
 

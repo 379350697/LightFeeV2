@@ -439,6 +439,83 @@ class TestEntryExecutionIdempotency:
         assert pos.peak_net_quote == pytest.approx(-2.0)
         assert pos.entry_quality_completed_at_ms == 0
 
+    def test_build_open_position_keeps_missing_entry_fee_provisional(self):
+        ctx = EntryContext(
+            entry_id="pos-fee-missing",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_price_hint=50000.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="BTC-USDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=50000.0,
+            order_id="m1",
+            fee_quote=None,
+            filled_at_ms=1000,
+        )
+        hedge_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTC-USDT",
+            side=Side.SELL,
+            quantity=1.0,
+            price=49990.0,
+            order_id="h1",
+            fee_quote=0.0,
+            filled_at_ms=1001,
+        )
+
+        pos = build_open_position(ctx, maker_fill, hedge_fill, now_ms=1001)
+
+        assert pos.entry_fee_evidence_complete is False
+
+    def test_build_open_position_keeps_negative_entry_fee_provisional(self):
+        """A malformed negative fee is not the same as an explicit zero fee."""
+        ctx = EntryContext(
+            entry_id="pos-fee-negative",
+            symbol="BTC-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_price_hint=50000.0,
+            short_price_hint=49990.0,
+            maker_leg=Side.BUY,
+            entry_type=EntryType.PASSIVE_INCREMENTAL,
+        )
+        maker_fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol="BTC-USDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=50000.0,
+            order_id="m1",
+            fee_quote=-0.01,
+            filled_at_ms=1000,
+        )
+        hedge_fill = OrderFill(
+            venue=Venue.BYBIT,
+            symbol="BTC-USDT",
+            side=Side.SELL,
+            quantity=1.0,
+            price=49990.0,
+            order_id="h1",
+            fee_quote=0.0,
+            filled_at_ms=1001,
+        )
+
+        pos = build_open_position(ctx, maker_fill, hedge_fill, now_ms=1001)
+
+        assert pos.entry_fee_evidence_complete is False
+
     def test_build_open_position_preserves_funding_semantics(self):
         """Entry-selected funding timestamps must survive into close decisions."""
         from lightfee.config.schema import StrategyConfig

@@ -4353,28 +4353,6 @@ class VenueTransport(MarketDataClient):
                     fill = self._parse_order_fill(raw, request, venue_sym, now_ms)
             except OrderSubmitError as exc:
                 order_id, client_order_id = self._extract_order_identifiers(raw)
-                if (
-                    spec.venue_id == Venue.OKX
-                    and exc.class_ == SubmitFailureClass.UNCERTAIN
-                    and order_id
-                ):
-                    fill = await self._okx_ack_fill_from_preflight(
-                        request=request,
-                        venue_sym=venue_sym,
-                        preflight=preflight,
-                        order_id=order_id,
-                        client_order_id=client_order_id or request.client_order_id or "",
-                        now_ms=now_ms,
-                    )
-                    result_payload = dict(preflight)
-                    result_payload["order_id"] = fill.order_id
-                    result_payload["client_order_id"] = (
-                        fill.client_order_id or request.client_order_id or ""
-                    )
-                    result_payload["response_classification"] = "ack_accepted"
-                    self._record_order_diagnostic("order.submit_result", result_payload)
-                    result_recorded = True
-                    return fill
                 result_payload = dict(preflight)
                 result_payload["order_id"] = order_id
                 result_payload["client_order_id"] = client_order_id or request.client_order_id or ""
@@ -4431,61 +4409,6 @@ class VenueTransport(MarketDataClient):
             raise
         except Exception as e:
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
-
-    async def _okx_ack_fill_from_preflight(
-        self,
-        *,
-        request: OrderRequest,
-        venue_sym: str,
-        preflight: dict[str, Any],
-        order_id: str,
-        client_order_id: str,
-        now_ms: int,
-    ) -> OrderFill:
-        """V1-compatible OKX market-order ack projection.
-
-        OKX REST acks often contain only ordId/clOrdId. Rust V1 treats an
-        accepted market order as the submitted base quantity and lets later
-        position reconciliation prove any residual. Keep the stricter
-        uncertain behavior for other venues.
-        """
-        contract_qty = float(preflight.get("contract_qty") or 0.0)
-        ct_val = float(preflight.get("ct_val") or 0.0)
-        quantity = (
-            contract_qty * ct_val
-            if contract_qty > 0 and ct_val > 0
-            else float(request.quantity)
-        )
-
-        price = float(
-            request.price_hint
-            or request.mark_price_hint
-            or request.price
-            or 0.0
-        )
-        if price <= 0:
-            try:
-                snapshot = await self.fetch_market_snapshot([request.symbol])
-                for quote in snapshot.quotes:
-                    if quote.symbol not in (request.symbol, venue_sym):
-                        continue
-                    candidate = quote.ask if request.side == Side.BUY else quote.bid
-                    if candidate > 0:
-                        price = float(candidate)
-                        break
-            except Exception:
-                price = 0.0
-
-        return OrderFill(
-            venue=Venue.OKX,
-            symbol=venue_sym,
-            side=request.side,
-            quantity=quantity,
-            price=price,
-            order_id=order_id,
-            client_order_id=client_order_id or request.client_order_id,
-            filled_at_ms=now_ms,
-        )
 
     def _parse_order_fill(
         self,
@@ -6858,7 +6781,7 @@ class VenueTransport(MarketDataClient):
                 client_order_id=private_progress.client_order_id or client_order_id or "",
                 cumulative_quantity=private_progress.cumulative_quantity,
                 average_price=private_progress.average_price or 0.0,
-                fee_quote=private_progress.fee_quote or 0.0,
+                fee_quote=private_progress.fee_quote,
                 last_fill_time_ms=private_progress.last_fill_at_ms or 0,
                 state=private_progress.state or PassiveOrderState.UNKNOWN,
                 observed_at_ms=now_ms,
@@ -6990,7 +6913,9 @@ class VenueTransport(MarketDataClient):
                     _safe_float(detail_data.get("avgPrice", "0")) or None
                 ),
                 fee_quote=(
-                    abs(_safe_float(detail_data.get("cumExecFee", "0"))) or None
+                    abs(_safe_float(detail_data["cumExecFee"]))
+                    if "cumExecFee" in detail_data
+                    else None
                 ),
                 updated_at_ms=updated_at_ms,
             )
@@ -7042,7 +6967,7 @@ class VenueTransport(MarketDataClient):
             client_order_id=merged.client_order_id or client_order_id or "",
             cumulative_quantity=merged.cumulative_quantity,
             average_price=merged.average_price or 0.0,
-            fee_quote=merged.fee_quote or 0.0,
+            fee_quote=merged.fee_quote,
             last_fill_time_ms=merged.last_fill_at_ms or 0,
             state=state,
             observed_at_ms=now_ms,
@@ -7292,7 +7217,7 @@ class VenueTransport(MarketDataClient):
             client_order_id=merged.client_order_id or client_order_id or "",
             cumulative_quantity=merged.cumulative_quantity,
             average_price=merged.average_price or 0.0,
-            fee_quote=merged.fee_quote or 0.0,
+            fee_quote=merged.fee_quote,
             last_fill_time_ms=merged.last_fill_at_ms or 0,
             state=state,
             observed_at_ms=now_ms,
@@ -7379,7 +7304,11 @@ class VenueTransport(MarketDataClient):
                          data.get("fillPriceAvg", data.get("averagePrice",
                          data.get("avgPx", data.get("price", 0)))))))
 
-        fee_quote = float(data.get("commission", data.get("fee", 0)))
+        raw_fee = data.get("commission", data.get("fee"))
+        try:
+            fee_quote = float(raw_fee) if raw_fee is not None else None
+        except (TypeError, ValueError):
+            fee_quote = None
         last_fill_time = int(data.get("updateTime", data.get("updatedTime",
                                data.get("updateTimestamp", data.get("cTime",
                                data.get("uTime", now_ms))))))
@@ -8186,7 +8115,7 @@ class VenueTransport(MarketDataClient):
                     order_id=oid, client_order_id=entry_cloid,
                     cumulative_quantity=total_sz,
                     average_price=avg_px if avg_px > 0 else limit_px,
-                    fee_quote=0.0, last_fill_time_ms=now_ms,
+                    fee_quote=None, last_fill_time_ms=now_ms,
                     state=PassiveOrderState.FILLED, observed_at_ms=now_ms,
                 )
             if status in ("open", "resting", "triggered"):
@@ -8195,7 +8124,7 @@ class VenueTransport(MarketDataClient):
                     order_id=oid, client_order_id=entry_cloid,
                     cumulative_quantity=orig_sz - sz,
                     average_price=limit_px,
-                    fee_quote=0.0, last_fill_time_ms=now_ms,
+                    fee_quote=None, last_fill_time_ms=now_ms,
                     state=PassiveOrderState.OPEN, observed_at_ms=now_ms,
                 )
             if status in ("canceled", "rejected"):
@@ -8204,7 +8133,7 @@ class VenueTransport(MarketDataClient):
                     order_id=oid, client_order_id=entry_cloid,
                     cumulative_quantity=orig_sz - sz,
                     average_price=0.0,
-                    fee_quote=0.0, last_fill_time_ms=now_ms,
+                    fee_quote=None, last_fill_time_ms=now_ms,
                     state=PassiveOrderState.CANCELED if status == "canceled" else PassiveOrderState.REJECTED,
                     observed_at_ms=now_ms,
                 )

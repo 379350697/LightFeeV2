@@ -47,8 +47,10 @@ from lightfee.engine.close_executor import (
     CloseExecutionLeg,
     _is_bybit_duplicate_order_link_id,
     build_close_execution_from_legs,
+    close_accounting_evidence_gaps,
     close_leg_exchange_min_notional_violation,
     compute_close_chunks,
+    register_close_accounting_reconciliation,
 )
 from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.engine.order_submit_uncertainty import (
@@ -1286,7 +1288,13 @@ class PassiveCloseExecutor:
                             average_price=float(
                                 getattr(terminal_truth, "average_price", 0.0) or 0.0
                             ),
-                            fee_quote=float(getattr(terminal_truth, "fee_quote", 0.0) or 0.0),
+                            fee_quote=(
+                                float(getattr(terminal_truth, "fee_quote"))
+                                if self._fee_evidence_complete(
+                                    getattr(terminal_truth, "fee_quote", None)
+                                )
+                                else None
+                            ),
                             last_fill_time_ms=int(
                                 getattr(terminal_truth, "filled_at_ms", 0) or 0
                             ),
@@ -2339,6 +2347,22 @@ class PassiveCloseExecutor:
             "filled_at_ms": fill.filled_at_ms,
         }
 
+    @staticmethod
+    def _fee_evidence_complete(fee_quote: float | None) -> bool:
+        try:
+            return math.isfinite(float(fee_quote)) and float(fee_quote) >= 0.0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _persisted_leg_fill(leg: PersistedCloseExecutionLeg) -> OrderFill | None:
+        """Expose no numeric fee when this persisted leg lacks evidence."""
+        if leg.fill is None:
+            return None
+        if leg.fee_evidence_complete is False:
+            return replace(leg.fill, fee_quote=None)
+        return leg.fill
+
     def _pending_passive_close_recovery_payload(
         self,
         pending: PendingPassiveClose,
@@ -2348,8 +2372,14 @@ class PassiveCloseExecutor:
         phase = pending.phase_state
 
         def serialize_leg(leg: PersistedCloseExecutionLeg) -> dict[str, Any]:
+            fee_evidence_complete = leg.fee_evidence_complete
+            if fee_evidence_complete is None:
+                fee_evidence_complete = self._fee_evidence_complete(
+                    leg.fill.fee_quote if leg.fill is not None else None
+                )
             return {
                 "fill": self._serialize_close_order_fill(leg.fill),
+                "fee_evidence_complete": fee_evidence_complete,
                 "client_order_id": leg.client_order_id,
                 "submit_started_at_ms": leg.submit_started_at_ms,
                 "latency_ms": leg.latency_ms,
@@ -2360,6 +2390,7 @@ class PassiveCloseExecutor:
                 "quantity": fill.quantity,
                 "average_price": fill.average_price,
                 "fee_quote": fill.fee_quote,
+                "fee_evidence_complete": fill.fee_evidence_complete,
                 "last_fill_time_ms": fill.last_fill_time_ms,
                 "order_id": fill.order_id,
                 "client_order_id": fill.client_order_id,
@@ -2433,6 +2464,9 @@ class PassiveCloseExecutor:
         for leg in legs:
             if leg.client_order_id == client_order_id and leg.fill is None:
                 leg.fill = fill
+                leg.fee_evidence_complete = PassiveCloseExecutor._fee_evidence_complete(
+                    fill.fee_quote
+                )
                 if not leg.submit_started_at_ms:
                     leg.submit_started_at_ms = submitted_at_ms
                 return
@@ -2453,17 +2487,28 @@ class PassiveCloseExecutor:
                     )
                 )
             )
-            if (
+            if not (
                 same_identity
                 and abs(existing.quantity - fill.quantity) <= 1e-12
                 and abs(existing.price - fill.price) <= 1e-12
-                and abs(float(existing.fee_quote or 0.0) - float(fill.fee_quote or 0.0)) <= 1e-12
                 and int(existing.filled_at_ms or 0) == int(fill.filled_at_ms or 0)
             ):
+                continue
+            if existing.fee_quote == fill.fee_quote:
                 return
+            # An exact later observation can supply fee evidence that the
+            # earlier progress update lacked; update rather than duplicate.
+            leg.fill = fill
+            leg.fee_evidence_complete = PassiveCloseExecutor._fee_evidence_complete(
+                fill.fee_quote
+            )
+            return
         legs.append(
             PersistedCloseExecutionLeg(
                 fill=fill,
+                fee_evidence_complete=PassiveCloseExecutor._fee_evidence_complete(
+                    fill.fee_quote
+                ),
                 client_order_id=client_order_id,
                 submit_started_at_ms=submitted_at_ms,
             )
@@ -2477,18 +2522,59 @@ class PassiveCloseExecutor:
     ) -> None:
         """Update pending state from maker progress poll result."""
         if progress.cumulative_quantity > pending.maker_fill.quantity + 1e-9:
-            delta_qty = progress.cumulative_quantity - pending.maker_fill.quantity
+            prior_quantity = pending.maker_fill.quantity
+            prior_notional = prior_quantity * pending.maker_fill.average_price
+            prior_fee = pending.maker_fill.fee_quote
+            prior_fee_evidence_complete = pending.maker_fill.fee_evidence_complete
+            delta_qty = progress.cumulative_quantity - prior_quantity
             progress_client_order_id = (
                 progress.client_order_id
                 or pending.phase_state.maker_client_order_id
             )
-            # Weighted average price update
-            prev_total = pending.maker_fill.quantity * pending.maker_fill.average_price
-            new_total = delta_qty * progress.average_price
-            new_qty = pending.maker_fill.quantity + delta_qty
-            pending.maker_fill.average_price = (prev_total + new_total) / new_qty if new_qty > 0 else 0.0
+            # V1's progress average_price and fee_quote are cumulative order
+            # values.  Store the latest cumulative observation and derive the
+            # execution-leg delta from the previous cumulative total; treating
+            # either field as incremental double-counts partial fills.
+            cumulative_price = (
+                float(progress.average_price)
+                if isinstance(progress.average_price, (int, float))
+                and math.isfinite(float(progress.average_price))
+                and float(progress.average_price) > 0.0
+                else pending.maker_fill.average_price
+            )
+            cumulative_notional = progress.cumulative_quantity * cumulative_price
+            delta_notional = cumulative_notional - prior_notional
+            delta_price = (
+                delta_notional / delta_qty
+                if delta_notional > 0.0 and delta_qty > 1e-12
+                else cumulative_price
+            )
+            pending.maker_fill.average_price = cumulative_price
             pending.maker_fill.quantity = progress.cumulative_quantity
-            pending.maker_fill.fee_quote += progress.fee_quote
+            try:
+                progress_fee = float(progress.fee_quote)
+            except (TypeError, ValueError):
+                progress_fee = None
+            if (
+                progress_fee is None
+                or not math.isfinite(progress_fee)
+                or progress_fee < 0.0
+            ):
+                pending.maker_fill.fee_evidence_complete = False
+                delta_fee = None
+            else:
+                pending.maker_fill.fee_quote = progress_fee
+                pending.maker_fill.fee_evidence_complete = True
+                if prior_quantity <= 1e-12:
+                    delta_fee = progress_fee
+                elif prior_fee_evidence_complete and progress_fee + 1e-12 >= prior_fee:
+                    delta_fee = max(progress_fee - prior_fee, 0.0)
+                else:
+                    # The latest cumulative fee is authoritative for this
+                    # order, but cannot truthfully split a previously unknown
+                    # amount across persisted delta legs.  Final accounting
+                    # therefore stays on the existing reconciliation path.
+                    delta_fee = None
             pending.maker_fill.last_fill_time_ms = progress.last_fill_time_ms
             pending.maker_fill.order_id = progress.order_id
             pending.maker_fill.client_order_id = progress_client_order_id
@@ -2500,10 +2586,10 @@ class PassiveCloseExecutor:
                 symbol=progress.symbol,
                 side=progress.side,
                 quantity=delta_qty,
-                price=progress.average_price,
+                price=delta_price,
                 order_id=progress.order_id,
                 client_order_id=progress_client_order_id,
-                fee_quote=progress.fee_quote,
+                fee_quote=delta_fee,
                 filled_at_ms=progress.last_fill_time_ms or now_ms,
             )
             self._record_close_execution_leg(
@@ -2521,6 +2607,7 @@ class PassiveCloseExecutor:
                     "cumulative_quantity": progress.cumulative_quantity,
                     "average_price": progress.average_price,
                     "delta_quantity": delta_qty,
+                    "fee_evidence_complete": pending.maker_fill.fee_evidence_complete,
                     "state": progress.state.value,
                     "maker_leg": maker_leg.value,
                 },
@@ -2745,7 +2832,16 @@ class PassiveCloseExecutor:
                 (prev_total + fill.quantity * fill.price) / new_qty
                 if new_qty > 0 else fill.price
             )
-            pending.hedge_fill.fee_quote += fill.fee_quote or 0.0
+            try:
+                fill_fee = float(fill.fee_quote)
+            except (TypeError, ValueError):
+                fill_fee = None
+            if not self._fee_evidence_complete(fill_fee):
+                pending.hedge_fill.fee_evidence_complete = False
+            else:
+                pending.hedge_fill.fee_quote += fill_fee
+                if previous_qty <= 1e-12:
+                    pending.hedge_fill.fee_evidence_complete = True
             pending.hedge_fill.last_fill_time_ms = fill.filled_at_ms
             pending.hedge_fill.order_id = fill.order_id
             pending.hedge_fill.client_order_id = fill_client_order_id
@@ -4116,9 +4212,10 @@ class PassiveCloseExecutor:
 
         short_legs = []
         for leg in pending.short_legs:
-            if leg.fill is not None:
+            fill = self._persisted_leg_fill(leg)
+            if fill is not None:
                 short_legs.append(CloseExecutionLeg(
-                    fill=leg.fill,
+                    fill=fill,
                     client_order_id=leg.client_order_id,
                     submit_started_at_ms=leg.submit_started_at_ms,
                     latency_ms=leg.latency_ms,
@@ -4126,9 +4223,10 @@ class PassiveCloseExecutor:
 
         long_legs = []
         for leg in pending.long_legs:
-            if leg.fill is not None:
+            fill = self._persisted_leg_fill(leg)
+            if fill is not None:
                 long_legs.append(CloseExecutionLeg(
-                    fill=leg.fill,
+                    fill=fill,
                     client_order_id=leg.client_order_id,
                     submit_started_at_ms=leg.submit_started_at_ms,
                     latency_ms=leg.latency_ms,
@@ -4147,8 +4245,8 @@ class PassiveCloseExecutor:
             gap = max(pending_fill.quantity - existing_qty, 0.0)
             if gap <= 1e-9:
                 return
-            fee_quote = 0.0
-            if pending_fill.quantity > 1e-12:
+            fee_quote = None
+            if pending_fill.fee_evidence_complete and pending_fill.quantity > 1e-12:
                 fee_quote = pending_fill.fee_quote * (gap / pending_fill.quantity)
             fill = OrderFill(
                 venue=venue,
@@ -4227,6 +4325,24 @@ class PassiveCloseExecutor:
             position, pending.chunk_count(), short_legs, long_legs,
         )
         close.reason = pending.reason
+        accounting_evidence_gaps = close_accounting_evidence_gaps(
+            position,
+            long_legs,
+            short_legs,
+        )
+        accounting_evidence_complete = not accounting_evidence_gaps
+        if not accounting_evidence_complete:
+            register_close_accounting_reconciliation(
+                state,
+                self._journal,
+                position,
+                long_legs=long_legs,
+                short_legs=short_legs,
+                now_ms=self._now_ms(),
+                reason=pending.reason,
+                source="passive_close_execution",
+                evidence_gaps=accounting_evidence_gaps,
+            )
 
         # Apply close to position state
         long_closed = sum(leg.fill.quantity for leg in long_legs if leg.fill)
@@ -4236,9 +4352,10 @@ class PassiveCloseExecutor:
         position.matched_quantity = max(position.matched_quantity - matched_closed, 0.0)
         position.long_quantity = max(position.long_quantity - long_closed, 0.0)
         position.short_quantity = max(position.short_quantity - short_closed, 0.0)
-        position.realized_price_pnl_quote += close.realized_price_pnl_quote
-        position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
-        position.current_net_quote += close.net_quote
+        if accounting_evidence_complete:
+            position.realized_price_pnl_quote += close.realized_price_pnl_quote
+            position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
+            position.current_net_quote += close.net_quote
 
         # V1: detect residual from asymmetric fills (exit.rs:4903-4917)
         from lightfee.engine.close_executor import split_close_fill_residual
@@ -4283,20 +4400,29 @@ class PassiveCloseExecutor:
         # Clean up pending passive close
         state.pending_passive_closes.pop(pending.position_id, None)
 
-        self._journal.append(
-            "exit.passive_close_resolved",
-            {
-                "position_id": pending.position_id,
-                "reason": pending.reason,
-                "long_closed_qty": long_closed,
-                "short_closed_qty": short_closed,
-                "price_pnl": close.realized_price_pnl_quote,
-                "net_quote": close.net_quote,
-                "chunk_count": pending.chunk_count(),
-                "total_legs": len(long_legs) + len(short_legs),
-                **closure_fields,
-            },
-        )
+        resolved_payload = {
+            "position_id": pending.position_id,
+            "reason": pending.reason,
+            "long_closed_qty": long_closed,
+            "short_closed_qty": short_closed,
+            "chunk_count": pending.chunk_count(),
+            "total_legs": len(long_legs) + len(short_legs),
+            "terminal_accounting_status": (
+                "final"
+                if accounting_evidence_complete
+                else "pending_close_accounting_reconciliation"
+            ),
+            "accounting_evidence_gaps": list(accounting_evidence_gaps),
+            **closure_fields,
+        }
+        if accounting_evidence_complete:
+            resolved_payload.update(
+                {
+                    "price_pnl": close.realized_price_pnl_quote,
+                    "net_quote": close.net_quote,
+                }
+            )
+        self._journal.append("exit.passive_close_resolved", resolved_payload)
         if fully_closed:
             def leg_record(leg: CloseExecutionLeg) -> dict[str, Any]:
                 fill = leg.fill
@@ -4316,7 +4442,9 @@ class PassiveCloseExecutor:
             entry_fee_quote = position.total_entry_fee_quote
             exit_fee_quote = position.realized_exit_fee_quote
             price_pnl_quote = position.realized_price_pnl_quote
-            entry_fee_evidence_complete = position.entry_fee_evidence_complete
+            entry_fee_evidence_complete = (
+                position.entry_fee_evidence_complete and accounting_evidence_complete
+            )
             terminal_payload = {
                 "position_id": position.position_id,
                 "symbol": position.symbol,
@@ -4353,7 +4481,7 @@ class PassiveCloseExecutor:
             }
             if entry_fee_evidence_complete:
                 self._journal.append_critical(now_ms, "exit.closed", terminal_payload)
-            else:
+            elif accounting_evidence_complete:
                 self._journal.append_critical(
                     now_ms,
                     "exit.billing_evidence_unavailable",
@@ -4519,6 +4647,7 @@ class PassiveCloseExecutor:
             "total_entry_fee_quote": position.total_entry_fee_quote,
             "entry_fee_evidence_complete": position.entry_fee_evidence_complete,
             "captured_funding_quote": position.captured_funding_quote,
+            "second_stage_funding_quote": position.second_stage_funding_quote,
             "opened_at_ms": position.opened_at_ms,
         }
 
@@ -4580,7 +4709,7 @@ class PassiveCloseExecutor:
         client_order_id: str = "",
         quantity: float = 0.0,
         average_price: float = 0.0,
-        fee_quote: float = 0.0,
+        fee_quote: float | None = None,
     ) -> dict[str, Any]:
         return {
             "venue": venue.value,
@@ -4588,7 +4717,11 @@ class PassiveCloseExecutor:
             "client_order_id": str(client_order_id or ""),
             "quantity": float(quantity or 0.0),
             "average_price": float(average_price or 0.0),
-            "fee_quote": float(fee_quote or 0.0),
+            "fee_quote": (
+                float(fee_quote)
+                if PassiveCloseExecutor._fee_evidence_complete(fee_quote)
+                else None
+            ),
         }
 
     def _pending_close_reconciliation_records(
@@ -4633,12 +4766,16 @@ class PassiveCloseExecutor:
                     client_order_id=fill_state.client_order_id,
                     quantity=fill_state.quantity,
                     average_price=fill_state.average_price,
-                    fee_quote=fill_state.fee_quote,
+                    fee_quote=(
+                        fill_state.fee_quote
+                        if fill_state.fee_evidence_complete
+                        else None
+                    ),
                 ),
             )
 
         for leg in pending.long_legs:
-            fill = leg.fill
+            fill = self._persisted_leg_fill(leg)
             if fill is None:
                 continue
             add_record(
@@ -4649,11 +4786,11 @@ class PassiveCloseExecutor:
                     client_order_id=leg.client_order_id or fill.client_order_id or "",
                     quantity=fill.quantity,
                     average_price=fill.price,
-                    fee_quote=fill.fee_quote or 0.0,
+                    fee_quote=fill.fee_quote,
                 ),
             )
         for leg in pending.short_legs:
-            fill = leg.fill
+            fill = self._persisted_leg_fill(leg)
             if fill is None:
                 continue
             add_record(
@@ -4664,7 +4801,7 @@ class PassiveCloseExecutor:
                     client_order_id=leg.client_order_id or fill.client_order_id or "",
                     quantity=fill.quantity,
                     average_price=fill.price,
-                    fee_quote=fill.fee_quote or 0.0,
+                    fee_quote=fill.fee_quote,
                 ),
             )
 
@@ -5561,9 +5698,10 @@ class PassiveCloseExecutor:
     ) -> tuple[list[CloseExecutionLeg], list[CloseExecutionLeg]]:
         short_legs: list[CloseExecutionLeg] = []
         for leg in pending.short_legs:
-            if leg.fill is not None:
+            fill = self._persisted_leg_fill(leg)
+            if fill is not None:
                 short_legs.append(CloseExecutionLeg(
-                    fill=leg.fill,
+                    fill=fill,
                     client_order_id=leg.client_order_id,
                     submit_started_at_ms=leg.submit_started_at_ms,
                     latency_ms=leg.latency_ms,
@@ -5571,9 +5709,10 @@ class PassiveCloseExecutor:
 
         long_legs: list[CloseExecutionLeg] = []
         for leg in pending.long_legs:
-            if leg.fill is not None:
+            fill = self._persisted_leg_fill(leg)
+            if fill is not None:
                 long_legs.append(CloseExecutionLeg(
-                    fill=leg.fill,
+                    fill=fill,
                     client_order_id=leg.client_order_id,
                     submit_started_at_ms=leg.submit_started_at_ms,
                     latency_ms=leg.latency_ms,

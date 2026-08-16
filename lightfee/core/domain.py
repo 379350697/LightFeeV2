@@ -328,7 +328,9 @@ class PassiveOrderProgress:
     client_order_id: str = ""  # V1: optional — venue may not include in progress updates
     cumulative_quantity: float = 0.0
     average_price: float = 0.0
-    fee_quote: float = 0.0
+    # ``None`` means the venue did not provide fee evidence.  Zero is a
+    # distinct, confirmed zero-fee execution.
+    fee_quote: float | None = None
     last_fill_time_ms: int = 0
     state: PassiveOrderState = PassiveOrderState.UNKNOWN
     observed_at_ms: int = 0

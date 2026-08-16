@@ -278,6 +278,38 @@ def test_exit_reconciliation_requires_explicit_exit_fee_provenance_even_for_zero
     assert payload["venue_statement_reconciled"] is True
 
 
+def test_exit_reconciliation_requires_positive_entry_and_close_prices():
+    runtime = CloseRuntime(ctx=None)
+    reconciliation = {
+        "position_id": "entry-home",
+        "symbol": "HOMEUSDT",
+        "position_snapshot": {
+            "long_quantity": 10.0,
+            "short_quantity": 10.0,
+            "long_entry_price": 1.0,
+            "short_entry_price": 1.2,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
+        },
+    }
+    long_fill = OrderFill(
+        venue=Venue.BINANCE, symbol="HOMEUSDT", side=Side.SELL,
+        quantity=10.0, price=0.0, order_id="long", fee_quote=0.01,
+    )
+    short_fill = OrderFill(
+        venue=Venue.BYBIT, symbol="HOMEUSDT", side=Side.BUY,
+        quantity=10.0, price=1.0, order_id="short", fee_quote=0.01,
+    )
+
+    payload = runtime._exit_reconciled_payload_from_leg_fills(
+        reconciliation, [long_fill], [short_fill], now_ms=2_000,
+    )
+
+    assert payload["close_price_evidence_complete"] is False
+    assert payload["venue_statement_reconciled"] is False
+    assert payload["net_quote_status"] == "provisional"
+
+
 # ---------------------------------------------------------------------------
 # CloseBalance
 # ---------------------------------------------------------------------------
@@ -779,6 +811,108 @@ class TestCloseChunkExecutor:
         # Each adapter called exactly once (one chunk)
         assert long_adapter.place_order_call_count == 1
         assert short_adapter.place_order_call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_final_close_emits_one_terminal_bill_with_complete_evidence(self):
+        """The aggressive path has one canonical final ledger event."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE)
+        short_adapter = FakeVenueAdapter(Venue.OKX)
+        long_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.BINANCE, "BTCUSDT", Side.SELL, 0.01,
+                price=50_100.0, order_id="long-close", fee_quote=0.1,
+            ),
+        ]
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX, "BTCUSDT", Side.BUY, 0.01,
+                price=49_900.0, order_id="short-close", fee_quote=0.1,
+            ),
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+        position = _make_position(
+            entry_fee_evidence_complete=True,
+            long_entry_fee_quote=0.1,
+            short_entry_fee_quote=0.1,
+            total_entry_fee_quote=0.2,
+        )
+        state = EngineState()
+        state.open_positions[position.position_id] = position
+
+        await executor.execute_close(
+            position, "profit_take", 2_000,
+            long_price_hint=50_000.0, short_price_hint=50_000.0,
+            state=state,
+        )
+
+        terminal = [
+            record for record in journal.read_all()
+            if record["kind"] == "exit.closed"
+        ]
+        assert len(terminal) == 1
+        assert position.position_id not in state.open_positions
+        assert state.pending_close_reconciliations == []
+
+    @pytest.mark.asyncio
+    async def test_missing_close_price_defers_terminal_accounting_to_reconciliation(self):
+        """A physical close without an execution price cannot become PnL."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        long_adapter = FakeVenueAdapter(Venue.BINANCE)
+        short_adapter = FakeVenueAdapter(Venue.OKX)
+        long_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.BINANCE, "BTCUSDT", Side.SELL, 0.01,
+                price=0.0, order_id="long-close", fee_quote=0.1,
+            ),
+        ]
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX, "BTCUSDT", Side.BUY, 0.01,
+                price=49_900.0, order_id="short-close", fee_quote=0.1,
+            ),
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+        position = _make_position(
+            entry_fee_evidence_complete=True,
+            long_entry_fee_quote=0.1,
+            short_entry_fee_quote=0.1,
+            total_entry_fee_quote=0.2,
+        )
+        state = EngineState()
+        state.open_positions[position.position_id] = position
+
+        await executor.execute_close(
+            position, "profit_take", 2_000,
+            long_price_hint=50_000.0, short_price_hint=50_000.0,
+            state=state,
+        )
+
+        assert position.position_id not in state.open_positions
+        assert position.realized_price_pnl_quote == pytest.approx(0.0)
+        assert position.realized_exit_fee_quote == pytest.approx(0.0)
+        assert len(state.pending_close_reconciliations) == 1
+        pending = state.pending_close_reconciliations[0]
+        assert pending["original_payload"]["accounting_evidence_gaps"] == [
+            "long_close_price_unavailable",
+        ]
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.pending_close_reconciliation_registered" in kinds
+        assert "exit.closed" not in kinds
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

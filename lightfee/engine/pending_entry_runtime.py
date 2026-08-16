@@ -1511,6 +1511,7 @@ class PendingEntryRuntime:
             quantity=pending.maker_leg_filled,
             price=pending.maker_fill_price if pending.maker_fill_price > 0 else pending.maker_price,
             order_id=maker_order_id_for_fill,
+            fee_quote=getattr(pending, "maker_fee_quote", None),
             filled_at_ms=now_ms,
         )
         hedge_fill = OrderFill(
@@ -1520,6 +1521,7 @@ class PendingEntryRuntime:
             quantity=pending.hedge_leg_filled,
             price=pending.hedge_fill_price if pending.hedge_fill_price > 0 else pending.maker_fill_price,
             order_id=pending.hedge_order_id,
+            fee_quote=getattr(pending, "hedge_fee_quote", None),
             filled_at_ms=now_ms,
         )
 
@@ -1782,6 +1784,7 @@ class PendingEntryRuntime:
             quantity=open_maker_fill_quantity,
             price=pending.maker_fill_price,
             order_id=maker_order_id_for_fill,
+            fee_quote=getattr(pending, "maker_fee_quote", None),
             filled_at_ms=now_ms,
         )
         hedge_fill = OrderFill(
@@ -1791,6 +1794,7 @@ class PendingEntryRuntime:
             quantity=open_hedge_fill_quantity,
             price=pending.hedge_fill_price,
             order_id=pending.hedge_order_id,
+            fee_quote=getattr(pending, "hedge_fee_quote", None),
             filled_at_ms=now_ms,
         )
 
@@ -1872,6 +1876,10 @@ class PendingEntryRuntime:
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": pending.maker_client_order_id,
                 "hedge_client_order_id": pending.hedge_client_order_id,
+                "long_entry_fee_quote": position.long_entry_fee_quote,
+                "short_entry_fee_quote": position.short_entry_fee_quote,
+                "total_entry_fee_quote": position.total_entry_fee_quote,
+                "entry_fee_evidence_complete": position.entry_fee_evidence_complete,
                 "funding_timestamp_ms": position.funding_timestamp_ms,
                 "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
                 "opportunity_type": position.opportunity_type,

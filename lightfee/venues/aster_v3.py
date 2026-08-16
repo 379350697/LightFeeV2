@@ -906,7 +906,7 @@ class AsterV3Client:
             client_order_id=str(data.get("clientOrderId", client_order_id or "") or ""),
             cumulative_quantity=cum_qty,
             average_price=_safe_float(data.get("avgPrice", data.get("price", 0)), default=0.0),
-            fee_quote=0.0,
+            fee_quote=None,
             last_fill_time_ms=int(_safe_float(data.get("updateTime"), default=0.0)),
             state=_order_state(data.get("status"), cum_qty),
             observed_at_ms=now_ms,

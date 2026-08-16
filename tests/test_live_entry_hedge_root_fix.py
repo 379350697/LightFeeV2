@@ -830,8 +830,10 @@ class TestPendingEntryPersistenceRoundtrip:
             maker_leg="long",
             maker_leg_filled=10.0,
             maker_fill_price=15.0,
+            maker_fee_quote=0.12,
             hedge_leg_filled=0.0,
             hedge_fill_price=0.0,
+            hedge_fee_quote=None,
             uncertain_outcome=True,
             hedge_inflight="link-hedge-inflight-cid",
             maker_client_order_id="maker-orig",
@@ -848,6 +850,8 @@ class TestPendingEntryPersistenceRoundtrip:
         assert pe["hedge_inflight"]["client_order_id"] == "link-hedge-inflight-cid"
         assert pe["maker_fill_price"] == 15.0
         assert pe["hedge_fill_price"] == 0.0
+        assert pe["maker_fee_quote"] == 0.12
+        assert pe["hedge_fee_quote"] is None
         assert pe["maker_client_order_id"] == "maker-orig"
         assert pe["hedge_client_order_id"] == "hedge-orig"
         assert pe["maker_leg"] == "long"
@@ -875,6 +879,8 @@ class TestPendingEntryPersistenceRoundtrip:
                     "uncertain_outcome": True,
                     "maker_fill_price": 0.85,
                     "hedge_fill_price": 0.84,
+                    "maker_fee_quote": 0.001,
+                    "hedge_fee_quote": -0.002,
                     "hedge_inflight": "matic-inflight-cid",
                     "maker_client_order_id": "matic-maker-cid",
                     "hedge_client_order_id": "matic-hedge-cid",
@@ -895,6 +901,8 @@ class TestPendingEntryPersistenceRoundtrip:
         assert restored.hedge_inflight.submitted_at_ms == 0  # legacy
         assert restored.maker_fill_price == 0.85
         assert restored.hedge_fill_price == 0.84
+        assert restored.maker_fee_quote == pytest.approx(0.001)
+        assert restored.hedge_fee_quote == pytest.approx(-0.002)
         assert restored.maker_client_order_id == "matic-maker-cid"
         assert restored.hedge_client_order_id == "matic-hedge-cid"
         assert restored.outcome == "hedge_uncertain"
@@ -6554,6 +6562,74 @@ class TestZeroFillFinalizeV1ParityGate:
         events = [e for e in runtime.journal.read_all() if e.get("kind") == "entry.opened"]
         assert events
         assert events[0]["payload"]["hedge_order_id"] == "hedge-real-oid"
+
+    @pytest.mark.asyncio
+    async def test_reconciled_entry_fees_survive_pending_finalization(self, tmp_path):
+        """Exact entry fees from both venues make the opened bill final."""
+        runtime = _make_open_runtime(tmp_path)
+        maker_adapter = _FakeVenueAdapter(Venue.BINANCE)
+        maker_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="HYPEUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            average_price=20.0,
+            order_id="maker-real-oid",
+            client_order_id="maker-cid",
+            fee_quote=0.01,
+            filled_at_ms=2000,
+            metadata={
+                "evidence_source": "binance_user_trades",
+                "response_classification": "filled",
+                "raw_exchange_status": "filled",
+            },
+        )
+        hedge_adapter = _FakeVenueAdapter(Venue.BYBIT)
+        hedge_adapter.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="HYPEUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            average_price=20.01,
+            order_id="hedge-real-oid",
+            client_order_id="hedge-cid",
+            fee_quote=0.02,
+            filled_at_ms=2000,
+            metadata={
+                "evidence_source": "bybit_execution_list",
+                "response_classification": "filled",
+            },
+        )
+        runtime._venue_adapters[Venue.BINANCE] = maker_adapter
+        runtime._venue_adapters[Venue.BYBIT] = hedge_adapter
+        pending = PendingEntry(
+            pending_id="entry-reconciled-fees",
+            symbol="HYPEUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BYBIT,
+            target_quantity=1.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1000,
+            maker_leg="long",
+            maker_leg_filled=1.0,
+            hedge_leg_filled=1.0,
+            maker_fill_price=20.0,
+            hedge_fill_price=20.01,
+            maker_order_id="maker-stale-oid",
+            hedge_order_id="hedge-stale-oid",
+            maker_client_order_id="maker-cid",
+            hedge_client_order_id="hedge-cid",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        assert await runtime._finalize_pending_entry(pending, pending.pending_id, 2_000)
+
+        position = runtime.state.open_positions[pending.pending_id]
+        assert position.long_entry_fee_quote == pytest.approx(0.01)
+        assert position.short_entry_fee_quote == pytest.approx(0.02)
+        assert position.total_entry_fee_quote == pytest.approx(0.03)
+        assert position.entry_fee_evidence_complete is True
 
     @pytest.mark.asyncio
     async def test_finalize_recomputes_residual_after_reconciliation_balances_entry(self, tmp_path):

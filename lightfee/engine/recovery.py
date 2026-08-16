@@ -62,6 +62,14 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 LEGACY_RECOVERY_BLOCK_CLEARABLE_REASONS = LEGACY_MIGRATION_CLEARABLE_BLOCK_REASONS
 
 
+def _optional_finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isfinite(parsed) else None
+
+
 _TERMINAL_CLOSE_EVENT_KINDS = frozenset(
     {
         "exit.closed",
@@ -362,6 +370,11 @@ def _restore_persisted_close_execution_legs(
         legs.append(
             PersistedCloseExecutionLeg(
                 fill=_deserialize_order_fill(item.get("fill")),
+                fee_evidence_complete=(
+                    bool(item.get("fee_evidence_complete"))
+                    if "fee_evidence_complete" in item
+                    else False
+                ),
                 client_order_id=str(item.get("client_order_id", "") or ""),
                 submit_started_at_ms=int(item.get("submit_started_at_ms", 0) or 0),
                 latency_ms=int(item.get("latency_ms", 0) or 0),
@@ -374,8 +387,15 @@ def _serialize_persisted_close_execution_leg(
     leg: PersistedCloseExecutionLeg,
 ) -> dict[str, Any]:
     """Serialize one immutable passive-close order record for recovery."""
+    fee_evidence_complete = leg.fee_evidence_complete
+    if fee_evidence_complete is None:
+        fee_quote = _optional_finite_float(
+            leg.fill.fee_quote if leg.fill is not None else None
+        )
+        fee_evidence_complete = fee_quote is not None and fee_quote >= 0.0
     return {
         "fill": _serialize_order_fill(leg.fill),
+        "fee_evidence_complete": fee_evidence_complete,
         "client_order_id": str(leg.client_order_id or ""),
         "submit_started_at_ms": int(leg.submit_started_at_ms or 0),
         "latency_ms": int(leg.latency_ms or 0),
@@ -621,6 +641,8 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     hedge_client_order_id=str(pdata.get("hedge_client_order_id", "")),
                     maker_leg_filled=float(pdata.get("maker_leg_filled", 0)),
                     hedge_leg_filled=float(pdata.get("hedge_leg_filled", 0)),
+                    maker_fee_quote=_optional_finite_float(pdata.get("maker_fee_quote")),
+                    hedge_fee_quote=_optional_finite_float(pdata.get("hedge_fee_quote")),
                     deadline_ms=int(pdata.get("deadline_ms", 0)),
                     fallback_route=str(pdata.get("fallback_route", "")),
                     uncertain_outcome=bool(pdata.get("uncertain_outcome", False)),
@@ -773,6 +795,9 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     quantity=float(mf.get("quantity", 0)),
                     average_price=float(mf.get("average_price", 0)),
                     fee_quote=float(mf.get("fee_quote", 0)),
+                    fee_evidence_complete=bool(
+                        mf.get("fee_evidence_complete", False)
+                    ),
                     last_fill_time_ms=int(mf.get("last_fill_time_ms", 0)),
                     order_id=str(mf.get("order_id", "")),
                     client_order_id=str(mf.get("client_order_id", "")),
@@ -782,6 +807,9 @@ def _restore_state_from_snapshot_dict(snap: dict[str, Any]) -> EngineState:
                     quantity=float(hf.get("quantity", 0)),
                     average_price=float(hf.get("average_price", 0)),
                     fee_quote=float(hf.get("fee_quote", 0)),
+                    fee_evidence_complete=bool(
+                        hf.get("fee_evidence_complete", False)
+                    ),
                     last_fill_time_ms=int(hf.get("last_fill_time_ms", 0)),
                     order_id=str(hf.get("order_id", "")),
                     client_order_id=str(hf.get("client_order_id", "")),
@@ -1519,6 +1547,8 @@ def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
             hedge_client_order_id=str(payload.get("hedge_client_order_id", "")),
             maker_leg_filled=float_from(payload.get("maker_leg_filled"), 0.0),
             hedge_leg_filled=float_from(payload.get("hedge_leg_filled"), 0.0),
+            maker_fee_quote=_optional_finite_float(payload.get("maker_fee_quote")),
+            hedge_fee_quote=_optional_finite_float(payload.get("hedge_fee_quote")),
             deadline_ms=int_from(payload.get("deadline_ms"), 0),
             fallback_route=str(payload.get("fallback_route", "")),
             uncertain_outcome=bool(payload.get("uncertain_outcome", False)),
@@ -1932,6 +1962,7 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
                 "quantity": ppc.maker_fill.quantity,
                 "average_price": ppc.maker_fill.average_price,
                 "fee_quote": ppc.maker_fill.fee_quote,
+                "fee_evidence_complete": ppc.maker_fill.fee_evidence_complete,
                 "last_fill_time_ms": ppc.maker_fill.last_fill_time_ms,
                 "order_id": ppc.maker_fill.order_id,
                 "client_order_id": ppc.maker_fill.client_order_id,
@@ -1940,6 +1971,7 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
                 "quantity": ppc.hedge_fill.quantity,
                 "average_price": ppc.hedge_fill.average_price,
                 "fee_quote": ppc.hedge_fill.fee_quote,
+                "fee_evidence_complete": ppc.hedge_fill.fee_evidence_complete,
                 "last_fill_time_ms": ppc.hedge_fill.last_fill_time_ms,
                 "order_id": ppc.hedge_fill.order_id,
                 "client_order_id": ppc.hedge_fill.client_order_id,

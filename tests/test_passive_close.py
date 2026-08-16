@@ -369,19 +369,66 @@ class TestPassiveProgressAndHedge:
         pending.maker_fill = PendingPassiveLegFill()
 
         p1 = _make_passive_progress(
-            cumulative_quantity=0.003, average_price=50100.0, side=Side.BUY,
+            cumulative_quantity=0.003,
+            average_price=50100.0,
+            fee_quote=0.1,
+            side=Side.BUY,
         )
         executor._apply_maker_progress(pending, p1, 1000)
         assert pending.maker_fill.quantity == 0.003
         assert len(pending.short_legs) == 1
 
         p2 = _make_passive_progress(
-            cumulative_quantity=0.007, average_price=50200.0, side=Side.BUY,
+            cumulative_quantity=0.007,
+            average_price=50200.0,
+            fee_quote=0.2,
+            side=Side.BUY,
         )
         executor._apply_maker_progress(pending, p2, 2000)
         assert pending.maker_fill.quantity == 0.007
+        assert pending.maker_fill.average_price == 50200.0
+        assert pending.maker_fill.fee_quote == pytest.approx(0.2)
+        assert pending.maker_fill.fee_evidence_complete is True
         assert len(pending.short_legs) == 2
         assert pending.short_legs[1].fill.quantity == 0.004
+        assert pending.short_legs[0].fill.fee_quote == pytest.approx(0.1)
+        assert pending.short_legs[1].fill.fee_quote == pytest.approx(0.1)
+        assert pending.short_legs[1].fill.price == pytest.approx(50275.0)
+
+    def test_apply_maker_progress_missing_cumulative_fee_defers_fee_evidence(self):
+        """A missing cumulative fee cannot become a zero-fee close leg."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        pending = PendingPassiveClose(
+            position_id="p001",
+            reason="funding_capture",
+            target_quantity=0.01,
+            chunk_quantities=[0.01],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+
+        executor._apply_maker_progress(
+            pending,
+            _make_passive_progress(cumulative_quantity=0.003, fee_quote=None),
+            1000,
+        )
+        executor._apply_maker_progress(
+            pending,
+            _make_passive_progress(
+                cumulative_quantity=0.007,
+                average_price=50200.0,
+                fee_quote=0.2,
+            ),
+            2000,
+        )
+
+        assert pending.maker_fill.fee_quote == pytest.approx(0.2)
+        assert pending.maker_fill.fee_evidence_complete is True
+        assert pending.long_legs[0].fill.fee_quote is None
+        assert pending.long_legs[1].fill.fee_quote is None
 
     def test_terminal_filled_persists_full_maker_leg(self):
         journal = _open_journal()
@@ -1067,6 +1114,7 @@ class TestAdvanceChunkRootInvariant:
                 quantity=10.0,
                 average_price=110.0,
                 fee_quote=1.1,
+                fee_evidence_complete=True,
                 order_id="long-close-order",
                 client_order_id="long-close-cid",
                 last_fill_time_ms=2000,
@@ -1075,6 +1123,7 @@ class TestAdvanceChunkRootInvariant:
                 quantity=10.0,
                 average_price=95.0,
                 fee_quote=0.9,
+                fee_evidence_complete=True,
                 order_id="short-close-order",
                 client_order_id="short-close-cid",
                 last_fill_time_ms=2001,
@@ -1101,6 +1150,130 @@ class TestAdvanceChunkRootInvariant:
         assert payload["net_quote"] == pytest.approx(199.0)
         assert payload["long_legs"][0]["order_id"] == "long-close-order"
         assert payload["short_legs"][0]["order_id"] == "short-close-order"
+
+    def test_finalized_passive_close_without_price_defers_accounting(self):
+        """Passive execution may close risk, but never invents a final PnL price."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="p-passive-missing-price",
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+            long_entry_price=100.0,
+            short_entry_price=105.0,
+            long_entry_fee_quote=1.0,
+            short_entry_fee_quote=2.0,
+            total_entry_fee_quote=3.0,
+            entry_fee_evidence_complete=True,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=10.0,
+                average_price=0.0,
+                fee_quote=1.1,
+                fee_evidence_complete=True,
+                order_id="long-close-order",
+                client_order_id="long-close-cid",
+                last_fill_time_ms=2000,
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=10.0,
+                average_price=95.0,
+                fee_quote=0.9,
+                fee_evidence_complete=True,
+                order_id="short-close-order",
+                client_order_id="short-close-cid",
+                last_fill_time_ms=2001,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        assert asyncio.run(executor._advance_chunk(state, pending)) is True
+
+        assert position.position_id not in state.open_positions
+        assert position.realized_price_pnl_quote == pytest.approx(0.0)
+        assert position.realized_exit_fee_quote == pytest.approx(0.0)
+        assert len(state.pending_close_reconciliations) == 1
+        records = journal.read_all()
+        kinds = [record["kind"] for record in records]
+        assert "exit.pending_close_reconciliation_registered" in kinds
+        assert "exit.closed" not in kinds
+        resolved = next(
+            record["payload"] for record in records
+            if record["kind"] == "exit.passive_close_resolved"
+        )
+        assert resolved["terminal_accounting_status"] == (
+            "pending_close_accounting_reconciliation"
+        )
+        assert "price_pnl" not in resolved
+        assert "net_quote" not in resolved
+
+    def test_finalized_passive_close_without_fee_evidence_defers_accounting(self):
+        """Confirmed price is insufficient when close fees remain unobserved."""
+        journal = _open_journal()
+        executor = PassiveCloseExecutor({}, journal)
+        state = EngineState()
+        position = _make_position(
+            position_id="p-passive-missing-fee",
+            long_quantity=10.0,
+            short_quantity=10.0,
+            matched_quantity=10.0,
+            long_entry_price=100.0,
+            short_entry_price=105.0,
+            long_entry_fee_quote=1.0,
+            short_entry_fee_quote=2.0,
+            total_entry_fee_quote=3.0,
+            entry_fee_evidence_complete=True,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=10.0,
+            chunk_quantities=[10.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+            maker_fill=PendingPassiveLegFill(
+                quantity=10.0,
+                average_price=110.0,
+                order_id="long-close-order",
+                client_order_id="long-close-cid",
+                last_fill_time_ms=2000,
+            ),
+            hedge_fill=PendingPassiveLegFill(
+                quantity=10.0,
+                average_price=95.0,
+                order_id="short-close-order",
+                client_order_id="short-close-cid",
+                last_fill_time_ms=2001,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        assert asyncio.run(executor._advance_chunk(state, pending)) is True
+
+        assert position.position_id not in state.open_positions
+        assert position.realized_price_pnl_quote == pytest.approx(0.0)
+        assert position.realized_exit_fee_quote == pytest.approx(0.0)
+        assert len(state.pending_close_reconciliations) == 1
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.pending_close_reconciliation_registered" in kinds
+        assert "exit.closed" not in kinds
 
 
 class TestTerminalMakerFillHedgeFail:
@@ -2685,7 +2858,7 @@ class TestFallbackResidualReal:
             "client_order_id": "bybit-force-cid",
             "quantity": 20.0,
             "average_price": 0.0,
-            "fee_quote": 0.0,
+            "fee_quote": None,
         }]
         assert captured_decisions[-1].evidence_class == (
             RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION
@@ -8250,7 +8423,7 @@ class TestCloseOrderIntentDurability:
             "client_order_id": client_order_id,
             "quantity": 0.0,
             "average_price": 0.0,
-            "fee_quote": 0.0,
+            "fee_quote": None,
         }]
 
     def test_intent_replays_after_ack_loss_without_followup_snapshot(self, tmp_path):
@@ -8482,5 +8655,5 @@ class TestCloseOrderIntentDurability:
             "client_order_id": "close-cid",
             "quantity": position.matched_quantity,
             "average_price": 50_000.0,
-            "fee_quote": 0.0,
+            "fee_quote": None,
         }]

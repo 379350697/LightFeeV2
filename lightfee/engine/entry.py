@@ -7,6 +7,7 @@ Rust references:
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -236,13 +237,25 @@ def build_open_position(
         long_entry_price = hedge_fill.price
         short_entry_price = maker_fill.price
 
+    def exact_fee_quote(fill: OrderFill) -> float | None:
+        try:
+            fee = float(fill.fee_quote)
+        except (TypeError, ValueError):
+            return None
+        return fee if math.isfinite(fee) and fee >= 0.0 else None
+
+    long_fee_quote = exact_fee_quote(long_fill)
+    short_fee_quote = exact_fee_quote(short_fill)
+    entry_fee_evidence_complete = (
+        long_fee_quote is not None and short_fee_quote is not None
+    )
     long_entry_fee_quote = (
-        float(long_fill.fee_quote or 0.0) * (matched_qty / long_fill.quantity)
+        float(long_fee_quote or 0.0) * (matched_qty / long_fill.quantity)
         if long_fill.quantity > 0.0
         else 0.0
     )
     short_entry_fee_quote = (
-        float(short_fill.fee_quote or 0.0) * (matched_qty / short_fill.quantity)
+        float(short_fee_quote or 0.0) * (matched_qty / short_fill.quantity)
         if short_fill.quantity > 0.0
         else 0.0
     )
@@ -297,7 +310,7 @@ def build_open_position(
         long_entry_fee_quote=long_entry_fee_quote,
         short_entry_fee_quote=short_entry_fee_quote,
         total_entry_fee_quote=total_entry_fee_quote,
-        entry_fee_evidence_complete=True,
+        entry_fee_evidence_complete=entry_fee_evidence_complete,
         current_net_quote=-total_entry_fee_quote,
         peak_net_quote=-total_entry_fee_quote,
         funding_timestamp_ms=inferred_first_funding_ms,

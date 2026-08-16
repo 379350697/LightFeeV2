@@ -17,6 +17,17 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-112 execution-evidence accounting contract, 2026-08-16: an OKX ACK-only
+fallback manufactured a hedge fill from a request hint/snapshot, and absent
+fees could become zero through entry, normal close, and passive close paths.
+Passive progress also added cumulative fees repeatedly.  V2 now preserves
+ACK-only uncertainty, carries missing fees as evidence gaps, restores V1
+cumulative fee/delta semantics, and registers durable reconciliation rather
+than booking a terminal bill from incomplete facts.  Focused suites (`903`) and
+the full validation profile (10/10) are green; cloud deployment and read-only
+verification remain required. See
+[daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract](daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract).
+
 CL-111 Binance live-order fixture dynamic-rule contract, 2026-08-15: two
 fixture-driven Binance success tests mocked every request with an order payload
 after CL-109 made exchange-backed rules mandatory.  The production path

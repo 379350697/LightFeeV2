@@ -33,7 +33,12 @@ from lightfee.engine.bybit_duplicate_reconcile import (
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.lifecycle import enter_fail_closed
 from lightfee.engine.residual import ResidualExposureTask, ResidualOrigin, approx_eq
-from lightfee.engine.state import CloseLegRecord, OpenPosition, PendingClose
+from lightfee.engine.state import (
+    CloseLegRecord,
+    OpenPosition,
+    PendingClose,
+    pending_close_reconciliation_missing_legs,
+)
 from lightfee.persistence.journal import Journal
 from lightfee.venues.cid import compact_client_order_id
 from lightfee.venues.common import venue_reduce_only_close_exempts_min_notional
@@ -571,6 +576,161 @@ def _legs_to_records(legs: list[CloseExecutionLeg]) -> list[CloseLegRecord]:
     return records
 
 
+def close_accounting_evidence_gaps(
+    position: OpenPosition,
+    long_legs: list[CloseExecutionLeg],
+    short_legs: list[CloseExecutionLeg],
+) -> tuple[str, ...]:
+    """Return the facts missing from a close bill without changing execution."""
+    gaps: list[str] = []
+
+    for leg_label, price in (
+        ("long_entry", position.long_entry_price),
+        ("short_entry", position.short_entry_price),
+    ):
+        try:
+            valid = math.isfinite(float(price)) and float(price) > 0.0
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            gaps.append(f"{leg_label}_price_unavailable")
+
+    if position.entry_fee_evidence_complete is not True:
+        gaps.append("entry_fee_evidence_unavailable")
+
+    for leg_label, legs in (("long", long_legs), ("short", short_legs)):
+        for leg in legs:
+            fill = leg.fill
+            if fill.quantity <= 1e-12:
+                continue
+            try:
+                valid_price = math.isfinite(float(fill.price)) and float(fill.price) > 0.0
+            except (TypeError, ValueError):
+                valid_price = False
+            if not valid_price:
+                gaps.append(f"{leg_label}_close_price_unavailable")
+                break
+        for leg in legs:
+            fill = leg.fill
+            if fill.quantity <= 1e-12:
+                continue
+            try:
+                valid_fee = (
+                    math.isfinite(float(fill.fee_quote))
+                    and float(fill.fee_quote) >= 0.0
+                )
+            except (TypeError, ValueError):
+                valid_fee = False
+            if not valid_fee:
+                gaps.append(f"{leg_label}_exit_fee_evidence_unavailable")
+                break
+    return tuple(gaps)
+
+
+def _close_reconciliation_position_snapshot(position: OpenPosition) -> dict[str, Any]:
+    return {
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "long_venue": position.long_venue.value,
+        "short_venue": position.short_venue.value,
+        "long_quantity": position.long_quantity,
+        "short_quantity": position.short_quantity,
+        "matched_quantity": position.matched_quantity,
+        "long_entry_price": position.long_entry_price,
+        "short_entry_price": position.short_entry_price,
+        "long_entry_fee_quote": position.long_entry_fee_quote,
+        "short_entry_fee_quote": position.short_entry_fee_quote,
+        "total_entry_fee_quote": position.total_entry_fee_quote,
+        "entry_fee_evidence_complete": position.entry_fee_evidence_complete,
+        "captured_funding_quote": position.captured_funding_quote,
+        "second_stage_funding_quote": position.second_stage_funding_quote,
+        "opened_at_ms": position.opened_at_ms,
+    }
+
+
+def _close_reconciliation_leg_records(
+    legs: list[CloseExecutionLeg],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "venue": leg.fill.venue.value,
+            "order_id": leg.fill.order_id,
+            "client_order_id": leg.fill.client_order_id or leg.client_order_id,
+            "quantity": leg.fill.quantity,
+            "average_price": leg.fill.price,
+            "fee_quote": leg.fill.fee_quote,
+            "filled_at_ms": leg.fill.filled_at_ms,
+        }
+        for leg in legs
+        if leg.fill.quantity > 1e-12
+    ]
+
+
+def register_close_accounting_reconciliation(
+    state: Any,
+    journal: Journal,
+    position: OpenPosition,
+    *,
+    long_legs: list[CloseExecutionLeg],
+    short_legs: list[CloseExecutionLeg],
+    now_ms: int,
+    reason: str,
+    source: str,
+    evidence_gaps: tuple[str, ...],
+) -> None:
+    """Persist exact close identities before discarding incomplete local billing."""
+    long_records = _close_reconciliation_leg_records(long_legs)
+    short_records = _close_reconciliation_leg_records(short_legs)
+    remaining_long = max(
+        position.long_quantity - sum(float(leg.fill.quantity) for leg in long_legs),
+        0.0,
+    )
+    remaining_short = max(
+        position.short_quantity - sum(float(leg.fill.quantity) for leg in short_legs),
+        0.0,
+    )
+    reconciliation = {
+        "position_id": position.position_id,
+        "symbol": position.symbol,
+        "kind": "final" if remaining_long <= 1e-12 and remaining_short <= 1e-12 else "partial",
+        "reason": reason,
+        "source": source,
+        "closed_at_ms": now_ms,
+        "created_cycle": int(getattr(state, "tick_count", 0) or 0),
+        "position_snapshot": _close_reconciliation_position_snapshot(position),
+        "original_payload": {
+            "accounting_evidence_gaps": list(evidence_gaps),
+            "long_closed_qty": sum(float(leg.fill.quantity) for leg in long_legs),
+            "short_closed_qty": sum(float(leg.fill.quantity) for leg in short_legs),
+        },
+        "long_legs": long_records,
+        "short_legs": short_records,
+        "attempt_count": 0,
+        "next_attempt_ms": now_ms,
+        "billing_reconciliation_required": True,
+    }
+    missing_identity_legs = pending_close_reconciliation_missing_legs(reconciliation)
+    reconciliation["missing_close_order_identity"] = bool(missing_identity_legs)
+    reconciliation["reconciliation_mode"] = (
+        "venue_execution_history_required"
+        if missing_identity_legs
+        else "order_identity"
+    )
+    journal.append_critical(
+        now_ms,
+        "exit.pending_close_reconciliation_registered",
+        {
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "source": source,
+            "accounting_evidence_gaps": list(evidence_gaps),
+            "missing_identity_legs": list(missing_identity_legs),
+            "reconciliation": reconciliation,
+        },
+    )
+    state.enqueue_pending_close_reconciliation(reconciliation)
+
+
 class CloseExecutor:
     """Async close executor using venue adapters.
 
@@ -887,6 +1047,24 @@ class CloseExecutor:
         # Detect residual from total closed quantities
         long_closed = sum(leg.fill.quantity for leg in long_legs)
         short_closed = sum(leg.fill.quantity for leg in short_legs)
+        accounting_evidence_gaps = close_accounting_evidence_gaps(
+            position,
+            long_legs,
+            short_legs,
+        )
+        accounting_evidence_complete = not accounting_evidence_gaps
+        if state is not None and not accounting_evidence_complete:
+            register_close_accounting_reconciliation(
+                state,
+                self.journal,
+                position,
+                long_legs=long_legs,
+                short_legs=short_legs,
+                now_ms=now_ms,
+                reason=reason,
+                source="aggressive_close_execution",
+                evidence_gaps=accounting_evidence_gaps,
+            )
         residual = split_close_fill_residual(
             position, long_closed, short_closed,
             now_ms, now_ms + self.config.deadline_ms,
@@ -929,11 +1107,13 @@ class CloseExecutor:
                 chunk_count=total_chunks,
                 long_legs=long_legs,
                 short_legs=short_legs,
+                accounting_evidence_complete=accounting_evidence_complete,
+                accounting_evidence_gaps=accounting_evidence_gaps,
             )
 
         pnl_attr = build_exit_pnl_attribution(position, close)
 
-        if long_closed > 1e-12 or short_closed > 1e-12:
+        if (long_closed > 1e-12 or short_closed > 1e-12) and accounting_evidence_complete:
             # V1: exit.closed is a critical event — synchronous durability
             self.journal.append_critical(
                 now_ms,
@@ -954,6 +1134,19 @@ class CloseExecutor:
                     "chunk_count": total_chunks,
                     "long_client_order_id": ", ".join(chunk_long_cids),
                     "short_client_order_id": ", ".join(chunk_short_cids),
+                },
+            )
+        elif (long_closed > 1e-12 or short_closed > 1e-12) and state is None:
+            self.journal.append_critical(
+                now_ms,
+                "exit.billing_evidence_unavailable",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "reason": reason,
+                    "terminal_accounting_status": "provisional_close_accounting_evidence_unavailable",
+                    "accounting_evidence_gaps": list(accounting_evidence_gaps),
+                    "billing_reconciliation_required": False,
                 },
             )
 
@@ -978,6 +1171,8 @@ class CloseExecutor:
         chunk_count: int = 1,
         long_legs: list[CloseExecutionLeg] | None = None,
         short_legs: list[CloseExecutionLeg] | None = None,
+        accounting_evidence_complete: bool = True,
+        accounting_evidence_gaps: tuple[str, ...] = (),
     ) -> None:
         """Write close execution results back into EngineState.
 
@@ -991,24 +1186,25 @@ class CloseExecutor:
         position.matched_quantity = max(position.matched_quantity - matched_closed, 0.0)
         position.long_quantity = max(position.long_quantity - long_closed, 0.0)
         position.short_quantity = max(position.short_quantity - short_closed, 0.0)
-        position.realized_price_pnl_quote += close.realized_price_pnl_quote
-        position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
-        if reason.startswith("risk_delever"):
-            position.risk_delever_realized_price_pnl_quote += close.realized_price_pnl_quote
-            position.risk_delever_realized_exit_fee_quote += (
-                close.long_fee_quote + close.short_fee_quote
-            )
-        elif (
-            "single_side_protection" in reason
-            or "death_protection" in reason
-            or reason.startswith("protection_")
-            or reason.startswith("risk_protection")
-        ):
-            position.protection_realized_price_pnl_quote += close.realized_price_pnl_quote
-            position.protection_realized_exit_fee_quote += (
-                close.long_fee_quote + close.short_fee_quote
-            )
-        position.current_net_quote += close.net_quote
+        if accounting_evidence_complete:
+            position.realized_price_pnl_quote += close.realized_price_pnl_quote
+            position.realized_exit_fee_quote += close.long_fee_quote + close.short_fee_quote
+            if reason.startswith("risk_delever"):
+                position.risk_delever_realized_price_pnl_quote += close.realized_price_pnl_quote
+                position.risk_delever_realized_exit_fee_quote += (
+                    close.long_fee_quote + close.short_fee_quote
+                )
+            elif (
+                "single_side_protection" in reason
+                or "death_protection" in reason
+                or reason.startswith("protection_")
+                or reason.startswith("risk_protection")
+            ):
+                position.protection_realized_price_pnl_quote += close.realized_price_pnl_quote
+                position.protection_realized_exit_fee_quote += (
+                    close.long_fee_quote + close.short_fee_quote
+                )
+            position.current_net_quote += close.net_quote
 
         # If any leg is uncertain, register a PendingClose for reconciliation
         if long_uncertain or short_uncertain:
@@ -1064,23 +1260,20 @@ class CloseExecutor:
                     "short_closed_qty": short_closed,
                     "close_id": close_id,
                     "reason": reason,
+                    "terminal_accounting_status": (
+                        "final"
+                        if accounting_evidence_complete
+                        else "pending_close_accounting_reconciliation"
+                    ),
+                    "accounting_evidence_gaps": list(accounting_evidence_gaps),
                 },
             )
 
-        # Fully closed → remove from open positions
-        # V1: exit.closed is a critical event
+        # Fully closed → remove from open positions.  `execute_close` owns the
+        # single canonical `exit.closed` record after this writeback, so this
+        # helper must not emit a second terminal bill.
         if position.matched_quantity < 1e-12:
             state.open_positions.pop(position.position_id, None)
-            self.journal.append_critical(
-                now_ms,
-                "exit.closed",
-                {
-                    "position_id": position.position_id,
-                    "reason": reason,
-                    "price_pnl": close.realized_price_pnl_quote,
-                    "net_quote": close.net_quote,
-                },
-            )
         else:
             # V1: dust pause — when remaining is below dust, mark last_risk_action
             # to prevent immediate re-close (exit.rs:3093-3171)
