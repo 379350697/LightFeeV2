@@ -5273,9 +5273,27 @@ class VenueTransport(MarketDataClient):
 
         V1: bybit.rs fetch_order_fill_reconciliation (lines 2820-2894)
         """
-        resolved_order_id = order_id
+        resolved_order_id = str(order_id or "").strip()
         resolved_client_id = ""
         queried_endpoints: list[str] = []
+
+        # Recovery position truth may retain a local ``-recovery-`` placeholder
+        # until an exchange order id is rediscovered.  It is never a Bybit
+        # orderId; prefer the submitted orderLinkId rather than letting the
+        # placeholder shadow the client-id lookup.
+        if "-recovery-" in resolved_order_id.lower():
+            if client_order_id:
+                resolved_order_id = ""
+            else:
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    order_id=order_id,
+                    queried_endpoints=["/v5/order/realtime"],
+                    response_classification="invalid_local_order_identifier",
+                    uncertain_subtype="invalid_local_order_identifier",
+                    next_action="check_live_position",
+                )
+                return None
 
         # Step 1: resolve orderId from client_order_id if needed.
         # V1 duplicate orderLinkId reconciliation must search open/realtime

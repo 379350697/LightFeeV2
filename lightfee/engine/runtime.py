@@ -6866,6 +6866,10 @@ class LiveRuntime:
         return PendingEntryRuntime._pending_entry_maker_order_identifiers(*args, **kwargs)
 
     @staticmethod
+    def _pending_entry_reconciliation_identifiers(*args, **kwargs):
+        return PendingEntryRuntime._pending_entry_reconciliation_identifiers(*args, **kwargs)
+
+    @staticmethod
     def _pending_entry_maker_cancel_requested(*args, **kwargs):
         return PendingEntryRuntime._pending_entry_maker_cancel_requested(*args, **kwargs)
 
@@ -7668,31 +7672,12 @@ class LiveRuntime:
                 continue
 
             try:
-                hedge_lookup_cid = (
-                    pending.hedge_inflight.client_order_id
-                    if pending.hedge_inflight
-                    else (
-                        pending.hedge_client_order_id
-                        if (
-                            pending.hedge_order_id
-                            or pending.hedge_leg_filled > 0
-                        )
-                        else ""
-                    )
-                )
-                maker_order_id, maker_client_order_id = (
-                    self._pending_entry_maker_order_identifiers(pending)
-                )
-                if pending.maker_leg == "short":
-                    long_order_id = pending.hedge_order_id
-                    long_client_order_id = hedge_lookup_cid
-                    short_order_id = maker_order_id
-                    short_client_order_id = maker_client_order_id
-                else:
-                    long_order_id = maker_order_id
-                    long_client_order_id = maker_client_order_id
-                    short_order_id = pending.hedge_order_id
-                    short_client_order_id = hedge_lookup_cid
+                (
+                    long_order_id,
+                    long_client_order_id,
+                    short_order_id,
+                    short_client_order_id,
+                ) = self._pending_entry_reconciliation_identifiers(pending)
                 result = await self.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
@@ -8520,9 +8505,6 @@ class LiveRuntime:
                 )
                 return True
 
-            if live_balanced <= current_balanced + 1e-9:
-                return False
-
             before_maker = float(pending.maker_leg_filled or 0.0)
             before_hedge = float(pending.hedge_leg_filled or 0.0)
             before_maker_price = float(pending.maker_fill_price or 0.0)
@@ -8542,6 +8524,21 @@ class LiveRuntime:
                 recovered_hedge_qty = min(live_balanced, short_pos.quantity)
                 maker_price_source = long_pos.entry_price
                 hedge_price_source = short_pos.entry_price
+
+            quantity_progress = live_balanced > current_balanced + 1e-9
+            live_covers_current = live_balanced + 1e-9 >= current_balanced
+            price_progress = live_covers_current and (
+                (
+                    pending.maker_fill_price <= 0
+                    and float(maker_price_source or 0.0) > 0
+                )
+                or (
+                    pending.hedge_fill_price <= 0
+                    and float(hedge_price_source or 0.0) > 0
+                )
+            )
+            if not quantity_progress and not price_progress:
+                return False
 
             if recovered_maker_qty > pending.maker_leg_filled + 1e-9:
                 pending.maker_leg_filled = recovered_maker_qty

@@ -244,6 +244,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 
 | Date | Attempt | Status | Why |
 |---|---|---|---|
+| 2026-08-17 | Short-maker identity unification, Bybit recovery `orderLinkId`, and equal-quantity price hydration | implemented locally; deploy pending | Normal tick stored maker/hedge identities but passed them as long/short unconditionally, unlike startup. A local Bybit `-recovery-` placeholder also shadowed valid client-id lookup, and equal quantity skipped price repair. Both runtime paths now share one mapper; Bybit uses `orderLinkId` or retains an evidence gap; live truth may backfill a missing price only when it covers the known balanced quantity. |
 | 2026-08-04 | Gate startup and normal direct removal on known zero fill | deployed; cloud health verified | `uncertain_outcome=false` had been treated as terminal even after replayed positive maker/hedge fill. Both paths now send every positive fill through existing exchange reconciliation and V1 finalization/residual ownership. Commit `3c42aea` is deployed; all-venue current truth is clean, while a fresh replay-fill production trigger remains watch-only evidence. |
 | 2026-05-17 | Pending hedge inflight metadata / deadline / cleanup parity | effective locally | Fixed direct-pop and cleanup semantics but later live truth exposed additional false-flat cases. |
 | 2026-05-27 | Stale accepted / planned-CID / false-flat root fix | effective | Remote RED/GREEN and credentialed truth passed; known live mismatches flattened. |
@@ -331,63 +332,71 @@ side is an evidence gap/fail-closed condition, not default buy.
 7. For Binance reconciliation, verify a local recovery placeholder is not sent
    as `orderId`; use `origClientOrderId` unless the id is numeric exchange
    truth.
-8. If a runtime live probe recovers balanced exchange positions while an old
+8. For Bybit reconciliation, verify a local `-recovery-` placeholder never
+   occupies `orderId`; use the submitted `orderLinkId` when it exists, and
+   retain an evidence gap otherwise.
+9. For a short maker, verify normal tick and startup give the maker identity to
+   the short venue and the hedge identity to the long venue.
+10. If live quantity already equals pending quantity, still inspect live entry
+    prices; hydrate only missing positive price evidence and do not open from
+    price-less quantity.
+11. If a runtime live probe recovers balanced exchange positions while an old
    `startup_recovery_pending_work_without_open_positions` block is latched,
    confirm the lifecycle re-finalizes to `running` when no pending work remains.
-9. If maker reconciliation reports quantity `0`, confirm the order status is
+12. If maker reconciliation reports quantity `0`, confirm the order status is
    terminal no-fill before finalizing as unfilled; otherwise keep pending
    unresolved.
-10. If a leg already has positive fill progress, reject later stale zero
+13. If a leg already has positive fill progress, reject later stale zero
    reconciliation unless exchange truth proves a terminal correction.
-11. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
-12. For retained rejected pending entries with positive fill evidence, verify
+14. Closure requires remote or cloud harness plus credentialed all-venue flat/no-open-orders probe.
+15. For retained rejected pending entries with positive fill evidence, verify
    startup recovery can use credentialed live truth to hydrate/finalize,
    residualize, or issue deterministic reduce-only cleanup instead of looping
    in local false-flat/risk-only.
-13. If Hyperliquid insufficient margin appears, confirm whether the block is
+16. If Hyperliquid insufficient margin appears, confirm whether the block is
    account/venue scoped. If yes, future new-entry candidates through Hyperliquid
    must be pruned before shortlist tracking and maker submit. This must not
    disable Hyperliquid exchange truth, close, cancel, or residual repair.
-14. If a pending entry remains unresolved, block same-symbol candidates that
+17. If a pending entry remains unresolved, block same-symbol candidates that
    share either venue until finalization, residual cleanup, or fail-closed
    evidence releases the risk.
-15. If finalization emits a deferred event, check that the caller retained the
+18. If finalization emits a deferred event, check that the caller retained the
    pending entry and did not append it to a resolved list or pop it afterward.
-16. If local state is flat, build or inspect the recovery ledger and V1 recovery
+19. If local state is flat, build or inspect the recovery ledger and V1 recovery
    decision before calling the state safe. A live position, non-reduce open
    order, local recovery work, or positive fill evidence must map to recovery
    work before any production-health conclusion or entry-risk decision. An
    unavailable/partial truth probe with no local work and no live artifact is an
    evidence gap, not a global recovery block.
-17. For quick-flat reports, join `execution.entry_selected`, `entry.opened`,
+20. For quick-flat reports, join `execution.entry_selected`, `entry.opened`,
     `runtime.funding_capture_state_updated`, `runtime.normal_close_routing_*`,
     and `exit.closed` by `position_id`.
-18. Deduplicate duplicate `exit.closed` projections before judging frequency.
-19. Classify each quick flat as bug, avoidable timing, unavoidable recovery, or
+21. Deduplicate duplicate `exit.closed` projections before judging frequency.
+22. Classify each quick flat as bug, avoidable timing, unavoidable recovery, or
     duplicate observation.
-20. If `pending_close_reconciliations` remains after a close, inspect stored
+23. If `pending_close_reconciliations` remains after a close, inspect stored
     close-leg identities, close-fill reconciliation availability, and terminal
     live sizes on both close venues before judging lifecycle unhealthy.
-21. Do not clear final pending-close accounting work from local flat alone:
+24. Do not clear final pending-close accounting work from local flat alone:
     require terminal flat live truth, and retain/backoff if either close venue
     still reports nonzero size.
-22. Confirm supervisor risk snapshots include venues from pending-close
+25. Confirm supervisor risk snapshots include venues from pending-close
     reconciliation snapshots even after `open_positions` is empty.
-23. For Hyperliquid, compare the configured account address against the signer
+26. For Hyperliquid, compare the configured account address against the signer
     address before accepting flat account truth. If they differ, confirm
     exchange truth queried the configured account and inspect sanitized
     `credential_identity`; signer-address empty `assetPositions` is not proof
     that the trading account is flat.
-24. If production is flat/no-open-orders but `unpaired_live_position` remains
+27. If production is flat/no-open-orders but `unpaired_live_position` remains
     latched, verify runtime live-position housekeeping emitted a core
     `RUNNING_CLEAN` clear after `no_live_positions`. Do not use position-flat
     truth to clear `orphan_maker_order`; require open-order truth for that
     blocker.
-25. For a journal-replayed confirmed fill, verify both startup force recovery
+28. For a journal-replayed confirmed fill, verify both startup force recovery
     and the normal tick construct exactly one managed open position (or retain
     residual/fail-closed work) before removing the pending owner. Do not use
     `uncertain_outcome=false` as a deletion authority.
-26. Before releasing an old live-artifact `risk_only` latch in the presence of
+29. Before releasing an old live-artifact `risk_only` latch in the presence of
     background close debt, require complete all-account position **and**
     open-order truth. Do not infer orders from a position-only or dirty-symbol
     scan; any partial probe remains blocked.

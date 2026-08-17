@@ -3555,6 +3555,130 @@ async def test_live_position_hydrates_balanced_pending_entry_and_finalizes_like_
 
 
 @pytest.mark.asyncio
+async def test_reconcile_maps_short_maker_order_identities_to_their_live_venues(
+    config, tmp_journal,
+):
+    """A short-side maker must not send its identities to the long venue."""
+    result = PositionReconciliationResult(
+        position_id="entry-short-maker-order-map",
+        symbol="COTIUSDT",
+        long_status="uncertain",
+        short_status="filled",
+        long_position=PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="COTIUSDT",
+            side=Side.BUY,
+            quantity=1496.0,
+            entry_price=0.01070068,
+            observed_at_ms=3000,
+        ),
+        short_position=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="COTIUSDT",
+            side=Side.SELL,
+            quantity=1496.0,
+            entry_price=0.010745,
+            observed_at_ms=3000,
+        ),
+        is_flat=False,
+    )
+    reconciler = _CapturingReconciler(result)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _NoFillReconciliationAdapter(),
+            Venue.BINANCE: _NoFillReconciliationAdapter(),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = reconciler
+    pending = _pending_entry(
+        pending_id="entry-short-maker-order-map",
+        symbol="COTIUSDT",
+        target_quantity=1496.0,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="short",
+        maker_order_id="binance-maker-order-id",
+        maker_client_order_id="binance-maker-cid",
+        hedge_order_id="bybit-hedge-order-id",
+        hedge_client_order_id="bybit-hedge-cid",
+        maker_leg_filled=1496.0,
+        hedge_leg_filled=1496.0,
+        maker_fill_price=0.010745,
+        hedge_fill_price=0.01070068,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=4000)
+
+    assert reconciler.calls == [{
+        "position_id": pending.pending_id,
+        "symbol": "COTIUSDT",
+        "long_venue": Venue.BYBIT,
+        "short_venue": Venue.BINANCE,
+        "long_order_id": "bybit-hedge-order-id",
+        "short_order_id": "binance-maker-order-id",
+        "long_client_order_id": "bybit-hedge-cid",
+        "short_client_order_id": "binance-maker-cid",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_startup_force_reconcile_uses_the_same_short_maker_identity_mapping(
+    config, tmp_journal,
+):
+    """Startup recovery and the normal tick share the long/short mapping."""
+    result = PositionReconciliationResult(
+        position_id="entry-short-maker-startup-map",
+        symbol="COTIUSDT",
+        long_status="uncertain",
+        short_status="uncertain",
+        is_flat=False,
+    )
+    reconciler = _CapturingReconciler(result)
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _NoFillReconciliationAdapter(),
+            Venue.BINANCE: _NoFillReconciliationAdapter(),
+        },
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = reconciler
+    pending = _pending_entry(
+        pending_id="entry-short-maker-startup-map",
+        symbol="COTIUSDT",
+        target_quantity=1496.0,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="short",
+        maker_order_id="binance-maker-order-id",
+        maker_client_order_id="binance-maker-cid",
+        hedge_order_id="bybit-hedge-order-id",
+        hedge_client_order_id="bybit-hedge-cid",
+        maker_leg_filled=1496.0,
+        hedge_leg_filled=1496.0,
+        maker_fill_price=0.010745,
+        hedge_fill_price=0.01070068,
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_entries_force(now_ms=4000)
+
+    assert reconciler.calls == [{
+        "position_id": pending.pending_id,
+        "symbol": "COTIUSDT",
+        "long_venue": Venue.BYBIT,
+        "short_venue": Venue.BINANCE,
+        "long_order_id": "bybit-hedge-order-id",
+        "short_order_id": "binance-maker-order-id",
+        "long_client_order_id": "bybit-hedge-cid",
+        "short_client_order_id": "binance-maker-cid",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_finalize_partially_matched_entry_caps_open_position_fills_and_records_residual_evidence(
     config, tmp_journal,
 ):
@@ -3760,6 +3884,118 @@ async def test_live_position_hydration_maps_short_maker_to_short_live_truth(
     assert payload["maker_live_position"]["side"] == "sell"
     assert payload["hedge_live_position"]["venue"] == "binance"
     assert payload["hedge_live_position"]["side"] == "buy"
+
+
+@pytest.mark.asyncio
+async def test_live_position_hydration_backfills_price_when_balanced_quantity_is_already_known(
+    config, tmp_journal,
+):
+    """Equal live/local quantities must still repair a missing entry price."""
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="COTIUSDT",
+                side=Side.BUY,
+                quantity=1496.0,
+                entry_price=0.01070068,
+                observed_at_ms=3000,
+            )),
+            Venue.BINANCE: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="COTIUSDT",
+                side=Side.SELL,
+                quantity=1496.0,
+                entry_price=0.010745,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-coti-price-only-hydration",
+        symbol="COTIUSDT",
+        target_quantity=1496.0,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="short",
+        maker_leg_filled=1496.0,
+        hedge_leg_filled=1496.0,
+        maker_fill_price=0.010745,
+        hedge_fill_price=0.0,
+        maker_order_id="binance-maker-order-id",
+        hedge_order_id="entry-coti-price-only-hydration-recovery-long",
+        hedge_client_order_id="bybit-hedge-cid",
+    )
+
+    hydrated = await runtime._recover_hydrate_from_live_positions(pending, now_ms=4000)
+    finalized = await runtime._finalize_pending_entry(pending, pending.pending_id, 4000)
+
+    assert hydrated is True
+    assert pending.hedge_fill_price == pytest.approx(0.01070068)
+    assert finalized is True
+    assert pending.pending_id in runtime.state.open_positions
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "entry.opened" in kinds
+    assert "pending_entry.finalize_deferred_incomplete_fill" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_live_position_hydration_does_not_open_when_equal_quantity_lacks_price_evidence(
+    config, tmp_journal,
+):
+    """Equal quantity alone remains insufficient when exchange price is absent."""
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={
+            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BYBIT,
+                symbol="COTIUSDT",
+                side=Side.BUY,
+                quantity=1496.0,
+                entry_price=0.0,
+                observed_at_ms=3000,
+            )),
+            Venue.BINANCE: _LivePositionAdapter(PositionSnapshot(
+                venue=Venue.BINANCE,
+                symbol="COTIUSDT",
+                side=Side.SELL,
+                quantity=1496.0,
+                entry_price=0.010745,
+                observed_at_ms=3000,
+            )),
+        },
+    )
+    runtime.journal = tmp_journal
+    pending = _pending_entry(
+        pending_id="entry-coti-price-evidence-gap",
+        symbol="COTIUSDT",
+        target_quantity=1496.0,
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        maker_leg="short",
+        maker_leg_filled=1496.0,
+        hedge_leg_filled=1496.0,
+        maker_fill_price=0.010745,
+        hedge_fill_price=0.0,
+        maker_order_id="binance-maker-order-id",
+        hedge_order_id="entry-coti-price-evidence-gap-recovery-long",
+        hedge_client_order_id="bybit-hedge-cid",
+    )
+
+    hydrated = await runtime._recover_hydrate_from_live_positions(pending, now_ms=4000)
+    finalized = await runtime._finalize_pending_entry(pending, pending.pending_id, 4000)
+
+    assert hydrated is False
+    assert finalized is False
+    assert pending.pending_id not in runtime.state.open_positions
+    deferred = [
+        event["payload"]
+        for event in tmp_journal.read_all()
+        if event["kind"] == "pending_entry.finalize_deferred_incomplete_fill"
+    ]
+    assert deferred[-1]["missing_fields"] == ["hedge_fill_price"]
 
 
 @pytest.mark.asyncio

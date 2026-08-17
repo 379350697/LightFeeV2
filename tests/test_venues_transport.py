@@ -8688,6 +8688,115 @@ class TestVenueSpecificOrderReconciliationEvidence:
         assert query_payload["client_order_id"] == "bn-recovery-cid"
 
     @pytest.mark.anyio
+    async def test_bybit_recovery_placeholder_order_id_uses_order_link_id(self):
+        from lightfee.venues.bybit import BybitAdapter
+
+        seen_queries: list[tuple[str, dict[str, str]]] = []
+
+        async def mock_handler(request):
+            query = dict(request.url.params)
+            seen_queries.append((request.url.path, query))
+            if request.url.path == "/v5/order/realtime":
+                if query.get("orderLinkId") == "by-recovery-cid" and "orderId" not in query:
+                    return httpx.Response(200, json={
+                        "retCode": 0,
+                        "retMsg": "OK",
+                        "result": {"list": [{
+                            "orderId": "bybit-real-order-id",
+                            "orderLinkId": "by-recovery-cid",
+                        }]},
+                    })
+                return httpx.Response(200, json={"retCode": 0, "result": {"list": []}})
+            if request.url.path == "/v5/execution/list":
+                if query.get("orderId") == "bybit-real-order-id":
+                    return httpx.Response(200, json={
+                        "retCode": 0,
+                        "retMsg": "OK",
+                        "result": {"list": [{
+                            "execQty": "1496",
+                            "execPrice": "0.01070068",
+                            "execFee": "0.01",
+                            "execTime": "1770000000000",
+                            "side": "Buy",
+                            "symbol": "COTIUSDT",
+                        }]},
+                    })
+                return httpx.Response(200, json={"retCode": 0, "result": {"list": []}})
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "COTIUSDT",
+            order_id="entry-coti-price-only-hydration-recovery-long",
+            client_order_id="by-recovery-cid",
+        )
+        await adapter.shutdown()
+
+        assert result is not None
+        assert result.order_id == "bybit-real-order-id"
+        assert result.client_order_id == "by-recovery-cid"
+        assert result.quantity == pytest.approx(1496.0)
+        assert result.average_price == pytest.approx(0.01070068)
+        assert seen_queries == [
+            ("/v5/order/realtime", {
+                "category": "linear",
+                "symbol": "COTIUSDT",
+                "openOnly": "0",
+                "orderLinkId": "by-recovery-cid",
+            }),
+            ("/v5/execution/list", {
+                "category": "linear",
+                "symbol": "COTIUSDT",
+                "orderId": "bybit-real-order-id",
+            }),
+        ]
+
+    @pytest.mark.anyio
+    async def test_bybit_recovery_placeholder_without_client_id_is_not_queried(self):
+        from lightfee.venues.bybit import BybitAdapter
+
+        seen_paths: list[str] = []
+
+        async def mock_handler(request):
+            seen_paths.append(request.url.path)
+            return httpx.Response(404, json={"msg": "unexpected"})
+
+        adapter = BybitAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+        adapter._transport._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(mock_handler),
+        )
+        adapter._transport._time_offset_ms = 0
+
+        result = await adapter.fetch_order_fill_reconciliation(
+            "COTIUSDT",
+            order_id="entry-coti-price-only-hydration-recovery-long",
+            client_order_id="",
+        )
+        events = adapter._transport.drain_order_diagnostics()
+        await adapter.shutdown()
+
+        assert result is None
+        assert seen_paths == []
+        payload = [
+            event["payload"]
+            for event in events
+            if event["kind"] == "order.reconcile_query"
+        ][-1]
+        assert payload["response_classification"] == "invalid_local_order_identifier"
+        assert payload["next_action"] == "check_live_position"
+
+    @pytest.mark.anyio
     async def test_binance_recovery_placeholder_without_client_id_is_not_queried(self):
         from lightfee.venues.binance import BinanceAdapter
 

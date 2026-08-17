@@ -143,31 +143,21 @@ class PendingEntryRuntime:
 
             pending.reconcile_attempt += 1
             try:
-                # V1: prefer hedge_inflight CID for reconciliation queries
-                hedge_lookup_cid = (
-                    pending.hedge_inflight.client_order_id
-                    if pending.hedge_inflight
-                    else (
-                        pending.hedge_client_order_id
-                        if (
-                            pending.hedge_order_id
-                            or pending.hedge_leg_filled > 0
-                        )
-                        else ""
-                    )
-                )
-                maker_order_id, maker_client_order_id = (
-                    self.ctx._pending_entry_maker_order_identifiers(pending)
-                )
+                (
+                    long_order_id,
+                    long_client_order_id,
+                    short_order_id,
+                    short_client_order_id,
+                ) = self._pending_entry_reconciliation_identifiers(pending)
                 result = await self.ctx.reconciler.reconcile_position(
                     position_id=entry_id,
                     symbol=pending.symbol,
                     long_venue=pending.long_venue,
                     short_venue=pending.short_venue,
-                    long_order_id=maker_order_id,
-                    short_order_id=pending.hedge_order_id,
-                    long_client_order_id=maker_client_order_id,
-                    short_client_order_id=hedge_lookup_cid,
+                    long_order_id=long_order_id,
+                    short_order_id=short_order_id,
+                    long_client_order_id=long_client_order_id,
+                    short_client_order_id=short_client_order_id,
                 )
                 self.ctx._flush_reconciler_order_diagnostics()
             except Exception as e:
@@ -718,6 +708,42 @@ class PendingEntryRuntime:
                 getattr(passive_order, "client_order_id", "") or ""
             )
         return order_id, client_order_id
+
+    @staticmethod
+    def _pending_entry_reconciliation_identifiers(
+        pending,
+    ) -> tuple[str, str, str, str]:
+        """Return order identities in live long/short venue order.
+
+        Pending entries store maker/hedge identities, while the reconciler
+        consumes long/short identities.  Keeping this conversion here prevents
+        the normal tick and startup recovery from disagreeing for short makers.
+        """
+        hedge_client_order_id = (
+            pending.hedge_inflight.client_order_id
+            if pending.hedge_inflight
+            else (
+                pending.hedge_client_order_id
+                if (pending.hedge_order_id or pending.hedge_leg_filled > 0)
+                else ""
+            )
+        )
+        maker_order_id, maker_client_order_id = (
+            PendingEntryRuntime._pending_entry_maker_order_identifiers(pending)
+        )
+        if pending.maker_leg == "short":
+            return (
+                str(pending.hedge_order_id or ""),
+                str(hedge_client_order_id or ""),
+                maker_order_id,
+                maker_client_order_id,
+            )
+        return (
+            maker_order_id,
+            maker_client_order_id,
+            str(pending.hedge_order_id or ""),
+            str(hedge_client_order_id or ""),
+        )
 
     @staticmethod
     def _pending_entry_maker_cancel_requested(pending) -> bool:

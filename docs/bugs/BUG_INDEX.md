@@ -17,6 +17,20 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-113 short-maker reconciliation and Bybit recovery identity, 2026-08-17:
+the normal pending-entry tick inverted maker/hedge order identities for short
+makers, while startup used a different mapping. Bybit recovery also sent a
+local `-recovery-` placeholder as `orderId`, masking its valid `orderLinkId`,
+and equal live/local quantity skipped a needed entry-price backfill. The
+shared mapper now serves both normal and startup paths; Bybit resolves a
+placeholder through client id or retains an explicit evidence gap; and
+hydration repairs a missing price only when exchange quantity covers the known
+balance. Six new production-path matrix cases, Bybit transport (`481`), and
+incident harness (`8`) pass locally. This is **implemented but not closed**:
+the full suite confirms `4298 passed, 9 skipped, 13` baseline failures, but
+it is not deployed and still needs live exchange-truth verification. See
+[daily/2026-08-17.md#cluster-cl-113-short-maker-reconciliation-and-bybit-recovery-identity](daily/2026-08-17.md#cluster-cl-113-short-maker-reconciliation-and-bybit-recovery-identity).
+
 CL-112 execution-evidence accounting contract, 2026-08-16: an OKX ACK-only
 fallback manufactured a hedge fill from a request hint/snapshot, and absent
 fees could become zero through entry, normal close, and passive close paths.
