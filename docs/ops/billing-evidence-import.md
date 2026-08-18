@@ -77,6 +77,39 @@ every leg venue must match its snapshot route, and entry-fee evidence must be
 explicitly complete. The CLI computes and journals a SHA-256 hash of the
 canonical evidence pack.
 
+## Read-Only Binance Candidate Discovery
+
+For a Binance `missing_close_order_identity` debt with no retained exact order
+key, `lightfee-ops discover-binance-close-evidence` can narrow an offline
+investigation using a separately captured `allOrders` JSON export. It compares
+only the persisted owner, symbol, close side, `reduceOnly=TRUE`, full executed
+quantity, and a bounded close-time window. It is deliberately **not** an
+evidence import: it does not call an exchange, take the writer lease, open a
+journal, write a snapshot, or change accounting state.
+
+For a `partial` owner it never treats the original position quantity as the
+close quantity. The candidate output records whether its quantity came from an
+unidentified close leg, recorded close total, or the exact opposite close leg;
+if none exists, it returns `missing_expected_quantity` instead of guessing.
+
+```bash
+cd /opt/lightfee-v2
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/lightfee-ops \
+  discover-binance-close-evidence \
+  --snapshot-path runtime/live-state.json \
+  --orders-file /secure/binance-all-orders.json \
+  --position-id persisted-owner-id \
+  --kind partial \
+  --closed-at-ms 1700000000000
+```
+
+The output is candidate-discovery data only. `unique_candidate_requires_operator_evidence`
+means an operator must retrieve and retain the exact execution history for that
+returned order ID/client ID, verify fill price, quantity, and fees, and then
+create one ordinary evidence pack. `ambiguous_candidates` and `no_candidate`
+must remain unresolved; never copy a candidate into an evidence pack without
+that exact exchange verification.
+
 ## Production Procedure
 
 Use the `event_log_path` and `snapshot_path` from the deployed live config. Do

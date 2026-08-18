@@ -21,7 +21,10 @@ from lightfee.engine.state import (
     EngineState,
     pending_close_reconciliation_import_reason,
 )
-from lightfee.ops.commands import execute_billing_evidence_import
+from lightfee.ops.commands import (
+    discover_binance_close_evidence_candidates,
+    execute_billing_evidence_import,
+)
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.persistence.writer_lease import (
@@ -117,6 +120,151 @@ def _evidence(
         "evidence_reference": "exchange-export:case-20260809-01",
         "reconciliation": reconciliation,
     }
+
+
+def _binance_close_debt() -> dict[str, object]:
+    snapshot = _snapshot()
+    snapshot.update(
+        {
+            "symbol": "COWUSDT",
+            "long_venue": "binance",
+            "short_venue": "bybit",
+            "long_quantity": 100.0,
+            "short_quantity": 100.0,
+            "matched_quantity": 100.0,
+        }
+    )
+    return {
+        "position_id": "missing-binance-close-owner",
+        "symbol": "COWUSDT",
+        "kind": "partial",
+        "closed_at_ms": CLOSED_AT_MS,
+        "position_snapshot": snapshot,
+        "long_legs": [],
+        "short_legs": [
+            {
+                "venue": "bybit",
+                "order_id": "known-bybit-close",
+                "client_order_id": "known-bybit-client",
+                "quantity": 100.0,
+                "average_price": 1.0,
+                "fee_quote": 0.01,
+            }
+        ],
+        "reconciliation_status": "evidence_debt",
+        "evidence_debt_reason": "missing_close_order_identity",
+    }
+
+
+def _binance_order(**overrides: object) -> dict[str, object]:
+    order: dict[str, object] = {
+        "symbol": "COWUSDT",
+        "side": "SELL",
+        "reduceOnly": True,
+        "status": "FILLED",
+        "executedQty": "100",
+        "origQty": "100",
+        "avgPrice": "1.25",
+        "orderId": "123456",
+        "clientOrderId": "lfx-historical-cow-close",
+        "updateTime": CLOSED_AT_MS + 1_000,
+    }
+    order.update(overrides)
+    return order
+
+
+def test_binance_close_evidence_discovery_returns_read_only_unique_candidate():
+    result = discover_binance_close_evidence_candidates(
+        _binance_close_debt(),
+        [_binance_order()],
+        time_window_ms=5_000,
+    )
+
+    assert result["candidate_discovery_only"] is True
+    assert result["automatically_importable"] is False
+    assert result["owner"] == {
+        "position_id": "missing-binance-close-owner",
+        "kind": "partial",
+        "closed_at_ms": CLOSED_AT_MS,
+    }
+    leg = result["legs"][0]
+    assert leg["leg"] == "long"
+    assert leg["expected_quantity_source"] == "opposite_identified_close_leg_quantity"
+    assert leg["disposition"] == "unique_candidate_requires_operator_evidence"
+    assert leg["candidate_count"] == 1
+    assert leg["candidates"][0]["order_id"] == "123456"
+    assert leg["candidates"][0]["system_client_order_id"] is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"symbol": "OTHERUSDT"},
+        {"side": "BUY"},
+        {"reduceOnly": False},
+        {"executedQty": "0"},
+        {"executedQty": "99"},
+        {"updateTime": CLOSED_AT_MS + 5_001},
+        {"orderId": "", "clientOrderId": ""},
+    ],
+)
+def test_binance_close_evidence_discovery_rejects_non_proof_candidates(overrides):
+    result = discover_binance_close_evidence_candidates(
+        _binance_close_debt(),
+        [_binance_order(**overrides)],
+        time_window_ms=5_000,
+    )
+
+    leg = result["legs"][0]
+    assert leg["candidate_count"] == 0
+    assert leg["disposition"] == "no_candidate"
+    assert result["automatically_importable"] is False
+
+
+def test_binance_close_evidence_discovery_keeps_multiple_matches_ambiguous():
+    result = discover_binance_close_evidence_candidates(
+        _binance_close_debt(),
+        [_binance_order(orderId="1"), _binance_order(orderId="2")],
+        time_window_ms=5_000,
+    )
+
+    leg = result["legs"][0]
+    assert leg["candidate_count"] == 2
+    assert leg["disposition"] == "ambiguous_candidates"
+    assert result["automatically_importable"] is False
+
+
+def test_binance_close_evidence_discovery_does_not_use_partial_open_quantity():
+    debt = _binance_close_debt()
+    debt["short_legs"][0]["quantity"] = 0.0
+
+    result = discover_binance_close_evidence_candidates(
+        debt,
+        [_binance_order()],
+        time_window_ms=5_000,
+    )
+
+    leg = result["legs"][0]
+    assert leg["expected_quantity"] is None
+    assert leg["expected_quantity_source"] == "missing_close_quantity"
+    assert leg["disposition"] == "missing_expected_quantity"
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({"time_window_ms": float("nan")}, "time_window_ms"),
+        ({"time_window_ms": 1.5}, "time_window_ms"),
+        ({"quantity_relative_tolerance": float("nan")}, "quantity_relative_tolerance"),
+    ],
+)
+def test_binance_close_evidence_discovery_rejects_invalid_matching_bounds(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        discover_binance_close_evidence_candidates(
+            _binance_close_debt(),
+            [_binance_order()],
+            **kwargs,
+        )
 
 
 def test_import_replaces_missing_snapshot_debt_and_replays_durably(tmp_path):
@@ -260,6 +408,80 @@ def test_ops_paths_require_one_explicit_persistence_pair(tmp_path):
 
     with pytest.raises(ValueError, match="must be supplied together"):
         _resolve_paths(event_log_path=tmp_path / "events.jsonl")
+
+
+def test_ops_cli_discovers_binance_candidate_without_writer_or_persistence_mutation(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    from lightfee.apps import ops
+
+    state = EngineState()
+    state.pending_close_reconciliations = [_binance_close_debt()]
+    snapshot_path = tmp_path / "live-state.json"
+    SnapshotStore(snapshot_path).write(build_persistent_state_view(state))
+    snapshot_before = snapshot_path.read_bytes()
+    orders_path = tmp_path / "binance-all-orders.json"
+    orders_path.write_text(json.dumps([_binance_order()]), encoding="utf-8")
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "discover-binance-close-evidence",
+            "--snapshot-path",
+            str(snapshot_path),
+            "--orders-file",
+            str(orders_path),
+            "--position-id",
+            "other-owner",
+            "--kind",
+            "partial",
+            "--closed-at-ms",
+            str(CLOSED_AT_MS),
+        ],
+    )
+    with pytest.raises(SystemExit) as rejected:
+        ops.main()
+    assert rejected.value.code == 2
+    assert snapshot_path.read_bytes() == snapshot_before
+
+    event_log_path = tmp_path / "live-events.jsonl"
+    live_writer = PersistenceWriterLease(event_log_path)
+    live_writer.acquire()
+    try:
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lightfee-ops",
+                "discover-binance-close-evidence",
+                "--snapshot-path",
+                str(snapshot_path),
+                "--orders-file",
+                str(orders_path),
+                "--position-id",
+                "missing-binance-close-owner",
+                "--kind",
+                "partial",
+                "--closed-at-ms",
+                str(CLOSED_AT_MS),
+            ],
+        )
+        with pytest.raises(SystemExit) as completed:
+            ops.main()
+    finally:
+        live_writer.release()
+
+    assert completed.value.code == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["candidate_discovery_only"] is True
+    assert result["automatically_importable"] is False
+    assert result["legs"][0]["disposition"] == "unique_candidate_requires_operator_evidence"
+    assert snapshot_path.read_bytes() == snapshot_before
+    assert not event_log_path.exists()
 
 
 def test_ops_cli_refuses_import_while_live_writer_lease_is_held(tmp_path, monkeypatch):

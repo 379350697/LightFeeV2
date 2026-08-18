@@ -10,6 +10,7 @@ Rust references:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -63,11 +64,80 @@ def main() -> None:
         type=Path,
         help="Configured live persistence snapshot_path (requires --event-log-path)",
     )
+    candidate_discovery = sub.add_parser(
+        "discover-binance-close-evidence",
+        help="Read-only candidate discovery for a Binance close-identity evidence debt",
+    )
+    candidate_discovery.add_argument(
+        "--snapshot-path",
+        required=True,
+        type=Path,
+        help="Persisted snapshot containing the exact evidence-debt owner",
+    )
+    candidate_discovery.add_argument(
+        "--orders-file",
+        required=True,
+        type=Path,
+        help="Read-only Binance allOrders JSON export (a list or {orders: [...]})",
+    )
+    candidate_discovery.add_argument("--position-id", required=True)
+    candidate_discovery.add_argument("--kind", choices=("final", "partial"), required=True)
+    candidate_discovery.add_argument("--closed-at-ms", required=True, type=int)
+    candidate_discovery.add_argument("--time-window-ms", default=300_000, type=int)
+    candidate_discovery.add_argument(
+        "--quantity-relative-tolerance",
+        default=1e-9,
+        type=float,
+    )
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # This branch deliberately exits before path-pair resolution, writer-lease
+    # acquisition, journal opening, or snapshot writing.  Candidate discovery
+    # can narrow an offline investigation, but it must never mutate live state
+    # or manufacture an accounting fact from a fuzzy historical match.
+    if args.command == "discover-binance-close-evidence":
+        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+        from lightfee.ops.commands import (
+            discover_binance_close_evidence_candidates,
+            load_binance_order_history_export,
+        )
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        snapshot = SnapshotStore(args.snapshot_path).read()
+        if snapshot is None:
+            parser.error("snapshot does not exist or is empty")
+        state = _restore_state_from_snapshot_dict(snapshot)
+        candidates = [
+            reconciliation
+            for reconciliation in state.pending_close_reconciliations
+            if (
+                str(reconciliation.get("position_id") or "") == args.position_id
+                and str(reconciliation.get("kind") or "") == args.kind
+                and str(reconciliation.get("closed_at_ms") or "") == str(args.closed_at_ms)
+                and reconciliation.get("reconciliation_status") == "evidence_debt"
+            )
+        ]
+        if len(candidates) != 1:
+            parser.error(
+                "expected exactly one evidence_debt reconciliation matching "
+                "--position-id/--kind/--closed-at-ms"
+            )
+        try:
+            orders = load_binance_order_history_export(args.orders_file)
+            result = discover_binance_close_evidence_candidates(
+                candidates[0],
+                orders,
+                time_window_ms=args.time_window_ms,
+                quantity_relative_tolerance=args.quantity_relative_tolerance,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, sort_keys=True))
+        sys.exit(0)
 
     commands = {
         "pause-entry": OperatorCommand.PAUSE_ENTRY,
