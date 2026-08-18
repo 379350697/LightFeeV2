@@ -23,6 +23,7 @@ from lightfee.engine.state import (
     PendingClose,
     OperatorControlState,
     normalize_pending_close_reconciliations,
+    pending_close_reconciliation_identity_evidence,
     pending_close_reconciliation_missing_legs,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
@@ -1077,6 +1078,39 @@ class TestEngineStateFieldCompleteness:
         assert pending_close_reconciliation_missing_legs(reconciliation) == (
             "long",
         )
+
+    def test_pending_close_reconciliation_identity_evidence_classifies_lookup_sources(self):
+        reconciliation = {
+            "position_snapshot": {"short_quantity": 0.0},
+            "long_legs": [
+                {"order_id": "exchange-close"},
+                {"client_order_id": "client-close"},
+                {
+                    "order_id": "entry-1-recovery-long",
+                    "client_order_id": "recovery-client",
+                },
+                {},
+            ],
+            "short_legs": [],
+        }
+
+        assert pending_close_reconciliation_identity_evidence(reconciliation) == {
+            "missing_identity_legs": ["long"],
+            "long": {
+                "leg_count": 4,
+                "exchange_order_id_count": 1,
+                "client_order_id_only_count": 1,
+                "recovery_placeholder_count": 1,
+                "missing_identity_count": 1,
+            },
+            "short": {
+                "leg_count": 0,
+                "exchange_order_id_count": 0,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 0,
+            },
+        }
 
     def test_pending_close_reconciliation_enqueue_caps_oldest_at_256(self):
         state = EngineState()

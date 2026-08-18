@@ -4550,6 +4550,21 @@ class TestRiskSnapshotCache:
             assert snap2 is None
             assert sup2 is True
 
+            events = [
+                event for event in rt.journal.read_all()
+                if event["kind"] == "runtime.risk_snapshot_fetch_error"
+            ]
+            assert len(events) == 1
+            assert events[0]["payload"] == {
+                "venue": "okx",
+                "error": "rate limited",
+                "error_type": "RuntimeError",
+                "request_source": "live_runtime_risk_snapshot",
+                "supports_risk_health": True,
+                "cache_ttl_ms": 1_000,
+                "cache_expires_at_ms": 2_000,
+            }
+
             rt.journal.close()
 
     @pytest.mark.asyncio

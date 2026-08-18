@@ -4485,9 +4485,18 @@ class LiveRuntime:
             return snapshot, True
         except Exception as e:
             error_str = str(e)
+            cache_ttl_ms = self._risk_snapshot_ttl_ms(venue)
             self.journal.append(
                 "runtime.risk_snapshot_fetch_error",
-                {"venue": venue.value, "error": error_str},
+                {
+                    "venue": venue.value,
+                    "error": error_str,
+                    "error_type": type(e).__name__,
+                    "request_source": "live_runtime_risk_snapshot",
+                    "supports_risk_health": supports,
+                    "cache_ttl_ms": cache_ttl_ms,
+                    "cache_expires_at_ms": now_ms + cache_ttl_ms,
+                },
             )
             self._store_risk_snapshot(venue, now_ms, (False, error_str))
             # Fetch error → snapshot unavailable, but capability (supports) unchanged.

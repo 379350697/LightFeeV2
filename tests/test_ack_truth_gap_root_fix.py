@@ -205,6 +205,23 @@ class TestBillingEvidenceIdentityGap:
         assert debt_events[0].args[2]["operator_action"] == (
             "supply_typed_snapshot_and_close_leg_identity"
         )
+        assert debt_events[0].args[2]["identity_evidence"] == {
+            "missing_identity_legs": ["long", "short"],
+            "long": {
+                "leg_count": 0,
+                "exchange_order_id_count": 0,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 0,
+            },
+            "short": {
+                "leg_count": 0,
+                "exchange_order_id_count": 0,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 0,
+            },
+        }
 
         await cr._process_pending_close_reconciliations(2000001)
         assert len([

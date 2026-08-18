@@ -18,6 +18,7 @@ from lightfee.engine.runtime_context import CloseRuntimeContext
 from lightfee.engine.state import (
     is_unattributed_recovered_live_flat_reconciliation,
     pending_close_reconciliation_evidence_debt_reason,
+    pending_close_reconciliation_identity_evidence,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -297,6 +298,10 @@ class CloseRuntime:
         reconciliation["billing_reconciliation_required"] = True
         if reason == "missing_close_order_identity":
             reconciliation["missing_close_order_identity"] = True
+        identity_evidence = pending_close_reconciliation_identity_evidence(
+            reconciliation
+        )
+        reconciliation["identity_evidence"] = identity_evidence
 
         def _leg_count(name: str) -> int:
             legs = reconciliation.get(name)
@@ -332,6 +337,7 @@ class CloseRuntime:
                 ),
                 "long_leg_count": _leg_count("long_legs"),
                 "short_leg_count": _leg_count("short_legs"),
+                "identity_evidence": identity_evidence,
                 "reconciliation": dict(reconciliation),
             },
         )

@@ -70,6 +70,7 @@ from lightfee.engine.state import (
     PendingPassiveLegFill,
     PersistedCloseExecutionLeg,
     is_unattributed_recovered_live_flat_reconciliation,
+    pending_close_reconciliation_identity_evidence,
     pending_close_reconciliation_missing_legs,
 )
 from lightfee.persistence.journal import Journal
@@ -382,6 +383,9 @@ class PassiveCloseExecutor:
         # Inject aggressive close executor for fallback (set by runtime after construction)
         self._close_executor: Optional[object] = None
         self._last_maker_progress_error: dict[str, Any] | None = None
+        self._terminal_zero_fill_diagnostic_signatures: dict[
+            tuple[str, str, str], tuple[str, str, str]
+        ] = {}
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -426,6 +430,60 @@ class PassiveCloseExecutor:
             PassiveOrderState.REJECTED,
             PassiveOrderState.EXPIRED,
         )
+
+    def _append_terminal_zero_fill_truth_unavailable(
+        self,
+        *,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        maker_venue: Venue,
+        progress: PassiveOrderProgress,
+        maker_order_id: str,
+        maker_client_id: str,
+        terminal_truth_error: str,
+        terminal_truth_error_type: str,
+        next_retry_at_ms: int,
+    ) -> None:
+        """Journal one distinct terminal-zero execution-truth gap per state."""
+        order_id = progress.order_id or maker_order_id
+        client_order_id = progress.client_order_id or maker_client_id
+        result = "error" if terminal_truth_error_type else "unavailable"
+        signature = (
+            progress.state.value,
+            result,
+            terminal_truth_error_type,
+        )
+        key = (pending.position_id, maker_venue.value, order_id or client_order_id)
+        previous = self._terminal_zero_fill_diagnostic_signatures.get(key)
+        if previous == signature:
+            return
+        if len(self._terminal_zero_fill_diagnostic_signatures) >= 256:
+            self._terminal_zero_fill_diagnostic_signatures.clear()
+        self._terminal_zero_fill_diagnostic_signatures[key] = signature
+
+        payload = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "maker_venue": maker_venue.value,
+            "maker_order_id": order_id,
+            "maker_client_order_id": client_order_id,
+            "state": progress.state.value,
+            "decision": "retain_pending",
+            "reason": (
+                "execution_truth_query_error"
+                if terminal_truth_error_type
+                else "no_execution_truth"
+            ),
+            "execution_truth_query": "fetch_order_fill_reconciliation",
+            "execution_truth_result": result,
+            "execution_truth_error_type": terminal_truth_error_type,
+            "diagnostic_emission": "initial" if previous is None else "state_changed",
+            "zero_fill_cycles_in_phase": pending.phase_state.zero_fill_cycles_in_phase,
+            "next_retry_at_ms": next_retry_at_ms,
+        }
+        if terminal_truth_error:
+            payload["error"] = terminal_truth_error
+        self._journal.append("exit.passive_close_terminal_zero_fill_truth_unavailable", payload)
 
     def set_l2_mid_resolver(self, resolver: callable) -> None:
         self._l2_mid_resolver = resolver
@@ -1167,6 +1225,7 @@ class PassiveCloseExecutor:
                     terminal_state = progress.state.value
                     terminal_truth = None
                     terminal_truth_error = ""
+                    terminal_truth_error_type = ""
                     try:
                         terminal_truth = await adapter.fetch_order_fill_reconciliation(
                             position.symbol,
@@ -1175,26 +1234,24 @@ class PassiveCloseExecutor:
                         )
                     except Exception as exc:
                         terminal_truth_error = str(exc)
+                        terminal_truth_error_type = type(exc).__name__
                     if terminal_truth is None:
                         if not self._terminal_zero_fill_status_is_authoritative(progress):
-                            payload = {
-                                "position_id": position_id,
-                                "symbol": position.symbol,
-                                "maker_venue": maker_venue.value,
-                                "maker_order_id": progress.order_id or maker_order_id,
-                                "maker_client_order_id": progress.client_order_id or maker_client_id,
-                                "state": progress.state.value,
-                                "decision": "retain_pending",
-                            }
-                            if terminal_truth_error:
-                                payload["error"] = terminal_truth_error
-                            else:
-                                payload["reason"] = "no_execution_truth"
-                            self._journal.append(
-                                "exit.passive_close_terminal_zero_fill_truth_unavailable",
-                                payload,
+                            next_retry_at_ms = (
+                                now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
                             )
-                            pending.next_retry_at_ms = now_ms + PASSIVE_CLOSE_PROGRESS_RETRY_WINDOW_MS
+                            self._append_terminal_zero_fill_truth_unavailable(
+                                pending=pending,
+                                position=position,
+                                maker_venue=maker_venue,
+                                progress=progress,
+                                maker_order_id=maker_order_id,
+                                maker_client_id=maker_client_id,
+                                terminal_truth_error=terminal_truth_error,
+                                terminal_truth_error_type=terminal_truth_error_type,
+                                next_retry_at_ms=next_retry_at_ms,
+                            )
+                            pending.next_retry_at_ms = next_retry_at_ms
                             return False
                         authoritative_payload = {
                             "position_id": position_id,
@@ -4931,6 +4988,11 @@ class PassiveCloseExecutor:
             # absence of an identity, rather than the local quantity alone,
             # determines whether venue order truth is queryable.
             missing_identity_legs = ("long", "short")
+        identity_evidence = pending_close_reconciliation_identity_evidence(
+            reconciliation
+        )
+        identity_evidence["missing_identity_legs"] = list(missing_identity_legs)
+        reconciliation["identity_evidence"] = identity_evidence
         # A local fill quantity without either order identity cannot be queried
         # through the order-status adapters.  It is still durable accounting
         # work: dropping it would turn a proved-flat position into an
@@ -4991,6 +5053,7 @@ class PassiveCloseExecutor:
                 "missing_close_order_identity": missing_close_order_identity,
                 "billing_reconciliation_required": True,
                 "missing_identity_legs": list(missing_identity_legs),
+                "identity_evidence": identity_evidence,
                 "live_flat_terminal": True,
                 # The complete record is the journal recovery boundary.  The
                 # scalar fields above remain convenient for diagnostics and

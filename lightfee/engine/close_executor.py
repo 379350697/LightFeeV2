@@ -37,6 +37,7 @@ from lightfee.engine.state import (
     CloseLegRecord,
     OpenPosition,
     PendingClose,
+    pending_close_reconciliation_identity_evidence,
     pending_close_reconciliation_missing_legs,
 )
 from lightfee.persistence.journal import Journal
@@ -710,6 +711,8 @@ def register_close_accounting_reconciliation(
         "billing_reconciliation_required": True,
     }
     missing_identity_legs = pending_close_reconciliation_missing_legs(reconciliation)
+    identity_evidence = pending_close_reconciliation_identity_evidence(reconciliation)
+    reconciliation["identity_evidence"] = identity_evidence
     reconciliation["missing_close_order_identity"] = bool(missing_identity_legs)
     reconciliation["reconciliation_mode"] = (
         "venue_execution_history_required"
@@ -725,6 +728,7 @@ def register_close_accounting_reconciliation(
             "source": source,
             "accounting_evidence_gaps": list(evidence_gaps),
             "missing_identity_legs": list(missing_identity_legs),
+            "identity_evidence": identity_evidence,
             "reconciliation": reconciliation,
         },
     )

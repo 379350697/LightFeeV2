@@ -910,6 +910,23 @@ class TestCloseChunkExecutor:
         assert pending["original_payload"]["accounting_evidence_gaps"] == [
             "long_close_price_unavailable",
         ]
+        assert pending["identity_evidence"] == {
+            "missing_identity_legs": [],
+            "long": {
+                "leg_count": 1,
+                "exchange_order_id_count": 1,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 0,
+            },
+            "short": {
+                "leg_count": 1,
+                "exchange_order_id_count": 1,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 0,
+            },
+        }
         kinds = [record["kind"] for record in journal.read_all()]
         assert "exit.pending_close_reconciliation_registered" in kinds
         assert "exit.closed" not in kinds

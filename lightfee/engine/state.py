@@ -1089,6 +1089,54 @@ def pending_close_reconciliation_missing_legs(
     return tuple(missing)
 
 
+def pending_close_reconciliation_identity_evidence(
+    reconciliation: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize durable close lookup identity without changing its meaning.
+
+    This diagnostic is intentionally derived from the existing reconciliation
+    payload and ``pending_close_reconciliation_missing_legs`` contract.  It is
+    used to distinguish a real exchange order id from a CID-only lookup, a
+    local recovery placeholder, and genuinely absent evidence; no execution
+    or billing decision consumes the summary.
+    """
+    def summarize(leg_label: str) -> dict[str, int]:
+        legs = reconciliation.get(f"{leg_label}_legs")
+        if not isinstance(legs, list):
+            legs = []
+
+        summary = {
+            "leg_count": len(legs),
+            "exchange_order_id_count": 0,
+            "client_order_id_only_count": 0,
+            "recovery_placeholder_count": 0,
+            "missing_identity_count": 0,
+        }
+        for leg in legs:
+            if not isinstance(leg, dict):
+                summary["missing_identity_count"] += 1
+                continue
+            order_id = str(leg.get("order_id") or "")
+            client_order_id = str(leg.get("client_order_id") or "")
+            if "-recovery-" in order_id.lower():
+                summary["recovery_placeholder_count"] += 1
+            elif order_id:
+                summary["exchange_order_id_count"] += 1
+            elif client_order_id:
+                summary["client_order_id_only_count"] += 1
+            else:
+                summary["missing_identity_count"] += 1
+        return summary
+
+    return {
+        "missing_identity_legs": list(
+            pending_close_reconciliation_missing_legs(reconciliation)
+        ),
+        "long": summarize("long"),
+        "short": summarize("short"),
+    }
+
+
 def pending_close_reconciliation_evidence_debt_reason(
     reconciliation: Any,
 ) -> str | None:

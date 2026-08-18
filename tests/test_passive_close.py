@@ -5717,6 +5717,23 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         )
         assert reconciliation["missing_close_order_identity"] is True
         assert reconciliation["billing_reconciliation_required"] is True
+        assert reconciliation["identity_evidence"] == {
+            "missing_identity_legs": ["long", "short"],
+            "long": {
+                "leg_count": 1,
+                "exchange_order_id_count": 0,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 1,
+            },
+            "short": {
+                "leg_count": 0,
+                "exchange_order_id_count": 0,
+                "client_order_id_only_count": 0,
+                "recovery_placeholder_count": 0,
+                "missing_identity_count": 0,
+            },
+        }
         assert not [
             event
             for event in journal.read_all()
@@ -7556,10 +7573,54 @@ class TestReduceOnlyRejectedEscalation:
         assert pending.phase_state.maker_order_id == "canceled-maker"
         assert pending.phase_state.phase == PassiveExecutionPhase.LOW_SLIPPAGE_MAKER
         assert pending.next_retry_at_ms > 0
-        assert any(
-            event["kind"] == "exit.passive_close_terminal_zero_fill_truth_unavailable"
-            for event in journal.read_all()
-        )
+        diagnostics = [
+            event for event in journal.read_all()
+            if event["kind"] == "exit.passive_close_terminal_zero_fill_truth_unavailable"
+        ]
+        assert len(diagnostics) == 1
+        assert diagnostics[0]["payload"] == {
+            "position_id": position.position_id,
+            "symbol": "BTCUSDT",
+            "maker_venue": "binance",
+            "maker_order_id": "canceled-maker",
+            "maker_client_order_id": "canceled-client",
+            "state": "canceled",
+            "decision": "retain_pending",
+            "reason": "no_execution_truth",
+            "execution_truth_query": "fetch_order_fill_reconciliation",
+            "execution_truth_result": "unavailable",
+            "execution_truth_error_type": "",
+            "diagnostic_emission": "initial",
+            "zero_fill_cycles_in_phase": PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES - 1,
+            "next_retry_at_ms": pending.next_retry_at_ms,
+        }
+
+        # The unchanged missing-truth state is a retained owner, not a new
+        # incident every poll. A different failure class is emitted once.
+        pending.next_retry_at_ms = 0
+        assert asyncio.run(executor.drive_pending_passive_close(state, position.position_id)) is False
+        assert len([
+            event for event in journal.read_all()
+            if event["kind"] == "exit.passive_close_terminal_zero_fill_truth_unavailable"
+        ]) == 1
+
+        maker_adapter.fetch_order_fill_reconciliation.side_effect = RuntimeError("reconcile timeout")
+        pending.next_retry_at_ms = 0
+        assert asyncio.run(executor.drive_pending_passive_close(state, position.position_id)) is False
+        diagnostics = [
+            event for event in journal.read_all()
+            if event["kind"] == "exit.passive_close_terminal_zero_fill_truth_unavailable"
+        ]
+        assert len(diagnostics) == 2
+        assert diagnostics[-1]["payload"] == {
+            **diagnostics[0]["payload"],
+            "error": "reconcile timeout",
+            "reason": "execution_truth_query_error",
+            "execution_truth_result": "error",
+            "execution_truth_error_type": "RuntimeError",
+            "diagnostic_emission": "state_changed",
+            "next_retry_at_ms": pending.next_retry_at_ms,
+        }
 
     def test_rejected_zero_progress_uses_late_execution_fill(self):
         """A rejected terminal status cannot discard a late venue execution."""
