@@ -1495,10 +1495,13 @@ class EngineState:
         """Replace exactly one historical billing debt with stronger evidence.
 
         This is the sole mutable entry point for operator-supplied close
-        accounting evidence.  It never creates a new owner, never changes the
-        physical-close identity, and does not mark a debt reconciled.  The live
-        reconciliation lane still queries exchange execution history by the
-        imported durable order identities before it can emit ``exit.reconciled``.
+        accounting evidence.  It never creates a new owner and does not mark a
+        debt reconciled.  The sole exception to preserving the owner kind is an
+        explicit, audited migration of an orphaned legacy ``partial`` record to
+        ``final``: both legs must be supplied at the original snapshot sizes,
+        and the live reconciliation lane still queries exchange execution
+        history by those durable identities before it can emit
+        ``exit.reconciled``.
         """
         if not isinstance(item, dict):
             raise BillingEvidenceImportError(
@@ -1524,6 +1527,7 @@ class EngineState:
             "position_snapshot",
             "long_legs",
             "short_legs",
+            "terminalize_orphan_partial",
         }
         unknown_fields = sorted(set(item) - allowed_fields)
         if unknown_fields:
@@ -1532,11 +1536,20 @@ class EngineState:
             )
         position_id = str(item.get("position_id") or "")
         kind = str(item.get("kind") or "final")
+        terminalize_orphan_partial = item.get("terminalize_orphan_partial") is True
+        if "terminalize_orphan_partial" in item and not terminalize_orphan_partial:
+            raise BillingEvidenceImportError(
+                "terminalize_orphan_partial must be true when supplied"
+            )
         closed_at_ms = _reconciliation_int(item.get("closed_at_ms"))
         if not position_id:
             raise BillingEvidenceImportError("position_id is required")
         if kind not in {"final", "partial"}:
             raise BillingEvidenceImportError("kind must be final or partial")
+        if terminalize_orphan_partial and kind == "final" and not allow_idempotent:
+            raise BillingEvidenceImportError(
+                "terminalized evidence must identify the partial owner"
+            )
         if closed_at_ms <= 0:
             raise BillingEvidenceImportError("closed_at_ms must be positive")
         if "position_snapshot" in item and not isinstance(
@@ -1550,15 +1563,38 @@ class EngineState:
                 raise BillingEvidenceImportError(f"{leg_field} must be a list")
 
         self.set_pending_close_reconciliations(self.pending_close_reconciliations)
+        owner_kind = "partial" if terminalize_orphan_partial else kind
         owner_matches = [
             (index, existing)
             for index, existing in enumerate(self.pending_close_reconciliations)
             if isinstance(existing, dict)
             and str(existing.get("position_id") or "") == position_id
-            and str(existing.get("kind") or "final") == kind
+            and str(existing.get("kind") or "final") == owner_kind
             and _reconciliation_int(existing.get("closed_at_ms")) == closed_at_ms
         ]
         if len(owner_matches) != 1:
+            if terminalize_orphan_partial and allow_idempotent:
+                imported_matches = [
+                    existing
+                    for existing in self.pending_close_reconciliations
+                    if isinstance(existing, dict)
+                    and str(existing.get("position_id") or "") == position_id
+                    and str(existing.get("kind") or "final") == "final"
+                    and _reconciliation_int(existing.get("closed_at_ms")) == closed_at_ms
+                    and existing.get("reconciliation_status")
+                    == "operator_evidence_imported"
+                    and isinstance(existing.get("operator_evidence"), dict)
+                    and existing["operator_evidence"].get(
+                        "terminalized_orphan_partial"
+                    )
+                    is True
+                    and str(existing["operator_evidence"].get("sha256") or "").lower()
+                    == digest
+                    and str(existing["operator_evidence"].get("reference") or "")
+                    == reference
+                ]
+                if len(imported_matches) == 1:
+                    return dict(imported_matches[0])
             raise BillingEvidenceImportError(
                 "evidence must match exactly one pending reconciliation owner"
             )
@@ -1576,10 +1612,36 @@ class EngineState:
         if existing.get("reconciliation_status") != "evidence_debt":
             raise BillingEvidenceImportError("target owner is not an evidence debt")
 
+        if terminalize_orphan_partial:
+            if position_id in self.open_positions or any(
+                str(getattr(position, "position_id", "") or "") == position_id
+                for position in self.open_positions.values()
+            ):
+                raise BillingEvidenceImportError(
+                    "orphan partial target position is still open"
+                )
+            if any(
+                isinstance(other, dict)
+                and str(other.get("position_id") or "") == position_id
+                and str(other.get("kind") or "final") == "final"
+                for other in self.pending_close_reconciliations
+            ):
+                raise BillingEvidenceImportError(
+                    "orphan partial already has a final successor"
+                )
+
         candidate = dict(existing)
         for evidence_field in ("position_snapshot", "long_legs", "short_legs"):
             if evidence_field in item:
                 candidate[evidence_field] = item[evidence_field]
+
+        if terminalize_orphan_partial:
+            # This is intentionally not a generic partial-to-final conversion.
+            # The candidate must carry complete terminal legs for the original
+            # paired snapshot; live exchange queries below remain the authority
+            # for the actual fill details and final billing event.
+            candidate["kind"] = "final"
+            candidate.pop("original_payload", None)
 
         # A V1 partial reconciliation may have already supplied exact
         # cumulative accounting to its later final owner.  Operator evidence
@@ -1589,6 +1651,7 @@ class EngineState:
         candidate_snapshot = candidate.get("position_snapshot")
         if (
             kind == "final"
+            and not terminalize_orphan_partial
             and isinstance(existing_snapshot, dict)
             and isinstance(candidate_snapshot, dict)
         ):
@@ -1619,6 +1682,52 @@ class EngineState:
                 f"imported evidence is incomplete: {import_reason}"
             )
 
+        if terminalize_orphan_partial:
+            snapshot = candidate.get("position_snapshot")
+            if not isinstance(snapshot, dict):
+                raise BillingEvidenceImportError(
+                    "orphan partial terminalization requires a position snapshot"
+                )
+            for leg_label in ("long", "short"):
+                try:
+                    expected_quantity = float(snapshot[f"{leg_label}_quantity"])
+                except (KeyError, TypeError, ValueError):
+                    raise BillingEvidenceImportError(
+                        "orphan partial terminalization requires dual-leg snapshot quantities"
+                    ) from None
+                legs = candidate.get(f"{leg_label}_legs")
+                if (
+                    not math.isfinite(expected_quantity)
+                    or expected_quantity <= 1e-12
+                    or not isinstance(legs, list)
+                    or not legs
+                ):
+                    raise BillingEvidenceImportError(
+                        "orphan partial terminalization requires complete dual-leg evidence"
+                    )
+                evidence_quantity = 0.0
+                for leg in legs:
+                    try:
+                        quantity = float(leg["quantity"])
+                    except (KeyError, TypeError, ValueError):
+                        raise BillingEvidenceImportError(
+                            "orphan partial terminalization requires dual-leg quantities"
+                        ) from None
+                    if not math.isfinite(quantity) or quantity <= 1e-12:
+                        raise BillingEvidenceImportError(
+                            "orphan partial terminalization requires dual-leg quantities"
+                        )
+                    evidence_quantity += quantity
+                if not math.isclose(
+                    evidence_quantity,
+                    expected_quantity,
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                ):
+                    raise BillingEvidenceImportError(
+                        "orphan partial terminalization quantities must match the snapshot"
+                    )
+
         candidate["reconciliation_status"] = "operator_evidence_imported"
         candidate.pop("evidence_debt_reason", None)
         candidate.pop("evidence_debt_at_ms", None)
@@ -1632,6 +1741,8 @@ class EngineState:
             "sha256": digest,
             "imported_at_ms": _reconciliation_int(imported_at_ms),
         }
+        if terminalize_orphan_partial:
+            candidate["operator_evidence"]["terminalized_orphan_partial"] = True
         self.pending_close_reconciliations[index] = candidate
         return dict(candidate)
 

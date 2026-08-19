@@ -77,6 +77,27 @@ every leg venue must match its snapshot route, and entry-fee evidence must be
 explicitly complete. The CLI computes and journals a SHA-256 hash of the
 canonical evidence pack.
 
+### Legacy Orphan Partial Terminalization
+
+Ordinary `partial` owners are non-terminal. The sole exception is a historical
+orphan whose two exchange close executions have independently been proven.
+Set `"kind": "partial"` and add `"terminalize_orphan_partial": true` in its
+`reconciliation`. The state gate then permits the transition only when all of
+the following are true:
+
+- the tuple identifies an existing `evidence_debt` partial, with no local open
+  position and no later final owner;
+- the evidence contains non-empty exact-identity legs for both venues;
+- each leg's aggregate quantity exactly equals its original paired snapshot
+  quantity.
+
+This flag does not make the supplied quantities or prices authoritative. The
+import remains a pending final reconciliation, and the live runtime must
+re-fetch both order identities from the venues before it writes
+`exit.reconciled`. A missing, partial, or mismatched re-fetch retains the debt.
+Do not use this flag for a time/side/quantity candidate; candidate discovery is
+not exact execution evidence.
+
 ## Read-Only Binance Candidate Discovery
 
 For a Binance `missing_close_order_identity` debt with no retained exact order

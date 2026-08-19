@@ -581,9 +581,19 @@ def close_accounting_evidence_gaps(
     position: OpenPosition,
     long_legs: list[CloseExecutionLeg],
     short_legs: list[CloseExecutionLeg],
+    *,
+    unresolved_submission_legs: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Return the facts missing from a close bill without changing execution."""
     gaps: list[str] = []
+
+    # A submit outcome that is not confirmed is not a zero fill.  V1 resolves
+    # it through exchange position truth / compensation; V2 must also retain
+    # its original CID for the later financial statement rather than issuing a
+    # bill from the locally observed opposite leg.
+    for leg_label in unresolved_submission_legs:
+        if leg_label in {"long", "short"}:
+            gaps.append(f"{leg_label}_close_execution_unconfirmed")
 
     for leg_label, price in (
         ("long_entry", position.long_entry_price),
@@ -669,6 +679,45 @@ def _close_reconciliation_leg_records(
     ]
 
 
+def _append_unresolved_close_submission_identities(
+    records: list[dict[str, Any]],
+    *,
+    venue: Venue,
+    client_order_ids: tuple[str, ...],
+) -> bool:
+    """Persist only CIDs whose submitted close has no local fill record.
+
+    The zero quantity is deliberately a placeholder, never an asserted fill.
+    It gives the reconciliation runtime the exact exchange lookup key while
+    keeping the local accounting segment fail-closed until that lookup returns
+    a real fill.
+    """
+    known_client_order_ids = {
+        str(record.get("client_order_id") or "")
+        for record in records
+        if isinstance(record, dict)
+    }
+    appended = False
+    for client_order_id in client_order_ids:
+        client_order_id = str(client_order_id or "")
+        if not client_order_id or client_order_id in known_client_order_ids:
+            continue
+        records.append(
+            {
+                "venue": venue.value,
+                "order_id": "",
+                "client_order_id": client_order_id,
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": 0.0,
+                "filled_at_ms": 0,
+            }
+        )
+        known_client_order_ids.add(client_order_id)
+        appended = True
+    return appended
+
+
 def register_close_accounting_reconciliation(
     state: Any,
     journal: Journal,
@@ -680,10 +729,25 @@ def register_close_accounting_reconciliation(
     reason: str,
     source: str,
     evidence_gaps: tuple[str, ...],
+    long_unresolved_client_order_ids: tuple[str, ...] = (),
+    short_unresolved_client_order_ids: tuple[str, ...] = (),
 ) -> None:
     """Persist exact close identities before discarding incomplete local billing."""
     long_records = _close_reconciliation_leg_records(long_legs)
     short_records = _close_reconciliation_leg_records(short_legs)
+    unresolved_submission_legs: list[str] = []
+    if _append_unresolved_close_submission_identities(
+        long_records,
+        venue=position.long_venue,
+        client_order_ids=long_unresolved_client_order_ids,
+    ):
+        unresolved_submission_legs.append("long")
+    if _append_unresolved_close_submission_identities(
+        short_records,
+        venue=position.short_venue,
+        client_order_ids=short_unresolved_client_order_ids,
+    ):
+        unresolved_submission_legs.append("short")
     remaining_long = max(
         position.long_quantity - sum(float(leg.fill.quantity) for leg in long_legs),
         0.0,
@@ -712,6 +776,8 @@ def register_close_accounting_reconciliation(
         "next_attempt_ms": now_ms,
         "billing_reconciliation_required": True,
     }
+    if unresolved_submission_legs:
+        reconciliation["unresolved_submission_legs"] = unresolved_submission_legs
     missing_identity_legs = pending_close_reconciliation_missing_legs(reconciliation)
     identity_evidence = pending_close_reconciliation_identity_evidence(reconciliation)
     reconciliation["identity_evidence"] = identity_evidence
@@ -822,6 +888,48 @@ class CloseExecutor:
         chunk_long_order_ids: list[str] = []
         any_short_uncertain = False
         any_long_uncertain = False
+        unresolved_short_client_order_ids: list[str] = []
+        unresolved_long_client_order_ids: list[str] = []
+
+        def persist_compensation_truth_gap() -> None:
+            """Keep exact submitted identities if V1 compensation cannot probe.
+
+            Compensation failure is fail-closed for exposure safety, but it must
+            not erase the order identities needed to reconcile whatever reached
+            the venue before the transport/position-truth failure.
+            """
+            if state is None:
+                return
+            evidence_gaps = close_accounting_evidence_gaps(
+                position,
+                long_legs,
+                short_legs,
+                unresolved_submission_legs=tuple(
+                    leg_label
+                    for leg_label, uncertain in (
+                        ("long", any_long_uncertain),
+                        ("short", any_short_uncertain),
+                    )
+                    if uncertain
+                ),
+            )
+            register_close_accounting_reconciliation(
+                state,
+                self.journal,
+                position,
+                long_legs=long_legs,
+                short_legs=short_legs,
+                now_ms=now_ms,
+                reason=reason,
+                source="aggressive_close_compensation_truth_unavailable",
+                evidence_gaps=evidence_gaps,
+                long_unresolved_client_order_ids=tuple(
+                    unresolved_long_client_order_ids
+                ),
+                short_unresolved_client_order_ids=tuple(
+                    unresolved_short_client_order_ids
+                ),
+            )
 
         for chunk_idx, chunk_qty in enumerate(chunk_quantities):
             chunk_suffix = f"_chunk_{chunk_idx + 1}" if total_chunks > 1 else ""
@@ -858,6 +966,7 @@ class CloseExecutor:
                 chunk_short_order_ids.append(short_result.get("order_id", ""))
             elif short_result["outcome"] == "uncertain":
                 any_short_uncertain = True
+                unresolved_short_client_order_ids.append(short_cid)
                 chunk_short_order_ids.append(short_result.get("order_id", ""))
                 # V1: compensate_failed_full_close for short leg uncertain errors
                 if reason:
@@ -888,6 +997,7 @@ class CloseExecutor:
                         )
                         break  # compensation succeeded, exit chunk loop
                     except CompensationFailedError:
+                        persist_compensation_truth_gap()
                         return build_close_execution_from_legs(
                             position, total_chunks, short_legs, long_legs,
                         )
@@ -941,6 +1051,7 @@ class CloseExecutor:
                 chunk_long_order_ids.append(long_result.get("order_id", ""))
             elif long_result["outcome"] == "uncertain":
                 any_long_uncertain = True
+                unresolved_long_client_order_ids.append(long_cid)
                 chunk_long_order_ids.append(long_result.get("order_id", ""))
                 # V1: compensate for long leg uncertain errors
                 if reason:
@@ -972,6 +1083,7 @@ class CloseExecutor:
                         )
                         break
                     except CompensationFailedError:
+                        persist_compensation_truth_gap()
                         return build_close_execution_from_legs(
                             position, total_chunks, short_legs, long_legs,
                         )
@@ -1005,6 +1117,7 @@ class CloseExecutor:
                     )
                     break
                 except CompensationFailedError:
+                    persist_compensation_truth_gap()
                     return build_close_execution_from_legs(
                         position, total_chunks, short_legs, long_legs,
                     )
@@ -1057,6 +1170,14 @@ class CloseExecutor:
             position,
             long_legs,
             short_legs,
+            unresolved_submission_legs=tuple(
+                leg_label
+                for leg_label, uncertain in (
+                    ("long", any_long_uncertain),
+                    ("short", any_short_uncertain),
+                )
+                if uncertain
+            ),
         )
         accounting_evidence_complete = not accounting_evidence_gaps
         if state is not None and not accounting_evidence_complete:
@@ -1070,6 +1191,8 @@ class CloseExecutor:
                 reason=reason,
                 source="aggressive_close_execution",
                 evidence_gaps=accounting_evidence_gaps,
+                long_unresolved_client_order_ids=tuple(unresolved_long_client_order_ids),
+                short_unresolved_client_order_ids=tuple(unresolved_short_client_order_ids),
             )
         residual = split_close_fill_residual(
             position, long_closed, short_closed,
@@ -1809,15 +1932,32 @@ class CloseExecutor:
             try:
                 pos = await adapter.fetch_position(position.symbol)
             except Exception as fetch_err:
-                self.journal.append(
-                    "exit.compensation_fetch_failed",
+                if state is not None:
+                    enter_fail_closed(state)
+                    state.last_error = (
+                        f"close compensation position truth unavailable for "
+                        f"{position.position_id} on {venue.value}"
+                    )
+                self.journal.append_critical(
+                    wall_clock_now_ms(),
+                    "execution.compensation_failed",
                     {
                         "position_id": position.position_id,
+                        "symbol": position.symbol,
+                        "phase": "close",
+                        "reason": close_reason,
+                        "failed_stage": failed_stage,
+                        "failed_venue": failed_venue.value,
                         "venue": venue.value,
-                        "error": str(fetch_err),
+                        "terminal_reason": "compensation_position_truth_unavailable",
+                        "error": str(error),
+                        "fetch_error": str(fetch_err),
                     },
                 )
-                continue
+                raise CompensationFailedError(
+                    f"close compensation position truth unavailable for "
+                    f"{position.position_id} on {venue.value}"
+                ) from fetch_err
 
             if pos is None or abs(pos.quantity) <= 1e-9:
                 continue

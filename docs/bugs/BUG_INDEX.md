@@ -25,9 +25,16 @@ CID that V1 passes with an exchange order ID. The repair restores partial
 propagation/replay, keeps orphan partials fail-closed, uses the shared
 average-price converter, and preserves the legacy final two-fill rule only
 where snapshots predate durable quantities. Full local validation is
-`4330 passed, 9 skipped, 1 warning`. This is **local green, not historical-debt
-closure**: COTI needs its known exact imports applied, BICO still needs exact
-Binance evidence, and COW still has no terminal successor. See
+`1550` profile tests plus targeted close/import/recovery coverage. A subsequent
+read-only COW proof established exact complete dual-leg fills despite a stale
+partial owner; an explicit restricted operator migration now converts only
+that fully proven orphan to normal final reconciliation, which must re-fetch
+both exchange fills before clearing. The current close path also keeps a
+durable CID for every uncertain submit and promotes it only after exact
+full-snapshot dual-leg proof, preventing this identity-loss shape from being
+created again. This is **local green, not historical-debt closure** until
+production import/reconciliation completes; COTI needs its known exact imports
+applied and BICO still needs exact Binance evidence. See
 [daily/2026-08-19.md#cluster-cl-114-staged-close-reconciliation-and-terminal-fill-price](daily/2026-08-19.md#cluster-cl-114-staged-close-reconciliation-and-terminal-fill-price).
 
 CL-113 short-maker reconciliation and Bybit recovery identity, 2026-08-17:

@@ -16,6 +16,7 @@ import pytest
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from lightfee.core.domain import (
     OrderFill,
@@ -932,6 +933,203 @@ class TestCloseChunkExecutor:
             },
         }
         kinds = [record["kind"] for record in journal.read_all()]
+        assert "exit.pending_close_reconciliation_registered" in kinds
+        assert "exit.closed" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_uncertain_submitted_close_is_reconciled_from_its_durable_cid(self):
+        """An ACK/transport-uncertain close must not lose its original CID.
+
+        This is the real COW-shaped path: the short close is locally confirmed,
+        the Binance long submit returns uncertain, and V1 compensation finds
+        both venue positions flat.  The later exact exchange execution lookup
+        must settle one final bill, rather than leaving an orphan partial debt.
+        """
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        class _LongUncertainButFilledAdapter(FakeVenueAdapter):
+            async def place_order(self, _request):
+                self.place_order_call_count += 1
+                raise _make_uncertain_error("submit response lost")
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.01,
+                    average_price=50_100.0,
+                    order_id="binance-late-fill",
+                    client_order_id=client_order_id,
+                    fee_quote=0.1,
+                    filled_at_ms=2_001,
+                )
+
+        class _ShortFilledAdapter(FakeVenueAdapter):
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.01,
+                    average_price=49_900.0,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fee_quote=0.1,
+                    filled_at_ms=2_000,
+                )
+
+        long_adapter = _LongUncertainButFilledAdapter(Venue.BINANCE)
+        short_adapter = _ShortFilledAdapter(Venue.OKX)
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.BUY,
+                0.01,
+                price=49_900.0,
+                order_id="okx-confirmed-fill",
+                fee_quote=0.1,
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        state = EngineState()
+        position = _make_position(
+            entry_fee_evidence_complete=True,
+            total_entry_fee_quote=0.2,
+            long_entry_fee_quote=0.1,
+            short_entry_fee_quote=0.1,
+        )
+        state.open_positions[position.position_id] = position
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+
+        await executor.execute_close(
+            position,
+            "funding_capture",
+            2_000,
+            long_price_hint=50_000.0,
+            short_price_hint=50_000.0,
+            state=state,
+        )
+
+        assert len(state.pending_close_reconciliations) == 1
+        pending = state.pending_close_reconciliations[0]
+        assert pending["kind"] == "partial"
+        assert pending["unresolved_submission_legs"] == ["long"]
+        assert pending["long_legs"] == [
+            {
+                "venue": "binance",
+                "order_id": "",
+                "client_order_id": pending["long_legs"][0]["client_order_id"],
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": 0.0,
+                "filled_at_ms": 0,
+            }
+        ]
+        assert not [
+            record for record in journal.read_all() if record["kind"] == "exit.closed"
+        ]
+
+        ctx = SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            _flush_adapter_order_diagnostics=lambda _adapter: None,
+        )
+        runtime = CloseRuntime(ctx)
+        await runtime._process_pending_close_reconciliations(2_100)
+
+        assert state.pending_close_reconciliations == []
+        assert position.position_id not in state.open_positions
+        assert state.pending_closes == {}
+        assert state.pending_residual_repairs == []
+        assert len([
+            record for record in journal.read_all() if record["kind"] == "exit.reconciled"
+        ]) == 1
+
+    def test_uncertain_submission_shortfill_is_not_promoted_to_a_final_bill(self):
+        """Exact CID lookup must retain a partial debt unless both legs are full."""
+        reconciliation = {
+            "kind": "partial",
+            "unresolved_submission_legs": ["long"],
+            "position_snapshot": {
+                "long_quantity": 0.01,
+                "short_quantity": 0.01,
+            },
+        }
+
+        promoted = CloseRuntime(None)._reclassify_full_uncertain_submission(
+            reconciliation,
+            [SimpleNamespace(quantity=0.009)],
+            [SimpleNamespace(quantity=0.01)],
+        )
+
+        assert promoted is None
+
+    @pytest.mark.asyncio
+    async def test_uncertain_close_with_unavailable_compensation_truth_keeps_cid(self):
+        """Fail-closed compensation still persists the original uncertain CID."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+        from lightfee.risk.modes import GlobalRiskMode
+
+        class _LongUncertainAndPositionUnavailable(FakeVenueAdapter):
+            async def place_order(self, _request):
+                self.place_order_call_count += 1
+                raise _make_uncertain_error("submit response lost")
+
+            async def fetch_position(self, _symbol):
+                raise RuntimeError("Binance position endpoint unavailable")
+
+        long_adapter = _LongUncertainAndPositionUnavailable(Venue.BINANCE)
+        short_adapter = FakeVenueAdapter(Venue.OKX)
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.BUY,
+                0.01,
+                order_id="okx-confirmed-fill",
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        state = EngineState()
+        position = _make_position()
+        state.open_positions[position.position_id] = position
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+
+        await executor.execute_close(
+            position,
+            "funding_capture",
+            2_000,
+            long_price_hint=50_000.0,
+            short_price_hint=50_000.0,
+            state=state,
+        )
+
+        assert state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert len(state.pending_close_reconciliations) == 1
+        pending = state.pending_close_reconciliations[0]
+        assert pending["source"] == "aggressive_close_compensation_truth_unavailable"
+        assert pending["unresolved_submission_legs"] == ["long"]
+        assert pending["long_legs"][0]["client_order_id"]
+        assert pending["long_legs"][0]["quantity"] == 0.0
+        assert pending["short_legs"][0]["order_id"] == "okx-confirmed-fill"
+        kinds = [record["kind"] for record in journal.read_all()]
+        assert "execution.compensation_failed" in kinds
         assert "exit.pending_close_reconciliation_registered" in kinds
         assert "exit.closed" not in kinds
 

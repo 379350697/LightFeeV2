@@ -745,6 +745,86 @@ class CloseRuntime:
             return actual <= 1e-12
         return actual > 1e-12 and actual + 1e-12 >= expected
 
+    def _reclassify_full_uncertain_submission(
+        self,
+        reconciliation: dict[str, Any],
+        long_fills: list[Any],
+        short_fills: list[Any],
+    ) -> dict[str, Any] | None:
+        """Correct a partial produced only by an uncertain submit response.
+
+        A V1 compensation probe can prove the account flat while the original
+        submit response lacked a local fill.  If its durable CID later returns
+        exact exchange fills for *both full snapshot legs*, the original
+        partial classification was observationally stale, not a staged close.
+        Promote only that exact shape to the existing final billing path.
+        """
+        if str(reconciliation.get("kind") or "final") != "partial":
+            return None
+        unresolved_legs = reconciliation.get("unresolved_submission_legs")
+        if not isinstance(unresolved_legs, list) or not {
+            str(leg) for leg in unresolved_legs
+        }.issubset({"long", "short"}):
+            return None
+        if not unresolved_legs:
+            return None
+
+        snapshot = reconciliation.get("position_snapshot")
+        if not isinstance(snapshot, dict):
+            return None
+        try:
+            expected_long = float(snapshot.get("long_quantity"))
+            expected_short = float(snapshot.get("short_quantity"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(expected_long)
+            or not math.isfinite(expected_short)
+            or expected_long <= 1e-12
+            or expected_short <= 1e-12
+        ):
+            return None
+
+        actual_long = sum(self._close_reconciliation_fill_qty(fill) for fill in long_fills)
+        actual_short = sum(self._close_reconciliation_fill_qty(fill) for fill in short_fills)
+        if not (
+            math.isclose(actual_long, expected_long, rel_tol=1e-9, abs_tol=1e-12)
+            and math.isclose(actual_short, expected_short, rel_tol=1e-9, abs_tol=1e-12)
+        ):
+            return None
+
+        promoted = dict(reconciliation)
+        promoted["kind"] = "final"
+        promoted["source"] = (
+            f"{str(reconciliation.get('source') or 'pending_close_reconciliation')}"
+            ":uncertain_submit_exact_fill"
+        )
+        promoted["reclassified_from_partial"] = True
+        promoted.pop("original_payload", None)
+        return promoted
+
+    def _clear_terminal_uncertain_submission_owners(self, position_id: str) -> None:
+        """Mirror the terminal journal replay after exact full close evidence."""
+        self.ctx.state.open_positions.pop(position_id, None)
+        self.ctx.state.pending_closes = {
+            close_id: pending
+            for close_id, pending in self.ctx.state.pending_closes.items()
+            if close_id != position_id
+            and str(getattr(pending, "position_id", "") or "") != position_id
+        }
+        self.ctx.state.pending_passive_closes = {
+            pending_id: pending
+            for pending_id, pending in self.ctx.state.pending_passive_closes.items()
+            if pending_id != position_id
+            and str(getattr(pending, "position_id", "") or "") != position_id
+        }
+        self.ctx.state.pending_residual_repairs = [
+            repair
+            for repair in self.ctx.state.pending_residual_repairs
+            if not isinstance(repair, dict)
+            or str(repair.get("position_id") or "") != position_id
+        ]
+
     def _exit_reconciled_payload_from_leg_fills(
         self,
         reconciliation: dict[str, Any],
@@ -1443,22 +1523,33 @@ class CloseRuntime:
                 legs=reconciliation.get("short_legs"),
             )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
-                is_partial = str(reconciliation.get("kind") or "final") == "partial"
+                settled_reconciliation = self._reclassify_full_uncertain_submission(
+                    reconciliation,
+                    long_fills,
+                    short_fills,
+                ) or reconciliation
+                reclassified_from_partial = settled_reconciliation is not reconciliation
+                is_partial = str(settled_reconciliation.get("kind") or "final") == "partial"
                 payload = (
                     self._partial_reconciled_payload_from_leg_fills(
-                        reconciliation,
+                        settled_reconciliation,
                         long_fills,
                         short_fills,
                         now_ms,
                     )
                     if is_partial
                     else self._exit_reconciled_payload_from_leg_fills(
-                        reconciliation,
+                        settled_reconciliation,
                         long_fills,
                         short_fills,
                         now_ms,
                     )
                 )
+                if reclassified_from_partial:
+                    payload["reclassified_from_partial"] = True
+                    payload["unresolved_submission_legs"] = list(
+                        reconciliation.get("unresolved_submission_legs") or []
+                    )
                 if not payload["venue_statement_reconciled"]:
                     self.ctx.journal.append(
                         "exit.billing_unreconciled",
@@ -1504,6 +1595,10 @@ class CloseRuntime:
                     "exit.reconciled",
                     payload,
                 )
+                if reclassified_from_partial:
+                    self._clear_terminal_uncertain_submission_owners(
+                        str(reconciliation.get("position_id") or "")
+                    )
                 changed = True
                 continue
             if long_fills == [] and short_fills == []:

@@ -156,6 +156,43 @@ def _binance_close_debt() -> dict[str, object]:
     }
 
 
+def _orphan_partial_close_debt() -> dict[str, object]:
+    """A legacy one-leg record whose two exchange closes are now proven."""
+    debt = _binance_close_debt()
+    debt["position_snapshot"]["position_id"] = debt["position_id"]
+    debt["original_payload"] = {
+        "long_closed_qty": 0.0,
+        "short_closed_qty": 100.0,
+    }
+    return debt
+
+
+def _orphan_partial_terminal_evidence() -> dict[str, object]:
+    debt = _orphan_partial_close_debt()
+    return {
+        "schema_version": 1,
+        "evidence_reference": "exchange-export:cow-dual-close-20260819",
+        "reconciliation": {
+            "position_id": debt["position_id"],
+            "kind": "partial",
+            "closed_at_ms": CLOSED_AT_MS,
+            "terminalize_orphan_partial": True,
+            "position_snapshot": debt["position_snapshot"],
+            "long_legs": [
+                {
+                    "venue": "binance",
+                    "order_id": "discovered-binance-close",
+                    "client_order_id": "discovered-binance-client",
+                    "quantity": 100.0,
+                    "average_price": 1.25,
+                    "fee_quote": 0.01,
+                }
+            ],
+            "short_legs": debt["short_legs"],
+        },
+    }
+
+
 def _binance_order(**overrides: object) -> dict[str, object]:
     order: dict[str, object] = {
         "symbol": "COWUSDT",
@@ -693,6 +730,145 @@ async def test_imported_evidence_uses_exact_order_ids_before_terminal_reconcilia
         call.args[1] == "exit.reconciled"
         for call in ctx.journal.append_critical.call_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_operator_can_terminalize_orphan_partial_only_after_exact_dual_leg_recheck(
+    tmp_path,
+):
+    """Production path: audited migration, restart replay, then venue recheck."""
+    debt = _orphan_partial_close_debt()
+    evidence = _orphan_partial_terminal_evidence()
+    state = EngineState()
+    state.tick_count = 1
+    state.pending_close_reconciliations = [debt]
+    journal = Journal(tmp_path / "journal.jsonl")
+    journal.open()
+    try:
+        execute_billing_evidence_import(
+            evidence,
+            journal=journal,
+            state=state,
+            now_ms=CLOSED_AT_MS + 1,
+        )
+        records = journal.read_all()
+    finally:
+        journal.close()
+
+    imported = state.pending_close_reconciliations[0]
+    assert imported["kind"] == "final"
+    assert "original_payload" not in imported
+    assert imported["operator_evidence"]["terminalized_orphan_partial"] is True
+    assert records[-1]["kind"] == "exit.billing_evidence_imported"
+
+    replayed = EngineState()
+    replayed.pending_close_reconciliations = [_orphan_partial_close_debt()]
+    _apply_journal_replay_to_state(replayed, records)
+    assert replayed.pending_close_reconciliations == [imported]
+
+    binance = MagicMock()
+    binance.fetch_order_fill_reconciliation = AsyncMock(
+        return_value=SimpleNamespace(
+            quantity=100.0,
+            average_price=1.25,
+            fee_quote=0.01,
+            order_id="discovered-binance-close",
+            client_order_id="discovered-binance-client",
+            venue="binance",
+            filled_at_ms=CLOSED_AT_MS,
+        )
+    )
+    bybit = MagicMock()
+    bybit.fetch_order_fill_reconciliation = AsyncMock(
+        return_value=SimpleNamespace(
+            quantity=100.0,
+            average_price=1.0,
+            fee_quote=0.01,
+            order_id="known-bybit-close",
+            client_order_id="known-bybit-client",
+            venue="bybit",
+            filled_at_ms=CLOSED_AT_MS,
+        )
+    )
+    ctx = MagicMock()
+    ctx.state = state
+    ctx.config.runtime.mode = "live"
+    ctx.venue_adapters = {Venue.BINANCE: binance, Venue.BYBIT: bybit}
+    ctx._flush_adapter_order_diagnostics = lambda adapter: None
+    for attribute in (
+        "_fetch_close_leg_reconciliations",
+        "_fetch_pending_close_terminal_live_sizes",
+        "_try_abandon_stale_pending_close_reconciliation",
+        "_venue_private_position_confirmed",
+        "_open_positions_private_confirmation_ready",
+    ):
+        setattr(ctx, attribute, None)
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(CLOSED_AT_MS + 2)
+
+    binance.fetch_order_fill_reconciliation.assert_awaited_once_with(
+        "COWUSDT", "discovered-binance-close", "discovered-binance-client"
+    )
+    bybit.fetch_order_fill_reconciliation.assert_awaited_once_with(
+        "COWUSDT", "known-bybit-close", "known-bybit-client"
+    )
+    assert state.pending_close_reconciliations == []
+    assert any(
+        call.args[1] == "exit.reconciled"
+        for call in ctx.journal.append_critical.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate, message",
+    [
+        (
+            lambda state, evidence: evidence["reconciliation"].update({"long_legs": []}),
+            "missing_close_order_identity",
+        ),
+        (
+            lambda state, evidence: evidence["reconciliation"]["long_legs"][0].update(
+                {"quantity": 99.0}
+            ),
+            "quantities must match",
+        ),
+        (
+            lambda state, evidence: state.pending_close_reconciliations.append(
+                {
+                    "position_id": evidence["reconciliation"]["position_id"],
+                    "kind": "final",
+                    "closed_at_ms": CLOSED_AT_MS + 1,
+                }
+            ),
+            "successor",
+        ),
+        (
+            lambda state, evidence: state.open_positions.update(
+                {evidence["reconciliation"]["position_id"]: object()}
+            ),
+            "still open",
+        ),
+    ],
+)
+def test_operator_cannot_terminalize_partial_without_a_safe_orphan_contract(
+    mutate,
+    message,
+):
+    debt = _orphan_partial_close_debt()
+    state = EngineState()
+    state.pending_close_reconciliations = [debt]
+    evidence = _orphan_partial_terminal_evidence()
+    mutate(state, evidence)
+
+    with pytest.raises(BillingEvidenceImportError, match=message):
+        execute_billing_evidence_import(
+            evidence,
+            journal=_JournalRecorder(),
+            state=state,
+            now_ms=CLOSED_AT_MS + 1,
+        )
+
+    assert state.pending_close_reconciliations[0] == debt
 
 
 class _JournalRecorder:

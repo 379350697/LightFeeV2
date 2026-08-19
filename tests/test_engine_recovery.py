@@ -479,6 +479,15 @@ class TestRecovery:
             snap.write({
                 "lifecycle": "running",
                 "risk_mode": "running",
+                "pending_residual_repairs": [
+                    {
+                        "position_id": "pos-close-me",
+                        "symbol": "ETHUSDT",
+                        "repair_venue": "binance",
+                        "repair_side": "sell",
+                        "repair_quantity": 1.0,
+                    },
+                ],
                 "open_positions": {
                     "pos-close-me": {
                         "position_id": "pos-close-me",
@@ -505,6 +514,7 @@ class TestRecovery:
 
             state = recover_from_snapshot(snap, journal)
             assert "pos-close-me" not in state.open_positions
+            assert state.pending_residual_repairs == []
 
             # recovery.flat should be emitted
             records = journal.read_all()

@@ -1157,6 +1157,16 @@ def _apply_journal_replay_to_state(
                 )
                 if field in reconciliation
             }
+            operator_evidence = reconciliation.get("operator_evidence")
+            if (
+                isinstance(operator_evidence, dict)
+                and operator_evidence.get("terminalized_orphan_partial") is True
+            ):
+                # The journal stores the normalized final candidate, while a
+                # replay over its pre-import snapshot must target the original
+                # partial owner.  The state gate permits this marker only for
+                # idempotent replay and re-applies every terminalization check.
+                import_item["terminalize_orphan_partial"] = True
             try:
                 state.import_pending_close_reconciliation_evidence(
                     import_item,
@@ -1620,7 +1630,12 @@ def _restore_pending_entry_from_journal(payload: dict[str, Any]) -> Any | None:
 
 
 def _clear_terminal_close_owners(state: EngineState, position_id: str) -> None:
-    """Remove local position/close owners while retaining billing work."""
+    """Remove local position/close owners while retaining billing work.
+
+    A terminal exchange-backed close also supersedes residual-repair tasks for
+    that position.  Otherwise a stale local partial observation can later
+    submit a needless reduce-only repair after an exact terminal reconciliation.
+    """
     state.open_positions.pop(position_id, None)
     state.pending_closes = {
         close_id: pending
@@ -1634,6 +1649,12 @@ def _clear_terminal_close_owners(state: EngineState, position_id: str) -> None:
         if pending_id != position_id
         and str(getattr(pending, "position_id", "") or "") != position_id
     }
+    state.pending_residual_repairs = [
+        repair
+        for repair in state.pending_residual_repairs
+        if not isinstance(repair, dict)
+        or str(repair.get("position_id") or "") != position_id
+    ]
 
 
 def _clear_terminal_close_state(state: EngineState, position_id: str) -> None:
