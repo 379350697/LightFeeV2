@@ -108,7 +108,7 @@ class CloseRuntime:
             return "", ""
         order_id = str(leg.get("order_id") or "")
         client_order_id = str(leg.get("client_order_id") or "")
-        return order_id, "" if order_id else client_order_id
+        return order_id, client_order_id
     @classmethod
     def _has_close_reconciliation_leg_identity(cls, legs: Any) -> bool:
         if not isinstance(legs, list):
@@ -691,6 +691,60 @@ class CloseRuntime:
             self._RECONCILE_RETRY_MAX_MS,
         )
         reconciliation["next_attempt_ms"] = now_ms + delay
+
+    @staticmethod
+    def _close_reconciliation_expected_quantities(
+        reconciliation: dict[str, Any],
+        snapshot: dict[str, Any],
+    ) -> tuple[float, float] | None:
+        """Return the exact close segment owned by this reconciliation.
+
+        V1 ``Partial`` reconciliation owns the quantities actually closed in
+        that stage, not the still-open opposite side.  ``Final`` owns the
+        quantities present in its own terminal snapshot.
+        """
+        kind = str(reconciliation.get("kind") or "final")
+        source = (
+            reconciliation.get("original_payload")
+            if kind == "partial"
+            else snapshot
+        )
+        if not isinstance(source, dict):
+            return None
+
+        expected: list[float] = []
+        for leg_label in ("long", "short"):
+            keys = (
+                (f"{leg_label}_closed_qty",)
+                if kind == "partial"
+                else (f"{leg_label}_quantity", "matched_quantity")
+            )
+            value: float | None = None
+            for key in keys:
+                if key not in source:
+                    continue
+                try:
+                    candidate = float(source.get(key))
+                except (TypeError, ValueError):
+                    return None
+                if not math.isfinite(candidate) or candidate < 0.0:
+                    return None
+                value = candidate
+                break
+            if value is None:
+                return None
+            expected.append(value)
+        return (expected[0], expected[1])
+
+    @staticmethod
+    def _close_reconciliation_leg_quantity_complete(
+        actual: float,
+        expected: float,
+    ) -> bool:
+        if expected <= 1e-12:
+            return actual <= 1e-12
+        return actual > 1e-12 and actual + 1e-12 >= expected
+
     def _exit_reconciled_payload_from_leg_fills(
         self,
         reconciliation: dict[str, Any],
@@ -754,10 +808,10 @@ class CloseRuntime:
             and math.isfinite(short_entry)
             and short_entry > 0.0
         )
-        price_pnl = ((float(long["average_price"]) - long_entry) * long_qty) + (
+        segment_price_pnl = ((float(long["average_price"]) - long_entry) * long_qty) + (
             (short_entry - float(short["average_price"])) * short_qty
         )
-        exit_fee = float(long["fee_quote"]) + float(short["fee_quote"])
+        segment_exit_fee = float(long["fee_quote"]) + float(short["fee_quote"])
         exit_fee_evidence_complete = True
         for fill in [*long_fills, *short_fills]:
             if self._close_reconciliation_fill_qty(fill) <= 1e-12:
@@ -774,22 +828,45 @@ class CloseRuntime:
         for fill in [*long_fills, *short_fills]:
             if self._close_reconciliation_fill_qty(fill) <= 1e-12:
                 continue
-            try:
-                price = float(getattr(fill, "price", None))
-            except (TypeError, ValueError):
-                close_price_evidence_complete = False
-                break
+            price = _recon_fill_price(fill)
             if not math.isfinite(price) or price <= 0.0:
                 close_price_evidence_complete = False
                 break
-        expected_long_qty = float(snapshot.get("long_quantity") or snapshot.get("matched_quantity") or 0.0)
-        expected_short_qty = float(snapshot.get("short_quantity") or snapshot.get("matched_quantity") or 0.0)
-        close_quantity_evidence_complete = (
-            long_qty > 1e-12
-            and short_qty > 1e-12
-            and (expected_long_qty <= 1e-12 or long_qty + 1e-12 >= expected_long_qty)
-            and (expected_short_qty <= 1e-12 or short_qty + 1e-12 >= expected_short_qty)
+        expected_quantities = self._close_reconciliation_expected_quantities(
+            reconciliation,
+            snapshot,
         )
+        expected_long_qty, expected_short_qty = expected_quantities or (0.0, 0.0)
+        is_partial = str(reconciliation.get("kind") or "final") == "partial"
+        if expected_quantities is None:
+            # Legacy final owners may predate durable snapshot quantities.
+            # Preserve the V1-compatible rule for that terminal shape: two
+            # exact, nonzero exchange fills can settle it.  A partial has no
+            # equivalent safe fallback because its empty opposite leg is
+            # meaningful, so it remains fail-closed without segment sizes.
+            close_quantity_evidence_complete = (
+                not is_partial and long_qty > 1e-12 and short_qty > 1e-12
+            )
+        else:
+            close_quantity_evidence_complete = (
+                expected_long_qty + expected_short_qty > 1e-12
+                and self._close_reconciliation_leg_quantity_complete(
+                    long_qty,
+                    expected_long_qty,
+                )
+                and self._close_reconciliation_leg_quantity_complete(
+                    short_qty,
+                    expected_short_qty,
+                )
+            )
+        prior_price_pnl = self._safe_reconciliation_float(
+            snapshot.get("realized_price_pnl_quote")
+        )
+        prior_exit_fee = self._safe_reconciliation_float(
+            snapshot.get("realized_exit_fee_quote")
+        )
+        price_pnl = prior_price_pnl + segment_price_pnl
+        exit_fee = prior_exit_fee + segment_exit_fee
         complete = (
             close_quantity_evidence_complete
             and entry_price_evidence_complete
@@ -817,12 +894,14 @@ class CloseRuntime:
             "long_legs": long["legs"],
             "short_legs": short["legs"],
             "price_pnl": price_pnl,
+            "segment_price_pnl": segment_price_pnl,
             "funding_pnl_quote": funding_quote,
             "entry_fee_quote": entry_fee,
             "entry_fee_source": entry_fee_source,
             "entry_fee_evidence_complete": entry_fee_evidence_complete,
             "entry_price_evidence_complete": entry_price_evidence_complete,
             "exit_fee_quote": exit_fee,
+            "segment_exit_fee_quote": segment_exit_fee,
             "exit_fee_evidence_complete": exit_fee_evidence_complete,
             "close_price_evidence_complete": close_price_evidence_complete,
             "net_quote": price_pnl + funding_quote - entry_fee - exit_fee,
@@ -837,6 +916,84 @@ class CloseRuntime:
             "duplicate_close_leg_suppressed_samples": duplicate_samples[:12],
             "source": reconciliation.get("source", "pending_close_reconciliation"),
         }
+
+    def _partial_reconciled_payload_from_leg_fills(
+        self,
+        reconciliation: dict[str, Any],
+        long_fills: list[Any],
+        short_fills: list[Any],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Build a non-terminal V1 partial-close accounting event."""
+        payload = self._exit_reconciled_payload_from_leg_fills(
+            reconciliation,
+            long_fills,
+            short_fills,
+            now_ms,
+        )
+        payload["partial_realized_price_pnl_quote"] = payload["segment_price_pnl"]
+        payload["partial_exit_fee_quote"] = payload["segment_exit_fee_quote"]
+        payload["reconciled_realized_price_pnl_quote"] = payload["price_pnl"]
+        payload["reconciled_realized_exit_fee_quote"] = payload["exit_fee_quote"]
+        payload["price_pnl"] = payload["segment_price_pnl"]
+        payload["exit_fee_quote"] = payload["segment_exit_fee_quote"]
+        payload["net_quote_status"] = (
+            "partial" if payload["venue_statement_reconciled"] else "provisional"
+        )
+        return payload
+
+    def _partial_reconciliation_has_successor(
+        self,
+        reconciliation: dict[str, Any],
+    ) -> bool:
+        """A partial is only removable when its remaining owner still exists."""
+        position_id = str(reconciliation.get("position_id") or "")
+        if position_id in getattr(self.ctx.state, "open_positions", {}):
+            return True
+        closed_at_ms = self._safe_reconciliation_int(
+            reconciliation.get("closed_at_ms")
+        )
+        return any(
+            isinstance(item, dict)
+            and str(item.get("position_id") or "") == position_id
+            and str(item.get("kind") or "final") == "final"
+            and self._safe_reconciliation_int(item.get("closed_at_ms")) >= closed_at_ms
+            for item in getattr(self.ctx.state, "pending_close_reconciliations", [])
+        )
+
+    def _propagate_partial_close_reconciliation(
+        self,
+        reconciliation: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        """Carry V1 partial accounting into the later final owner/state."""
+        position_id = str(reconciliation.get("position_id") or "")
+        price_pnl = self._safe_reconciliation_float(
+            payload.get("reconciled_realized_price_pnl_quote")
+        )
+        exit_fee = self._safe_reconciliation_float(
+            payload.get("reconciled_realized_exit_fee_quote")
+        )
+        closed_at_ms = self._safe_reconciliation_int(
+            reconciliation.get("closed_at_ms")
+        )
+        for item in getattr(self.ctx.state, "pending_close_reconciliations", []):
+            if (
+                not isinstance(item, dict)
+                or str(item.get("position_id") or "") != position_id
+                or str(item.get("kind") or "final") != "final"
+                or self._safe_reconciliation_int(item.get("closed_at_ms")) < closed_at_ms
+            ):
+                continue
+            snapshot = item.get("position_snapshot")
+            if isinstance(snapshot, dict):
+                snapshot["realized_price_pnl_quote"] = price_pnl
+                snapshot["realized_exit_fee_quote"] = exit_fee
+
+        position = getattr(self.ctx.state, "open_positions", {}).get(position_id)
+        if position is not None:
+            position.realized_price_pnl_quote = price_pnl
+            position.realized_exit_fee_quote = exit_fee
     async def _resolve_accepted_order_truth_gap(
         self,
         reconciliation: dict[str, Any],
@@ -1286,11 +1443,21 @@ class CloseRuntime:
                 legs=reconciliation.get("short_legs"),
             )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
-                payload = self._exit_reconciled_payload_from_leg_fills(
-                    reconciliation,
-                    long_fills,
-                    short_fills,
-                    now_ms,
+                is_partial = str(reconciliation.get("kind") or "final") == "partial"
+                payload = (
+                    self._partial_reconciled_payload_from_leg_fills(
+                        reconciliation,
+                        long_fills,
+                        short_fills,
+                        now_ms,
+                    )
+                    if is_partial
+                    else self._exit_reconciled_payload_from_leg_fills(
+                        reconciliation,
+                        long_fills,
+                        short_fills,
+                        now_ms,
+                    )
                 )
                 if not payload["venue_statement_reconciled"]:
                     self.ctx.journal.append(
@@ -1310,6 +1477,26 @@ class CloseRuntime:
                         continue
                     self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
                     retained.append(reconciliation)
+                    changed = True
+                    continue
+                if is_partial:
+                    if not self._partial_reconciliation_has_successor(reconciliation):
+                        self._call_apply_pending_close_reconciliation_backoff(
+                            reconciliation,
+                            now_ms,
+                        )
+                        retained.append(reconciliation)
+                        changed = True
+                        continue
+                    self.ctx.journal.append_critical(
+                        now_ms,
+                        "exit.partial_reconciled",
+                        payload,
+                    )
+                    self._propagate_partial_close_reconciliation(
+                        reconciliation,
+                        payload,
+                    )
                     changed = True
                     continue
                 self.ctx.journal.append_critical(

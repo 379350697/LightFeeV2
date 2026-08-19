@@ -250,6 +250,31 @@ def test_binance_close_evidence_discovery_does_not_use_partial_open_quantity():
     assert leg["disposition"] == "missing_expected_quantity"
 
 
+def test_operator_import_refuses_partial_without_recorded_segment_quantities():
+    debt = _binance_close_debt()
+    debt["position_snapshot"]["position_id"] = debt["position_id"]
+    debt["long_legs"] = [
+        {
+            "venue": "binance",
+            "order_id": "known-binance-close",
+            "client_order_id": "known-binance-client",
+            "quantity": 100.0,
+            "average_price": 1.25,
+            "fee_quote": 0.01,
+        }
+    ]
+
+    assert pending_close_reconciliation_import_reason(debt) == (
+        "missing_or_invalid_long_closed_qty"
+    )
+
+    debt["original_payload"] = {
+        "long_closed_qty": 0.0,
+        "short_closed_qty": 100.0,
+    }
+    assert pending_close_reconciliation_import_reason(debt) is None
+
+
 @pytest.mark.parametrize(
     "kwargs, message",
     [

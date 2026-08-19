@@ -1026,6 +1026,51 @@ def _apply_journal_replay_to_state(
                             pending, "_replay_uncertain_outcome_before_hedge_submit"
                         )
 
+        elif kind == "exit.partial_reconciled":
+            # V1 partial reconciliation is non-terminal.  Its exact segment
+            # accounting becomes the starting point for the later final close;
+            # dropping it during replay would make the final bill omit (or
+            # double-count) the already reconciled segment after a restart.
+            pid = str(payload.get("position_id") or "")
+            partial_closed_at_ms = _optional_finite_float(
+                payload.get("closed_at_ms")
+            )
+            price_pnl = _optional_finite_float(
+                payload.get("reconciled_realized_price_pnl_quote")
+            )
+            exit_fee = _optional_finite_float(
+                payload.get("reconciled_realized_exit_fee_quote")
+            )
+            if pid:
+                for task in state.pending_close_reconciliations:
+                    if (
+                        not isinstance(task, dict)
+                        or str(task.get("position_id") or "") != pid
+                        or str(task.get("kind") or "final") != "final"
+                    ):
+                        continue
+                    final_closed_at_ms = _optional_finite_float(
+                        task.get("closed_at_ms")
+                    )
+                    if (
+                        partial_closed_at_ms is not None
+                        and final_closed_at_ms is not None
+                        and final_closed_at_ms < partial_closed_at_ms
+                    ):
+                        continue
+                    snapshot = task.get("position_snapshot")
+                    if isinstance(snapshot, dict):
+                        if price_pnl is not None:
+                            snapshot["realized_price_pnl_quote"] = price_pnl
+                        if exit_fee is not None:
+                            snapshot["realized_exit_fee_quote"] = exit_fee
+                position = state.open_positions.get(pid)
+                if position is not None:
+                    if price_pnl is not None:
+                        position.realized_price_pnl_quote = price_pnl
+                    if exit_fee is not None:
+                        position.realized_exit_fee_quote = exit_fee
+
         elif kind in _TERMINAL_CLOSE_EVENT_KINDS:
             pid = payload.get("position_id", "")
             if pid:

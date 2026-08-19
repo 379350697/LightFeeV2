@@ -893,6 +893,8 @@ class TestCloseChunkExecutor:
             short_entry_fee_quote=0.1,
             total_entry_fee_quote=0.2,
         )
+        position.realized_price_pnl_quote = 1.25
+        position.realized_exit_fee_quote = 0.05
         state = EngineState()
         state.open_positions[position.position_id] = position
 
@@ -903,13 +905,15 @@ class TestCloseChunkExecutor:
         )
 
         assert position.position_id not in state.open_positions
-        assert position.realized_price_pnl_quote == pytest.approx(0.0)
-        assert position.realized_exit_fee_quote == pytest.approx(0.0)
+        assert position.realized_price_pnl_quote == pytest.approx(1.25)
+        assert position.realized_exit_fee_quote == pytest.approx(0.05)
         assert len(state.pending_close_reconciliations) == 1
         pending = state.pending_close_reconciliations[0]
         assert pending["original_payload"]["accounting_evidence_gaps"] == [
             "long_close_price_unavailable",
         ]
+        assert pending["position_snapshot"]["realized_price_pnl_quote"] == pytest.approx(1.25)
+        assert pending["position_snapshot"]["realized_exit_fee_quote"] == pytest.approx(0.05)
         assert pending["identity_evidence"] == {
             "missing_identity_legs": [],
             "long": {

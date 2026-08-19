@@ -162,6 +162,239 @@ class TestBillingEvidenceIdentityGap:
     """A close without durable identity becomes a persistent evidence debt."""
 
     @pytest.mark.asyncio
+    async def test_staged_partial_then_final_reconciles_once_with_combined_pnl(self):
+        """V1 partial accounting is non-terminal and flows into its later final.
+
+        A historical COTI-style close first confirms only the long leg.  The
+        second close is a final task whose snapshot has no remaining long
+        quantity.  Both operator-evidence imports must be accepted, the
+        partial must emit ``exit.partial_reconciled``, and the final bill must
+        include each segment exactly once.
+        """
+        from lightfee.engine.close_runtime import CloseRuntime
+        from lightfee.engine.state import EngineState
+
+        position_id = "entry-staged-COTIUSDT"
+        snapshot = {
+            "position_id": position_id,
+            "symbol": "COTIUSDT",
+            "long_venue": "bybit",
+            "short_venue": "binance",
+            "long_quantity": 100.0,
+            "short_quantity": 100.0,
+            "matched_quantity": 100.0,
+            "long_entry_price": 10.0,
+            "short_entry_price": 12.0,
+            "total_entry_fee_quote": 0.4,
+            "entry_fee_evidence_complete": True,
+            "captured_funding_quote": 0.0,
+        }
+        partial = {
+            "position_id": position_id,
+            "symbol": "COTIUSDT",
+            "kind": "partial",
+            "reason": "funding_capture",
+            "closed_at_ms": 1000,
+            "position_snapshot": snapshot,
+            "original_payload": {
+                "long_closed_qty": 100.0,
+                "short_closed_qty": 0.0,
+            },
+            "long_legs": [{"venue": "bybit", "order_id": "long-partial"}],
+            "short_legs": [],
+            "reconciliation_status": "evidence_debt",
+        }
+        final = {
+            "position_id": position_id,
+            "symbol": "COTIUSDT",
+            "kind": "final",
+            "reason": "funding_capture",
+            "closed_at_ms": 2000,
+            "position_snapshot": {**snapshot, "long_quantity": 0.0},
+            "original_payload": {"long_closed_qty": 0.0, "short_closed_qty": 100.0},
+            "long_legs": [],
+            "short_legs": [{"venue": "binance", "order_id": "short-final"}],
+            "reconciliation_status": "evidence_debt",
+        }
+        stale_final_snapshot = dict(final["position_snapshot"])
+
+        state = EngineState(lifecycle=EngineLifecycle.RUNNING)
+        state.pending_close_reconciliations = [partial, final]
+        evidence_digest = "a" * 64
+        state.import_pending_close_reconciliation_evidence(
+            {
+                "position_id": position_id,
+                "kind": "partial",
+                "closed_at_ms": 1000,
+                "position_snapshot": snapshot,
+                "long_legs": partial["long_legs"],
+                "short_legs": [],
+            },
+            evidence_reference="fixture:partial",
+            evidence_sha256=evidence_digest,
+            imported_at_ms=3000,
+        )
+        class Adapter:
+            async def fetch_order_fill_reconciliation(self, _symbol, order_id, _cid):
+                return {
+                    "long-partial": _FakeFill(
+                        quantity=100.0,
+                        price=11.0,
+                        fee_quote=0.2,
+                        order_id=order_id,
+                        venue="bybit",
+                        filled_at_ms=1100,
+                    ),
+                    "short-final": _FakeFill(
+                        quantity=100.0,
+                        price=10.0,
+                        fee_quote=0.3,
+                        order_id=order_id,
+                        venue="binance",
+                        filled_at_ms=2100,
+                    ),
+                }[order_id]
+
+        ctx = _ctx()
+        ctx.state = state
+        ctx.venue_adapters = {Venue.BYBIT: Adapter(), Venue.BINANCE: Adapter()}
+        runtime = CloseRuntime(ctx)
+        await runtime._process_pending_close_reconciliations(4000)
+
+        # The final evidence arrives after the partial is reconciled.  Its
+        # source snapshot is necessarily older and must not erase the partial
+        # cumulative accounting that V1 carries forward.
+        state.import_pending_close_reconciliation_evidence(
+            {
+                "position_id": position_id,
+                "kind": "final",
+                "closed_at_ms": 2000,
+                "position_snapshot": stale_final_snapshot,
+                "long_legs": [],
+                "short_legs": final["short_legs"],
+            },
+            evidence_reference="fixture:final",
+            evidence_sha256="b" * 64,
+            imported_at_ms=4000,
+        )
+        imported_final = state.pending_close_reconciliations[0]["position_snapshot"]
+        assert imported_final["realized_price_pnl_quote"] == pytest.approx(100.0)
+        assert imported_final["realized_exit_fee_quote"] == pytest.approx(0.2)
+
+        await runtime._process_pending_close_reconciliations(4001)
+
+        assert state.pending_close_reconciliations == []
+        critical = list(ctx.journal.append_critical.call_args_list)
+        partial_events = [call for call in critical if call.args[1] == "exit.partial_reconciled"]
+        final_events = [call for call in critical if call.args[1] == "exit.reconciled"]
+        assert len(partial_events) == 1
+        assert len(final_events) == 1
+        assert partial_events[0].args[2]["price_pnl"] == pytest.approx(100.0)
+        assert final_events[0].args[2]["price_pnl"] == pytest.approx(300.0)
+        assert final_events[0].args[2]["exit_fee_quote"] == pytest.approx(0.5)
+        assert final_events[0].args[2]["net_quote"] == pytest.approx(299.1)
+
+    def test_partial_reconciled_replay_propagates_later_final_accounting(self):
+        """A restart after partial evidence must not lose the later final sum."""
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.engine.state import EngineState
+        from lightfee.persistence.journal import replay_journal_records
+
+        position_id = "entry-partial-replay"
+        final = {
+            "position_id": position_id,
+            "kind": "final",
+            "closed_at_ms": 2000,
+            "position_snapshot": {
+                "position_id": position_id,
+                "realized_price_pnl_quote": 0.0,
+                "realized_exit_fee_quote": 0.0,
+            },
+        }
+        partial_event = {
+            "kind": "exit.partial_reconciled",
+            "ts_ms": 1500,
+            "payload": {
+                "position_id": position_id,
+                "reconciled_realized_price_pnl_quote": 100.0,
+                "reconciled_realized_exit_fee_quote": 0.2,
+            },
+        }
+
+        restored = EngineState()
+        restored.pending_close_reconciliations = [final]
+        _apply_journal_replay_to_state(restored, [partial_event])
+        replayed = replay_journal_records([
+            {
+                "kind": "entry.opened",
+                "ts_ms": 1000,
+                "payload": {"position_id": position_id},
+            },
+            partial_event,
+        ])
+
+        final_snapshot = restored.pending_close_reconciliations[0]["position_snapshot"]
+        assert final_snapshot["realized_price_pnl_quote"] == pytest.approx(100.0)
+        assert final_snapshot["realized_exit_fee_quote"] == pytest.approx(0.2)
+        assert replayed["positions"][position_id]["realized_price_pnl_quote"] == pytest.approx(100.0)
+        assert replayed["positions"][position_id]["realized_exit_fee_quote"] == pytest.approx(0.2)
+
+    @pytest.mark.asyncio
+    async def test_orphan_partial_is_not_cleared_as_a_terminal_bill(self):
+        """Exact partial evidence without a remaining owner stays fail-closed."""
+        from lightfee.engine.close_runtime import CloseRuntime
+        from lightfee.engine.state import EngineState
+
+        task = {
+            "position_id": "entry-orphan-partial",
+            "symbol": "COWUSDT",
+            "kind": "partial",
+            "closed_at_ms": 1000,
+            "position_snapshot": {
+                "position_id": "entry-orphan-partial",
+                "symbol": "COWUSDT",
+                "long_venue": "bybit",
+                "short_venue": "binance",
+                "long_quantity": 100.0,
+                "short_quantity": 100.0,
+                "long_entry_price": 10.0,
+                "short_entry_price": 12.0,
+                "total_entry_fee_quote": 0.4,
+                "entry_fee_evidence_complete": True,
+                "captured_funding_quote": 0.0,
+            },
+            "original_payload": {"long_closed_qty": 100.0, "short_closed_qty": 0.0},
+            "long_legs": [{"venue": "bybit", "order_id": "partial-only"}],
+            "short_legs": [],
+        }
+
+        class Adapter:
+            async def fetch_order_fill_reconciliation(self, _symbol, order_id, _cid):
+                return _FakeFill(
+                    quantity=100.0,
+                    price=11.0,
+                    fee_quote=0.2,
+                    order_id=order_id,
+                    venue="bybit",
+                )
+
+        state = EngineState(lifecycle=EngineLifecycle.RUNNING)
+        state.pending_close_reconciliations = [task]
+        ctx = _ctx()
+        ctx.state = state
+        ctx.venue_adapters = {Venue.BYBIT: Adapter(), Venue.BINANCE: Adapter()}
+        await CloseRuntime(ctx)._process_pending_close_reconciliations(2000)
+
+        assert len(state.pending_close_reconciliations) == 1
+        retained = state.pending_close_reconciliations[0]
+        assert retained["position_id"] == task["position_id"]
+        assert retained["attempt_count"] == 1
+        assert not any(
+            call.args and call.args[1] == "exit.partial_reconciled"
+            for call in ctx.journal.append_critical.call_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_missing_identity_is_classified_once_and_retained_fail_closed(self):
         from lightfee.engine.close_runtime import CloseRuntime
 

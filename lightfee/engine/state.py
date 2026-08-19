@@ -1047,14 +1047,21 @@ def pending_close_reconciliation_missing_legs(
 ) -> tuple[str, ...]:
     """Identify final/partial close legs that lack durable lookup identity.
 
-    An empty leg group is only complete when its persisted expected quantity is
-    explicitly zero.  Missing or malformed quantities remain unknown and must
-    fail closed.  ``accepted_order_truth_gap`` callers intentionally do not use
-    this helper because that task kind is allowed to contain one leg only.
+    A final task uses the quantities in its terminal snapshot.  A partial task
+    instead owns only its recorded close segment: the untouched opposite leg is
+    deliberately empty and must not be treated as missing evidence.  Missing or
+    malformed expected quantities remain unknown and fail closed.
+
+    ``accepted_order_truth_gap`` callers intentionally do not use this helper
+    because that task kind is allowed to contain one leg only.
     """
     snapshot = reconciliation.get("position_snapshot") or {}
     if not isinstance(snapshot, dict):
         snapshot = {}
+    kind = str(reconciliation.get("kind") or "final")
+    original_payload = reconciliation.get("original_payload") or {}
+    if not isinstance(original_payload, dict):
+        original_payload = {}
 
     missing: list[str] = []
     for leg_label in ("long", "short"):
@@ -1070,11 +1077,17 @@ def pending_close_reconciliation_missing_legs(
             continue
 
         expected: float | None = None
-        for key in (f"{leg_label}_quantity", "matched_quantity"):
-            if key not in snapshot:
+        expected_keys = (
+            (f"{leg_label}_closed_qty",)
+            if kind == "partial"
+            else (f"{leg_label}_quantity", "matched_quantity")
+        )
+        expected_source = original_payload if kind == "partial" else snapshot
+        for key in expected_keys:
+            if key not in expected_source:
                 continue
             try:
-                value = float(snapshot.get(key))
+                value = float(expected_source.get(key))
             except (TypeError, ValueError):
                 expected = None
                 break
@@ -1196,6 +1209,19 @@ def pending_close_reconciliation_import_reason(
         return "invalid_reconciliation_item"
     if _reconciliation_int(reconciliation.get("closed_at_ms")) <= 0:
         return "missing_closed_at_ms"
+
+    if str(reconciliation.get("kind") or "final") == "partial":
+        original_payload = reconciliation.get("original_payload")
+        if not isinstance(original_payload, dict):
+            return "missing_or_invalid_long_closed_qty"
+        for leg_label in ("long", "short"):
+            field = f"{leg_label}_closed_qty"
+            try:
+                value = float(original_payload[field])
+            except (KeyError, TypeError, ValueError):
+                return f"missing_or_invalid_{field}"
+            if not math.isfinite(value) or value < 0.0:
+                return f"missing_or_invalid_{field}"
 
     snapshot = reconciliation.get("position_snapshot")
     if not isinstance(snapshot, dict):
@@ -1554,6 +1580,26 @@ class EngineState:
         for evidence_field in ("position_snapshot", "long_legs", "short_legs"):
             if evidence_field in item:
                 candidate[evidence_field] = item[evidence_field]
+
+        # A V1 partial reconciliation may have already supplied exact
+        # cumulative accounting to its later final owner.  Operator evidence
+        # imports replace identity/snapshot provenance, not that established
+        # accounting, so an older exported snapshot must not erase it.
+        existing_snapshot = existing.get("position_snapshot")
+        candidate_snapshot = candidate.get("position_snapshot")
+        if (
+            kind == "final"
+            and isinstance(existing_snapshot, dict)
+            and isinstance(candidate_snapshot, dict)
+        ):
+            candidate_snapshot = dict(candidate_snapshot)
+            candidate["position_snapshot"] = candidate_snapshot
+            for field in (
+                "realized_price_pnl_quote",
+                "realized_exit_fee_quote",
+            ):
+                if field in existing_snapshot:
+                    candidate_snapshot[field] = existing_snapshot[field]
 
         snapshot = candidate.get("position_snapshot")
         if isinstance(snapshot, dict):

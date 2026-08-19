@@ -330,7 +330,7 @@ def replay_journal_records(
 
     _timeline_interesting = frozenset({
         "entry.opened", "entry.pending_registered",
-        "exit.closed", "exit.partial_closed", "exit.reconciled",
+        "exit.closed", "exit.partial_closed", "exit.partial_reconciled", "exit.reconciled",
         "exit.billing_evidence_unavailable",
         "exit.billing_evidence_debt_registered",
         "exit.billing_evidence_imported",
@@ -428,6 +428,26 @@ def replay_journal_records(
                 if "second_stage_funding_captured" in payload:
                     pos["second_stage_funding_captured"] = bool(
                         payload["second_stage_funding_captured"])
+
+        elif kind == "exit.partial_reconciled":
+            pid = payload.get("position_id", "")
+            if pid and pid in positions:
+                pos = positions[pid]
+                for source_field, target_field in (
+                    (
+                        "reconciled_realized_price_pnl_quote",
+                        "realized_price_pnl_quote",
+                    ),
+                    (
+                        "reconciled_realized_exit_fee_quote",
+                        "realized_exit_fee_quote",
+                    ),
+                ):
+                    try:
+                        value = float(payload[source_field])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    pos[target_field] = value
 
         elif kind == "entry.pending_registered":
             pid = payload.get("pending_id", "")

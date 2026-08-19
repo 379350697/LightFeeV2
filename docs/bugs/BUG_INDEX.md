@@ -17,6 +17,19 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Closures
 
+CL-114 staged close reconciliation and terminal fill-price, 2026-08-19: V2
+treated V1's non-terminal partial close as a full two-legged terminal owner,
+then rejected genuine exchange reconciliation objects by reading `price`
+instead of their contractual `average_price`. It also discarded the auxiliary
+CID that V1 passes with an exchange order ID. The repair restores partial
+propagation/replay, keeps orphan partials fail-closed, uses the shared
+average-price converter, and preserves the legacy final two-fill rule only
+where snapshots predate durable quantities. Full local validation is
+`4330 passed, 9 skipped, 1 warning`. This is **local green, not historical-debt
+closure**: COTI needs its known exact imports applied, BICO still needs exact
+Binance evidence, and COW still has no terminal successor. See
+[daily/2026-08-19.md#cluster-cl-114-staged-close-reconciliation-and-terminal-fill-price](daily/2026-08-19.md#cluster-cl-114-staged-close-reconciliation-and-terminal-fill-price).
+
 CL-113 short-maker reconciliation and Bybit recovery identity, 2026-08-17:
 the normal pending-entry tick inverted maker/hedge order identities for short
 makers, while startup used a different mapping. Bybit recovery also sent a

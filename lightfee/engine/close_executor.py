@@ -645,6 +645,8 @@ def _close_reconciliation_position_snapshot(position: OpenPosition) -> dict[str,
         "entry_fee_evidence_complete": position.entry_fee_evidence_complete,
         "captured_funding_quote": position.captured_funding_quote,
         "second_stage_funding_quote": position.second_stage_funding_quote,
+        "realized_price_pnl_quote": position.realized_price_pnl_quote,
+        "realized_exit_fee_quote": position.realized_exit_fee_quote,
         "opened_at_ms": position.opened_at_ms,
     }
 
