@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101418" />
+    <title>LightFee V2 | 运营看板</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="看板导航">
+        <a class="brand" href="#overview" data-nav="overview">
+          <span class="brand-mark" aria-hidden="true">LF</span>
+          <span>
+            <strong>LightFee V2</strong>
+            <small>只读运营看板</small>
+          </span>
+        </a>
+
+        <nav class="navigation">
+          <button class="nav-item is-active" type="button" data-nav="overview">总览</button>
+          <button class="nav-item" type="button" data-nav="positions">当前持仓</button>
+          <button class="nav-item" type="button" data-nav="history">历史仓</button>
+          <button class="nav-item" type="button" data-nav="issues">问题开仓</button>
+          <button class="nav-item" type="button" data-nav="balances">交易所余额</button>
+          <button class="nav-item" type="button" data-nav="logs">问题日志</button>
+        </nav>
+
+        <div class="sidebar-footnote">
+          <p>数据仅在浏览器内解析。</p>
+          <p>本页面没有交易控制按钮。</p>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <header class="topbar">
+          <div>
+            <p class="section-label">运营状态</p>
+            <h1>交易观察台</h1>
+          </div>
+          <div class="topbar-actions">
+            <span id="source-state" class="source-state">等待导入数据</span>
+            <button id="load-local" class="button button-secondary" type="button">读取本地快照</button>
+            <button id="open-journal" class="button button-secondary" type="button">导入日志</button>
+            <button id="open-diagnostic" class="button button-primary" type="button">导入诊断</button>
+            <input id="diagnostic-upload" type="file" accept="application/json,.json" hidden />
+            <input id="journal-upload" type="file" accept=".jsonl,.log,text/plain" hidden />
+          </div>
+        </header>
+
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+
+        <section id="overview" class="view-section is-visible" data-view-section="overview">
+          <div class="status-hero">
+            <div>
+              <p id="status-kicker" class="section-label">尚未加载诊断</p>
+              <h2 id="status-title">导入一次只读诊断开始查看</h2>
+              <p id="status-summary">支持诊断 JSON 与可选的 journal JSONL。数据不会上传或写回交易系统。</p>
+            </div>
+            <div class="status-meta">
+              <span>诊断时间</span>
+              <strong id="generated-at">未提供</strong>
+            </div>
+          </div>
+
+          <div class="metric-grid" aria-label="关键状态">
+            <article class="metric-block">
+              <span>当前持仓</span>
+              <strong id="metric-positions">--</strong>
+              <small id="metric-positions-detail">等待诊断</small>
+            </article>
+            <article class="metric-block">
+              <span>待完成开仓</span>
+              <strong id="metric-pending-entry">--</strong>
+              <small id="metric-pending-entry-detail">等待诊断</small>
+            </article>
+            <article class="metric-block">
+              <span>待平仓与对账</span>
+              <strong id="metric-pending-close">--</strong>
+              <small id="metric-pending-close-detail">等待诊断</small>
+            </article>
+            <article class="metric-block">
+              <span>风险模式</span>
+              <strong id="metric-risk-mode">--</strong>
+              <small id="metric-risk-mode-detail">等待诊断</small>
+            </article>
+          </div>
+
+          <div class="overview-grid">
+            <section class="panel panel-wide">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">当前持仓</p>
+                  <h2>本地状态中的活动仓位</h2>
+                </div>
+                <button class="text-button" type="button" data-nav="positions">查看全部</button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>交易对</th>
+                      <th>多头交易所</th>
+                      <th>空头交易所</th>
+                      <th>数量</th>
+                      <th>已匹配</th>
+                      <th>开仓时间</th>
+                    </tr>
+                  </thead>
+                  <tbody id="overview-positions"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel panel-narrow">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">处置建议</p>
+                  <h2>下一步检查</h2>
+                </div>
+              </div>
+              <ol id="next-actions" class="action-list"></ol>
+            </section>
+          </div>
+        </section>
+
+        <section id="positions" class="view-section" data-view-section="positions">
+          <div class="section-heading">
+            <p class="section-label">当前持仓</p>
+            <h2>本地状态中的活动仓位</h2>
+            <p>用于核对策略恢复状态。交易所真相应以诊断中的查询结果为准。</p>
+          </div>
+          <section class="panel">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>仓位 ID</th>
+                    <th>交易对</th>
+                    <th>多头交易所</th>
+                    <th>空头交易所</th>
+                    <th>数量</th>
+                    <th>已匹配</th>
+                    <th>开仓时间</th>
+                  </tr>
+                </thead>
+                <tbody id="positions-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="history" class="view-section" data-view-section="history">
+          <div class="section-heading">
+            <p class="section-label">历史仓</p>
+            <h2>从 journal 推导的已结束与未结束生命周期</h2>
+            <p>导入 events.jsonl 后显示。这里是事件归纳，不替代完整的审计账本。</p>
+          </div>
+          <section class="panel">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>仓位或开仓 ID</th>
+                    <th>交易对</th>
+                    <th>交易所路径</th>
+                    <th>首次记录</th>
+                    <th>结束记录</th>
+                    <th>生命周期</th>
+                  </tr>
+                </thead>
+                <tbody id="history-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="issues" class="view-section" data-view-section="issues">
+          <div class="section-heading">
+            <p class="section-label">问题开仓</p>
+            <h2>被拒绝、阻断或仍待处理的开仓证据</h2>
+            <p>聚合诊断里的订单错误与 journal 中的开仓阻断事件。</p>
+          </div>
+          <section class="panel">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>来源</th>
+                    <th>交易对</th>
+                    <th>交易所</th>
+                    <th>原因</th>
+                    <th>次数</th>
+                  </tr>
+                </thead>
+                <tbody id="issues-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="balances" class="view-section" data-view-section="balances">
+          <div class="section-heading">
+            <p class="section-label">交易所余额</p>
+            <h2>诊断已采集的余额视图</h2>
+            <p>仅展示报告里已有的余额字段。未采集不代表余额为零。</p>
+          </div>
+          <div id="balance-grid" class="balance-grid"></div>
+        </section>
+
+        <section id="logs" class="view-section" data-view-section="logs">
+          <div class="section-heading log-header">
+            <div>
+              <p class="section-label">问题日志</p>
+              <h2>需要关注的近期运行事件</h2>
+              <p>从导入的 journal 中筛选错误、阻断、恢复与未分类异常事件。</p>
+            </div>
+            <label class="search-field">
+              <span>筛选日志</span>
+              <input id="log-filter" type="search" placeholder="交易对、交易所或原因" />
+            </label>
+          </div>
+          <section class="panel">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>事件</th>
+                    <th>交易对</th>
+                    <th>交易所</th>
+                    <th>摘要</th>
+                  </tr>
+                </thead>
+                <tbody id="logs-table"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
