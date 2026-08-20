@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -441,6 +440,109 @@ def test_recovery_decision_marks_compact_close_reconciliation_as_background_debt
     assert decision["entry_allowed"] is True
     assert decision["block_reason"] is None
     assert decision["clear_reason"] == "core_background_close_reconciliation"
+
+
+def test_run_diagnose_allows_flat_background_close_reconciliation(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_close_reconciliation_count": 1,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1700000000000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1700000005000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is True
+        assert gate["background_close_reconciliation_pending"] is True
+        assert "pending_close_reconciliations_not_empty" not in gate["blocking_reasons"]
+        assert result["conclusion"]["status"] != "unhealthy"
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_acceptance_gate_background_reconciliation_requires_flat_high_truth():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_close_reconciliation_count": 1,
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {},
+            "open_orders": {"binance": {"COTIUSDT": [{"id": "open"}]}},
+        },
+        state_consistency={"state_mismatch": False},
+    )
+
+    assert gate["gate_passed"] is False
+    assert gate["background_close_reconciliation_pending"] is False
+    assert "pending_close_reconciliations_not_empty" in gate["blocking_reasons"]
+    assert "exchange_truth_open_orders_present" in gate["blocking_reasons"]
+
+
+def test_acceptance_gate_blocks_unknown_background_reconciliation_status():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliation_summary": {
+                "total_count": 1,
+                "unknown_status_count": 1,
+            },
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+        state_consistency={"state_mismatch": False},
+    )
+
+    assert gate["gate_passed"] is False
+    assert gate["background_close_reconciliation_pending"] is False
+    assert "pending_close_reconciliations_unknown_status" in gate["blocking_reasons"]
 
 
 def test_acceptance_gate_flags_local_l2_residual_events_when_final_l2_data_disabled():

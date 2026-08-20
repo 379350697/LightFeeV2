@@ -233,6 +233,43 @@ def pending_close_owner_counts(
     )
 
 
+def is_nonblocking_background_close_reconciliation(
+    *,
+    open_position_count: int,
+    pending_entry_count: int,
+    pending_close_owners: PendingCloseOwnerCounts,
+    pending_residual_repair_count: int,
+    pending_close_reconciliation_unknown_count: int,
+    exchange_truth: Mapping[str, Any] | Any | None,
+    recovery_decision: Mapping[str, Any],
+) -> bool:
+    """Whether visible reconciliation is the only non-blocking recovery work.
+
+    V1 allows this accounting work to continue after trustworthy exchange truth
+    proves the account is flat. Consumers must not infer the condition from an
+    owner count alone: any execution owner, incomplete exchange truth, or
+    unknown reconciliation status remains fail-closed.
+    """
+    return (
+        open_position_count == 0
+        and pending_entry_count == 0
+        and pending_close_owners.pending_close_count == 0
+        and pending_close_owners.pending_passive_close_count == 0
+        and pending_close_owners.pending_close_reconciliation_count > 0
+        and pending_residual_repair_count == 0
+        and pending_close_reconciliation_unknown_count == 0
+        and isinstance(exchange_truth, Mapping)
+        and bool(exchange_truth.get("available"))
+        and str(exchange_truth.get("confidence", "")) == "high"
+        and not bool(exchange_truth.get("has_nonzero_position"))
+        and not bool(exchange_truth.get("has_open_order"))
+        and recovery_decision.get("kind") == "RUNNING_WITH_EVIDENCE_GAP"
+        and recovery_decision.get("evidence_quality")
+        == "background_close_reconciliation"
+        and recovery_decision.get("entry_allowed") is True
+    )
+
+
 @dataclass(frozen=True)
 class RecoveryDecision:
     kind: RecoveryDecisionKind

@@ -6,6 +6,7 @@ from typing import Any, Iterable
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
+    is_nonblocking_background_close_reconciliation,
     pending_close_owner_counts,
     pending_passive_close_evidence,
 )
@@ -544,30 +545,25 @@ def analyze_current_state(
         if isinstance(exchange_truth, dict)
         else ""
     )
-    exchange_truth_high_confidence_flat = (
-        exchange_truth_available
-        and exchange_truth_confidence == "high"
-        and not bool(exchange_truth.get("has_nonzero_position"))
-        and not bool(exchange_truth.get("has_open_order"))
-        if isinstance(exchange_truth, dict)
-        else False
-    )
     recovery_decision = _recovery_decision_payload(state, exchange_truth)
-    # V1 distinguishes durable accounting reconciliation from live execution
-    # recovery. The former remains operator-visible, but a trusted-flat account
-    # has no order-management work that makes a restart unsafe.
+    reconciliation_summary = state.get("pending_close_reconciliation_summary")
+    pending_close_reconciliation_unknown_count = (
+        int(reconciliation_summary.get("unknown_status_count") or 0)
+        if isinstance(reconciliation_summary, dict)
+        else 0
+    )
     background_close_reconciliation_pending = (
-        open_count == 0
-        and pending_entries == 0
-        and pending_closes == 0
-        and pending_passive_closes == 0
-        and pending_close_reconciliations > 0
-        and pending_residual_repairs == 0
-        and exchange_truth_high_confidence_flat
-        and recovery_decision.get("kind") == "RUNNING_WITH_EVIDENCE_GAP"
-        and recovery_decision.get("evidence_quality")
-        == "background_close_reconciliation"
-        and recovery_decision.get("entry_allowed") is True
+        is_nonblocking_background_close_reconciliation(
+            open_position_count=open_count,
+            pending_entry_count=pending_entries,
+            pending_close_owners=pending_close_owners,
+            pending_residual_repair_count=pending_residual_repairs,
+            pending_close_reconciliation_unknown_count=(
+                pending_close_reconciliation_unknown_count
+            ),
+            exchange_truth=exchange_truth,
+            recovery_decision=recovery_decision,
+        )
     )
     clean = (
         open_count == 0

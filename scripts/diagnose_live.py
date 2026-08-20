@@ -39,6 +39,7 @@ from lightfee.engine.exchange_truth import (
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
+    is_nonblocking_background_close_reconciliation,
     pending_close_owner_counts,
     pending_passive_close_evidence,
 )
@@ -3962,6 +3963,19 @@ def _build_production_acceptance_gate(
         exchange_truth,
     )
     recovery_decision = _recovery_decision_payload(local_state, exchange_truth)
+    background_close_reconciliation_pending = (
+        is_nonblocking_background_close_reconciliation(
+            open_position_count=open_position_count,
+            pending_entry_count=pending_entry_count,
+            pending_close_owners=pending_close_owners,
+            pending_residual_repair_count=pending_residual_repair_count,
+            pending_close_reconciliation_unknown_count=(
+                pending_reconciliation_unknown
+            ),
+            exchange_truth=exchange_truth,
+            recovery_decision=recovery_decision,
+        )
+    )
     v1_lifecycle_closure = _v1_lifecycle_closure_payload(
         local_state,
         exchange_truth,
@@ -3970,7 +3984,10 @@ def _build_production_acceptance_gate(
     local_recovery_clean = (
         open_position_count == 0
         and pending_entry_count == 0
-        and pending_close_owner_count == 0
+        and (
+            pending_close_owner_count == 0
+            or background_close_reconciliation_pending
+        )
         and pending_residual_repair_count == 0
     )
     exchange_recovery_clean = exchange_truth_flat and exchange_truth_no_open_orders
@@ -4097,7 +4114,9 @@ def _build_production_acceptance_gate(
         blocking_reasons.append("open_positions_exceed_configured_max")
     elif open_position_count and not active_positions_with_capacity:
         blocking_reasons.append("local_open_positions_present")
-    if pending_entry_count or pending_close_owner_count:
+    if pending_entry_count or (
+        pending_close_owner_count and not background_close_reconciliation_pending
+    ):
         blocking_reasons.append("local_pending_entries_or_closes_present")
     if pending_residual_repair_count:
         blocking_reasons.append("local_pending_residual_repairs_present")
@@ -4132,12 +4151,15 @@ def _build_production_acceptance_gate(
     if provisional_billing_evidence_count:
         blocking_reasons.append("billing_evidence_provisional")
         fingerprints.append("billing_evidence_provisional")
-    if pending_reconciliation_total > 0:
-        blocking_reasons.append("pending_close_reconciliations_not_empty")
-        fingerprints.append("pending_close_reconciliations_not_empty")
-    elif pending_reconciliation_unknown > 0:
+    if pending_reconciliation_unknown > 0:
         blocking_reasons.append("pending_close_reconciliations_unknown_status")
         fingerprints.append("pending_close_reconciliations_unknown")
+    elif (
+        pending_reconciliation_total > 0
+        and not background_close_reconciliation_pending
+    ):
+        blocking_reasons.append("pending_close_reconciliations_not_empty")
+        fingerprints.append("pending_close_reconciliations_not_empty")
 
     diagnostic_counts = {
         "passive_maker_zero_fill": passive_maker_zero_fill_count,
@@ -4251,6 +4273,9 @@ def _build_production_acceptance_gate(
         "pending_close_reconciliation_total": pending_reconciliation_total,
         "pending_close_reconciliation_ack_truth_gap": pending_reconciliation_ack_truth_gap_count,
         "pending_close_reconciliation_summary": pending_reconciliation_summary,
+        "background_close_reconciliation_pending": (
+            background_close_reconciliation_pending
+        ),
         "pending_residual_repair_count": pending_residual_repair_count,
         "residual_count": residual_count,
         "quick_flat_count": quick_flat_count,
