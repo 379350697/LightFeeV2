@@ -6,7 +6,7 @@ their historical status text must not be used to decide whether a fix is
 deployed or closed.
 
 Scope: current operational status begins with the post-regression batch
-`CL-093` through `CL-114`. The explicit pre-CL-093 historical boundary below
+`CL-093` through `CL-116`. The explicit pre-CL-093 historical boundary below
 prevents older nonterminal prose from being mistaken for current work. New
 production/parity bugs must be added here when they are discovered.
 
@@ -34,8 +34,9 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `36d2e168098b5b93a3419a7ee78874beba60872c`
-- Checked on: `2026-08-20` by read-only service verification.
+- Last production SHA checked: `cb31ff20a8fa33590bb3b23637097a204b78c054`
+- Checked on: `2026-08-21` after deployment: manifest, singleton, and service
+  verifier passed; exchange truth was high-confidence flat with no open orders.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -69,8 +70,8 @@ do not rewrite the daily evidence just to change status.
 | CL-112 | closed | `cf31c16` | execution-accounting regression suite | manifest, singleton, verifier, and seven-venue probe production-green | [2026-08-16](daily/2026-08-16.md#cluster-cl-112-execution-evidence-accounting-contract) |
 | CL-113 | deployed-awaiting-verification | `047b22c` | short-maker/Bybit recovery regression | needs lifecycle that finalizes or retains explicit ownership | [2026-08-17](daily/2026-08-17.md#cluster-cl-113-short-maker-reconciliation-and-bybit-recovery-identity) |
 | CL-114 | deployed-awaiting-verification | `e06d58c` | staged close/import/recovery regression | COW needs dual-fill refetch; BICO needs Binance identity | [2026-08-19](daily/2026-08-19.md#cluster-cl-114-staged-close-reconciliation-and-terminal-fill-price) |
-| CL-115 | local-green | `79db9b4` | direct reconciliation, passive reconciliation removal, direct passive completion, and passive-to-accounting handoff matrix (`3 passed`); recovery/closure suite (`90 passed`); targeted suite (`141 passed`) | 2026-08-20 pre-deploy gate was blocked by a then-live COTI position and pending passive-close owner. Recheck before deploy; historical bills still require exact exchange evidence. | [2026-08-20](daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness) |
-| CL-116 | local-green | `1d13de3` | health-gate RED/GREEN plus real `verify_production_services.py` CLI path (`40 passed`); full suite (`4356 passed, 9 skipped`) | Deployment may proceed only if remote recheck shows high-confidence flat exchange truth with no execution owner or open order. The COTI accounting debt must remain visible and needs exact Binance evidence. | [2026-08-21](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate) |
+| CL-115 | deployed-awaiting-verification | `79db9b4` | direct reconciliation, passive reconciliation removal, direct passive completion, and passive-to-accounting handoff matrix (`3 passed`); recovery/closure suite (`90 passed`); targeted suite (`141 passed`) | 2026-08-21 post-deploy check is high-confidence flat with no pending passive-close owner. Needs another lifecycle/restart observation; the separate COTI bill still requires exact Binance evidence. | [2026-08-20](daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness) |
+| CL-116 | closed | `1d13de3` | health-gate RED/GREEN plus real `verify_production_services.py` CLI path (`40 passed`); full suite (`4356 passed, 9 skipped`) | `cb31ff20` production probe: `ok: true`, zero critical/warning, high-confidence flat/no-order truth, one visible background reconciliation. The COTI bill is a separate evidence-retrieval task, not an open deploy-gate defect. | [2026-08-21](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate) |
 
 ## Pre-CL-093 Historical Boundary
 
