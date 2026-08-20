@@ -1,5 +1,10 @@
 # Bug Ledger Index
 
+> Historical index only. Current active status is maintained in
+> [ACTIVE.md](ACTIVE.md). The deployment/status wording below is preserved as
+> incident evidence and may be stale; do not use it to decide release or
+> closure state.
+
 This index tracks LightFeeV2 production/parity bugs with stable fingerprints. It follows the V1 bug-ledger style so regressions can be tied back to prior fixes, failed attempts, and verification evidence.
 
 ## Bug Cards
@@ -14,6 +19,10 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 | [local-l2-sequence-continuity](cards/local-l2-sequence-continuity.md) | Local-L2 rebuilds and official sequence evidence | `runtime.local_l2_sequence_gap_rebuild`, `runtime.local_l2_snapshot_error`, or Local-L2 insufficient evidence recurs. |
 | [passive-close-terminal-flatness](cards/passive-close-terminal-flatness.md) | passive close terminal flatness / under-min / price unavailable | Pending passive close loops, terminal flat, under-min, or price-unavailable close branches recur. |
 | [pending-entry-terminality-live-truth](cards/pending-entry-terminality-live-truth.md) | pending entry false flat / live truth mismatch | Local state is flat but exchange truth has nonzero positions, or pending entries clear on stale/uncertain evidence. |
+
+## Recent Investigations
+
+CL-115 post-terminal recovery-ledger staleness, 2026-08-20: historical COTI accounting debt is distinct from the current balanced COTI position. A downstream cache-invalidation gap could retain a pre-built recovery-ledger owner after close ownership changes, leaving the V1 lifecycle conclusion stale. Commit `79db9b4` covers direct reconciliation removal plus all passive outcomes: reconciliation removal, direct completion, and handoff to accounting. It is **implemented but not closed**: it is committed locally and undeployed, requires production-safe deployment, and cannot clear any historical bill without exact exchange execution evidence. See [daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness](daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness).
 
 ## Recent Closures
 

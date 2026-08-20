@@ -4,15 +4,27 @@ This directory is the lightweight, long-term bug ledger for LightFeeV2.
 
 The goal is to preserve enough context for future debugging, GitNexus search, and regression review without storing large logs or raw command output.
 
+## Status Source
+
+[ACTIVE.md](ACTIVE.md) is the single source of current status for active bug
+work. `BUG_INDEX.md`, daily ledgers, and cards are historical evidence and
+reusable investigation memory; their old prose status must not override
+`ACTIVE.md`.
+
+Use `python scripts/check_bug_ledger.py --deployed-sha <production-.deploy_version>`
+after a deployment or read-only production check. The production SHA argument
+is mandatory: it rejects a stale recorded deployment SHA and rows that claim
+deployed/closed when their fixing commit is not included in that deployment.
+
 ## Quick Workflow
 
 When debugging or documenting a bug, follow this order:
 
-1. Search existing cards first: `rg "<event|error|symbol|fingerprint>" docs/bugs/cards docs/bugs/BUG_INDEX.md`.
+1. Check [ACTIVE.md](ACTIVE.md) first, then search existing cards: `rg "<event|error|symbol|fingerprint>" docs/bugs/cards docs/bugs/BUG_INDEX.md`.
 2. If the failure matches an existing card, update that card's `Recurrences` and, if needed, `Attempts Ledger`.
 3. Record the full incident in `docs/bugs/daily/YYYY-MM-DD.md`.
-4. Add or update only an index-level row in `docs/bugs/BUG_INDEX.md`; do not duplicate the full investigation there.
-5. Mark a bug `closed` only after the card/daily entry records the required harness/probe evidence. Local tests alone are `local green`, not closure, unless the bug is explicitly non-production.
+4. Add or update its one-line status row in `docs/bugs/ACTIVE.md`; do not use daily prose or `BUG_INDEX.md` as a second status source.
+5. Mark a production bug `closed` only after its regression, deployed SHA, and production evidence are recorded. Local tests alone are `local-green`; a non-production fixture must say so explicitly.
 
 If no existing card matches, write the daily entry first. Add a new card only
 when the failure family has recurred, is likely to recur, or contains a partial
@@ -80,10 +92,10 @@ Closed / local green / deployed pending probe / blocked, with the exact remainin
 | YYYY-MM-DD | `SYMBOL` venue pair | `commit` or `working tree` | closed / open / partial | [daily link](../daily/YYYY-MM-DD.md#cluster-anchor) |
 ```
 
-### BUG_INDEX Row
+### ACTIVE Row
 
 ```md
-| [CL-XXX-topic](daily/YYYY-MM-DD.md#cluster-cl-xxx-topic) | status | severity | `component-a`, `component-b` | `stable.failure.fingerprint` | YYYY-MM-DD | first evidence commit/run | fixed commit or working tree | latest short verification | related rule/card | one-sentence current outcome |
+| CL-XXX | detected / root-cause-confirmed / local-green / deployed-awaiting-verification / closed / superseded | `fixed-sha` | exact production-path regression | production proof or next condition | [daily evidence](daily/YYYY-MM-DD.md#cluster-cl-xxx-topic) |
 ```
 
 ## File Layout
@@ -114,7 +126,9 @@ Use a standalone bug file only when a cluster becomes too large for the daily fi
 docs/bugs/BUG-YYYYMMDD-topic-fingerprint.md
 ```
 
-Keep `docs/bugs/BUG_INDEX.md` as the cross-day index. The index should list daily clusters or standalone bug files, not duplicate full investigations.
+Keep `docs/bugs/BUG_INDEX.md` as a searchable cross-day historical index. The
+index should list daily clusters or standalone bug files, not duplicate full
+investigations or carry the authoritative current status.
 
 ## Bug Cards
 
@@ -247,7 +261,8 @@ When a fix is incomplete, say so explicitly in `Fix Status` and keep the item in
 - Update the ledger in the same branch as the code fix whenever possible.
 - For same-family incidents, update both the daily entry and the matching card.
 - After adding or changing bug docs, run `npx gitnexus analyze` when a fresh GitNexus index is needed.
-- Keep `BUG_INDEX.md` small and index-like. The daily or standalone ledger owns the details.
+- Keep `ACTIVE.md` short and current. `BUG_INDEX.md` and the daily or
+  standalone ledger own searchable history and detail.
 
 ### Handoff Checklist
 
@@ -256,8 +271,8 @@ Before handing off a bug-ledger-only update:
 - Confirm any same-family issue has an updated card in `docs/bugs/cards/`.
 - Confirm the daily or standalone bug entry has a stable `Fingerprint`, exact
   `Components`, exact `Symbols`, exact `Files`, and concrete `Watch` indicators.
-- Confirm `docs/bugs/BUG_INDEX.md` links to the entry and keeps only index-level
-  summary text.
+- Confirm `docs/bugs/ACTIVE.md` has exactly one current status row for the
+  issue; `BUG_INDEX.md` may link to the entry for historical search only.
 - Record verification as short evidence rows or compact result lines, not raw
   command transcripts.
 - Run the documentation-only validation gate from
