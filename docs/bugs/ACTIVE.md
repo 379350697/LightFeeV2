@@ -34,9 +34,10 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `cb31ff20a8fa33590bb3b23637097a204b78c054`
-- Checked on: `2026-08-21` after deployment: manifest, singleton, and service
-  verifier passed; exchange truth was high-confidence flat with no open orders.
+- Last production SHA checked: `76e6f914c42b60ef526487656caa69f648e5c746`
+- Checked on: `2026-08-21` after deployment: manifest and singleton passed;
+  verifier and diagnostic acceptance gate were green with high-confidence
+  flat/no-order exchange truth.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -71,7 +72,7 @@ do not rewrite the daily evidence just to change status.
 | CL-113 | deployed-awaiting-verification | `047b22c` | short-maker/Bybit recovery regression | needs lifecycle that finalizes or retains explicit ownership | [2026-08-17](daily/2026-08-17.md#cluster-cl-113-short-maker-reconciliation-and-bybit-recovery-identity) |
 | CL-114 | deployed-awaiting-verification | `e06d58c` | staged close/import/recovery regression | COW needs dual-fill refetch; BICO needs Binance identity | [2026-08-19](daily/2026-08-19.md#cluster-cl-114-staged-close-reconciliation-and-terminal-fill-price) |
 | CL-115 | deployed-awaiting-verification | `79db9b4` | direct reconciliation, passive reconciliation removal, direct passive completion, and passive-to-accounting handoff matrix (`3 passed`); recovery/closure suite (`90 passed`); targeted suite (`141 passed`) | 2026-08-21 post-deploy check is high-confidence flat with no pending passive-close owner. Needs another lifecycle/restart observation; the separate COTI bill still requires exact Binance evidence. | [2026-08-20](daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness) |
-| CL-116 | local-green | `f174bce` | shared health/diagnosis-gate RED/GREEN (`7 passed`), related suite (`220 passed`), full suite (`4359 passed, 9 skipped`) | `cb31ff20` made the deployment verifier green but `diagnose_live --since-deploy` still falsely blocked on the same background debt. Redeploy `f174bce`; then require both verifier and diagnostic acceptance gate green. The COTI bill remains a separate evidence-retrieval task. | [2026-08-21](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate) |
+| CL-116 | closed | `f174bce` | shared health/diagnosis-gate RED/GREEN (`7 passed`), related suite (`220 passed`), full suite (`4359 passed, 9 skipped`) | `76e6f914` production probe: manifest/singleton passed; verifier green and `diagnose_live --since-deploy` reported a passing acceptance gate with no blockers. The one visible COTI bill remains a separate evidence-retrieval task. | [2026-08-21](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate) |
 
 ## Pre-CL-093 Historical Boundary
 

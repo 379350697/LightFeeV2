@@ -31,8 +31,9 @@ only owner is that background accounting task; it leaves the task visible and
 does not invent the missing Binance close evidence. Commit `1d13de3` deployed
 in `cb31ff20` and made the verifier green, but the final diagnostic gate still
 used a copied owner predicate. Commit `f174bce` makes both consumers use the
-same recovery-core predicate and is **local green, pending redeploy**. The
-missing Binance bill evidence is a separate accounting task. See [daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate).
+same recovery-core predicate; deployed in `76e6f914`, both gates now pass, so
+the **deployment-gate defect is closed**. The missing Binance bill evidence is
+a separate accounting task. See [daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate).
 
 CL-115 post-terminal recovery-ledger staleness, 2026-08-20: historical COTI accounting debt is distinct from the current balanced COTI position. A downstream cache-invalidation gap could retain a pre-built recovery-ledger owner after close ownership changes, leaving the V1 lifecycle conclusion stale. Commit `79db9b4` covers direct reconciliation removal plus all passive outcomes: reconciliation removal, direct completion, and handoff to accounting. It is **implemented but not closed**: a read-only pre-deploy gate found one live COTI position plus a pending passive-close owner in `risk_only`, so no cloud pull/restart occurred. Historical bills cannot be cleared without exact exchange execution evidence. See [daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness](daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness).
 
