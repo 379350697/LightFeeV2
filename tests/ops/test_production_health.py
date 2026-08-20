@@ -133,7 +133,7 @@ def test_current_state_pending_close_owner_is_visible_and_blocks_green_health():
     assert report.details["recovery_decision"]["entry_allowed"] is False
 
 
-def test_current_state_reconciliation_owner_is_visible_from_compact_count():
+def test_current_state_background_reconciliation_is_visible_but_deploy_safe_when_flat():
     state = {
         "lifecycle": "running",
         "risk_mode": "running",
@@ -162,15 +162,98 @@ def test_current_state_reconciliation_owner_is_visible_from_compact_count():
         require_exchange_truth=True,
     )
 
-    assert report.ok is False
-    assert "pending_close_owner_present" in report.fingerprints
+    assert report.ok is True
+    assert "pending_close_owner_present" not in report.fingerprints
     assert report.details["pending_close_reconciliation_count"] == 1
     assert report.details["pending_close_owner_count"] == 1
+    assert report.details["background_close_reconciliation_pending"] is True
     assert report.details["recovery_decision"]["kind"] == "RUNNING_WITH_EVIDENCE_GAP"
     assert report.details["recovery_decision"]["evidence_quality"] == (
         "background_close_reconciliation"
     )
     assert report.details["recovery_decision"]["entry_allowed"] is True
+
+
+def test_current_state_background_reconciliation_does_not_hide_live_order():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "last_scan": {"ts_ms": 1778786999000},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_close_reconciliation_count": 1,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": True,
+            "positions": {},
+            "open_orders": {
+                "binance": {
+                    "COTIUSDT": [{
+                        "venue": "binance",
+                        "symbol": "COTIUSDT",
+                        "side": "buy",
+                        "quantity": 2400.0,
+                        "reduce_only": True,
+                        "order_id": "still-open",
+                    }]
+                }
+            },
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is False
+    assert report.severity == "critical"
+    assert report.details["background_close_reconciliation_pending"] is False
+    assert "live_open_order" in report.fingerprints
+
+
+def test_current_state_background_reconciliation_requires_high_confidence_flat_truth():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "last_scan": {"ts_ms": 1778786999000},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_close_reconciliation_count": 1,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "medium",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.ok is False
+    assert report.severity == "critical"
+    assert report.details["background_close_reconciliation_pending"] is False
+    assert "pending_close_owner_present" in report.fingerprints
+    assert "exchange_truth_confidence_not_high" in report.fingerprints
 
 
 def test_current_state_clean_local_exchange_nonzero_is_critical():
@@ -577,6 +660,74 @@ def test_verify_production_services_cli_json_success(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
+
+
+def test_verify_production_services_cli_allows_flat_background_reconciliation(tmp_path):
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    (unit_dir / "lightfee-sidecar.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config /opt/lightfee-v2/config/live.toml\n"
+    )
+    (unit_dir / "lightfee-live.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.live --config /opt/lightfee-v2/config/live.toml\n"
+    )
+    snapshot = tmp_path / "snapshot.json"
+    venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
+    snapshot.write_text(json.dumps({
+        "market_observed_at_ms": 1778786998000,
+        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
+        "degraded_venues": [],
+    }))
+    current = tmp_path / "current.json"
+    current.write_text(json.dumps({
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "last_scan": {"ts_ms": 1778786999000},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_close_reconciliation_count": 1,
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }))
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/verify_production_services.py",
+            "--unit-dir", str(unit_dir),
+            "--snapshot", str(snapshot),
+            "--current-state", str(current),
+            "--resolv-conf", str(resolv),
+            "--now-ms", "1778787000000",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    payload = json.loads(result.stdout)
+    current_report = next(
+        report for report in payload["reports"] if report["name"] == "current_state"
+    )
+    assert current_report["ok"] is True
+    assert current_report["details"]["background_close_reconciliation_pending"] is True
 
 
 def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_path):

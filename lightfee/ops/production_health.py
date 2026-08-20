@@ -534,38 +534,7 @@ def analyze_current_state(
     )
     pending_close_owner_count = pending_close_owners.pending_close_owner_count
     pending_residual_repairs = int(state.get("pending_residual_repair_count") or 0)
-    clean = (
-        open_count == 0
-        and pending_entries == 0
-        and pending_close_owner_count == 0
-        and pending_residual_repairs == 0
-    )
-    last_scan = state.get("last_scan")
-    last_scan_ts_ms = 0
-    if isinstance(last_scan, dict):
-        try:
-            last_scan_ts_ms = int(last_scan.get("ts_ms", 0) or 0)
-        except (TypeError, ValueError):
-            last_scan_ts_ms = 0
-    last_scan_age_ms = now_ms - last_scan_ts_ms if last_scan_ts_ms > 0 else None
-
-    if state.get("lifecycle") != "running":
-        fingerprints.append("live_lifecycle_not_running")
-    if state.get("risk_mode") == "fail_closed" and clean and not state.get("recovery_blocked_reason"):
-        fingerprints.append("stale_fail_closed_clean_state")
-    if pending_close_owner_count:
-        fingerprints.append("pending_close_owner_present")
-    if state.get("last_scan") is None:
-        fingerprints.append("last_scan_missing")
     exchange_truth = state.get("exchange_truth")
-    exchange_truth_mismatches: list[dict[str, Any]] = []
-    recovery_decision = _recovery_decision_payload(state, exchange_truth)
-    v1_lifecycle_closure = _v1_lifecycle_closure_payload(state, exchange_truth, now_ms)
-    pending_entry_live_conflicts = (
-        _pending_entry_live_conflict_summary(state, exchange_truth)
-        if isinstance(exchange_truth, dict)
-        else {"count": 0, "details": []}
-    )
     exchange_truth_available = (
         isinstance(exchange_truth, dict)
         and bool(exchange_truth.get("available"))
@@ -582,6 +551,54 @@ def analyze_current_state(
         and not bool(exchange_truth.get("has_open_order"))
         if isinstance(exchange_truth, dict)
         else False
+    )
+    recovery_decision = _recovery_decision_payload(state, exchange_truth)
+    # V1 distinguishes durable accounting reconciliation from live execution
+    # recovery. The former remains operator-visible, but a trusted-flat account
+    # has no order-management work that makes a restart unsafe.
+    background_close_reconciliation_pending = (
+        open_count == 0
+        and pending_entries == 0
+        and pending_closes == 0
+        and pending_passive_closes == 0
+        and pending_close_reconciliations > 0
+        and pending_residual_repairs == 0
+        and exchange_truth_high_confidence_flat
+        and recovery_decision.get("kind") == "RUNNING_WITH_EVIDENCE_GAP"
+        and recovery_decision.get("evidence_quality")
+        == "background_close_reconciliation"
+        and recovery_decision.get("entry_allowed") is True
+    )
+    clean = (
+        open_count == 0
+        and pending_entries == 0
+        and pending_closes == 0
+        and pending_passive_closes == 0
+        and pending_residual_repairs == 0
+    )
+    last_scan = state.get("last_scan")
+    last_scan_ts_ms = 0
+    if isinstance(last_scan, dict):
+        try:
+            last_scan_ts_ms = int(last_scan.get("ts_ms", 0) or 0)
+        except (TypeError, ValueError):
+            last_scan_ts_ms = 0
+    last_scan_age_ms = now_ms - last_scan_ts_ms if last_scan_ts_ms > 0 else None
+
+    if state.get("lifecycle") != "running":
+        fingerprints.append("live_lifecycle_not_running")
+    if state.get("risk_mode") == "fail_closed" and clean and not state.get("recovery_blocked_reason"):
+        fingerprints.append("stale_fail_closed_clean_state")
+    if pending_close_owner_count and not background_close_reconciliation_pending:
+        fingerprints.append("pending_close_owner_present")
+    if state.get("last_scan") is None:
+        fingerprints.append("last_scan_missing")
+    exchange_truth_mismatches: list[dict[str, Any]] = []
+    v1_lifecycle_closure = _v1_lifecycle_closure_payload(state, exchange_truth, now_ms)
+    pending_entry_live_conflicts = (
+        _pending_entry_live_conflict_summary(state, exchange_truth)
+        if isinstance(exchange_truth, dict)
+        else {"count": 0, "details": []}
     )
     exchange_truth_available_flat = (
         exchange_truth_available
@@ -691,6 +708,9 @@ def analyze_current_state(
             "pending_passive_close_count": pending_passive_closes,
             "pending_close_reconciliation_count": pending_close_reconciliations,
             "pending_close_owner_count": pending_close_owner_count,
+            "background_close_reconciliation_pending": (
+                background_close_reconciliation_pending
+            ),
             "pending_residual_repair_count": pending_residual_repairs,
             "last_scan_age_ms": last_scan_age_ms,
             "current_state_age_ms": current_state_age_ms,
