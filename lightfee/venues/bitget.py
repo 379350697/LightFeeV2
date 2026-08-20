@@ -6,7 +6,7 @@ import logging
 import json
 import time
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
@@ -31,6 +31,10 @@ from lightfee.venues.specs import (
     get_operation_contract,
 )
 from lightfee.venues.transport import LiveCredential, TransportError, TransportErrorCategory, VenueTransport
+
+if TYPE_CHECKING:
+    from lightfee.core.domain import OrderFillReconciliation
+    from lightfee.marketdata.l2 import LocalL2Update
 
 logger = logging.getLogger("lightfee.venues.bitget")
 

@@ -20,7 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
 
@@ -60,6 +60,14 @@ from lightfee.venues.specs import (
     get_spec,
 )
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
+
+if TYPE_CHECKING:
+    from lightfee.core.domain import (
+        PassiveOrderAck,
+        PassiveOrderAmendRequest,
+        PassiveOrderProgress,
+    )
+    from lightfee.marketdata.l2 import LocalL2Update
 
 import logging
 

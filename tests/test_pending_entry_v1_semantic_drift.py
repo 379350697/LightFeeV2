@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from unittest.mock import AsyncMock
@@ -1030,6 +1031,18 @@ async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_que
             "short_legs": [],
         }
     }
+    exchange_truth = {
+        "truth_available": True,
+        "positions": [],
+        "open_orders": [],
+    }
+    runtime._last_recovery_exchange_truth = exchange_truth
+    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=runtime.state,
+        exchange_truth=exchange_truth,
+        owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+    )
+    ledger_before = runtime.recovery_ledger
 
     await runtime._process_pending_close_reconciliations(now_ms=3000)
 
@@ -1046,6 +1059,64 @@ async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_que
     assert retained["reconciliation_status"] == "evidence_debt"
     assert retained["evidence_debt_reason"] == "missing_close_order_identity"
     assert retained["missing_close_order_identity"] is True
+    assert runtime.recovery_ledger is ledger_before
+    assert any(
+        item.kind == "pending_close_reconciliation"
+        for item in runtime.recovery_ledger.work_items
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_close_reconciliation_processor_keeps_ledger_for_single_dict_task(
+    config, tmp_journal,
+):
+    """Queue-shape normalization alone is not a terminal reconciliation."""
+    _mark_live(config)
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(
+            position_id="entry-single-dict",
+            symbol="BABYUSDT",
+        )
+    ))
+    runtime.state.tick_count = 2
+    runtime.state.pending_close_reconciliations = {
+        "position_id": "entry-single-dict",
+        "symbol": "BABYUSDT",
+        "kind": "final",
+        "closed_at_ms": 1780771929000,
+        "created_cycle": 1,
+        "next_attempt_ms": 1000,
+        "position_snapshot": {
+            "position_id": "entry-single-dict",
+            "symbol": "BABYUSDT",
+            "long_venue": Venue.OKX.value,
+            "short_venue": Venue.BYBIT.value,
+        },
+        "long_legs": [],
+        "short_legs": [],
+    }
+    raw_reconciliation = dict(runtime.state.pending_close_reconciliations)
+    runtime.state.set_pending_close_reconciliations(raw_reconciliation)
+    exchange_truth = {
+        "truth_available": True,
+        "positions": [],
+        "open_orders": [],
+    }
+    runtime._last_recovery_exchange_truth = exchange_truth
+    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=runtime.state,
+        exchange_truth=exchange_truth,
+        owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+    )
+    ledger_before = runtime.recovery_ledger
+    runtime.state.pending_close_reconciliations = raw_reconciliation
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    assert runtime.state.pending_close_reconciliations[0]["position_id"] == (
+        "entry-single-dict"
+    )
+    assert runtime.recovery_ledger is ledger_before
 
 
 @pytest.mark.asyncio
@@ -1083,10 +1154,35 @@ async def test_pending_close_reconciliation_processor_reclassifies_unattributed_
         "reconciliation_status": "evidence_debt",
         "evidence_debt_reason": "missing_close_order_identity",
     }]
+    exchange_truth = {
+        "truth_available": True,
+        "positions": [],
+        "open_orders": [],
+    }
+    runtime._last_recovery_exchange_truth = exchange_truth
+    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local=runtime.state,
+        exchange_truth=exchange_truth,
+        owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+    )
+    runtime._refresh_v1_lifecycle_closure_state(now_ms=2000)
+    assert any(
+        item.kind == "pending_close_reconciliation"
+        for item in runtime.recovery_ledger.work_items
+    )
 
     await runtime._process_pending_close_reconciliations(now_ms=3000)
 
     assert runtime.state.pending_close_reconciliations == []
+    assert all(
+        item.kind != "pending_close_reconciliation"
+        for item in runtime.recovery_ledger.work_items
+    )
+    closure = runtime._current_v1_lifecycle_closure(now_ms=3000)
+    assert all(
+        row.get("owner_id") != "live-recovered:CLUSDT:okx->bitget"
+        for row in closure["rows"]
+    )
     reclassified = next(
         record for record in tmp_journal.read_all()
         if record["kind"] == "recovery.external_pair_flat_reclassified"
@@ -1875,7 +1971,6 @@ async def test_billing_evidence_gap_restart_clears_stale_reconciliation_snapshot
     clear the stale reconciliation from the terminal event, not re-emit
     exit.billing_unreconciled."""
     from lightfee.engine.recovery import (
-        _apply_journal_replay_to_state,
         recover_from_snapshot,
     )
     from lightfee.persistence.snapshot_store import SnapshotStore

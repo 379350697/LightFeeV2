@@ -16,6 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from lightfee.marketdata.l2 import LocalL2Update
 
 
 class SequenceMode(Enum):

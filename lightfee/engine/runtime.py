@@ -34,6 +34,7 @@ from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
+from lightfee.engine.entry_sync import HedgeDriveResult
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.bootstrap import (
     active_position_poll_enabled,
@@ -115,6 +116,7 @@ from lightfee.engine.state import (
     EngineState,
     HedgeInflight,
     OpenPosition,
+    normalize_pending_close_reconciliations,
 )
 from lightfee.engine.supervisor import Supervisor
 from lightfee.persistence.journal import Journal
@@ -3594,9 +3596,21 @@ class LiveRuntime:
                 book.generation = entry.get("generation", 1)
             # V1: restore book data (bids/asks) if available
             if entry.get("bids"):
-                book.bids = [PriceLevel(price=l["price"], quantity=l["quantity"]) for l in entry["bids"]]
+                book.bids = [
+                    PriceLevel(
+                        price=level["price"],
+                        quantity=level["quantity"],
+                    )
+                    for level in entry["bids"]
+                ]
             if entry.get("asks"):
-                book.asks = [PriceLevel(price=l["price"], quantity=l["quantity"]) for l in entry["asks"]]
+                book.asks = [
+                    PriceLevel(
+                        price=level["price"],
+                        quantity=level["quantity"],
+                    )
+                    for level in entry["asks"]
+                ]
             # Restore the persisted pool — only RETAINED books should be
             # re-bootstrapped at startup (V1: retained_local_l2_books).
             try:
@@ -3828,7 +3842,6 @@ class LiveRuntime:
 
         # Final current-state export
         now_ms = wall_clock_now_ms()
-        path = self.config.persistence.snapshot_path.replace(".json", "-current.json")
         self._maybe_export_current_state_snapshot(self._export_state, now_ms)
 
         self.journal.append("runtime.stopped", {"ts_ms": wall_clock_now_ms()})
@@ -5543,7 +5556,6 @@ class LiveRuntime:
 
         attempt_limit = self._pending_entry_passive_post_only_attempt_limit()
         attempt_index = max(0, int(start_attempt_index or 0))
-        last_error: Exception | None = None
         while attempt_index < attempt_limit:
             client_order_id = compact_client_order_id(
                 entry_id,
@@ -5571,7 +5583,6 @@ class LiveRuntime:
                 ack = await adapter.submit_passive_order(request)
                 return ack, request, attempt_index + 1
             except Exception as exc:
-                last_error = exc
                 if (
                     attempt_index + 1 >= attempt_limit
                     or not self._entry_reject_is_post_only_would_take(str(exc))
@@ -6758,7 +6769,44 @@ class LiveRuntime:
         )
 
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
-        return await self.close_runtime._process_pending_close_reconciliations(now_ms)
+        previous_owner_counts = self._pending_close_recovery_owner_counts()
+        await self.close_runtime._process_pending_close_reconciliations(now_ms)
+        self._refresh_recovery_ledger_after_pending_close_owner_change(
+            previous_owner_counts=previous_owner_counts,
+            now_ms=now_ms,
+        )
+
+    def _pending_close_recovery_owner_counts(self) -> tuple[int, int]:
+        """Return the close owners represented by the recovery ledger."""
+        return (
+            len(
+                normalize_pending_close_reconciliations(
+                    self.state.pending_close_reconciliations
+                )
+            ),
+            len(self.state.pending_passive_closes),
+        )
+
+    def _refresh_recovery_ledger_after_pending_close_owner_change(
+        self,
+        *,
+        previous_owner_counts: tuple[int, int],
+        now_ms: int,
+    ) -> None:
+        """Rebuild cached recovery work after a close owner is added or removed."""
+        if (
+            getattr(self, "recovery_ledger", None) is None
+            or self._pending_close_recovery_owner_counts() == previous_owner_counts
+        ):
+            return
+        exchange_truth = self._last_recovery_exchange_truth
+        if not isinstance(exchange_truth, dict):
+            exchange_truth = {"truth_available": False}
+        self._refresh_recovery_ledger_from_exchange_truth(
+            exchange_truth,
+            now_ms=now_ms,
+            lifecycle_clear_reason="pending_close_owner_changed",
+        )
 
     async def _reconcile_pending_state(self, *args, **kwargs):
         return await self.pending_entry_runtime._reconcile_pending_state(*args, **kwargs)
@@ -6909,7 +6957,6 @@ class LiveRuntime:
         exist on the exchange. This prevents duplicate hedge exposure.
         """
         hedge_venue = pending.hedge_venue()
-        is_long_hedge = pending.maker_leg != "long"
         is_short_hedge = pending.maker_leg != "short"
 
         hedge_status = result.short_status if is_short_hedge else result.long_status
@@ -7923,9 +7970,6 @@ class LiveRuntime:
             return
 
         strategy = self.config.strategy
-        hard_ceiling_ms = strategy.pending_entry_hard_ceiling_ms
-        force_terminal_after_ms = strategy.pending_entry_force_terminal_after_ms
-
         for entry_id, pending in list(self.state.pending_entries.items()):
             if has_pending_entry_zero_fill_retry(pending):
                 continue
@@ -7941,8 +7985,6 @@ class LiveRuntime:
             # V1: startup_recovery_ready gate — skip entries that don't need recovery yet
             if not pending.startup_recovery_ready():
                 continue
-
-            lifetime_ms = pending.compute_lifetime_ms(now_ms)
 
             # --- Step 1: Query venue for order status (resolve uncertain outcomes) ---
             if pending.uncertain_outcome:
@@ -11086,7 +11128,6 @@ class LiveRuntime:
             shadow_promotion_is_eligible,
         )
 
-        tracked_lookup = {t.pair_id: t for t in tracked}
         primaries = [t for t in tracked if t.class_ == TrackedOpportunityClass.PRIMARY]
         shadows = [t for t in tracked if t.class_ == TrackedOpportunityClass.SHADOW]
 
@@ -11815,10 +11856,15 @@ class LiveRuntime:
             return
 
         self._arm_overdue_passive_close_fallbacks(now_ms)
+        previous_owner_counts = self._pending_close_recovery_owner_counts()
 
         try:
             await self.passive_close_executor.process_pending_passive_closes(
                 self.state, now_ms,
+            )
+            self._refresh_recovery_ledger_after_pending_close_owner_change(
+                previous_owner_counts=previous_owner_counts,
+                now_ms=now_ms,
             )
             if (
                 not self.state.pending_passive_closes

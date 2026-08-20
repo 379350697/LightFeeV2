@@ -6,9 +6,8 @@ Do not change passive maker business conditions while extracting it.
 
 from __future__ import annotations
 
-from typing import Any
-
 from lightfee.core.domain import Side
+from lightfee.engine.entry_sync import HedgeDriveResult
 from lightfee.engine.runtime_context import PassiveMakerRuntimeContext
 
 
@@ -451,7 +450,6 @@ class PassiveMakerRuntime:
         Uses entry_executor.execute() for the non-parity sidecar-mid path.
         Local-L2 parity mode uses _reprice_passive_maker_l2() instead.
         """
-        from lightfee.core.domain import Side
         from lightfee.engine.entry import EntryContext, EntryType
 
         maker_leg = self._pending_active_maker_side(pending)
@@ -533,7 +531,6 @@ class PassiveMakerRuntime:
 
         Returns HedgeDriveResult so the caller can write back to PendingEntry state.
         """
-        from lightfee.core.domain import Side
         from lightfee.engine.entry_sync import drive_pending_entry_hedge
 
         maker_leg = self._pending_active_maker_side(pending)

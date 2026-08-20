@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING, Optional
 
 from lightfee.core.domain import Venue
 from lightfee.core.money import floor_to_step, normalize_order_quantity
+
+if TYPE_CHECKING:
+    from lightfee.core.domain import Side
+    from lightfee.venues.specs import VenueSpec
 
 
 def venue_reduce_only_close_exempts_min_notional(venue: Venue) -> bool:

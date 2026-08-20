@@ -7,7 +7,7 @@ so engine code never reaches into private transport internals.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
@@ -28,6 +28,9 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
 )
 from lightfee.core.errors import OrderSubmitError
+
+if TYPE_CHECKING:
+    from lightfee.marketdata.l2 import LocalL2Update
 
 
 class VenueAdapter(ABC):

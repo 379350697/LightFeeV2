@@ -24,13 +24,12 @@ the recovery methods that would run during LiveRuntime.start().
 
 import asyncio
 import time
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lightfee.config.schema import StrategyConfig
-from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
-from lightfee.engine.recovery import build_recovery_snapshot, classify_startup_recovery_state
+from lightfee.core.domain import PositionSnapshot, Side, Venue
+from lightfee.engine.recovery import classify_startup_recovery_state
 from lightfee.engine.state import EngineState, PendingEntry
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -213,7 +212,6 @@ class TestRecoveryLifecycleTransition:
         RISK_ONLY (if work remains) or RUNNING (if clean).
         """
         from lightfee.engine.runtime import LiveRuntime
-        from lightfee.engine.state import OpenPosition
         from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
 
         config = AppConfig(
@@ -471,6 +469,190 @@ class TestRecoveryLifecycleTransition:
             SimpleNamespace(symbol="BTCUSDT", long_venue="binance", short_venue="okx")
         ) == (True, "")
 
+    @pytest.mark.asyncio
+    async def test_passive_close_reconciliation_removal_refreshes_recovery_ledger(self):
+        """A resolved passive-close truth gap cannot outlive its local owner."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+        from lightfee.engine.recovery_ledger import RecoveryLedger
+        from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import PendingPassiveClose
+
+        class ResolvingPassiveClose:
+            async def process_pending_passive_closes(self, state, now_ms):
+                state.pending_passive_closes.clear()
+                state.remove_pending_close_reconciliation(
+                    state.pending_close_reconciliations[0]
+                )
+                return set()
+
+        runtime = LiveRuntime(
+            AppConfig(
+                runtime=RuntimeConfig(mode="paper"),
+                strategy=StrategyConfig(),
+                persistence=PersistenceConfig(),
+            ),
+            venue_adapters=None,
+        )
+        runtime.passive_close_executor = ResolvingPassiveClose()
+        runtime.state.pending_passive_closes["entry-passive"] = PendingPassiveClose(
+            position_id="entry-passive",
+            reason="funding_capture",
+        )
+        runtime.state.set_pending_close_reconciliations([
+            {
+                "position_id": "entry-passive",
+                "symbol": "BEATUSDT",
+                "kind": "accepted_order_truth_gap",
+                "closed_at_ms": 1778787000000,
+                "position_snapshot": {
+                    "position_id": "entry-passive",
+                    "symbol": "BEATUSDT",
+                    "long_venue": "okx",
+                    "short_venue": "bybit",
+                },
+                "long_legs": [],
+                "short_legs": [],
+            }
+        ])
+        exchange_truth = {
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [],
+        }
+        runtime._last_recovery_exchange_truth = exchange_truth
+        runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local=runtime.state,
+            exchange_truth=exchange_truth,
+            owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+        )
+
+        await runtime._maybe_tick_passive_close(1778787000000)
+
+        assert runtime.state.pending_close_reconciliations == []
+        assert all(
+            item.kind != "pending_close_reconciliation"
+            for item in runtime.recovery_ledger.work_items
+        )
+        closure = runtime._current_v1_lifecycle_closure(1778787000000)
+        assert all(
+            row.get("owner_id") != "entry-passive"
+            for row in closure["rows"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_passive_close_completion_refreshes_recovery_ledger_without_reconciliation(self):
+        """A fully accounted passive close cannot leave its cached owner behind."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+        from lightfee.engine.recovery_ledger import RecoveryLedger
+        from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import PendingPassiveClose
+
+        class ResolvingPassiveClose:
+            async def process_pending_passive_closes(self, state, now_ms):
+                state.pending_passive_closes.clear()
+                return set()
+
+        runtime = LiveRuntime(
+            AppConfig(
+                runtime=RuntimeConfig(mode="paper"),
+                strategy=StrategyConfig(),
+                persistence=PersistenceConfig(),
+            ),
+            venue_adapters=None,
+        )
+        runtime.passive_close_executor = ResolvingPassiveClose()
+        runtime.state.pending_passive_closes["entry-accounted"] = PendingPassiveClose(
+            position_id="entry-accounted",
+            reason="funding_capture",
+        )
+        exchange_truth = {
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [],
+        }
+        runtime._last_recovery_exchange_truth = exchange_truth
+        runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local=runtime.state,
+            exchange_truth=exchange_truth,
+            owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+        )
+
+        await runtime._maybe_tick_passive_close(1778787000000)
+
+        assert runtime.state.pending_passive_closes == {}
+        assert all(
+            item.kind != "pending_passive_close"
+            for item in runtime.recovery_ledger.work_items
+        )
+        closure = runtime._current_v1_lifecycle_closure(1778787000000)
+        assert all(
+            row.get("owner_id") != "entry-accounted"
+            for row in closure["rows"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_passive_close_handoff_to_reconciliation_refreshes_recovery_ledger(self):
+        """A passive owner handed to accounting must update the cached owner kind."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, PersistenceConfig
+        from lightfee.engine.recovery_ledger import RecoveryLedger
+        from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import PendingPassiveClose
+
+        class HandoffPassiveClose:
+            async def process_pending_passive_closes(self, state, now_ms):
+                state.pending_passive_closes.clear()
+                state.set_pending_close_reconciliations([
+                    {
+                        "position_id": "entry-handoff",
+                        "symbol": "BEATUSDT",
+                        "kind": "final",
+                        "closed_at_ms": now_ms,
+                        "position_snapshot": {
+                            "position_id": "entry-handoff",
+                            "symbol": "BEATUSDT",
+                            "long_venue": "okx",
+                            "short_venue": "bybit",
+                        },
+                        "long_legs": [],
+                        "short_legs": [],
+                    }
+                ])
+                return set()
+
+        runtime = LiveRuntime(
+            AppConfig(
+                runtime=RuntimeConfig(mode="paper"),
+                strategy=StrategyConfig(),
+                persistence=PersistenceConfig(),
+            ),
+            venue_adapters=None,
+        )
+        runtime.passive_close_executor = HandoffPassiveClose()
+        runtime.state.pending_passive_closes["entry-handoff"] = PendingPassiveClose(
+            position_id="entry-handoff",
+            reason="funding_capture",
+        )
+        exchange_truth = {
+            "truth_available": True,
+            "positions": [],
+            "open_orders": [],
+        }
+        runtime._last_recovery_exchange_truth = exchange_truth
+        runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
+            local=runtime.state,
+            exchange_truth=exchange_truth,
+            owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+        )
+
+        await runtime._maybe_tick_passive_close(1778787000000)
+
+        kinds = {item.kind for item in runtime.recovery_ledger.work_items}
+        assert "pending_passive_close" not in kinds
+        assert "pending_close_reconciliation" in kinds
+
     def test_drive_pending_entry_recovery_with_adapters(self):
         """With venue adapters, recovery should attempt to resolve pending entries.
 
@@ -587,8 +769,8 @@ class TestRecoveryWithLivePositionHydration:
         result = asyncio.run(runtime._recover_hydrate_from_live_positions(saga))
 
         assert result is True, (
-            f"Hydration must succeed when both venues have positions. "
-            f"Real transport returns side=SELL, quantity=abs(net)=positive."
+            "Hydration must succeed when both venues have positions. "
+            "Real transport returns side=SELL, quantity=abs(net)=positive."
         )
         # After hydration, hedge should have been filled from live position
         assert saga.hedge_leg_filled > 0, (

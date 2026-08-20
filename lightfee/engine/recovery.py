@@ -14,7 +14,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from lightfee.core.domain import OrderFill
 
 from lightfee.engine.pending_entry_hedge_delta import note_pending_entry_hedge_filled
 from lightfee.engine.pending_entry_runtime import apply_pending_entry_hedge_progress

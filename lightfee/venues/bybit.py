@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
@@ -21,6 +21,9 @@ from lightfee.venues.entry_tradability import (
 )
 from lightfee.venues.specs import bybit_spec
 from lightfee.venues.transport import LiveCredential, VenueTransport
+
+if TYPE_CHECKING:
+    from lightfee.core.domain import OrderFillReconciliation
 
 
 class BybitAdapter(VenueAdapter):

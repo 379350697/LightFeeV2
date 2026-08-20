@@ -9,11 +9,15 @@ Rust references:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER, OrderTruthFillStatus
+
+if TYPE_CHECKING:
+    from lightfee.engine.residual import ResidualExposureTask
+    from lightfee.engine.state import PendingCloseReconciliation
 
 
 # ---------------------------------------------------------------------------
