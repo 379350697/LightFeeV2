@@ -178,7 +178,7 @@ class LocalL2DataPlane:
         now_ms: int = 0,
         required_ws_generation: int | None = None,
     ) -> bool:
-        """Bootstrap a single book with a REST snapshot via the adapter.
+        """Bootstrap a single book with a policy-permitted REST snapshot.
 
         Uses the adapter's public fetch_l2_snapshot() interface — never
         reaches into adapter._transport from outside.
@@ -209,6 +209,14 @@ class LocalL2DataPlane:
         ):
             return False
 
+        if self._defer_rest_bootstrap_for_active_ws_snapshot(
+            venue,
+            symbol,
+            now_ms=now_ms,
+            rest_fetch_completed=False,
+        ):
+            return False
+
         water_level_ms = max(1, ss.snapshot_cooldown_ms)
         if ss.snapshot_in_flight:
             return False
@@ -222,6 +230,17 @@ class LocalL2DataPlane:
         ss.snapshot_in_flight = True
         try:
             update = await adapter.fetch_l2_snapshot(symbol=symbol, depth=depth)
+
+            # The WS can become live while the REST request is in flight. Check
+            # again before any runtime mutation so a late REST result never
+            # becomes the Bybit book anchor.
+            if self._defer_rest_bootstrap_for_active_ws_snapshot(
+                venue,
+                symbol,
+                now_ms=now_ms,
+                rest_fetch_completed=True,
+            ):
+                return False
 
             # A reconnect clears the old delta buffer and advances its generation.
             # A REST snapshot fetched across that boundary cannot be safely bridged.
@@ -262,23 +281,6 @@ class LocalL2DataPlane:
                     )
                     # Small delay to avoid tight loop re-fetching the same stale snapshot
                     await asyncio.sleep(0.25)
-                    return False
-
-            # For WS-snapshot-authoritative venues with an active WS client, the REST
-            # snapshot is secondary evidence — it must not be applied as the primary
-            # bootstrap/recovery anchor when a WS stream is providing book snapshots.
-            if policy.bridge_mode is BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
-                ws_key = LocalL2BookKey(venue=venue, symbol=symbol)
-                ws_client = self._ws_clients.get(ws_key)
-                if ws_client is not None and getattr(ws_client, "is_connected", False):
-                    self._append_rate_limited_state_event(
-                        "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
-                        {"venue": venue, "symbol": symbol,
-                         "snapshot_seq": update.sequence, "book_seq": getattr(book, "last_update_id", 0) if book else 0,
-                         "policy": policy.bridge_mode.value},
-                        now_ms,
-                        reason=policy.bridge_mode.value,
-                    )
                     return False
 
             apply_result = self._runtime.record_update_result(update, now_ms)
@@ -693,18 +695,99 @@ class LocalL2DataPlane:
 
     def _request_ws_snapshot_reconnect(
         self,
-        update: LocalL2Update,
+        venue: str,
+        symbol: str,
         reason: str,
     ) -> None:
         """Reconnect only a WS-snapshot-authoritative stream after real bad data."""
-        if policy_for_venue(update.venue).bridge_mode is not BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+        if policy_for_venue(venue).bridge_mode is not BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
             return
         client = self._ws_clients.get(
-            LocalL2BookKey(venue=update.venue, symbol=update.symbol),
+            LocalL2BookKey(venue=venue, symbol=symbol),
         )
         request_reconnect = getattr(client, "request_reconnect", None)
         if callable(request_reconnect):
             request_reconnect(reason or "rebuild_required")
+
+    def _defer_rest_bootstrap_for_active_ws_snapshot(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        rest_fetch_completed: bool,
+    ) -> bool:
+        """Keep an active Bybit WS snapshot authoritative across REST awaits."""
+        policy = policy_for_venue(venue)
+        if policy.bridge_mode is not BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+            return False
+        key = LocalL2BookKey(venue=venue, symbol=symbol)
+        ws_client = self._ws_clients.get(key)
+        if ws_client is None or not getattr(ws_client, "is_connected", False):
+            return False
+
+        book = self._runtime.get_book(venue, symbol)
+        bootstrap_started_ms = int(getattr(book, "bootstrap_started_ms", 0) or 0)
+        if (
+            book is not None
+            and book.status is not L2BookStatus.HOT
+            and bootstrap_started_ms > 0
+            and now_ms >= bootstrap_started_ms
+            and now_ms - bootstrap_started_ms >= self.bootstrap_timeout_ms
+        ):
+            self._recover_missing_ws_snapshot(
+                venue,
+                symbol,
+                now_ms=now_ms,
+                reason="initial_snapshot_timeout",
+            )
+            return True
+
+        payload = {
+            "venue": venue,
+            "symbol": symbol,
+            "book_seq": getattr(book, "last_update_id", 0) if book else 0,
+            "policy": policy.bridge_mode.value,
+        }
+        if rest_fetch_completed:
+            payload["rest_fetch_discarded"] = True
+        else:
+            payload["rest_fetch_skipped"] = True
+        self._append_rate_limited_state_event(
+            "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
+            payload,
+            now_ms,
+            reason=policy.bridge_mode.value,
+        )
+        return True
+
+    def _recover_missing_ws_snapshot(
+        self,
+        venue: str,
+        symbol: str,
+        *,
+        now_ms: int,
+        reason: str,
+    ) -> None:
+        """Discard unusable pre-snapshot deltas and reacquire the Bybit snapshot."""
+        if policy_for_venue(venue).bridge_mode is not BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+            return
+        book = self._runtime.get_book(venue, symbol)
+        self._pre_snapshot_buffers.pop(f"{venue}:{symbol}", None)
+        self._append_rate_limited_state_event(
+            "runtime.local_l2_ws_snapshot_missing",
+            {
+                "venue": venue,
+                "symbol": symbol,
+                "reason": reason,
+                "book_status": self._status_value(book.status) if book is not None else "missing",
+                "book_seq": getattr(book, "last_update_id", 0) if book is not None else 0,
+                "policy": BridgeMode.WS_SNAPSHOT_AUTHORITATIVE.value,
+            },
+            now_ms,
+            reason=reason,
+        )
+        self._request_ws_snapshot_reconnect(venue, symbol, reason)
 
     def _ws_client_connected(self, key: LocalL2BookKey) -> bool:
         client = self._ws_clients.get(key)
@@ -1010,7 +1093,8 @@ class LocalL2DataPlane:
                 )
             elif result.rebuild_required:
                 self._request_ws_snapshot_reconnect(
-                    update,
+                    update.venue,
+                    update.symbol,
                     result.fault_reason or "rebuild_required",
                 )
             return result.events
@@ -1023,6 +1107,18 @@ class LocalL2DataPlane:
         # Buffer delta updates during bootstrap/rebuild gap
         # V1: handle_binance_local_l2_ws_message_for_instance lines 4423-4435
         if book is not None and book.status in (L2BookStatus.BOOTSTRAPPING, L2BookStatus.REBUILDING):
+            # Bybit's documented order is snapshot then delta.  A delta cannot
+            # establish a valid book, and neither V1 nor V2 can safely bridge it
+            # to a REST snapshot at a different depth.  Reconnect this symbol to
+            # obtain the authoritative snapshot instead of buffering forever.
+            if policy_for_venue(update.venue).bridge_mode is BridgeMode.WS_SNAPSHOT_AUTHORITATIVE:
+                self._recover_missing_ws_snapshot(
+                    update.venue,
+                    update.symbol,
+                    now_ms=now_ms,
+                    reason="delta_before_initial_snapshot",
+                )
+                return []
             buf = self._pre_snapshot_buffers.get(key)
             if buf is None:
                 buf = deque()
@@ -1052,7 +1148,8 @@ class LocalL2DataPlane:
                 LocalL2BookKey(update.venue, update.symbol), None,
             )
             self._request_ws_snapshot_reconnect(
-                update,
+                update.venue,
+                update.symbol,
                 result.fault_reason or "rebuild_required",
             )
         elif result.applied:

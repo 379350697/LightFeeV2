@@ -935,12 +935,13 @@ class TestBybitWsSnapshotAuthoritative:
         )
 
         assert success is True
+        assert adapter.call_count == 1
         assert rt.get_book("bybit", "IRYSUSDT").status == L2BookStatus.HOT
         assert rt.get_book("bybit", "IRYSUSDT").sequence == 7103120
 
     @pytest.mark.asyncio
     async def test_bybit_rest_bootstrap_deferred_when_ws_is_connected(self):
-        """Connected Bybit WS stream is snapshot-authoritative; REST bootstrap is evidence only."""
+        """Connected Bybit WS stream must not spend a REST request before its snapshot."""
         rt = LocalL2Runtime()
         book = rt.ensure_book("bybit", "IRYSUSDT")
         book.status = L2BookStatus.BOOTSTRAPPING
@@ -950,14 +951,174 @@ class TestBybitWsSnapshotAuthoritative:
             is_connected = True
 
         dp._ws_clients[LocalL2BookKey("bybit", "IRYSUSDT")] = FakeClient()
-        adapter = MockL2Adapter("bybit", sequence=7103120)
+        adapter = MockL2Adapter("bybit", should_fail=True)
 
         success = await dp.bootstrap_book(
             "bybit", "IRYSUSDT", adapter, depth=50, now_ms=1779302500002,
         )
 
         assert success is False
+        assert adapter.call_count == 0
         assert rt.get_book("bybit", "IRYSUSDT").status == L2BookStatus.BOOTSTRAPPING
+
+    @pytest.mark.parametrize(
+        (
+            "now_ms",
+            "ws_snapshot_before_rest_returns",
+            "expected_status",
+            "expected_sequence",
+            "expected_reconnect_reasons",
+        ),
+        [
+            pytest.param(
+                2_000,
+                False,
+                L2BookStatus.BOOTSTRAPPING,
+                0,
+                [],
+                id="connected_before_deadline",
+            ),
+            pytest.param(
+                16_000,
+                False,
+                L2BookStatus.BOOTSTRAPPING,
+                0,
+                ["initial_snapshot_timeout"],
+                id="connected_after_deadline",
+            ),
+            pytest.param(
+                16_000,
+                True,
+                L2BookStatus.HOT,
+                100,
+                [],
+                id="ws_snapshot_arrives_before_rest_returns",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_bybit_rest_snapshot_is_discarded_if_ws_connects_while_fetching(
+        self,
+        now_ms,
+        ws_snapshot_before_rest_returns,
+        expected_status,
+        expected_sequence,
+        expected_reconnect_reasons,
+    ):
+        """A REST response cannot anchor Bybit after its WS stream becomes live."""
+        import asyncio
+
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "RACEUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        class ToggleClient:
+            def __init__(self):
+                self.is_connected = False
+                self.reconnect_reasons = []
+
+            def request_reconnect(self, reason):
+                self.reconnect_reasons.append(reason)
+                return True
+
+        class BlockingAdapter:
+            def __init__(self):
+                self.call_count = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def fetch_l2_snapshot(self, symbol: str, depth: int = 50) -> LocalL2Update:
+                self.call_count += 1
+                self.started.set()
+                await self.release.wait()
+                return LocalL2Update(
+                    venue="bybit",
+                    symbol=symbol,
+                    bids=[PriceLevel(price=49900.0, quantity=1.0)],
+                    asks=[PriceLevel(price=50100.0, quantity=1.0)],
+                    sequence=99,
+                    event_time_ms=1_000,
+                    received_at_ms=1_000,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                )
+
+        client = ToggleClient()
+        adapter = BlockingAdapter()
+        dp._ws_clients[LocalL2BookKey("bybit", "RACEUSDT")] = client
+        bootstrap = asyncio.create_task(
+            dp.bootstrap_book("bybit", "RACEUSDT", adapter, depth=50, now_ms=now_ms),
+        )
+
+        await adapter.started.wait()
+        client.is_connected = True
+        if ws_snapshot_before_rest_returns:
+            dp.ingest_external_update(
+                LocalL2Update(
+                    venue="bybit",
+                    symbol="RACEUSDT",
+                    bids=[PriceLevel(price=49900.0, quantity=1.0)],
+                    asks=[PriceLevel(price=50100.0, quantity=1.0)],
+                    sequence=100,
+                    event_time_ms=now_ms,
+                    received_at_ms=now_ms,
+                    update_kind=LocalL2UpdateKind.SNAPSHOT,
+                ),
+                now_ms=now_ms,
+            )
+        adapter.release.set()
+
+        assert await bootstrap is False
+        assert adapter.call_count == 1
+        assert book.status == expected_status
+        assert book.sequence == expected_sequence
+        assert client.reconnect_reasons == expected_reconnect_reasons
+        if expected_reconnect_reasons:
+            assert any(
+                kind == "runtime.local_l2_ws_snapshot_missing"
+                and payload["reason"] == "initial_snapshot_timeout"
+                for kind, payload in journal.records
+            )
+
+    @pytest.mark.asyncio
+    async def test_bybit_missing_initial_snapshot_reconnects_at_bootstrap_deadline(self):
+        """A connected but depth-silent Bybit stream must not defer REST forever."""
+        rt = LocalL2Runtime()
+        book = rt.ensure_book("bybit", "DUSKUSDT")
+        book.transition_to_bootstrapping(now_ms=1_000)
+        journal = _RecordingJournal()
+        dp = LocalL2DataPlane(rt, journal)
+
+        class FakeClient:
+            is_connected = True
+
+            def __init__(self):
+                self.reconnect_reasons = []
+
+            def request_reconnect(self, reason):
+                self.reconnect_reasons.append(reason)
+                return True
+
+        client = FakeClient()
+        dp._ws_clients[LocalL2BookKey("bybit", "DUSKUSDT")] = client
+
+        adapter = MockL2Adapter("bybit", should_fail=True)
+        success = await dp.bootstrap_book(
+            "bybit", "DUSKUSDT", adapter,
+            depth=50, now_ms=16_000,
+        )
+
+        assert success is False
+        assert adapter.call_count == 0
+        assert book.status == L2BookStatus.BOOTSTRAPPING
+        assert book.sequence == 0
+        assert client.reconnect_reasons == ["initial_snapshot_timeout"]
+        assert any(
+            kind == "runtime.local_l2_ws_snapshot_missing"
+            and payload["reason"] == "initial_snapshot_timeout"
+            for kind, payload in journal.records
+        )
 
     def test_rest_snapshot_sequence_not_compared_to_ws_depth_book(self):
         """Bybit REST u (depth-1000 domain) must not be compared with WS orderbook.50 sequence."""
@@ -1814,6 +1975,7 @@ class TestLocalL2DiagnosticCompaction:
         assert await dp.bootstrap_book("bybit", "DEFERCOMPACTUSDT", adapter, now_ms=1_000) is False
         assert await dp.bootstrap_book("bybit", "DEFERCOMPACTUSDT", adapter, now_ms=2_000) is False
         assert await dp.bootstrap_book("bybit", "DEFERCOMPACTUSDT", adapter, now_ms=61_000) is False
+        assert adapter.call_count == 0
 
         payloads = [
             payload for kind, payload in journal.records

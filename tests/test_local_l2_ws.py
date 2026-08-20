@@ -570,6 +570,91 @@ class TestLocalL2WsFreshnessEvidence:
             journal.close()
 
     @pytest.mark.asyncio
+    async def test_bybit_delta_before_initial_snapshot_reconnects_this_stream(self):
+        """A delta cannot establish a Bybit book; reconnect for the promised snapshot."""
+        dp, rt, journal = _make_data_plane()
+
+        class CloseableWs:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+
+        try:
+            book = rt.ensure_book("bybit", "DUSKUSDT")
+            book.transition_to_bootstrapping(now_ms=1_000)
+            ws = CloseableWs()
+            client = BybitL2WsClient(venue="bybit", symbol="DUSKUSDT", data_plane=dp)
+            client._state = "connected"
+            client._ws = ws
+            dp.start_worker(LocalL2BookKey("bybit", "DUSKUSDT"), client)
+
+            await client._handle_message(json.dumps({
+                "topic": "orderbook.50.DUSKUSDT",
+                "type": "delta",
+                "data": {
+                    "s": "DUSKUSDT", "b": [["1.000", "2"]], "a": [], "u": 101,
+                },
+            }))
+            await asyncio.sleep(0)
+
+            assert book.status == L2BookStatus.BOOTSTRAPPING
+            assert book.sequence == 0
+            assert "bybit:DUSKUSDT" not in dp._pre_snapshot_buffers
+            assert ws.close_calls == 1
+            records = journal.read_all()
+            assert any(
+                record["kind"] == "runtime.local_l2_ws_snapshot_missing"
+                and record["payload"]["reason"] == "delta_before_initial_snapshot"
+                for record in records
+            )
+            assert any(
+                record["kind"] == "runtime.local_l2_ws_transport"
+                and record["payload"]["event"] == "reconnect_requested"
+                and record["payload"]["reason"] == "delta_before_initial_snapshot"
+                for record in records
+            )
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
+    async def test_bybit_initial_snapshot_completes_without_reconnect(self):
+        """The normal snapshot-first path remains authoritative and connection-stable."""
+        dp, rt, journal = _make_data_plane()
+
+        class CloseableWs:
+            def __init__(self):
+                self.close_calls = 0
+
+            async def close(self):
+                self.close_calls += 1
+
+        try:
+            book = rt.ensure_book("bybit", "DUSKUSDT")
+            book.transition_to_bootstrapping(now_ms=1_000)
+            ws = CloseableWs()
+            client = BybitL2WsClient(venue="bybit", symbol="DUSKUSDT", data_plane=dp)
+            client._state = "connected"
+            client._ws = ws
+            dp.start_worker(LocalL2BookKey("bybit", "DUSKUSDT"), client)
+
+            await client._handle_message(json.dumps({
+                "topic": "orderbook.50.DUSKUSDT",
+                "type": "snapshot",
+                "data": {
+                    "s": "DUSKUSDT", "b": [["1.000", "2"]], "a": [["1.001", "3"]], "u": 100,
+                },
+            }))
+            await asyncio.sleep(0)
+
+            assert book.status == L2BookStatus.HOT
+            assert book.sequence == 100
+            assert ws.close_calls == 0
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
     async def test_connect_failure_records_reconnect_evidence(self, monkeypatch):
         """The real WS loop must journal failures before it backs off and retries."""
         dp, _rt, journal = _make_data_plane()
