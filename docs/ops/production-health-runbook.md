@@ -55,7 +55,11 @@ ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
   "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json"
 ```
 
-Must show `ok: true`, no open orders, no pending entries, no recovery work.
+Must show `ok: true`, no open orders, no pending entries, and no execution
+recovery work. A durable close-accounting reconciliation is allowed only when
+the report retains `background_close_reconciliation_pending: true`; it is not a
+settled bill and must remain in the incident record until exact exchange
+evidence reconciles it.
 
 ## Deploy
 
@@ -118,4 +122,9 @@ getent hosts www.okx.com
 
 ## Resume Live Only If Safe
 
-Only resume from stale fail-closed when open/pending/recovery work is zero. Prefer the code-level clean-start recovery. Manual state edits require a backup and must be followed by `verify_production_services.py`.
+Only resume from stale fail-closed when open positions, entry/pending execution
+work, and residual repairs are zero. A background close-accounting
+reconciliation may remain only when `verify_production_services.py` passes;
+never remove it manually to make a health check green. Prefer the code-level
+clean-start recovery. Manual state edits require a backup and must be followed
+by `verify_production_services.py`.
