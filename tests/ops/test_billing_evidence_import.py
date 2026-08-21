@@ -365,11 +365,24 @@ def test_import_replaces_missing_snapshot_debt_and_replays_durably(tmp_path):
     assert replayed.pending_close_reconciliations == [imported]
 
 
-def test_import_replaces_missing_order_identity_without_rewriting_snapshot():
+def test_import_replaces_unattributed_exchange_execution_without_rewriting_snapshot():
     state = EngineState()
     original_snapshot = _snapshot()
-    state.pending_close_reconciliations = [_debt(snapshot=original_snapshot, with_legs=False)]
+    debt = _debt(snapshot=original_snapshot, with_legs=False)
+    long_legs, _ = _legs()
+    debt["long_legs"] = long_legs
+    debt["unattributed_exchange_close_legs"] = ["short"]
+    state.pending_close_reconciliations = [debt]
     evidence = _evidence(include_legs=True)
+
+    assert pending_close_reconciliation_import_reason(debt) == (
+        "unattributed_exchange_execution"
+    )
+    malformed_marker = dict(debt)
+    malformed_marker["unattributed_exchange_close_legs"] = ["short", "unknown"]
+    assert pending_close_reconciliation_import_reason(malformed_marker) == (
+        "missing_close_order_identity"
+    )
 
     message = execute_billing_evidence_import(
         evidence,

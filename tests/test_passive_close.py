@@ -5717,6 +5717,9 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         )
         assert reconciliation["missing_close_order_identity"] is True
         assert reconciliation["billing_reconciliation_required"] is True
+        assert reconciliation["unattributed_exchange_close_legs"] == [
+            "long", "short"
+        ]
         assert reconciliation["identity_evidence"] == {
             "missing_identity_legs": ["long", "short"],
             "long": {
@@ -5748,6 +5751,88 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         assert replayed["pending_close_reconciliation_ids"] == [
             position.position_id
         ]
+
+    def test_live_flat_unknown_short_execution_is_tagged_and_retained_as_debt(self):
+        """A V2-owned long close cannot make an unknown flat short leg V2-owned."""
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        pending = state.pending_passive_closes[position.position_id]
+        pending.maker_fill = PendingPassiveLegFill(
+            quantity=1.0,
+            average_price=0.01,
+            order_id="owned-long-close-order",
+            client_order_id="owned-long-close-cid",
+        )
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3000))
+
+        assert remaining == set()
+        reconciliation = state.pending_close_reconciliations[0]
+        assert reconciliation["unattributed_exchange_close_legs"] == ["short"]
+        assert reconciliation["missing_close_order_identity"] is True
+        registered = next(
+            event["payload"]
+            for event in journal.read_all()
+            if event["kind"] == "exit.pending_close_reconciliation_registered"
+        )
+        assert registered["unattributed_exchange_close_legs"] == ["short"]
+
+        # The registered marker must survive the production journal replay
+        # path; otherwise a restart would downgrade this specific evidence debt
+        # to the generic missing-identity category.
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.engine.state import (
+            pending_close_reconciliation_evidence_debt_reason,
+        )
+
+        restored = EngineState()
+        _apply_journal_replay_to_state(restored, journal.read_all())
+        restored_reconciliation = restored.pending_close_reconciliations[0]
+        assert restored_reconciliation["unattributed_exchange_close_legs"] == ["short"]
+        assert (
+            pending_close_reconciliation_evidence_debt_reason(restored_reconciliation)
+            == "unattributed_exchange_execution"
+        )
+
+        # Exercise the actual accounting consumer: an exchange-observed flat
+        # leg without any V2 close identity must be durable operator work, not
+        # be guessed into the owned long-close fill or cleared as resolved.
+        from lightfee.engine.close_runtime import CloseRuntime
+
+        runtime_ctx = MagicMock()
+        runtime_ctx.state = state
+        runtime_ctx.config.runtime.mode = "live"
+        runtime_ctx.journal = journal
+        runtime_ctx.venue_adapters = {
+            position.long_venue: long_adapter,
+            position.short_venue: short_adapter,
+        }
+        for attribute in (
+            "_apply_pending_close_reconciliation_backoff",
+            "_fetch_close_leg_reconciliations",
+            "_fetch_pending_close_terminal_live_sizes",
+            "_try_abandon_stale_pending_close_reconciliation",
+            "_venue_private_position_confirmed",
+            "_open_positions_private_confirmation_ready",
+            "_resolve_local_l2_mid",
+        ):
+            setattr(runtime_ctx, attribute, None)
+
+        asyncio.run(
+            CloseRuntime(runtime_ctx)._process_pending_close_reconciliations(4_000)
+        )
+
+        retained = state.pending_close_reconciliations[0]
+        assert retained["reconciliation_status"] == "evidence_debt"
+        assert retained["evidence_debt_reason"] == "unattributed_exchange_execution"
+        debt = next(
+            event["payload"]
+            for event in journal.read_all()
+            if event["kind"] == "exit.billing_evidence_debt_registered"
+        )
+        assert debt["unattributed_exchange_close_legs"] == ["short"]
+        assert debt["terminal_reason"] == "unattributed_exchange_execution"
 
     def test_live_flat_absorbs_unsettled_partial_into_one_terminal_owner(self):
         """A live-flat final absorbs its complete unsettled partial predecessor."""
@@ -5809,6 +5894,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         ]
         final = state.pending_close_reconciliations[0]
         assert final["missing_close_order_identity"] is False
+        assert "unattributed_exchange_close_legs" not in final
         assert final["reconciliation_mode"] == "order_identity"
         assert final["long_legs"][0]["order_id"] == "current-long-order"
         assert final["short_legs"][0]["client_order_id"] == "prior-short-cid"
@@ -5822,6 +5908,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             if event["kind"] == "exit.pending_close_reconciliation_registered"
         ]
         assert registered[-1]["missing_close_order_identity"] is False
+        assert "unattributed_exchange_close_legs" not in registered[-1]
         assert registered[-1]["absorbed_partial_reconciliations"] == [{
             "kind": "partial",
             "closed_at_ms": 1_000,

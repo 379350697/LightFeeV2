@@ -296,21 +296,32 @@ class CloseRuntime:
         reconciliation["evidence_debt_at_ms"] = now_ms
         reconciliation["next_attempt_ms"] = 0
         reconciliation["billing_reconciliation_required"] = True
-        if reason == "missing_close_order_identity":
+        if reason in {
+            "missing_close_order_identity",
+            "unattributed_exchange_execution",
+        }:
             reconciliation["missing_close_order_identity"] = True
         identity_evidence = pending_close_reconciliation_identity_evidence(
             reconciliation
         )
         reconciliation["identity_evidence"] = identity_evidence
+        observed_unattributed_legs = reconciliation.get(
+            "unattributed_exchange_close_legs"
+        )
+        unattributed_exchange_close_legs: list[str] = []
+        if (
+            reason == "unattributed_exchange_execution"
+            and isinstance(observed_unattributed_legs, list)
+            and observed_unattributed_legs
+            == identity_evidence["missing_identity_legs"]
+        ):
+            unattributed_exchange_close_legs = observed_unattributed_legs
 
         def _leg_count(name: str) -> int:
             legs = reconciliation.get(name)
             return len(legs) if isinstance(legs, list) else 0
 
-        self.ctx.journal.append_critical(
-            now_ms,
-            "exit.billing_evidence_debt_registered",
-            {
+        evidence_debt_payload = {
                 "position_id": str(
                     reconciliation.get("position_id") or snapshot.get("position_id") or ""
                 ),
@@ -339,7 +350,15 @@ class CloseRuntime:
                 "short_leg_count": _leg_count("short_legs"),
                 "identity_evidence": identity_evidence,
                 "reconciliation": dict(reconciliation),
-            },
+        }
+        if unattributed_exchange_close_legs:
+            evidence_debt_payload["unattributed_exchange_close_legs"] = (
+                unattributed_exchange_close_legs
+            )
+        self.ctx.journal.append_critical(
+            now_ms,
+            "exit.billing_evidence_debt_registered",
+            evidence_debt_payload,
         )
         return True
 

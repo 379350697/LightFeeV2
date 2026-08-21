@@ -1185,7 +1185,16 @@ def pending_close_reconciliation_evidence_debt_reason(
         reconciliation.get("short_venue") or snapshot.get("short_venue") or ""
     ):
         return "missing_position_snapshot_venues"
-    if pending_close_reconciliation_missing_legs(reconciliation):
+    missing_identity_legs = pending_close_reconciliation_missing_legs(reconciliation)
+    if missing_identity_legs:
+        observed_unattributed_legs = reconciliation.get(
+            "unattributed_exchange_close_legs"
+        )
+        if (
+            isinstance(observed_unattributed_legs, list)
+            and tuple(observed_unattributed_legs) == missing_identity_legs
+        ):
+            return "unattributed_exchange_execution"
         return "missing_close_order_identity"
     return None
 

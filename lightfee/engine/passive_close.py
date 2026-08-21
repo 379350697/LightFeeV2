@@ -5124,6 +5124,16 @@ class PassiveCloseExecutor:
         )
         identity_evidence["missing_identity_legs"] = list(missing_identity_legs)
         reconciliation["identity_evidence"] = identity_evidence
+        # Trusted exchange-flat truth can prove physical terminality, but not
+        # ownership of a leg for which this V2 close has no durable lookup
+        # identity.  Persist that distinction at the sole live-flat handoff;
+        # CloseRuntime must retain it for an exact operator evidence import
+        # rather than infer an order from timing, symbol, or quantity.
+        unattributed_exchange_close_legs = list(missing_identity_legs)
+        if unattributed_exchange_close_legs:
+            reconciliation["unattributed_exchange_close_legs"] = (
+                unattributed_exchange_close_legs
+            )
         # A local fill quantity without either order identity cannot be queried
         # through the order-status adapters.  It is still durable accounting
         # work: dropping it would turn a proved-flat position into an
@@ -5189,6 +5199,10 @@ class PassiveCloseExecutor:
             # backward-compatible event consumers.
             "reconciliation": dict(reconciliation),
         }
+        if unattributed_exchange_close_legs:
+            registration_payload["unattributed_exchange_close_legs"] = (
+                unattributed_exchange_close_legs
+            )
         if absorbed_partial_reconciliations:
             registration_payload["absorbed_partial_reconciliations"] = (
                 absorbed_partial_reconciliations
