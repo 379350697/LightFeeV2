@@ -1252,6 +1252,29 @@ def _apply_journal_replay_to_state(
                 reconciliation = dict(reconciliation)
             if reconciliation.get("position_id"):
                 state.enqueue_pending_close_reconciliation(reconciliation)
+                # A live-flat final can durably absorb one complete, still
+                # unsettled partial predecessor.  Replay the same ownership
+                # transfer after the final has been restored, so a crash
+                # between its critical journal append and the next snapshot
+                # cannot recreate two billing owners for the same fills.
+                for absorbed in reconciliation.get(
+                    "absorbed_partial_reconciliations", []
+                ):
+                    if not isinstance(absorbed, dict):
+                        continue
+                    if str(absorbed.get("kind") or "") != "partial":
+                        continue
+                    try:
+                        absorbed_closed_at_ms = int(absorbed.get("closed_at_ms"))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    state.remove_pending_close_reconciliation(
+                        {
+                            "position_id": str(reconciliation["position_id"]),
+                            "kind": "partial",
+                            "closed_at_ms": absorbed_closed_at_ms,
+                        }
+                    )
                 # Registration and evidence-debt transitions preserve the queue
                 # after live-flat cleanup.  Restore it without dropping the
                 # financial reconciliation owner; the unconditional behavior also

@@ -5749,6 +5749,203 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             position.position_id
         ]
 
+    def test_live_flat_absorbs_unsettled_partial_into_one_terminal_owner(self):
+        """A live-flat final absorbs its complete unsettled partial predecessor."""
+        state, position, journal, executor, long_adapter, short_adapter = (
+            self._arrange_live_flat_cleanup()
+        )
+        pending = state.pending_passive_closes[position.position_id]
+        pending.maker_fill = PendingPassiveLegFill()
+        pending.long_legs = [PersistedCloseExecutionLeg(
+            fill=OrderFill(
+                venue=position.long_venue,
+                symbol=position.symbol,
+                side=Side.SELL,
+                quantity=1.0,
+                price=0.01,
+                order_id="current-long-order",
+                client_order_id="current-long-cid",
+                filled_at_ms=2_000,
+            ),
+            client_order_id="current-long-cid",
+        )]
+        state.pending_close_reconciliations = [{
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "kind": "partial",
+            "closed_at_ms": 1_000,
+            "position_snapshot": {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "long_venue": position.long_venue.value,
+                "short_venue": position.short_venue.value,
+                "long_quantity": 1.0,
+                "short_quantity": 1.0,
+            },
+            "original_payload": {
+                "long_closed_qty": 0.0,
+                "short_closed_qty": 0.0,
+            },
+            "long_legs": [{
+                "venue": position.long_venue.value,
+                "order_id": "current-long-order",
+                "client_order_id": "current-long-cid",
+                "quantity": 0.0,
+            }],
+            "short_legs": [{
+                "venue": position.short_venue.value,
+                "order_id": "",
+                "client_order_id": "prior-short-cid",
+                "quantity": 0.0,
+            }],
+        }]
+        position.entry_fee_evidence_complete = True
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3_000))
+
+        assert remaining == set()
+        assert [reconciliation["kind"] for reconciliation in state.pending_close_reconciliations] == [
+            "final"
+        ]
+        final = state.pending_close_reconciliations[0]
+        assert final["missing_close_order_identity"] is False
+        assert final["reconciliation_mode"] == "order_identity"
+        assert final["long_legs"][0]["order_id"] == "current-long-order"
+        assert final["short_legs"][0]["client_order_id"] == "prior-short-cid"
+        assert final["absorbed_partial_reconciliations"] == [{
+            "kind": "partial",
+            "closed_at_ms": 1_000,
+        }]
+        registered = [
+            event["payload"]
+            for event in journal.read_all()
+            if event["kind"] == "exit.pending_close_reconciliation_registered"
+        ]
+        assert registered[-1]["missing_close_order_identity"] is False
+        assert registered[-1]["absorbed_partial_reconciliations"] == [{
+            "kind": "partial",
+            "closed_at_ms": 1_000,
+        }]
+        assert registered[-1]["reconciliation"]["absorbed_partial_reconciliations"] == [{
+            "kind": "partial",
+            "closed_at_ms": 1_000,
+        }]
+
+        # The critical final record must also collapse the predecessor during
+        # journal replay, otherwise a crash between the journal append and the
+        # in-memory queue update recreates two billing owners.
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+
+        restored = EngineState()
+        _apply_journal_replay_to_state(restored, journal.read_all())
+        assert [reconciliation["kind"] for reconciliation in restored.pending_close_reconciliations] == [
+            "final"
+        ]
+
+        # Exercise the actual accounting runtime after the passive-close path:
+        # each exchange identity must be queried once and settle one terminal
+        # bill, never a partial plus a final bill for the same close.
+        from lightfee.engine.close_runtime import CloseRuntime
+
+        long_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=(
+            OrderFillReconciliation(
+                venue=position.long_venue,
+                symbol=position.symbol,
+                side=Side.SELL,
+                quantity=1.0,
+                average_price=0.02,
+                order_id="current-long-order",
+                client_order_id="current-long-cid",
+                fee_quote=0.001,
+                filled_at_ms=2_000,
+            )
+        ))
+        short_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=(
+            OrderFillReconciliation(
+                venue=position.short_venue,
+                symbol=position.symbol,
+                side=Side.BUY,
+                quantity=1.0,
+                average_price=0.02,
+                order_id="prior-short-order",
+                client_order_id="prior-short-cid",
+                fee_quote=0.001,
+                filled_at_ms=2_000,
+            )
+        ))
+        runtime_ctx = MagicMock()
+        runtime_ctx.state = state
+        runtime_ctx.config.runtime.mode = "live"
+        runtime_ctx.journal = journal
+        runtime_ctx.venue_adapters = {
+            position.long_venue: long_adapter,
+            position.short_venue: short_adapter,
+        }
+        for attribute in (
+            "_apply_pending_close_reconciliation_backoff",
+            "_fetch_close_leg_reconciliations",
+            "_fetch_pending_close_terminal_live_sizes",
+            "_try_abandon_stale_pending_close_reconciliation",
+            "_venue_private_position_confirmed",
+            "_open_positions_private_confirmation_ready",
+            "_resolve_local_l2_mid",
+        ):
+            setattr(runtime_ctx, attribute, None)
+
+        asyncio.run(CloseRuntime(runtime_ctx)._process_pending_close_reconciliations(2_000_000_000_000))
+
+        assert state.pending_close_reconciliations == []
+        long_adapter.fetch_order_fill_reconciliation.assert_awaited_once_with(
+            position.symbol, "current-long-order", "current-long-cid"
+        )
+        short_adapter.fetch_order_fill_reconciliation.assert_awaited_once_with(
+            position.symbol, "", "prior-short-cid"
+        )
+        accounting_kinds = [
+            event["kind"]
+            for event in journal.read_all()
+            if event["kind"] in {"exit.partial_reconciled", "exit.reconciled"}
+        ]
+        assert accounting_kinds == ["exit.reconciled"]
+
+    def test_live_flat_keeps_missing_leg_fail_closed_when_prior_task_lacks_it(self):
+        """A same-position prior task cannot supply an identity it never had."""
+        state, position, _, executor, *_ = self._arrange_live_flat_cleanup()
+        state.pending_passive_closes[position.position_id].maker_fill = (
+            PendingPassiveLegFill()
+        )
+        state.pending_close_reconciliations = [{
+            "position_id": position.position_id,
+            "symbol": position.symbol,
+            "kind": "partial",
+            "closed_at_ms": 1_000,
+            "long_legs": [{
+                "venue": position.long_venue.value,
+                "order_id": "prior-long-order",
+                "client_order_id": "prior-long-cid",
+                "quantity": 1.0,
+            }],
+            "short_legs": [],
+        }]
+
+        remaining = asyncio.run(executor.process_pending_passive_closes(state, now_ms=3_000))
+
+        assert remaining == set()
+        final = next(
+            reconciliation
+            for reconciliation in state.pending_close_reconciliations
+            if reconciliation["kind"] == "final"
+        )
+        assert final["missing_close_order_identity"] is True
+        assert final["identity_evidence"]["missing_identity_legs"] == [
+            "long", "short"
+        ]
+        assert "absorbed_partial_reconciliations" not in final
+        assert [
+            reconciliation["kind"]
+            for reconciliation in state.pending_close_reconciliations
+        ] == ["partial", "final"]
+
     def test_unattributed_recovered_pair_flat_is_audited_without_billing_debt(self):
         """A recovered external pair has no V2 PnL owner to reconcile."""
         state, position, journal, executor, *_ = self._arrange_live_flat_cleanup()

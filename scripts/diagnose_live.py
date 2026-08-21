@@ -45,7 +45,11 @@ from lightfee.engine.recovery_decision_core import (
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
-from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+from lightfee.engine.v1_lifecycle_closure import (
+    V1LifecycleClosurePhase,
+    build_v1_lifecycle_closure_table,
+    map_lifecycle_event_kind,
+)
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
 from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
@@ -3141,6 +3145,7 @@ def _is_residual_completion(kind: str, payload: dict[str, Any]) -> bool:
     if kind in {
         "execution.residual_repair_completed",
         "recovery.residual_repairs_complete",
+        "execution.entry_residual_dust_tolerated",
     }:
         return True
     if kind == "execution.residual_repair_terminal":
@@ -3149,21 +3154,40 @@ def _is_residual_completion(kind: str, payload: dict[str, Any]) -> bool:
     return False
 
 
+def _is_residual_lifecycle_event(kind: str, payload: dict[str, Any]) -> bool:
+    """Whether an event records residual lifecycle evidence in V1 taxonomy."""
+    if _is_transient_passive_close_residual(kind):
+        return True
+    return (
+        map_lifecycle_event_kind(kind)
+        == V1LifecycleClosurePhase.RESIDUAL_REPAIR.value
+    )
+
+
+def _is_transient_passive_close_residual(kind: str) -> bool:
+    """Whether a residual marker is a passive-close retry, not repair work."""
+    return kind == "exit.passive_close_unhedged_residual"
+
+
 def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     opened_keys: set[str] = set()
     opened_key_symbols: dict[str, str] = {}
     terminal_keys: set[str] = set()
     terminal_symbols: set[str] = set()
     residual_keys: set[str] = set()
-    residual_completed_keys: set[str] = set()
-    all_residuals_completed = False
+    residual_event_order: dict[str, tuple[int, int]] = {}
+    nontransient_residual_event_order: dict[str, tuple[int, int]] = {}
+    residual_completion_order: dict[str, tuple[int, int]] = {}
+    terminal_order: dict[str, tuple[int, int]] = {}
+    transient_passive_close_residual_keys: set[str] = set()
+    all_residual_completion_order: tuple[int, int] | None = None
 
-    for rec in events:
+    for index, rec in enumerate(events):
         kind = str(rec.get("kind", "") or "")
         payload = _payload_dict(rec)
-        reason = str(payload.get("reason", "") or "")
         key = _event_recovery_key(payload)
         symbol = _event_symbol(payload)
+        event_order = (int(_event_timestamp_ms(rec)), index)
 
         if kind in {"entry.opened", "runtime.position_opened"} and key:
             opened_keys.add(key)
@@ -3174,20 +3198,51 @@ def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str,
             terminal_keys.add(key)
             if symbol:
                 terminal_symbols.add(symbol)
+            for candidate in (key, symbol):
+                if candidate:
+                    terminal_order[candidate] = max(
+                        terminal_order.get(candidate, event_order),
+                        event_order,
+                    )
 
-        if "residual" in kind or "residual" in reason:
-            residual_key = symbol or key
+        if (
+            _is_residual_lifecycle_event(kind, payload)
+            and not _is_residual_completion(kind, payload)
+        ):
+            # Position identity is the authority when available.  A later
+            # terminal event for another trade in the same symbol must not
+            # close this residual marker.
+            residual_key = key or symbol
             if residual_key:
                 residual_keys.add(residual_key)
-            elif kind == "recovery.residual_repairs_complete":
-                all_residuals_completed = True
+                residual_event_order[residual_key] = max(
+                    residual_event_order.get(residual_key, event_order),
+                    event_order,
+                )
+                if _is_transient_passive_close_residual(kind):
+                    transient_passive_close_residual_keys.add(residual_key)
+                else:
+                    nontransient_residual_event_order[residual_key] = max(
+                        nontransient_residual_event_order.get(
+                            residual_key,
+                            event_order,
+                        ),
+                        event_order,
+                    )
 
         if _is_residual_completion(kind, payload):
             residual_candidates = {value for value in (key, symbol) if value}
             if residual_candidates:
-                residual_completed_keys.update(residual_candidates)
+                for candidate in residual_candidates:
+                    residual_completion_order[candidate] = max(
+                        residual_completion_order.get(candidate, event_order),
+                        event_order,
+                    )
             else:
-                all_residuals_completed = True
+                all_residual_completion_order = max(
+                    all_residual_completion_order or event_order,
+                    event_order,
+                )
 
     symbol_closed_open_keys = {
         key for key in opened_keys
@@ -3196,25 +3251,68 @@ def _build_recovery_lifecycle_summary(events: list[dict[str, Any]]) -> dict[str,
     }
     closed_open_keys = (opened_keys & terminal_keys) | symbol_closed_open_keys
     unclosed_open_keys = opened_keys - closed_open_keys
-    if all_residuals_completed:
-        unclosed_residual_keys: set[str] = set()
-    else:
-        unclosed_residual_keys = residual_keys - residual_completed_keys
+    closed_residual_keys: set[str] = set()
+    transient_passive_close_closed_keys: set[str] = set()
+    for residual_key in residual_keys:
+        opened_at = residual_event_order.get(residual_key, (0, 0))
+        completed_at = residual_completion_order.get(residual_key)
+        if completed_at is not None and completed_at >= opened_at:
+            closed_residual_keys.add(residual_key)
+            continue
+        if (
+            all_residual_completion_order is not None
+            and all_residual_completion_order >= opened_at
+        ):
+            closed_residual_keys.add(residual_key)
+            continue
+        if residual_key in transient_passive_close_residual_keys:
+            # A passive retry marker does not settle an actual residual repair
+            # for the same position.  Keep any non-transient residual marker
+            # fail-closed until its own explicit completion arrives.
+            nontransient_opened_at = nontransient_residual_event_order.get(
+                residual_key
+            )
+            nontransient_completion_events = [
+                completion_at
+                for completion_at in (
+                    residual_completion_order.get(residual_key),
+                    all_residual_completion_order,
+                )
+                if completion_at is not None
+            ]
+            nontransient_completed_at = (
+                max(nontransient_completion_events)
+                if nontransient_completion_events
+                else None
+            )
+            if (
+                nontransient_opened_at is not None
+                and (
+                    nontransient_completed_at is None
+                    or nontransient_completed_at < nontransient_opened_at
+                )
+            ):
+                continue
+            terminal_at = terminal_order.get(residual_key)
+            if terminal_at is not None and terminal_at >= opened_at:
+                closed_residual_keys.add(residual_key)
+                transient_passive_close_closed_keys.add(residual_key)
+
+    unclosed_residual_keys = residual_keys - closed_residual_keys
 
     return {
         "opened_keys": sorted(opened_keys),
         "closed_open_keys": sorted(closed_open_keys),
         "unclosed_open_keys": sorted(unclosed_open_keys),
         "residual_keys": sorted(residual_keys),
-        "closed_residual_keys": sorted(residual_completed_keys),
+        "closed_residual_keys": sorted(closed_residual_keys),
+        "transient_passive_close_residual_closed_keys": sorted(
+            transient_passive_close_closed_keys
+        ),
         "unclosed_residual_keys": sorted(unclosed_residual_keys),
         "closed_trade_lifecycle_count": len(closed_open_keys),
         "unclosed_trade_lifecycle_count": len(unclosed_open_keys),
-        "closed_residual_lifecycle_count": (
-            len(residual_keys)
-            if all_residuals_completed
-            else len(residual_keys & residual_completed_keys)
-        ),
+        "closed_residual_lifecycle_count": len(closed_residual_keys),
         "unclosed_residual_lifecycle_count": len(unclosed_residual_keys),
     }
 
@@ -3857,7 +3955,7 @@ def _build_production_acceptance_gate(
                     int(_event_timestamp_ms(rec)),
                 )
 
-        if "residual" in kind or "residual" in reason:
+        if _is_residual_lifecycle_event(kind, payload):
             residual_count += 1
 
     unresolved_billing_unreconciled_position_ids: set[str] = set()

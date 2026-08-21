@@ -2317,6 +2317,213 @@ def test_run_diagnose_acceptance_gate_accepts_completed_residual_lifecycle(monke
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_releases_transient_passive_unhedged_residual_after_flat_terminal(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 3_000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 2_000,
+                "kind": "exit.passive_close_unhedged_residual",
+                "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+            },
+            {
+                "ts_ms": 2_100,
+                "kind": "exit.passive_close_fallback_terminal_flat",
+                "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+            },
+            {
+                "ts_ms": 2_101,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-ont",
+                    "symbol": "ONTUSDT",
+                    "terminal_state": "flat",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ONTUSDT",
+            venues=["binance", "bybit"],
+            now_ms=3_000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["residual_count"] == 1
+        assert gate["gate_passed"] is True
+        assert gate["blocking_reasons"] == []
+        assert gate["recovery_lifecycle"][
+            "transient_passive_close_residual_closed_keys"
+        ] == ["entry-ont"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_keeps_uncompleted_residual_blocking_after_flat_terminal(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "pending_residual_repairs": [],
+            "last_tick_ms": 3_000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 2_000,
+                "kind": "exit.close_residual_detected",
+                "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+            },
+            {
+                "ts_ms": 2_100,
+                "kind": "runtime.position_lifecycle_terminal",
+                "payload": {
+                    "position_id": "entry-ont",
+                    "symbol": "ONTUSDT",
+                    "terminal_state": "flat",
+                },
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            symbol="ONTUSDT",
+            venues=["binance", "bybit"],
+            now_ms=3_000,
+        )
+
+        gate = result["production_acceptance_gate"]
+        assert gate["gate_passed"] is False
+        assert "residual_events_present" in gate["blocking_reasons"]
+        assert gate["recovery_lifecycle"]["unclosed_residual_keys"] == ["entry-ont"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_recovery_lifecycle_does_not_close_transient_residual_from_another_position():
+    from scripts import diagnose_live as dl
+
+    summary = dl._build_recovery_lifecycle_summary([
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_unhedged_residual",
+            "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+        },
+        {
+            "ts_ms": 2_100,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": "entry-other-ont",
+                "symbol": "ONTUSDT",
+                "terminal_state": "flat",
+            },
+        },
+    ])
+
+    assert summary["unclosed_residual_keys"] == ["entry-ont"]
+    assert summary["transient_passive_close_residual_closed_keys"] == []
+
+
+def test_recovery_lifecycle_keeps_true_residual_blocking_beside_transient_marker():
+    from scripts import diagnose_live as dl
+
+    summary = dl._build_recovery_lifecycle_summary([
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.close_residual_detected",
+            "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+        },
+        {
+            "ts_ms": 2_100,
+            "kind": "exit.passive_close_unhedged_residual",
+            "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+        },
+        {
+            "ts_ms": 2_200,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": "entry-ont",
+                "symbol": "ONTUSDT",
+                "terminal_state": "flat",
+            },
+        },
+    ])
+
+    assert summary["unclosed_residual_keys"] == ["entry-ont"]
+    assert summary["transient_passive_close_residual_closed_keys"] == []
+
+
+def test_recovery_lifecycle_ignores_passive_close_reason_text_without_residual_event():
+    from scripts import diagnose_live as dl
+
+    summary = dl._build_recovery_lifecycle_summary([
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_hedge_error",
+            "payload": {
+                "position_id": "entry-ont",
+                "symbol": "ONTUSDT",
+                "reason": "unhedged residual retry will be scheduled",
+            },
+        },
+    ])
+
+    assert summary["residual_keys"] == []
+    assert summary["unclosed_residual_keys"] == []
+
+
+def test_recovery_lifecycle_keeps_passive_close_residual_repair_blocking():
+    from scripts import diagnose_live as dl
+
+    summary = dl._build_recovery_lifecycle_summary([
+        {
+            "ts_ms": 2_000,
+            "kind": "exit.passive_close_residual_detected",
+            "payload": {"position_id": "entry-ont", "symbol": "ONTUSDT"},
+        },
+        {
+            "ts_ms": 3_000,
+            "kind": "runtime.position_lifecycle_terminal",
+            "payload": {
+                "position_id": "entry-ont",
+                "symbol": "ONTUSDT",
+                "terminal_state": "flat",
+            },
+        },
+    ])
+
+    assert summary["unclosed_residual_keys"] == ["entry-ont"]
+
+
 def test_run_diagnose_deduplicates_duplicate_quick_flat_close_events(monkeypatch):
     from scripts import diagnose_live as dl
 

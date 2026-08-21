@@ -22,6 +22,23 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Investigations
 
+CL-117 close-evidence lineage and residual classification, 2026-08-21: a
+read-only production review found two distinct sources of apparent historical
+debt. ONT's `passive_close_unhedged_residual` is a passive retry marker that
+was counted as a residual-repair owner despite a later same-position trusted
+flat terminal. COTI's later live-flat fallback also created a weaker final
+reconciliation with no Binance short identity even though an earlier
+same-position partial retained the exact close identity. Review found that
+copying that identity into a second final owner would itself permit duplicated
+billing. The replacement repair atomically absorbs only a complete, unsettled,
+same-position partial into the final owner and repeats that ownership transfer
+during journal replay; incomplete prior evidence remains fail-closed. Residual
+classification now uses the V1 event taxonomy, including the exact
+`exit.passive_close_residual_detected` repair producer, rather than text in an
+event `reason`. This is **local green, not deployed or closed**; the existing
+COTI debt still requires an audited exchange-evidence import. See
+[daily/2026-08-21.md#cluster-cl-117-close-evidence-lineage-and-residual-classification](daily/2026-08-21.md#cluster-cl-117-close-evidence-lineage-and-residual-classification).
+
 CL-116 background accounting debt deploy gate, 2026-08-21: V1 recovery correctly
 classified a physically flat close-accounting reconciliation as non-blocking,
 but production health counted it as an execution owner and the deploy verifier

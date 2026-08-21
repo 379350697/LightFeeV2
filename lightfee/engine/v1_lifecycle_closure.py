@@ -1097,6 +1097,11 @@ _EVENT_KIND_PHASES = {
     "exit.retry_wait": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.close_chunk_submitted": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.close_residual_detected": V1LifecycleClosurePhase.RESIDUAL_REPAIR.value,
+    # This event is emitted only after passive close creates durable residual
+    # repair work.  It must outrank the broad `exit.passive_close_` prefix.
+    "exit.passive_close_residual_detected": (
+        V1LifecycleClosurePhase.RESIDUAL_REPAIR.value
+    ),
     "exit.closed": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_evidence_unavailable": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,
     "exit.billing_evidence_debt_registered": V1LifecycleClosurePhase.PASSIVE_CLOSE.value,

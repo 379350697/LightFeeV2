@@ -499,6 +499,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert map_lifecycle_event_kind("exit.retry_wait") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.close_chunk_submitted") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("exit.close_residual_detected") == "RESIDUAL_REPAIR"
+    assert (
+        map_lifecycle_event_kind("exit.passive_close_residual_detected")
+        == "RESIDUAL_REPAIR"
+    )
     assert map_lifecycle_event_kind("exit.closed") == "PASSIVE_CLOSE"
     assert map_lifecycle_event_kind("runtime.risk_mode_changed") == "RECOVERY_TRUTH"
     assert map_lifecycle_event_kind("runtime.recovery_fail_closed") == "RECOVERY_TRUTH"

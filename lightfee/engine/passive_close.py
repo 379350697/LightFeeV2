@@ -4975,6 +4975,137 @@ class PassiveCloseExecutor:
         missing_identity_legs = pending_close_reconciliation_missing_legs(
             reconciliation
         )
+
+        absorbed_partial_reconciliations: list[dict[str, int | str]] = []
+        absorbed_partial_tasks: list[dict[str, Any]] = []
+        if missing_identity_legs:
+            # A final live-flat observation may finish the exact close attempt
+            # represented by one still-unsettled partial task.  Its durable
+            # identities must become part of the terminal owner, not a copied
+            # lookup key in a second billing task.  A partial with any missing
+            # evidence remains its own fail-closed owner.
+            def durable_records(
+                records: Any,
+                *,
+                venue: Venue,
+            ) -> list[dict[str, Any]]:
+                retained: list[dict[str, Any]] = []
+                seen: set[tuple[str, str]] = set()
+                for record in records if isinstance(records, list) else []:
+                    if not isinstance(record, dict):
+                        continue
+                    if str(record.get("venue") or "") != venue.value:
+                        continue
+                    order_id = str(record.get("order_id") or "")
+                    client_order_id = str(record.get("client_order_id") or "")
+                    if not order_id and not client_order_id:
+                        continue
+                    if "-recovery-" in order_id.lower():
+                        continue
+                    identity = (order_id, "" if order_id else client_order_id)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    retained.append(dict(record))
+                return retained
+
+            def merge_records(
+                current: list[dict[str, Any]],
+                prior: list[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
+                merged = [dict(record) for record in current]
+                seen = {
+                    (
+                        str(record.get("order_id") or ""),
+                        "" if record.get("order_id") else str(
+                            record.get("client_order_id") or ""
+                        ),
+                    )
+                    for record in merged
+                    if record.get("order_id") or record.get("client_order_id")
+                }
+                for record in prior:
+                    identity = (
+                        str(record.get("order_id") or ""),
+                        "" if record.get("order_id") else str(
+                            record.get("client_order_id") or ""
+                        ),
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    merged.append(dict(record))
+                return merged
+
+            for existing in state.pending_close_reconciliations:
+                if not isinstance(existing, dict):
+                    continue
+                if (
+                    str(existing.get("position_id") or "") != pending.position_id
+                    or str(existing.get("kind") or "final") != "partial"
+                    or existing.get("reconciliation_status") == "evidence_debt"
+                    or pending_close_reconciliation_missing_legs(existing)
+                ):
+                    continue
+                snapshot = existing.get("position_snapshot")
+                if not isinstance(snapshot, dict) or (
+                    str(existing.get("symbol") or snapshot.get("symbol") or "")
+                    != position.symbol
+                    or str(snapshot.get("long_venue") or "")
+                    != position.long_venue.value
+                    or str(snapshot.get("short_venue") or "")
+                    != position.short_venue.value
+                ):
+                    continue
+                try:
+                    existing_closed_at_ms = int(existing.get("closed_at_ms") or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if existing_closed_at_ms > closed_at_ms:
+                    continue
+
+                prior_records = {
+                    "long": durable_records(
+                        existing.get("long_legs"), venue=position.long_venue
+                    ),
+                    "short": durable_records(
+                        existing.get("short_legs"), venue=position.short_venue
+                    ),
+                }
+                # A blank final leg can only be repaired by a complete prior
+                # owner carrying that exact leg.  Do not cover a submitted
+                # identity-less final record or combine unrelated tasks.
+                if any(
+                    reconciliation.get(f"{leg_label}_legs")
+                    or not prior_records[leg_label]
+                    for leg_label in missing_identity_legs
+                ):
+                    continue
+
+                reconciliation["long_legs"] = merge_records(
+                    reconciliation["long_legs"], prior_records["long"]
+                )
+                reconciliation["short_legs"] = merge_records(
+                    reconciliation["short_legs"], prior_records["short"]
+                )
+                absorbed_partial_tasks.append(existing)
+                absorbed_partial_reconciliations.append(
+                    {
+                        "kind": "partial",
+                        "closed_at_ms": existing_closed_at_ms,
+                    }
+                )
+                break
+
+            if absorbed_partial_tasks:
+                reconciliation["absorbed_partial_reconciliations"] = (
+                    absorbed_partial_reconciliations
+                )
+            long_legs = reconciliation["long_legs"]
+            short_legs = reconciliation["short_legs"]
+            missing_identity_legs = pending_close_reconciliation_missing_legs(
+                reconciliation
+            )
         order_key = tuple(
             sorted(
                 str(record.get("order_id") or record.get("client_order_id") or "")
@@ -5028,6 +5159,7 @@ class PassiveCloseExecutor:
             if (
                 existing.get("position_id") == pending.position_id
                 and existing_key == order_key
+                and not absorbed_partial_tasks
                 and not (
                     missing_close_order_identity
                     and existing.get("reconciliation_mode")
@@ -5039,29 +5171,36 @@ class PassiveCloseExecutor:
         # in-memory queue.  If the process exits between these operations,
         # recovery can replay the critical event and rebuild the queue instead
         # of losing the billing obligation.
+        registration_payload = {
+            "position_id": pending.position_id,
+            "symbol": position.symbol,
+            "source": source,
+            "long_leg_count": len(long_legs),
+            "short_leg_count": len(short_legs),
+            "order_ids": order_key,
+            "reconciliation_mode": reconciliation["reconciliation_mode"],
+            "missing_close_order_identity": missing_close_order_identity,
+            "billing_reconciliation_required": True,
+            "missing_identity_legs": list(missing_identity_legs),
+            "identity_evidence": identity_evidence,
+            "live_flat_terminal": True,
+            # The complete record is the journal recovery boundary.  The
+            # scalar fields above remain convenient for diagnostics and
+            # backward-compatible event consumers.
+            "reconciliation": dict(reconciliation),
+        }
+        if absorbed_partial_reconciliations:
+            registration_payload["absorbed_partial_reconciliations"] = (
+                absorbed_partial_reconciliations
+            )
         self._journal.append_critical(
             closed_at_ms,
             "exit.pending_close_reconciliation_registered",
-            {
-                "position_id": pending.position_id,
-                "symbol": position.symbol,
-                "source": source,
-                "long_leg_count": len(long_legs),
-                "short_leg_count": len(short_legs),
-                "order_ids": order_key,
-                "reconciliation_mode": reconciliation["reconciliation_mode"],
-                "missing_close_order_identity": missing_close_order_identity,
-                "billing_reconciliation_required": True,
-                "missing_identity_legs": list(missing_identity_legs),
-                "identity_evidence": identity_evidence,
-                "live_flat_terminal": True,
-                # The complete record is the journal recovery boundary.  The
-                # scalar fields above remain convenient for diagnostics and
-                # backward-compatible event consumers.
-                "reconciliation": dict(reconciliation),
-            },
+            registration_payload,
         )
         state.enqueue_pending_close_reconciliation(reconciliation)
+        for partial in absorbed_partial_tasks:
+            state.remove_pending_close_reconciliation(partial)
         return True
 
     def _register_accepted_order_truth_gap(
