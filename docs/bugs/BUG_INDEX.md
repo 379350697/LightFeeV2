@@ -35,8 +35,11 @@ same-position partial into the final owner and repeats that ownership transfer
 during journal replay; incomplete prior evidence remains fail-closed. Residual
 classification now uses the V1 event taxonomy, including the exact
 `exit.passive_close_residual_detected` repair producer, rather than text in an
-event `reason`. This is **local green, not deployed or closed**; the existing
-COTI debt still requires an audited exchange-evidence import. See
+event `reason`. Commit `9e7c982` is deployed and its post-deploy manifest,
+service verifier, and diagnostic acceptance gate are green; CL-117 is
+**deployed-awaiting-verification**, not closed, until a real complete
+partial-to-final handoff is observed. The existing COTI debt still requires an
+audited exchange-evidence import. See
 [daily/2026-08-21.md#cluster-cl-117-close-evidence-lineage-and-residual-classification](daily/2026-08-21.md#cluster-cl-117-close-evidence-lineage-and-residual-classification).
 
 CL-116 background accounting debt deploy gate, 2026-08-21: V1 recovery correctly
