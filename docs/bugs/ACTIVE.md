@@ -6,7 +6,7 @@ their historical status text must not be used to decide whether a fix is
 deployed or closed.
 
 Scope: current operational status begins with the post-regression batch
-`CL-093` through `CL-123`. The explicit pre-CL-093 historical boundary below
+`CL-093` through `CL-124`. The explicit pre-CL-093 historical boundary below
 prevents older nonterminal prose from being mistaken for current work. New
 production/parity bugs must be added here when they are discovered.
 
@@ -34,24 +34,19 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `0474ca288843a403c9c2812cded7657cd266bb33`
-- Checked on: `2026-08-22` after the final CL-119 deployment: remote
-  compileall/manifest and singleton checks passed; one live and one sidecar
-  were active with zero restarts; exchange truth was flat/no-order.  Ordinary
-  health correctly retained the background-debt warning (`ok=false`) while
-  explicit deployment admission returned `deployment_acceptable=true`.
-  all passed.  Explicit deployment admission returned
-  `deployment_acceptable=true`; ordinary health correctly retained only the
-  background close-accounting warning.  High-confidence exchange truth across
-  all seven venues was flat with no open orders or mismatches.  Both COTI/ONG
-  debt rows remained visible but now reported `blocking=false` and
-  `allow_new_risk_background_work`; the closure summary had zero blocking
-  rows.  Since-deploy scans had no recovery-ledger or final-dispatch blocker;
-  no candidate passed strategy edge thresholds, so no real order was expected
-  in that short window.  Historical billing evidence remains unsettled.
-  CL-122 is also closed by the earlier natural ONG selected-but-not-dispatched
-  sample, which preserved the exact RecoveryLedger blocker in both dispatch
-  and final-gate counters.  CL-121 still needs a natural targeted-OI scenario.
+- Last production SHA checked: `67e5c66b4721bba21c6c05cd05e7e78ec0c6d4d8`
+- Checked on: `2026-08-22` after the CL-123/CL-124 closure deployments. Remote
+  compileall and the 427-file manifest passed all 14 critical hashes; singleton
+  reported exactly one live and one sidecar process, both active with zero
+  restarts. Deployment health was fully green (`ok=true`, zero warnings), and
+  high-confidence truth across all seven venues reported zero positions, zero
+  open orders, and no missing evidence or mismatch. COTI and ONG each emitted
+  exactly one `exit.reconciled` from `automatic_historical_close_evidence` with
+  complete exact order/fill/fee evidence; the persisted close-owner,
+  reconciliation, and evidence-debt counts are now zero. A subsequent restart
+  emitted no duplicate reconciliation. The final natural Local-L2/startup
+  sample reported `unmapped_event_kinds=[]`, no diagnostic blockers, and
+  `RUNNING_CLEAN`. CL-121 still needs a natural targeted-OI 429 sample.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -93,7 +88,8 @@ do not rewrite the daily evidence just to change status.
 | CL-120 | closed | `2377193c` | default production health retained one warning and `ok=false`; explicit deployment admission independently returned `deployment_acceptable=true`; prior full suite/profile green | Required production split observed with no hidden extra warning. Accounting evidence debt is not settled by this closure. | [2026-08-22](daily/2026-08-22.md#cluster-cl-120-background-debt-health-and-deploy-admission-split) |
 | CL-121 | deployed-awaiting-verification | `2377193c` | direct per-symbol OI request, snapshot mark-price reuse, shared typed 429/retry-after classifier, stale-counter reset, runtime fail-closed regression; prior full suite/profile green | Needs a natural production targeted-OI success or 429 sample showing exact causality; no forced request/order is required. | [2026-08-22](daily/2026-08-22.md#cluster-cl-121-targeted-oi-refresh-rate-limit-causality) |
 | CL-122 | closed | `2377193c` | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; full suite/profile green | Production run `lightfee-1787395032184-4057959` naturally selected ONG, dispatched zero, and emitted `entry_dispatch_blocked_counts={recovery_ledger_blocked:1}`, the same final-gate count, and `candidate_stage_blocked_counts.entry_dispatch=1`; later CL-119 closure removed the false blocker without changing diagnostics. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |
-| CL-123 | local-green | `194861c` | real `CloseRuntime` → Binance/Bybit history → exact order/execution → billing regressions cover COTI/ONG, stale CID fallback, Hedge/One-way semantics, pagination, ambiguity, incomplete fees, mismatched/unrelated execution identity, and live-truth blockers (dedicated `11 passed`; related selection `191 passed, 338 deselected`); complete suite `4411 passed, 9 skipped`; full profile 10/10 with `1571` tests | Not deployed. Next condition: deploy, then observe both historical owners either settle with the exact recorded IDs/fees or remain with a specific fail-closed classification; verify all venues remain flat/no-order. | [2026-08-22](daily/2026-08-22.md#cluster-cl-123-automatic-historical-close-evidence-exact-recheck) |
+| CL-123 | closed | `194861c` | real `CloseRuntime` → Binance/Bybit history → exact order/execution → billing regressions cover COTI/ONG, stale CID fallback, Hedge/One-way semantics, pagination, ambiguity, incomplete fees, mismatched/unrelated execution identity, and live-truth blockers (dedicated `11 passed`; related selection `191 passed, 338 deselected`); complete suite `4411 passed, 9 skipped`; full profile 10/10 with `1571` tests | Deployed in `62474b39` and retained in `67e5c66b`. COTI reconciled Binance order `7918051356`, fee `0.01213439`; ONG reconciled Binance `2926675711`, fee `0.00473472`, and Bybit `9cec8c96-dc21-4c31-baf9-ec43f6184195`, fee `0.0144743`. Both events have `venue_statement_reconciled=true`, `evidence_gap=false`; owners/debts are zero and all seven venues remain flat/no-order. | [2026-08-22](daily/2026-08-22.md#cluster-cl-123-automatic-historical-close-evidence-exact-recheck) |
+| CL-124 | closed | `67e5c66b` | production-shaped `diagnose_live` RED/GREEN covers account-fee success/unavailable, exact Local-L2 phase start/complete, and the shared `runtime.local_l2_*` / `runtime.entry_local_l2_*` diagnostic families; lifecycle/diagnose suite `135 passed`; complete suite `4412 passed, 9 skipped` | Initial exact-only attempt `ebecc081` left nine natural Local-L2 kinds unmapped and was not accepted as closed. `67e5c66b` is deployed: the same natural startup/Local-L2 family now yields `unmapped_event_kinds=[]`; health/gate are green, services have zero restarts, and seven-venue truth is flat/no-order. | [2026-08-22](daily/2026-08-22.md#cluster-cl-124-startup-local-l2-lifecycle-diagnostic-mapping) |
 
 ## Pre-CL-093 Historical Boundary
 
