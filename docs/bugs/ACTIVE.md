@@ -49,7 +49,9 @@ production-evidence cell.
   rows.  Since-deploy scans had no recovery-ledger or final-dispatch blocker;
   no candidate passed strategy edge thresholds, so no real order was expected
   in that short window.  Historical billing evidence remains unsettled.
-  CL-121/122 still need natural scenario evidence.
+  CL-122 is also closed by the earlier natural ONG selected-but-not-dispatched
+  sample, which preserved the exact RecoveryLedger blocker in both dispatch
+  and final-gate counters.  CL-121 still needs a natural targeted-OI scenario.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -90,7 +92,7 @@ do not rewrite the daily evidence just to change status.
 | CL-119 | closed | `0474ca28` | three production REDs drove the diagnostics/runtime schema, startup owner-symbol reachability, and production-adapter order-contract counterexamples; persisted `runtime.start()` exercises official Bybit/Binance private order endpoints through the shared operation contract/parser; metadata-only adapters remain unsupported; focused `2 passed`; adjacent recovery/startup/closure `343 passed`; complete `4398 passed, 9 skipped`; full profile 10/10, `1571 passed` | `0474ca28` manifest/singleton/services passed; all seven venues high-confidence flat/no-order; COTI/ONG rows visible with `blocking=false`, `allow_new_risk_background_work`, and closure `blocking_row_count=0`; post-deploy scans show no recovery-ledger/final-dispatch blocker. Historical accounting debts remain separately unsettled. | [2026-08-22](daily/2026-08-22.md#cluster-cl-119-terminal-close-debt-entry-gate-semantics) |
 | CL-120 | closed | `2377193c` | default production health retained one warning and `ok=false`; explicit deployment admission independently returned `deployment_acceptable=true`; prior full suite/profile green | Required production split observed with no hidden extra warning. Accounting evidence debt is not settled by this closure. | [2026-08-22](daily/2026-08-22.md#cluster-cl-120-background-debt-health-and-deploy-admission-split) |
 | CL-121 | deployed-awaiting-verification | `2377193c` | direct per-symbol OI request, snapshot mark-price reuse, shared typed 429/retry-after classifier, stale-counter reset, runtime fail-closed regression; prior full suite/profile green | Needs a natural production targeted-OI success or 429 sample showing exact causality; no forced request/order is required. | [2026-08-22](daily/2026-08-22.md#cluster-cl-121-targeted-oi-refresh-rate-limit-causality) |
-| CL-122 | deployed-awaiting-verification | `2377193c` | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; prior full suite/profile green | Needs a future selected-candidate zero-dispatch scan to expose the final dispatch blocker breakdown without changing admission. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |
+| CL-122 | closed | `2377193c` | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; full suite/profile green | Production run `lightfee-1787395032184-4057959` naturally selected ONG, dispatched zero, and emitted `entry_dispatch_blocked_counts={recovery_ledger_blocked:1}`, the same final-gate count, and `candidate_stage_blocked_counts.entry_dispatch=1`; later CL-119 closure removed the false blocker without changing diagnostics. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |
 
 ## Pre-CL-093 Historical Boundary
 
