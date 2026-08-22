@@ -1021,6 +1021,59 @@ def test_run_diagnose_acceptance_gate_classifies_nonblocking_health_and_containe
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_maps_normal_production_startup_events(monkeypatch):
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_residual_repair_count": 0,
+            "last_tick_ms": 1787421700000,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [
+            {
+                "ts_ms": 1787421699000,
+                "kind": "runtime.account_fee_snapshot_refreshed",
+                "payload": {"venue_count": 7},
+            },
+            {
+                "ts_ms": 1787421699050,
+                "kind": "runtime.account_fee_snapshot_refresh_unavailable",
+                "payload": {"venue": "example", "fallback_source": "configured"},
+            },
+            {
+                "ts_ms": 1787421699100,
+                "kind": "runtime.local_l2_phase_start",
+                "payload": {"symbol_count": 12},
+            },
+            {
+                "ts_ms": 1787421699200,
+                "kind": "runtime.local_l2_phase_complete",
+                "payload": {"symbol_count": 12},
+            },
+        ])
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1787421705000,
+        )
+
+        closure = result["production_acceptance_gate"]["v1_lifecycle_closure"]
+        assert closure["unmapped_event_kinds"] == []
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_acceptance_gate_accepts_passive_close_resolved_lifecycle_when_flat():
     from scripts import diagnose_live as dl
 

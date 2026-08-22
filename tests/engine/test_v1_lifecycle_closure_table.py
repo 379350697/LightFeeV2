@@ -376,6 +376,10 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.order_quote_stale_health_summary",
         "runtime.private_ws_started",
         "runtime.private_ws_stopped",
+        "runtime.account_fee_snapshot_refreshed",
+        "runtime.account_fee_snapshot_refresh_unavailable",
+        "runtime.local_l2_phase_start",
+        "runtime.local_l2_phase_complete",
         "runtime.reconciling",
         "runtime.recovery_block_reconcile_attempt",
         "runtime.recovery_fail_closed",
@@ -531,6 +535,19 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     )
     assert map_lifecycle_event_kind("risk.warning_triggered") == "OPEN_POSITION"
     assert map_lifecycle_event_kind("risk.warning_cleared") == "OPEN_POSITION"
+    assert (
+        map_lifecycle_event_kind("runtime.account_fee_snapshot_refreshed")
+        == "RUNTIME_PROGRESS"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.account_fee_snapshot_refresh_unavailable")
+        == "RUNTIME_PROGRESS"
+    )
+    assert map_lifecycle_event_kind("runtime.local_l2_phase_start") == "RUNTIME_PROGRESS"
+    assert (
+        map_lifecycle_event_kind("runtime.local_l2_phase_complete")
+        == "RUNTIME_PROGRESS"
+    )
 
 
 def test_exported_positions_alias_prevents_diagnose_orphan_drift():

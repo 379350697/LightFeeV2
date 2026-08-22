@@ -1048,6 +1048,14 @@ _EVENT_KIND_PHASES = {
     "runtime.shutdown_stage": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.private_ws_started": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.private_ws_stopped": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.account_fee_snapshot_refreshed": (
+        V1LifecycleClosurePhase.RUNTIME_PROGRESS.value
+    ),
+    "runtime.account_fee_snapshot_refresh_unavailable": (
+        V1LifecycleClosurePhase.RUNTIME_PROGRESS.value
+    ),
+    "runtime.local_l2_phase_start": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
+    "runtime.local_l2_phase_complete": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.live_scan_revalidate_required": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.live_scan_recovery_warmup": V1LifecycleClosurePhase.RUNTIME_PROGRESS.value,
     "runtime.order_quote_stale_health_summary": V1LifecycleClosurePhase.ENTRY_QUOTE_LEASE.value,
