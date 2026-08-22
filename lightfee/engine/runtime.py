@@ -73,7 +73,10 @@ from lightfee.engine.recovery_decision_core import (
     STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON,
     V1RecoveryDecisionCore,
 )
-from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.engine.recovery_ledger import (
+    RecoveryLedger,
+    recovery_work_item_blocks_candidate,
+)
 from lightfee.engine.recovery_startup_runtime import RecoveryStartupRuntime
 from lightfee.engine.market_data_runtime import MarketDataRuntime
 from lightfee.engine.passive_maker_runtime import PassiveMakerRuntime
@@ -325,6 +328,9 @@ class LiveRuntime:
         self._recovery_dedup_index: dict[str, str] = {}
         self.recovery_ledger: RecoveryLedger | None = None
         self._last_recovery_exchange_truth: dict[str, Any] | None = None
+        self._recovery_ledger_owner_semantics_fingerprint: (
+            tuple[Any, ...] | None
+        ) = None
         self._startup_pending_entry_terminal_symbols: set[str] | None = None
 
         # V1 entry gate cooldown state
@@ -1096,6 +1102,10 @@ class LiveRuntime:
         entry_policy = str(row.get("entry_policy") or "")
         if entry_policy == "block_all_new_risk":
             return True
+        if details.get("kind"):
+            work_item = dict(details)
+            work_item["blocking"] = True
+            return recovery_work_item_blocks_candidate(work_item, candidate)
         candidate_symbol = str(getattr(candidate, "symbol", "") or "").upper()
         row_symbol = str(details.get("symbol") or "").upper()
         if candidate_symbol and row_symbol and candidate_symbol != row_symbol:
@@ -4374,10 +4384,15 @@ class LiveRuntime:
                     ),
                 )
                 self.state.last_scan["selected_candidate_count"] = len(finalists)
+                dispatch_blocker_counts: Counter[str] = Counter()
                 dispatched = await self._dispatch_selected_entry_candidates(
                     finalists,
                     now_ms=selection_now_ms,
                     price_hints=price_hints,
+                    dispatch_blocker_counts=dispatch_blocker_counts,
+                )
+                self.state.last_scan["entry_dispatch_blocked_counts"] = dict(
+                    sorted(dispatch_blocker_counts.items())
                 )
                 self.state.last_scan.update(self._entry_capacity_snapshot())
                 self.state.last_scan["dispatched_candidate_count"] = dispatched
@@ -4399,6 +4414,7 @@ class LiveRuntime:
                         self._v1_tradeable_no_entry_reason(
                             selection_blocker_counts,
                             admission_blocker_counts,
+                            dispatch_blocker_counts,
                         )
                         or "no_entry_dispatched"
                     )
@@ -4413,6 +4429,7 @@ class LiveRuntime:
                         candidate_blockers=candidate_blockers,
                         now_ms=selection_now_ms,
                         admission_blocker_counts=admission_blocker_counts,
+                        dispatch_blocker_counts=dispatch_blocker_counts,
                     )
             elif can_enter_new_positions(self.state) and self.entry_executor is not None:
                 self._emit_scan_no_entry_diagnostics(
@@ -5010,7 +5027,6 @@ class LiveRuntime:
 
         gates = [
             ("reduce_only", self._gate_reduce_only, ()),
-            ("pending_close_reconciliation", self._gate_pending_close_reconciliation, ()),
             ("passive_close_in_flight", self._gate_passive_close_pending, ()),
             ("recovery_ledger", self._gate_recovery_ledger, ()),
             ("entry_sizing", self._gate_entry_sizing, ()),
@@ -6769,34 +6785,77 @@ class LiveRuntime:
         )
 
     async def _process_pending_close_reconciliations(self, now_ms: int) -> None:
-        previous_owner_counts = self._pending_close_recovery_owner_counts()
-        await self.close_runtime._process_pending_close_reconciliations(now_ms)
-        self._refresh_recovery_ledger_after_pending_close_owner_change(
-            previous_owner_counts=previous_owner_counts,
-            now_ms=now_ms,
-        )
+        try:
+            await self.close_runtime._process_pending_close_reconciliations(now_ms)
+        finally:
+            self._refresh_recovery_ledger_after_local_owner_change(
+                now_ms=now_ms,
+                reason="pending_close_owner_semantics_changed",
+            )
 
-    def _pending_close_recovery_owner_counts(self) -> tuple[int, int]:
-        """Return the close owners represented by the recovery ledger."""
-        return (
-            len(
-                normalize_pending_close_reconciliations(
-                    self.state.pending_close_reconciliations
+    def _pending_close_recovery_owner_fingerprint(self) -> tuple[Any, ...]:
+        """Return the close-owner semantics represented by the cached ledger."""
+
+        def text(value: Any) -> str:
+            if hasattr(value, "value"):
+                value = value.value
+            return str(value or "").lower()
+
+        reconciliations: list[tuple[str, ...]] = []
+        for item in normalize_pending_close_reconciliations(
+            self.state.pending_close_reconciliations
+        ):
+            snapshot = item.get("position_snapshot")
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            reconciliations.append(
+                (
+                    text(item.get("position_id") or item.get("close_id")),
+                    text(item.get("symbol") or snapshot.get("symbol")),
+                    text(item.get("venue")),
+                    text(item.get("long_venue") or snapshot.get("long_venue")),
+                    text(item.get("short_venue") or snapshot.get("short_venue")),
+                    text(item.get("reconciliation_status")),
+                    text(item.get("evidence_debt_reason")),
                 )
-            ),
-            len(self.state.pending_passive_closes),
+            )
+
+        passive_closes: list[tuple[str, ...]] = []
+        for owner_id, item in sorted(
+            self.state.pending_passive_closes.items(),
+            key=lambda row: str(row[0]),
+        ):
+            snapshot = getattr(item, "position_snapshot", None)
+            passive_closes.append(
+                (
+                    text(owner_id),
+                    text(getattr(item, "position_id", "")),
+                    text(getattr(snapshot, "symbol", "")),
+                    text(getattr(snapshot, "long_venue", "")),
+                    text(getattr(snapshot, "short_venue", "")),
+                )
+            )
+        return tuple(reconciliations), tuple(passive_closes)
+
+    def _recovery_owner_semantics_fingerprint(self) -> tuple[Any, ...]:
+        """Return mutable close/residual semantics represented by the ledger."""
+        return (
+            self._pending_close_recovery_owner_fingerprint(),
+            self._pending_residual_recovery_owner_fingerprint(),
         )
 
-    def _refresh_recovery_ledger_after_pending_close_owner_change(
+    def _refresh_recovery_ledger_after_local_owner_change(
         self,
         *,
-        previous_owner_counts: tuple[int, int],
         now_ms: int,
+        reason: str,
     ) -> None:
-        """Rebuild cached recovery work after a close owner is added or removed."""
+        """Rebuild when local owners differ from the ledger-build snapshot."""
+        if getattr(self, "recovery_ledger", None) is None:
+            return
         if (
-            getattr(self, "recovery_ledger", None) is None
-            or self._pending_close_recovery_owner_counts() == previous_owner_counts
+            self._recovery_owner_semantics_fingerprint()
+            == self._recovery_ledger_owner_semantics_fingerprint
         ):
             return
         exchange_truth = self._last_recovery_exchange_truth
@@ -6805,7 +6864,7 @@ class LiveRuntime:
         self._refresh_recovery_ledger_from_exchange_truth(
             exchange_truth,
             now_ms=now_ms,
-            lifecycle_clear_reason="pending_close_owner_changed",
+            lifecycle_clear_reason=reason,
         )
 
     async def _reconcile_pending_state(self, *args, **kwargs):
@@ -9724,6 +9783,10 @@ class LiveRuntime:
         if evidence:
             payload.update(evidence)
         self.journal.append("execution.residual_repair_queued", payload)
+        self._refresh_recovery_ledger_after_local_owner_change(
+            now_ms=wall_clock_now_ms(),
+            reason="pending_residual_owner_semantics_changed",
+        )
 
     def _finalize_startup_recovery(self) -> None:
         """Transition lifecycle after startup recovery per V1 semantics.
@@ -9883,7 +9946,50 @@ class LiveRuntime:
                     pass
 
     async def _recover_residual_repairs(self, now_ms: int) -> None:
-        return await self.residual_repair_runtime.recover_residual_repairs(now_ms)
+        try:
+            await self.residual_repair_runtime.recover_residual_repairs(now_ms)
+        finally:
+            self._refresh_recovery_ledger_after_local_owner_change(
+                now_ms=now_ms,
+                reason="pending_residual_owner_semantics_changed",
+            )
+
+    def _pending_residual_recovery_owner_fingerprint(self) -> tuple[Any, ...]:
+        """Return the residual-owner semantics represented by the cached ledger."""
+
+        def text(value: Any) -> str:
+            if hasattr(value, "value"):
+                value = value.value
+            return str(value or "").lower()
+
+        def field(item: Any, key: str) -> Any:
+            if isinstance(item, dict):
+                return item.get(key)
+            return getattr(item, key, None)
+
+        fingerprint: list[tuple[str, ...]] = []
+        for item in self._recovery_state_collection("pending_residual_repairs"):
+            fingerprint.append(
+                (
+                    text(field(item, "position_id")),
+                    text(field(item, "pair_id")),
+                    text(field(item, "symbol")),
+                    text(field(item, "origin")),
+                    text(
+                        field(item, "repair_venue")
+                        or field(item, "exposure_venue")
+                    ),
+                    text(
+                        field(item, "repair_side")
+                        or field(item, "exposure_side")
+                    ),
+                    text(
+                        field(item, "repair_quantity")
+                        or field(item, "quantity")
+                    ),
+                )
+            )
+        return tuple(fingerprint)
 
     @staticmethod
     def _residual_repair_client_order_id(
@@ -10269,9 +10375,6 @@ class LiveRuntime:
     # ------------------------------------------------------------------
     # Entry guards (V1: apply_runtime_entry_guards)
     # ------------------------------------------------------------------
-
-    def _gate_pending_close_reconciliation(self, *args, **kwargs):
-        return self.entry_gate_runtime._gate_pending_close_reconciliation(*args, **kwargs)
 
     def _gate_passive_close_pending(self, *args, **kwargs):
         return self.entry_gate_runtime._gate_passive_close_pending(*args, **kwargs)
@@ -10905,6 +11008,7 @@ class LiveRuntime:
     def _v1_tradeable_no_entry_reason(
         selection_blocker_counts: Counter,
         admission_blocker_counts: Counter | None = None,
+        dispatch_blocker_counts: Counter | None = None,
     ) -> str | None:
         blocker_counts: Counter[str] = Counter()
         for key, value in selection_blocker_counts.items():
@@ -10913,6 +11017,11 @@ class LiveRuntime:
                 blocker_counts[str(key)] += count
         if admission_blocker_counts is not None:
             for key, value in admission_blocker_counts.items():
+                count = int(value)
+                if count > 0:
+                    blocker_counts[str(key)] += count
+        if dispatch_blocker_counts is not None:
+            for key, value in dispatch_blocker_counts.items():
                 count = int(value)
                 if count > 0:
                     blocker_counts[str(key)] += count
@@ -10945,7 +11054,7 @@ class LiveRuntime:
         if admission_blockers and blockers <= admission_blockers:
             return "tradeable_candidates_blocked_by_entry_admission"
         lifecycle_blockers = LiveRuntime._V1_ENTRY_LIFECYCLE_SELECTION_BLOCKERS
-        if "entry_blocked_recovery_ledger" in blockers:
+        if blockers & {"entry_blocked_recovery_ledger", "recovery_ledger_blocked"}:
             return "tradeable_candidates_blocked_by_recovery_ledger"
         if blockers & lifecycle_blockers:
             return "tradeable_candidates_blocked_by_lifecycle"
@@ -11003,6 +11112,7 @@ class LiveRuntime:
         candidate_blockers: dict[str, str],
         now_ms: int,
         admission_blocker_counts: Counter | None = None,
+        dispatch_blocker_counts: Counter | None = None,
     ) -> None:
         return self.entry_gate_runtime._emit_scan_no_entry_diagnostics(
             reason=reason,
@@ -11015,6 +11125,7 @@ class LiveRuntime:
             candidate_blockers=candidate_blockers,
             now_ms=now_ms,
             admission_blocker_counts=admission_blocker_counts,
+            dispatch_blocker_counts=dispatch_blocker_counts,
         )
 
     def _emit_entry_opportunity_funnel(
@@ -11221,6 +11332,7 @@ class LiveRuntime:
         *,
         now_ms: int,
         price_hints: dict[str, float],
+        dispatch_blocker_counts: Counter | None = None,
     ) -> int:
         """Dispatch the V1 selection buffer without exceeding capacity."""
         dispatched = 0
@@ -11231,7 +11343,15 @@ class LiveRuntime:
             if int(self._entry_capacity_snapshot()["remaining_slots"]) <= 0:
                 break
             mid_price = float(price_hints.get(str(getattr(candidate, "symbol", "")).upper(), 0.0) or 0.0)
-            if await self._dispatch_entry(candidate, now_ms, price_hint=mid_price):
+            dispatch_kwargs = {}
+            if dispatch_blocker_counts is not None:
+                dispatch_kwargs["dispatch_blocker_counts"] = dispatch_blocker_counts
+            if await self._dispatch_entry(
+                candidate,
+                now_ms,
+                price_hint=mid_price,
+                **dispatch_kwargs,
+            ):
                 dispatched += 1
         return dispatched
 
@@ -11759,11 +11879,14 @@ class LiveRuntime:
         candidate,
         now_ms: int,
         price_hint: float = 0.0,
+        *,
+        dispatch_blocker_counts: Counter | None = None,
     ) -> bool:
         return await self.entry_dispatch_runtime._dispatch_entry(
             candidate,
             now_ms,
             price_hint=price_hint,
+            dispatch_blocker_counts=dispatch_blocker_counts,
         )
 
     # ------------------------------------------------------------------
@@ -11856,15 +11979,9 @@ class LiveRuntime:
             return
 
         self._arm_overdue_passive_close_fallbacks(now_ms)
-        previous_owner_counts = self._pending_close_recovery_owner_counts()
-
         try:
             await self.passive_close_executor.process_pending_passive_closes(
                 self.state, now_ms,
-            )
-            self._refresh_recovery_ledger_after_pending_close_owner_change(
-                previous_owner_counts=previous_owner_counts,
-                now_ms=now_ms,
             )
             if (
                 not self.state.pending_passive_closes
@@ -11915,13 +12032,24 @@ class LiveRuntime:
                 "runtime.passive_close_tick_error",
                 {"error": str(e), "ts_ms": now_ms},
             )
+        finally:
+            self._refresh_recovery_ledger_after_local_owner_change(
+                now_ms=now_ms,
+                reason="passive_close_owner_semantics_changed",
+            )
 
     # ------------------------------------------------------------------
     # Normal exit lane (V1: standard_close_reason → passive/aggressive)
     # ------------------------------------------------------------------
 
     async def _maybe_process_normal_exits(self, now_ms: int) -> None:
-        return await self.close_runtime._maybe_process_normal_exits(now_ms)
+        try:
+            return await self.close_runtime._maybe_process_normal_exits(now_ms)
+        finally:
+            self._refresh_recovery_ledger_after_local_owner_change(
+                now_ms=now_ms,
+                reason="normal_exit_owner_semantics_changed",
+            )
 
     def _resolve_local_l2_mid(self, venue, symbol: str, now_ms: int | None = None) -> float:
         return self.close_runtime._resolve_local_l2_mid(venue, symbol, now_ms=now_ms)

@@ -23,6 +23,7 @@ from lightfee.ops.production_health import (
     analyze_resolver_config,
     analyze_sidecar_snapshot,
     analyze_systemd_unit,
+    deployment_acceptance_ok,
     summarize_reports,
 )
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
@@ -172,6 +173,14 @@ def main() -> None:
         ),
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--deployment-acceptance",
+        action="store_true",
+        help=(
+            "Exit successfully only for a fully green report or the exact "
+            "high-confidence-flat background close-accounting warning."
+        ),
+    )
     args = parser.parse_args()
 
     now_ms = args.now_ms or int(time.time() * 1000)
@@ -238,14 +247,20 @@ def main() -> None:
 
     summary = summarize_reports(reports)
     payload = asdict(summary)
+    deployment_acceptable = deployment_acceptance_ok(summary)
+    payload["deployment_acceptable"] = deployment_acceptable
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(f"ok={summary.ok} critical={summary.critical_count} warning={summary.warning_count}")
+        print(
+            f"ok={summary.ok} deployment_acceptable={deployment_acceptable} "
+            f"critical={summary.critical_count} warning={summary.warning_count}"
+        )
         for report in summary.reports:
             status = "PASS" if report.ok else report.severity.upper()
             print(f"{status} {report.name}: {','.join(report.fingerprints) or 'ok'}")
-    sys.exit(0 if summary.ok else 1)
+    accepted = deployment_acceptable if args.deployment_acceptance else summary.ok
+    sys.exit(0 if accepted else 1)
 
 
 if __name__ == "__main__":

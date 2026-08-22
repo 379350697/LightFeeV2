@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
@@ -337,7 +339,15 @@ def test_close_reconciliation_is_visible_background_work_without_global_entry_bl
                 }
             ]
         },
-        exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
+        exchange_truth={
+            "truth_available": True,
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": [],
+            "open_orders": [],
+        },
     )
 
     assert [item.kind for item in ledger.work_items] == [
@@ -350,6 +360,99 @@ def test_close_reconciliation_is_visible_background_work_without_global_entry_bl
     assert item.decision.outcome == "background_accounting_reconciliation"
     assert item.blocking is False
     assert ledger.allows_new_entry(SimpleNamespace(symbol="HOMEUSDT")) is True
+
+
+@pytest.mark.parametrize(
+    ("reconciliation", "exchange_truth"),
+    [
+        (
+            {
+                "position_id": "pos-active",
+                "symbol": "HOMEUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+                "reconciliation_status": "pending",
+            },
+            {
+                "truth_available": True,
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "positions": [],
+                "open_orders": [],
+            },
+        ),
+        (
+            {
+                "position_id": "pos-unknown",
+                "symbol": "HOMEUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+            },
+            {
+                "truth_available": True,
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "positions": [],
+                "open_orders": [],
+            },
+        ),
+        (
+            {
+                "position_id": "pos-debt-no-truth",
+                "symbol": "HOMEUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+                "reconciliation_status": "evidence_debt",
+            },
+            {
+                "truth_available": False,
+                "available": False,
+                "confidence": "low",
+                "positions": [],
+                "open_orders": [],
+            },
+        ),
+    ],
+)
+def test_close_reconciliation_only_releases_entry_for_terminal_debt_with_flat_truth(
+    reconciliation,
+    exchange_truth,
+):
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={"pending_close_reconciliations": [reconciliation]},
+        exchange_truth=exchange_truth,
+    )
+
+    item = next(
+        item for item in ledger.work_items
+        if item.kind == "pending_close_reconciliation"
+    )
+    assert item.blocking is True
+    assert ledger.allows_new_entry(
+        SimpleNamespace(
+            symbol="HOMEUSDT",
+            long_venue="okx",
+            short_venue="bybit",
+        )
+    ) is False
+    assert ledger.allows_new_entry(
+        SimpleNamespace(
+            symbol="BTCUSDT",
+            long_venue="binance",
+            short_venue="aster",
+        )
+    ) is True
+    assert ledger.allows_new_entry(
+        SimpleNamespace(
+            symbol="HOMEUSDT",
+            long_venue="binance",
+            short_venue="okx",
+        )
+    ) is True
 
 
 def test_live_artifact_overrides_background_close_reconciliation():
@@ -402,7 +505,7 @@ def test_live_artifact_overrides_background_close_reconciliation():
     assert decision.block_reason == "unpaired_live_position"
 
 
-def test_compact_close_reconciliation_count_keeps_distinct_background_owners():
+def test_compact_close_reconciliation_count_keeps_distinct_blocking_unknown_owners():
     ledger = RecoveryLedger.from_local_and_exchange_truth(
         local={"pending_close_reconciliation_count": 2},
         exchange_truth={"truth_available": True, "positions": [], "open_orders": []},
@@ -417,7 +520,7 @@ def test_compact_close_reconciliation_count_keeps_distinct_background_owners():
         "compact-0",
         "compact-1",
     ]
-    assert all(item.blocking is False for item in items)
+    assert all(item.blocking is True for item in items)
 
 
 def test_local_work_unavailable_truth_remains_blocking():

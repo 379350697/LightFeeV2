@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections import Counter
 from typing import Any
 
 from lightfee.core.domain import OrderRequest, Side, TimeInForce, Venue
@@ -77,9 +78,6 @@ class EntryDispatchRuntime:
 
     def _gate_reduce_only(self, *args: Any, **kwargs: Any):
         return self.ctx._gate_reduce_only(*args, **kwargs)
-
-    def _gate_pending_close_reconciliation(self, *args: Any, **kwargs: Any):
-        return self.ctx._gate_pending_close_reconciliation(*args, **kwargs)
 
     def _gate_passive_close_pending(self, *args: Any, **kwargs: Any):
         return self.ctx._gate_passive_close_pending(*args, **kwargs)
@@ -896,7 +894,17 @@ class EntryDispatchRuntime:
             "ts_ms": now_ms,
         }
 
-    def _entry_initial_gate_blocked(self, candidate, now_ms: int) -> bool:
+    def _entry_initial_gate_blocked(
+        self,
+        candidate,
+        now_ms: int,
+        *,
+        blocker_counts: Counter | None = None,
+    ) -> bool:
+        def record_blocker(reason: str) -> None:
+            if blocker_counts is not None:
+                blocker_counts[str(reason or "entry_dispatch_blocked")] += 1
+
         admission_block = self._candidate_admission_block(candidate, now_ms)
         if admission_block:
             pair_id = self._candidate_pair_id(candidate)
@@ -915,6 +923,7 @@ class EntryDispatchRuntime:
                 "runtime.entry_admission_blocked",
                 payload,
             )
+            record_blocker(str(payload.get("reason") or "entry_admission_blocked"))
             return True
 
         if not self._candidate_is_tradeable_for_selection(candidate):
@@ -928,6 +937,7 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            record_blocker("candidate_not_tradeable_for_selection")
             return True
 
         decision = V1TradingLifecycle.entry_admissibility(
@@ -949,12 +959,12 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            record_blocker(decision.reason)
             return True
 
         # V1: apply_runtime_entry_guards — 8+ gate checks before entry
         gates = [
             ("reduce_only", self._gate_reduce_only, ()),
-            ("pending_close_reconciliation", self._gate_pending_close_reconciliation, ()),
             ("passive_close_in_flight", self._gate_passive_close_pending, ()),
             ("recovery_ledger", self._gate_recovery_ledger, ()),
             ("pending_entry_duplicate", self._gate_pending_entry_dedup, ()),
@@ -984,6 +994,7 @@ class EntryDispatchRuntime:
                         "ts_ms": now_ms,
                     },
                 )
+                record_blocker(reason or gate_name)
                 return True
         return False
 
@@ -1604,18 +1615,36 @@ class EntryDispatchRuntime:
 
         return True
 
-    async def _dispatch_entry(self, candidate, now_ms: int, price_hint: float = 0.0) -> bool:
+    async def _dispatch_entry(
+        self,
+        candidate,
+        now_ms: int,
+        price_hint: float = 0.0,
+        *,
+        dispatch_blocker_counts: Counter | None = None,
+    ) -> bool:
         """Transform a tradeable candidate into an entry context and execute via entry_executor.
 
         V1: entry route/maker-leg/price gate from config and execution planner.
         Fix 5: no 1.0 pseudo-price — reject entries without valid quote.
         Fix EN-001: route and maker leg driven by planner, not hardcoded in runtime.
         """
-        if self._entry_initial_gate_blocked(candidate, now_ms):
+        def record_dispatch_blocker(reason: str) -> None:
+            if dispatch_blocker_counts is not None:
+                dispatch_blocker_counts[
+                    str(reason or "entry_dispatch_blocked")
+                ] += 1
+
+        if self._entry_initial_gate_blocked(
+            candidate,
+            now_ms,
+            blocker_counts=dispatch_blocker_counts,
+        ):
             return False
 
         price_resolution = self._entry_price_resolution(candidate, now_ms, price_hint)
         if price_resolution is None:
+            record_dispatch_blocker("no_valid_entry_quote")
             return False
         price_hint, long_order_price_hint, short_order_price_hint = price_resolution
 
@@ -1630,12 +1659,12 @@ class EntryDispatchRuntime:
             now_ms=now_ms,
         )
         if quantity_resolution is None:
+            record_dispatch_blocker("entry_quantity_resolution_failed")
             return False
         raw_quantity, quantity, okx_base_step, long_quantity_step, short_quantity_step = quantity_resolution
 
         # V1 runtime entry guards (apply_runtime_entry_guards)
         gate_checks = [
-            ("pending_close_reconciliation", self._gate_pending_close_reconciliation),
             ("passive_close_pending", self._gate_passive_close_pending),
             ("reduce_only", self._gate_reduce_only),
             ("venue_cooldown", self._gate_venue_cooldown),
@@ -1648,6 +1677,7 @@ class EntryDispatchRuntime:
                     "runtime.entry_blocked_gate",
                     {"symbol": candidate.symbol, "gate": gate_name, "reason": reason, "ts_ms": now_ms},
                 )
+                record_dispatch_blocker(reason or gate_name)
                 return False
 
         if self._entry_local_l2_gate_blocked(
@@ -1656,6 +1686,7 @@ class EntryDispatchRuntime:
             short_venue=short_venue,
             now_ms=now_ms,
         ):
+            record_dispatch_blocker("entry_local_l2_gate_blocked")
             return False
 
         # V1 entry route planning: derive route and maker leg from execution planner.
@@ -1688,6 +1719,7 @@ class EntryDispatchRuntime:
                         "ts_ms": now_ms,
                     },
                 )
+                record_dispatch_blocker("entry_local_l2_session_lost_before_submit")
                 return False
             long_book, short_book = session_books
             if maker_leg == Side.BUY:
@@ -1736,6 +1768,7 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            record_dispatch_blocker("joint_venue_quantity_grid_invalid")
             return False
 
         long_metadata = venue_quantity_metadata[long_venue.value]
@@ -1776,6 +1809,7 @@ class EntryDispatchRuntime:
                     "ts_ms": now_ms,
                 },
             )
+            record_dispatch_blocker("joint_hedgeability_invalid")
             return False
 
         pre_planner_common_quantity = quantity
@@ -1800,6 +1834,7 @@ class EntryDispatchRuntime:
                     "reason": plan.reason or "planner rejected entry",
                 },
             )
+            record_dispatch_blocker(plan.reason or "entry_planner_rejected")
             return False
 
         if (
@@ -1882,6 +1917,7 @@ class EntryDispatchRuntime:
                     "reason": "duplicate maker clientOrderId in recovery dedup index",
                 },
             )
+            record_dispatch_blocker("duplicate_maker_client_order_id")
             return False
 
         if is_client_order_id_duplicate(hedge_cid, self.ctx._recovery_dedup_index):
@@ -1893,6 +1929,7 @@ class EntryDispatchRuntime:
                     "reason": "duplicate hedge clientOrderId in recovery dedup index",
                 },
             )
+            record_dispatch_blocker("duplicate_hedge_client_order_id")
             return False
 
         # Check for existing pending entry on same symbol pair
@@ -1909,6 +1946,7 @@ class EntryDispatchRuntime:
                     "reason": "pending entry already exists for this symbol pair",
                 },
             )
+            record_dispatch_blocker("existing_pending_entry_for_pair")
             return False
 
         if not await self._prepare_live_entry_leverage_for_candidate(
@@ -1917,6 +1955,7 @@ class EntryDispatchRuntime:
             long_venue=long_venue,
             short_venue=short_venue,
         ):
+            record_dispatch_blocker("entry_leverage_preparation_failed")
             return False
 
         maker_l2_evidence: dict = {}
@@ -1955,6 +1994,7 @@ class EntryDispatchRuntime:
                         "ts_ms": now_ms,
                     },
                 )
+                record_dispatch_blocker(l2_reason or "post_only_l2_blocked")
                 return False
             repriced_price = float(
                 maker_l2_evidence.get("repriced_price", 0.0) or 0.0
@@ -1989,6 +2029,7 @@ class EntryDispatchRuntime:
             maker_client_order_id=maker_cid,
             hedge_client_order_id=hedge_cid,
         ):
+            record_dispatch_blocker("entry_admission_precheck_failed")
             return False
 
         ctx = self._build_entry_context(
@@ -2016,9 +2057,10 @@ class EntryDispatchRuntime:
             short_venue=short_venue,
             stage="immediately_before_dispatch",
         ):
+            record_dispatch_blocker("entry_venue_tradability_precheck_failed")
             return False
 
-        return await self._execute_entry_context(
+        executed = await self._execute_entry_context(
             ctx=ctx,
             candidate=candidate,
             route=route,
@@ -2029,3 +2071,6 @@ class EntryDispatchRuntime:
             maker_l2_evidence=maker_l2_evidence,
             now_ms=now_ms,
         )
+        if not executed:
+            record_dispatch_blocker("entry_execution_failed_or_uncertain")
+        return executed

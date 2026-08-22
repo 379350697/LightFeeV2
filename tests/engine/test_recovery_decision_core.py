@@ -71,6 +71,45 @@ def test_full_flat_truth_releases_prior_live_conflict_with_background_close_debt
     assert decision.clear_reason == "core_background_close_reconciliation"
 
 
+def test_close_reconciliation_runs_in_background_without_prior_account_latch():
+    snapshot = RecoveryEvidenceSnapshot(
+        exchange_truth=None,
+        recovery_work_items=(
+            {
+                "kind": "pending_close_reconciliation",
+                "blocking": True,
+                "position_id": "entry-active-close",
+            },
+        ),
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+    assert decision.entry_allowed is True
+    assert decision.evidence_quality == "background_close_reconciliation"
+
+
+def test_close_reconciliation_does_not_release_account_latch_without_truth():
+    snapshot = RecoveryEvidenceSnapshot(
+        exchange_truth=None,
+        prior_recovery_block_reason="owned_pending_entry_live_conflict",
+        recovery_work_items=(
+            {
+                "kind": "pending_close_reconciliation",
+                "blocking": True,
+                "position_id": "entry-active-close",
+            },
+        ),
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
+    assert decision.entry_allowed is False
+    assert decision.clear_previous_block is False
+
+
 def test_symbol_scoped_flat_truth_does_not_release_prior_live_conflict():
     """A candidate sweep cannot disprove a live artifact on another symbol."""
     snapshot = RecoveryEvidenceSnapshot(

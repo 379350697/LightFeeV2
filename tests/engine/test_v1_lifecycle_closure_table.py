@@ -750,7 +750,10 @@ def test_static_entry_recovery_gate_reads_v1_lifecycle_closure():
 
     assert "_v1_lifecycle_entry_gate_decision()" in body
     assert "recovery_decision.entry_allowed" not in body
-    assert "ledger.allows_new_entry" not in body
+    assert "ledger.allows_new_entry(candidate)" in body
+    assert body.index("ledger.allows_new_entry(candidate)") < body.index(
+        "_v1_lifecycle_entry_gate_decision()"
+    )
 
 
 def test_static_release_paths_attach_closure_decision_ids():

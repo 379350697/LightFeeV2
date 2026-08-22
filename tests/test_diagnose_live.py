@@ -427,7 +427,7 @@ def test_recovery_decision_counts_compact_pending_passive_close_state():
     assert decision["block_reason"] == "truth_unavailable_for_required_recovery"
 
 
-def test_recovery_decision_marks_compact_close_reconciliation_as_background_debt():
+def test_recovery_decision_marks_compact_close_reconciliation_as_runtime_background():
     from scripts.diagnose_live import _recovery_decision_payload
 
     decision = _recovery_decision_payload(
@@ -456,6 +456,11 @@ def test_run_diagnose_allows_flat_background_close_reconciliation(monkeypatch):
             "pending_close_count": 0,
             "pending_passive_close_count": 0,
             "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliation_summary": {
+                "total_count": 1,
+                "unknown_status_count": 0,
+                "evidence_debt_count": 1,
+            },
             "pending_residual_repair_count": 0,
             "last_tick_ms": 1700000000000,
         })
@@ -543,6 +548,48 @@ def test_acceptance_gate_blocks_unknown_background_reconciliation_status():
     assert gate["gate_passed"] is False
     assert gate["background_close_reconciliation_pending"] is False
     assert "pending_close_reconciliations_unknown_status" in gate["blocking_reasons"]
+
+
+def test_acceptance_gate_blocks_active_reconciliation_even_when_summary_is_known():
+    from scripts.diagnose_live import _build_production_acceptance_gate
+
+    gate = _build_production_acceptance_gate(
+        events=[],
+        local_state={
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "pending_passive_close_count": 0,
+            "pending_close_reconciliation_count": 1,
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-active",
+                    "reconciliation_status": "pending",
+                }
+            ],
+            "pending_close_reconciliation_summary": {
+                "total_count": 1,
+                "unknown_status_count": 0,
+                "evidence_debt_count": 0,
+            },
+            "pending_residual_repair_count": 0,
+        },
+        exchange_truth={
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+        state_consistency={"state_mismatch": False},
+    )
+
+    assert gate["gate_passed"] is False
+    assert gate["background_close_reconciliation_pending"] is False
+    assert "pending_close_reconciliations_not_empty" in gate["blocking_reasons"]
 
 
 def test_acceptance_gate_flags_local_l2_residual_events_when_final_l2_data_disabled():

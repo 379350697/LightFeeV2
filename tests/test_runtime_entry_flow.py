@@ -329,6 +329,9 @@ def test_scan_no_entry_diagnostics_buckets_lifecycle_outside_readiness(
         admission_blocker_counts=Counter({
             "entry_local_l2_waiting_for_primary_tracking": 3,
         }),
+        dispatch_blocker_counts=Counter({
+            "recovery_ledger_blocked": 2,
+        }),
     )
 
     records = [
@@ -346,6 +349,16 @@ def test_scan_no_entry_diagnostics_buckets_lifecycle_outside_readiness(
         "primary_tracked_not_ready": 2,
         "lifecycle_selection_blocked": 2,
     }
+    assert payload["entry_dispatch_blocked_counts"] == {
+        "recovery_ledger_blocked": 2,
+    }
+    assert payload["entry_final_gate_blocked_counts"] == {
+        "entry_blocked_first_funding_too_close": 1,
+        "entry_blocked_recovery_ledger": 1,
+        "entry_local_l2_waiting_for_dual_ready": 2,
+        "recovery_ledger_blocked": 2,
+    }
+    assert payload["candidate_stage_blocked_counts"]["entry_dispatch"] == 2
 
 
 def test_scan_no_entry_diagnostics_exposes_capacity_context(config, tmp_journal):
@@ -1192,6 +1205,27 @@ class TestPlannerDispatchIntegration:
         )
 
     @staticmethod
+    def _binance_okx_candidate(symbol: str = "BTCUSDT"):
+        from lightfee.sidecar.snapshot import CandidateInput
+
+        return CandidateInput(
+            long_venue="binance",
+            short_venue="okx",
+            symbol=symbol,
+            funding_diff_bps=10.0,
+            funding_edge_bps=8.0,
+            expected_edge_bps=5.0,
+            worst_case_edge_bps=2.0,
+            ranking_edge_bps=8.0,
+            transfer_bias_bps=0.0,
+            opportunity_type="funding_arb",
+            blocked=False,
+            entry_notional_quote=500.0,
+            first_funding_timestamp_ms=605_000,
+            funding_timestamp_ms=605_000,
+        )
+
+    @staticmethod
     def _capturing_executor():
         class CapturingExecutor:
             ctx = None
@@ -1211,9 +1245,14 @@ class TestPlannerDispatchIntegration:
     ):
         binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
         bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+        okx = FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)
         runtime = LiveRuntime(
             config,
-            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            venue_adapters={
+                Venue.BINANCE: binance,
+                Venue.BYBIT: bybit,
+                Venue.OKX: okx,
+            },
         )
         runtime.journal = tmp_journal
         runtime.state.lifecycle = EngineLifecycle.RUNNING
@@ -1227,11 +1266,24 @@ class TestPlannerDispatchIntegration:
                 "symbol": "BTCUSDT",
                 "long_venue": "binance",
                 "short_venue": "bybit",
+                "reconciliation_status": "pending",
             }
         ])
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_available": True,
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "positions": [],
+                "open_orders": [],
+            },
+            now_ms=4_999,
+        )
 
         blocked_candidate = self._binance_bybit_candidate("BTCUSDT")
-        allowed_candidate = self._binance_bybit_candidate("ETHUSDT")
+        allowed_candidate = self._binance_okx_candidate("BTCUSDT")
 
         blocked = await runtime._dispatch_entry(
             blocked_candidate,
@@ -1247,7 +1299,7 @@ class TestPlannerDispatchIntegration:
         assert blocked is False
         assert dispatched is True
         assert executor.ctx is not None
-        assert executor.ctx.symbol == "ETHUSDT"
+        assert executor.ctx.symbol == "BTCUSDT"
         blocked_events = [
             record
             for record in runtime.journal.read_all()
@@ -1255,11 +1307,111 @@ class TestPlannerDispatchIntegration:
         ]
         assert len(blocked_events) == 1
         assert blocked_events[0]["payload"] == {
-            "gate": "pending_close_reconciliation",
-            "reason": "pending_close_reconciliation_conflict",
+            "gate": "recovery_ledger",
+            "reason": "recovery_ledger_blocked",
             "symbol": "BTCUSDT",
             "ts_ms": 5000,
         }
+
+    @pytest.mark.asyncio
+    async def test_dispatch_entry_terminal_evidence_debt_allows_same_pair_after_flat_truth(
+        self, config, tmp_journal,
+    ):
+        binance = FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
+        bybit = FakeVenueAdapter(Venue.BYBIT, _min_notional_quote=10.0)
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+        )
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        executor = self._capturing_executor()
+        runtime.entry_executor = executor
+        runtime.state.set_pending_close_reconciliations([
+            {
+                "position_id": "pos-billing-debt",
+                "kind": "final",
+                "symbol": "BTCUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "reconciliation_status": "evidence_debt",
+                "evidence_debt_reason": "missing_close_order_identity",
+            }
+        ])
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_available": True,
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "positions": [],
+                "open_orders": [],
+            },
+            now_ms=4_999,
+        )
+
+        dispatched = await runtime._dispatch_entry(
+            self._binance_bybit_candidate("BTCUSDT"),
+            5000,
+            price_hint=50000.0,
+        )
+
+        assert dispatched is True
+        assert executor.ctx is not None
+        assert executor.ctx.symbol == "BTCUSDT"
+        assert not any(
+            record["kind"] == "runtime.entry_blocked_gate"
+            for record in runtime.journal.read_all()
+        )
+
+    @pytest.mark.asyncio
+    async def test_selected_dispatch_reports_recovery_gate_reason(
+        self, config, tmp_journal,
+    ):
+        runtime = LiveRuntime(config, venue_adapters={})
+        runtime.journal = tmp_journal
+        runtime.state.lifecycle = EngineLifecycle.RUNNING
+        runtime.state.risk_mode = GlobalRiskMode.RUNNING
+        runtime.state.set_pending_close_reconciliations([
+            {
+                "position_id": "pos-active",
+                "kind": "final",
+                "symbol": "BTCUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "reconciliation_status": "pending",
+            }
+        ])
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_available": True,
+                "available": True,
+                "confidence": "high",
+                "has_nonzero_position": False,
+                "has_open_order": False,
+                "positions": [],
+                "open_orders": [],
+            },
+            now_ms=4_999,
+        )
+        blocker_counts = Counter()
+
+        dispatched = await runtime._dispatch_selected_entry_candidates(
+            [self._binance_bybit_candidate("BTCUSDT")],
+            now_ms=5_000,
+            price_hints={"BTCUSDT": 50_000.0},
+            dispatch_blocker_counts=blocker_counts,
+        )
+
+        assert dispatched == 0
+        assert blocker_counts == {"recovery_ledger_blocked": 1}
+        assert runtime._v1_tradeable_no_entry_reason(
+            Counter(),
+            Counter(),
+            blocker_counts,
+        ) == "tradeable_candidates_blocked_by_recovery_ledger"
 
     @pytest.mark.asyncio
     async def test_dispatch_entry_pending_passive_close_blocks_only_matching_pair(
@@ -1383,7 +1535,12 @@ class TestPlannerDispatchIntegration:
             refreshed_symbols.extend(symbols)
             return None
 
-        async def dispatch(candidate, now_ms, price_hint=0.0):
+        async def dispatch(
+            candidate,
+            now_ms,
+            price_hint=0.0,
+            dispatch_blocker_counts=None,
+        ):
             order.append("dispatch")
             return False
 
@@ -2935,10 +3092,18 @@ class TestPlannerDispatchIntegration:
             funding_timestamp_ms=605_000,
         )
 
-        await runtime._dispatch_entry(candidate, 5000, price_hint=0.0)
+        blocker_counts = Counter()
+        dispatched = await runtime._dispatch_entry(
+            candidate,
+            5000,
+            price_hint=0.0,
+            dispatch_blocker_counts=blocker_counts,
+        )
 
         records = runtime.journal.read_all()
         kinds = [r["kind"] for r in records]
+        assert dispatched is False
+        assert blocker_counts == {"no_valid_entry_quote": 1}
         assert "runtime.entry_skipped_no_quote" in kinds
 
 

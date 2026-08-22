@@ -50,6 +50,9 @@ class RecoveryStartupRuntime:
         )
         self.ctx.recovery_ledger = ledger
         self.ctx._last_recovery_exchange_truth = dict(exchange_truth or {})
+        self.ctx._recovery_ledger_owner_semantics_fingerprint = (
+            self.ctx._recovery_owner_semantics_fingerprint()
+        )
         core_decision = V1RecoveryDecisionCore().decide(
             RecoveryEvidenceSnapshot(
                 local_open_positions=tuple(

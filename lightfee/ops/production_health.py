@@ -8,6 +8,7 @@ from lightfee.engine.recovery_decision_core import (
     V1RecoveryDecisionCore,
     is_nonblocking_background_close_reconciliation,
     pending_close_owner_counts,
+    pending_close_reconciliation_evidence_debt_count,
     pending_passive_close_evidence,
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
@@ -552,12 +553,18 @@ def analyze_current_state(
         if isinstance(reconciliation_summary, dict)
         else 0
     )
+    pending_close_reconciliation_debt_count = (
+        pending_close_reconciliation_evidence_debt_count(state)
+    )
     background_close_reconciliation_pending = (
         is_nonblocking_background_close_reconciliation(
             open_position_count=open_count,
             pending_entry_count=pending_entries,
             pending_close_owners=pending_close_owners,
             pending_residual_repair_count=pending_residual_repairs,
+            pending_close_reconciliation_evidence_debt_count=(
+                pending_close_reconciliation_debt_count
+            ),
             pending_close_reconciliation_unknown_count=(
                 pending_close_reconciliation_unknown_count
             ),
@@ -585,7 +592,7 @@ def analyze_current_state(
         fingerprints.append("live_lifecycle_not_running")
     if state.get("risk_mode") == "fail_closed" and clean and not state.get("recovery_blocked_reason"):
         fingerprints.append("stale_fail_closed_clean_state")
-    if pending_close_owner_count and not background_close_reconciliation_pending:
+    if pending_close_owner_count:
         fingerprints.append("pending_close_owner_present")
     if state.get("last_scan") is None:
         fingerprints.append("last_scan_missing")
@@ -723,6 +730,24 @@ def analyze_current_state(
             "pending_entry_live_conflicts": pending_entry_live_conflicts,
             "weak_order_truth_events": weak_order_truth_events,
         },
+    )
+
+
+def deployment_acceptance_ok(summary: HealthSummary) -> bool:
+    """Allow only proven-flat accounting debt to remain warning-visible at deploy."""
+    if summary.ok:
+        return True
+    if summary.critical_count != 0 or summary.warning_count != 1:
+        return False
+    non_green = [report for report in summary.reports if not report.ok]
+    if len(non_green) != 1:
+        return False
+    report = non_green[0]
+    return bool(
+        report.name == "current_state"
+        and report.severity == "warning"
+        and report.fingerprints == ["pending_close_owner_present"]
+        and report.details.get("background_close_reconciliation_pending") is True
     )
 
 

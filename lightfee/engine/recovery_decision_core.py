@@ -191,7 +191,13 @@ def pending_close_reconciliation_evidence(
         summary = getattr(state, "pending_close_reconciliation_summary", None)
 
     if isinstance(collection, Mapping):
-        materialized = tuple(collection.values())
+        if any(
+            key in collection
+            for key in ("position_id", "close_id", "symbol", "position_snapshot")
+        ):
+            materialized = (collection,)
+        else:
+            materialized = tuple(collection.values())
     elif isinstance(collection, (list, tuple, set)):
         materialized = tuple(collection)
     else:
@@ -207,10 +213,36 @@ def pending_close_reconciliation_evidence(
         except (TypeError, ValueError):
             continue
     count = max(candidate_counts)
-    return materialized + tuple(
-        {"source": "pending_close_reconciliation_count"}
-        for _ in range(count - len(materialized))
+    missing_count = count - len(materialized)
+    try:
+        summarized_debt_count = max(
+            int(summary.get("evidence_debt_count") or 0),
+            0,
+        ) if isinstance(summary, Mapping) else 0
+    except (TypeError, ValueError):
+        summarized_debt_count = 0
+    materialized_debt_count = sum(
+        1
+        for item in materialized
+        if str(_get(item, "reconciliation_status", "") or "").lower()
+        == "evidence_debt"
     )
+    synthesized_debt_count = min(
+        max(summarized_debt_count - materialized_debt_count, 0),
+        missing_count,
+    )
+    synthesized_debt = tuple(
+        {
+            "source": "pending_close_reconciliation_summary",
+            "reconciliation_status": "evidence_debt",
+        }
+        for _ in range(synthesized_debt_count)
+    )
+    synthesized_unknown = tuple(
+        {"source": "pending_close_reconciliation_count"}
+        for _ in range(missing_count - synthesized_debt_count)
+    )
+    return materialized + synthesized_debt + synthesized_unknown
 
 
 def pending_close_owner_counts(
@@ -233,22 +265,40 @@ def pending_close_owner_counts(
     )
 
 
+def pending_close_reconciliation_evidence_debt_count(
+    state: Mapping[str, Any] | Any,
+) -> int:
+    """Count terminal accounting debts from the canonical owner evidence.
+
+    Deployment and diagnostic acceptance must inspect every materialized owner,
+    not trust a compact summary that can lag the queue during a state transition.
+    """
+    return sum(
+        1
+        for item in pending_close_reconciliation_evidence(state)
+        if str(_get(item, "reconciliation_status", "") or "").lower()
+        == "evidence_debt"
+    )
+
+
 def is_nonblocking_background_close_reconciliation(
     *,
     open_position_count: int,
     pending_entry_count: int,
     pending_close_owners: PendingCloseOwnerCounts,
     pending_residual_repair_count: int,
+    pending_close_reconciliation_evidence_debt_count: int,
     pending_close_reconciliation_unknown_count: int,
     exchange_truth: Mapping[str, Any] | Any | None,
     recovery_decision: Mapping[str, Any],
 ) -> bool:
-    """Whether visible reconciliation is the only non-blocking recovery work.
+    """Whether visible reconciliation is terminal, deploy-safe background work.
 
-    V1 allows this accounting work to continue after trustworthy exchange truth
-    proves the account is flat. Consumers must not infer the condition from an
-    owner count alone: any execution owner, incomplete exchange truth, or
-    unknown reconciliation status remains fail-closed.
+    V1 allows active close reconciliation to run in the background once
+    trustworthy exchange truth proves the account is flat. Deployment and
+    diagnostics use a stricter contract: every reconciliation owner must already
+    be terminal evidence debt. Any active/mixed owner, execution owner,
+    incomplete exchange truth, or unknown status remains fail-closed.
     """
     return (
         open_position_count == 0
@@ -257,6 +307,8 @@ def is_nonblocking_background_close_reconciliation(
         and pending_close_owners.pending_passive_close_count == 0
         and pending_close_owners.pending_close_reconciliation_count > 0
         and pending_residual_repair_count == 0
+        and pending_close_reconciliation_evidence_debt_count
+        == pending_close_owners.pending_close_reconciliation_count
         and pending_close_reconciliation_unknown_count == 0
         and isinstance(exchange_truth, Mapping)
         and bool(exchange_truth.get("available"))
@@ -335,6 +387,19 @@ class V1RecoveryDecisionCore:
             snapshot
         )
         truth_available = self._truth_available(snapshot.exchange_truth)
+        only_close_reconciliation_work = self._has_only_close_reconciliation_work(
+            snapshot
+        )
+        if (
+            only_close_reconciliation_work
+            and snapshot.prior_recovery_block_reason
+            not in ACCOUNT_TRUTH_REQUIRED_BLOCK_REASONS
+        ):
+            # V1 keeps close-accounting reconciliation visible while the
+            # runtime stays Running. RecoveryLedger still blocks the exact
+            # unresolved pair; account truth is required only before clearing
+            # a prior account-wide live-artifact latch.
+            return self._background_close_reconciliation_decision(snapshot)
         if has_truth_required_work and not truth_available:
             reason = RecoveryEvidenceClass.TRUTH_UNAVAILABLE_FOR_REQUIRED_RECOVERY.value
             return RecoveryDecision(
@@ -354,6 +419,9 @@ class V1RecoveryDecisionCore:
                 management_action=RecoveryManagementAction.WAIT_FOR_TRUTH,
             )
 
+        if only_close_reconciliation_work:
+            return self._background_close_reconciliation_decision(snapshot)
+
         if has_local_work:
             return RecoveryDecision(
                 kind=RecoveryDecisionKind.MANAGE_OWNED_RECOVERY_WORK,
@@ -370,30 +438,6 @@ class V1RecoveryDecisionCore:
                     "entry risk is allowed."
                 ),
                 management_action=RecoveryManagementAction.MANAGE_OWNED_RECOVERY_WORK,
-            )
-
-        if self._has_background_close_reconciliation(snapshot.recovery_work_items):
-            # V1 keeps close-accounting reconciliation visible in recovery work,
-            # but a physically flat position must not be treated as open-risk
-            # work.  Preserve that split centrally: diagnostics are non-clean,
-            # while entry admission remains available.
-            return RecoveryDecision(
-                kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
-                evidence_class=RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION,
-                entry_allowed=True,
-                clear_previous_block=self._should_clear_core_block(snapshot),
-                clear_reason="core_background_close_reconciliation",
-                recovery_work_items=snapshot.recovery_work_items,
-                diagnostic_severity="warning",
-                evidence_quality=(
-                    RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION.value
-                ),
-                journal_event_name="recovery.core.background_close_reconciliation",
-                maintenance_note=(
-                    "Close-accounting reconciliation remains visible as "
-                    "background work; no live execution owner requires an "
-                    "entry block."
-                ),
             )
 
         if not truth_available or self._has_partial_evidence_gap(snapshot.exchange_truth):
@@ -489,12 +533,50 @@ class V1RecoveryDecisionCore:
                 return True
         return False
 
-    def _has_background_close_reconciliation(self, work_items: Any) -> bool:
-        return any(
-            str(_get(item, "kind", "") or "")
-            == "pending_close_reconciliation"
-            and not _bool(_get(item, "blocking", True))
-            for item in _as_items(work_items)
+    def _has_only_close_reconciliation_work(
+        self,
+        snapshot: RecoveryEvidenceSnapshot,
+    ) -> bool:
+        work_items = _as_items(snapshot.recovery_work_items)
+        return bool(
+            not _has_items(snapshot.local_open_positions)
+            and not _has_items(snapshot.pending_entries)
+            and not _has_items(snapshot.residual_repairs)
+            and not _has_items(snapshot.passive_closes)
+            and not _has_items(snapshot.owner_evidence)
+            and any(
+                str(_get(item, "kind", "") or "")
+                == "pending_close_reconciliation"
+                for item in work_items
+            )
+            and all(
+                str(_get(item, "kind", "") or "")
+                == "pending_close_reconciliation"
+                or not _bool(_get(item, "blocking", True))
+                for item in work_items
+            )
+        )
+
+    def _background_close_reconciliation_decision(
+        self,
+        snapshot: RecoveryEvidenceSnapshot,
+    ) -> RecoveryDecision:
+        return RecoveryDecision(
+            kind=RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP,
+            evidence_class=RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION,
+            entry_allowed=True,
+            clear_previous_block=self._should_clear_core_block(snapshot),
+            clear_reason="core_background_close_reconciliation",
+            recovery_work_items=snapshot.recovery_work_items,
+            diagnostic_severity="warning",
+            evidence_quality=(
+                RecoveryEvidenceClass.BACKGROUND_CLOSE_RECONCILIATION.value
+            ),
+            journal_event_name="recovery.core.background_close_reconciliation",
+            maintenance_note=(
+                "Close-accounting reconciliation remains visible as background "
+                "work; RecoveryLedger owns any pair-scoped entry block."
+            ),
         )
 
     def _has_truth_required_recovery_work_item(self, work_items: Any) -> bool:

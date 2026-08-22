@@ -287,7 +287,7 @@ ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightf
 
 echo "=== Verifying production health ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
-if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --json"; then
+if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --deployment-acceptance --json"; then
   echo "=== Production health failed; collecting diagnose evidence ==="
   ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
   exit 1

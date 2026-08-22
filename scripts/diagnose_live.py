@@ -41,6 +41,7 @@ from lightfee.engine.recovery_decision_core import (
     V1RecoveryDecisionCore,
     is_nonblocking_background_close_reconciliation,
     pending_close_owner_counts,
+    pending_close_reconciliation_evidence_debt_count,
     pending_passive_close_evidence,
 )
 from lightfee.engine.recovery_ledger import RecoveryLedger
@@ -4041,6 +4042,9 @@ def _build_production_acceptance_gate(
     pending_reconciliation_unknown = int(
         pending_reconciliation_summary.get("unknown_status_count", 0) or 0
     )
+    pending_reconciliation_evidence_debt_count = (
+        pending_close_reconciliation_evidence_debt_count(local_state)
+    )
     pending_reconciliation_by_kind = (
         pending_reconciliation_summary.get("by_kind") or {}
     )
@@ -4067,6 +4071,9 @@ def _build_production_acceptance_gate(
             pending_entry_count=pending_entry_count,
             pending_close_owners=pending_close_owners,
             pending_residual_repair_count=pending_residual_repair_count,
+            pending_close_reconciliation_evidence_debt_count=(
+                pending_reconciliation_evidence_debt_count
+            ),
             pending_close_reconciliation_unknown_count=(
                 pending_reconciliation_unknown
             ),

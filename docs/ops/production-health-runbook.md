@@ -18,6 +18,15 @@ Expected:
 - sidecar snapshot with 7 venues
 - current state `lifecycle=running`, `risk_mode=running`
 
+Exception: a known, physically flat close-accounting evidence debt intentionally
+keeps ordinary health at `ok: false`.  In that case the only acceptable shape is
+one `pending_close_owner_present` warning,
+`background_close_reconciliation_pending: true`, and
+`deployment_acceptable: true`.  Every close-reconciliation owner must be
+explicitly classified `evidence_debt`; active, mixed, compact-unknown, or
+truth-incomplete owner sets are not eligible.  This is still an unsettled
+accounting warning, not normal-green health.
+
 ## Capture Read-Only Evidence
 
 Before remediation, deploy, restart, or manual state repair, capture read-only
@@ -52,14 +61,20 @@ Before deploying, verify no open work on remote:
 
 ```bash
 ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
-  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json"
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --deployment-acceptance --json"
 ```
 
-Must show `ok: true`, no open orders, no pending entries, and no execution
-recovery work. A durable close-accounting reconciliation is allowed only when
-the report retains `background_close_reconciliation_pending: true`; it is not a
-settled bill and must remain in the incident record until exact exchange
-evidence reconciles it.
+Must show `deployment_acceptable: true`, no open orders, no pending entries, and
+no execution recovery work.  A fully clean state also shows `ok: true`.  A
+durable close-accounting reconciliation is allowed only when `ok: false` is
+caused by the sole `pending_close_owner_present` warning and the report retains
+`background_close_reconciliation_pending: true`; every reconciliation owner
+must be `evidence_debt`, with high-confidence flat/no-open-order truth and no
+execution/residual owner.  Active or mixed queues are rejected even when the
+V1 runtime lifecycle may remain `running` to manage background close work.  It
+is not a settled bill and must remain in the incident record until exact
+exchange evidence reconciles it. Never use `--deployment-acceptance` as a
+general health-suppression flag.
 
 ## Deploy
 
@@ -99,9 +114,9 @@ ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
 ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
   "systemctl show lightfee-live.service | grep ExecMainStartTimestamp"
 
-# 6. No-orders health probe (must not submit orders)
+# 6. No-orders deployment-acceptance probe (must not submit orders)
 ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
-  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --json"
+  "cd /opt/lightfee-v2 && PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/python3 scripts/verify_production_services.py --deployment-acceptance --json"
 
 # 7. Since-deploy diagnostic evidence (same interpreter as production)
 ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 root@38.60.253.248 \
@@ -125,6 +140,8 @@ getent hosts www.okx.com
 Only resume from stale fail-closed when open positions, entry/pending execution
 work, and residual repairs are zero. A background close-accounting
 reconciliation may remain only when `verify_production_services.py` passes;
-never remove it manually to make a health check green. Prefer the code-level
-clean-start recovery. Manual state edits require a backup and must be followed
-by `verify_production_services.py`.
+for that exact case, “passes” means the explicit `--deployment-acceptance`
+result is true while ordinary `ok` remains false.  Never remove it manually to
+make a health check green. Prefer the code-level clean-start recovery. Manual
+state edits require a backup and must be followed by the ordinary verifier and,
+when deployment is intended, the explicit deployment-acceptance verifier.

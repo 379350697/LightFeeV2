@@ -2840,6 +2840,12 @@ class TestFallbackResidualReal:
                 "force_close_client_order_ids": ["bybit-force-cid"],
                 "force_close_order_ids": ["bybit-force-order"],
             },
+            exchange_truth={
+                "truth_available": True,
+                "confidence": "high",
+                "positions": [],
+                "open_orders": [],
+            },
         )
 
         assert position.position_id not in state.pending_passive_closes
@@ -6210,6 +6216,12 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             source="pending_passive_close_flat_probe",
             actual_long_size=0.0,
             actual_short_size=0.0,
+            exchange_truth={
+                "truth_available": True,
+                "confidence": "high",
+                "positions": [],
+                "open_orders": [],
+            },
         )
 
         assert position.position_id in state.pending_passive_closes

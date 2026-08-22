@@ -14,7 +14,7 @@ import asyncio
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import httpx
 
@@ -43,6 +43,8 @@ class FundingTicker:
     open_interest_quote: float = 0.0
     open_interest_evidence_status: str = "available"
     open_interest_evidence_reason: str = ""
+    open_interest_http_status_code: int = 0
+    open_interest_retry_after_ms: int = 0
     oi_candidate_count: int = 0
     oi_cache_hit_count: int = 0
     oi_cache_miss_count: int = 0
@@ -256,6 +258,7 @@ class MarketDataClient:
                 raise ValueError(f"unsupported method: {method}")
 
             if resp.status_code >= 400:
+                retry_after = None
                 if resp.status_code in (429, 418):
                     retry_after = _parse_retry_after_ms(dict(resp.headers))
                     if self._rate_limiter is not None:
@@ -272,6 +275,7 @@ class MarketDataClient:
                     PublicTransportErrorCategory.TRANSPORT_FAILURE,
                     f"HTTP {resp.status_code}: {resp.text[:200]}",
                     status_code=resp.status_code,
+                    retry_after_ms=int(retry_after or 0),
                 )
 
             if self._rate_limiter is not None:
@@ -281,7 +285,10 @@ class MarketDataClient:
                 return {}
             return resp.json()
         except httpx.TimeoutException:
-            raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"timeout: {method} {path}")
+            raise PublicTransportError(
+                PublicTransportErrorCategory.TIMEOUT,
+                f"timeout: {method} {path}",
+            )
         except httpx.NetworkError as e:
             raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"network: {method} {path}: {e}")
 
@@ -313,6 +320,8 @@ class MarketDataClient:
     async def fetch_entry_open_interest_evidence(
         self,
         symbols: list[str],
+        *,
+        mark_prices: Mapping[str, float],
     ) -> dict[str, FundingTicker]:
         """Fetch candidate-scoped OI evidence without widening sidecar scope.
 
@@ -326,9 +335,168 @@ class MarketDataClient:
             for symbol in symbols
             if str(symbol or "").strip()
         ]
+        scoped_symbols = list(dict.fromkeys(scoped_symbols))
         if not scoped_symbols:
             return {}
-        return await self.fetch_funding_tickers(list(dict.fromkeys(scoped_symbols)))
+        venue = self._spec.venue_id
+        venue_key = venue.value
+        if venue not in (Venue.BINANCE, Venue.ASTER):
+            return {
+                f"{venue_key}:{symbol}": FundingTicker(
+                    venue=venue_key,
+                    symbol=symbol,
+                    bid=0.0,
+                    ask=0.0,
+                    open_interest_evidence_status="unsupported",
+                    open_interest_evidence_reason="unsupported_targeted_refresh",
+                    oi_candidate_count=len(scoped_symbols),
+                )
+                for symbol in scoped_symbols
+            }
+
+        now_ms = _now_ms()
+        budget_s = max(
+            float(
+                getattr(
+                    self,
+                    "binance_style_open_interest_enrichment_budget_s",
+                    BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+
+        async def fetch_symbol(symbol: str) -> tuple[str, FundingTicker]:
+            started_ms = _now_ms()
+            venue_symbol = self._to_venue_symbol(symbol)
+            mark_price = _safe_float(
+                mark_prices.get(symbol, mark_prices.get(venue_symbol, 0.0))
+            )
+            common = {
+                "venue": venue_key,
+                "symbol": symbol,
+                "bid": 0.0,
+                "ask": 0.0,
+                "mark_price": mark_price,
+                "oi_candidate_count": len(scoped_symbols),
+                "oi_refresh_cap": len(scoped_symbols),
+            }
+            if not self._spec.open_interest_path:
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status="unsupported",
+                    open_interest_evidence_reason="open_interest_endpoint_unavailable",
+                )
+            if mark_price <= 0.0:
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status="missing_mark_price",
+                    open_interest_evidence_reason="snapshot_mark_price_unavailable",
+                )
+            cached = self._binance_style_cached_open_interest(
+                venue_symbol,
+                mark_price=mark_price,
+                now_ms=now_ms,
+            )
+            if cached is not None:
+                open_interest_quote, status, reason = cached
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_quote=open_interest_quote,
+                    open_interest_evidence_status=status,
+                    open_interest_evidence_reason=reason or "cache_hit",
+                    oi_cache_hit_count=1,
+                )
+            if budget_s <= 0.0:
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status="timeout",
+                    open_interest_evidence_reason="targeted_refresh_budget_exhausted",
+                    oi_cache_miss_count=1,
+                    oi_timeout_count=1,
+                )
+            try:
+                raw = await asyncio.wait_for(
+                    self._public_get(
+                        self._spec.open_interest_path,
+                        params={"symbol": venue_symbol},
+                    ),
+                    timeout=budget_s,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status="timeout",
+                    open_interest_evidence_reason="timeout_waiting_for_oi",
+                    oi_cache_miss_count=1,
+                    oi_refresh_attempt_count=1,
+                    oi_timeout_count=1,
+                    oi_refresh_elapsed_ms=max(_now_ms() - started_ms, 0),
+                )
+            except Exception as exc:
+                status = self._binance_style_oi_status_from_error(exc)
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status=status,
+                    open_interest_evidence_reason=str(exc)[:200] or status,
+                    open_interest_http_status_code=int(
+                        getattr(exc, "status_code", 0) or 0
+                    ),
+                    open_interest_retry_after_ms=int(
+                        getattr(exc, "retry_after_ms", 0) or 0
+                    ),
+                    oi_cache_miss_count=1,
+                    oi_refresh_attempt_count=1,
+                    oi_timeout_count=1 if status == "timeout" else 0,
+                    oi_refresh_elapsed_ms=max(_now_ms() - started_ms, 0),
+                )
+            item = raw[0] if isinstance(raw, list) and raw else raw
+            if not isinstance(item, dict):
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status="parse_error",
+                    open_interest_evidence_reason="invalid_open_interest_payload",
+                    oi_cache_miss_count=1,
+                    oi_refresh_attempt_count=1,
+                    oi_refresh_elapsed_ms=max(_now_ms() - started_ms, 0),
+                )
+            open_interest = _safe_float(item.get("openInterest", 0.0))
+            open_interest_quote = open_interest * mark_price
+            if open_interest_quote <= 0.0:
+                return symbol, FundingTicker(
+                    **common,
+                    open_interest_evidence_status="parse_error",
+                    open_interest_evidence_reason="nonpositive_open_interest",
+                    oi_cache_miss_count=1,
+                    oi_refresh_attempt_count=1,
+                    oi_refresh_elapsed_ms=max(_now_ms() - started_ms, 0),
+                )
+            self._binance_style_store_open_interest(
+                venue_symbol,
+                open_interest_quote=open_interest_quote,
+                mark_price=mark_price,
+                observed_at_ms=now_ms,
+                status="available",
+                reason="fresh_targeted_refresh",
+            )
+            return symbol, FundingTicker(
+                **common,
+                open_interest_quote=open_interest_quote,
+                open_interest_evidence_status="available",
+                open_interest_evidence_reason="fresh_targeted_refresh",
+                oi_cache_miss_count=1,
+                oi_refresh_attempt_count=1,
+                oi_refresh_elapsed_ms=max(_now_ms() - started_ms, 0),
+            )
+
+        refreshed = await asyncio.gather(
+            *(fetch_symbol(symbol) for symbol in scoped_symbols)
+        )
+        return {
+            f"{venue_key}:{symbol}": ticker
+            for symbol, ticker in refreshed
+        }
 
     # ------------------------------------------------------------------
     # Per-symbol L2 snapshot
@@ -426,18 +594,7 @@ class MarketDataClient:
 
     @staticmethod
     def _binance_style_oi_status_from_error(exc: Exception) -> str:
-        status_code = int(getattr(exc, "status_code", 0) or 0)
-        message = str(exc).lower()
-        if status_code in (429, 418) or "429" in message or "too many" in message:
-            return "rate_limited"
-        if status_code in (400, 404) and (
-            "invalid symbol" in message
-            or "unknown symbol" in message
-            or "symbol not found" in message
-            or "-1121" in message
-        ):
-            return "unsupported"
-        return "http_error"
+        return open_interest_evidence_status_from_error(exc)
 
     def _binance_style_oi_cache_key(self, venue_sym: str) -> str:
         return f"{self._spec.venue_id.value}:{venue_sym}"
@@ -1064,14 +1221,43 @@ class MarketDataClient:
 
 class PublicTransportErrorCategory:
     TRANSPORT_FAILURE = "transport_failure"
+    TIMEOUT = "timeout"
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
 
 
 class PublicTransportError(Exception):
-    def __init__(self, category: str, message: str, status_code: int = 0) -> None:
+    def __init__(
+        self,
+        category: str,
+        message: str,
+        status_code: int = 0,
+        retry_after_ms: int = 0,
+    ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
+        self.retry_after_ms = retry_after_ms
+
+
+def open_interest_evidence_status_from_error(exc: Exception) -> str:
+    """Map transport failures to the canonical candidate-OI evidence status."""
+    status_code = int(getattr(exc, "status_code", 0) or 0)
+    category = str(getattr(exc, "category", "") or "")
+    message = str(exc).lower()
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException)):
+        return "timeout"
+    if category == PublicTransportErrorCategory.TIMEOUT:
+        return "timeout"
+    if status_code in (429, 418) or "429" in message or "too many" in message:
+        return "rate_limited"
+    if status_code in (400, 404) and (
+        "invalid symbol" in message
+        or "unknown symbol" in message
+        or "symbol not found" in message
+        or "-1121" in message
+    ):
+        return "unsupported"
+    return "http_error"
 
 
 def _parse_retry_after_ms(headers: dict[str, str]) -> Optional[int]:

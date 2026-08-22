@@ -954,33 +954,6 @@ class EntryGateRuntime:
             )
         return filtered_candidates
 
-    def _gate_pending_close_reconciliation(self, candidate) -> tuple[bool, str]:
-        """Block entry if a pending close reconciliation exists for same symbol+venues."""
-        sym = getattr(candidate, 'symbol', '')
-        long_v = getattr(candidate, 'long_venue', '')
-        short_v = getattr(candidate, 'short_venue', '')
-        self.ctx.state.set_pending_close_reconciliations(
-            getattr(self.ctx.state, "pending_close_reconciliations", [])
-        )
-        for rec in self.ctx.state.pending_close_reconciliations:
-            if not isinstance(rec, dict):
-                continue
-            snapshot = rec.get("position_snapshot", {})
-            if not isinstance(snapshot, dict):
-                snapshot = {}
-            if (rec.get("symbol") or snapshot.get("symbol") or "") != sym:
-                continue
-            pc_long = rec.get("long_venue") or snapshot.get("long_venue")
-            pc_short = rec.get("short_venue") or snapshot.get("short_venue")
-            pc_long_s = pc_long.value if hasattr(pc_long, "value") else str(pc_long)
-            pc_short_s = pc_short.value if hasattr(pc_short, "value") else str(pc_short)
-            if not pc_long_s or not pc_short_s:
-                return False, "pending_close_reconciliation_invalid"
-            if (pc_long_s == long_v and pc_short_s == short_v) or \
-               (pc_long_s == short_v and pc_short_s == long_v):
-                return False, "pending_close_reconciliation_conflict"
-        return True, ""
-
     def _gate_passive_close_pending(self, candidate) -> tuple[bool, str]:
         """Block entry if a passive close is in-flight for the same symbol pair."""
         sym = getattr(candidate, 'symbol', '')
@@ -1049,6 +1022,9 @@ class EntryGateRuntime:
         return True, ""
 
     def _gate_recovery_ledger(self, candidate) -> tuple[bool, str]:
+        ledger = getattr(self, "recovery_ledger", None)
+        if ledger is not None and not ledger.allows_new_entry(candidate):
+            return False, "recovery_ledger_blocked"
         allowed, reason = self._v1_lifecycle_entry_gate_decision()
         if not allowed:
             if not self._v1_lifecycle_closure_blocks_candidate(
@@ -1402,6 +1378,7 @@ class EntryGateRuntime:
             "execution_liquidity_blocked_counts",
             "entry_final_gate_blocked_counts",
             "tradeable_selection_blocker_counts",
+            "entry_dispatch_blocked_counts",
             "entry_admission_blocker_counts",
             "quote_truth_must_resolve_count",
             "quote_truth_resolved_count",
@@ -1678,6 +1655,7 @@ class EntryGateRuntime:
         candidate_blockers: dict[str, str],
         now_ms: int,
         admission_blocker_counts: Counter | None = None,
+        dispatch_blocker_counts: Counter | None = None,
     ) -> None:
         if getattr(self.ctx.journal, "_file", None) is None:
             return
@@ -1754,6 +1732,17 @@ class EntryGateRuntime:
                 execution_liquidity_blocked_counts[str(reason_key)] += int(count)
 
         admission_counts = admission_blocker_counts if admission_blocker_counts is not None else {}
+        dispatch_counts = dispatch_blocker_counts if dispatch_blocker_counts is not None else {}
+        final_gate_blocker_counts: Counter[str] = Counter(
+            {
+                str(key): int(value)
+                for key, value in tradeable_selection_blocker_counts.items()
+                if int(value) > 0
+            }
+        )
+        for key, value in dispatch_counts.items():
+            if int(value) > 0:
+                final_gate_blocker_counts[str(key)] += int(value)
         not_primary_tracked = int(
             admission_counts.get("entry_local_l2_waiting_for_primary_tracking", 0)
         )
@@ -1824,6 +1813,7 @@ class EntryGateRuntime:
             "entry_selection": sum(
                 int(v) for v in tradeable_selection_blocker_counts.values()
             ),
+            "entry_dispatch": sum(int(v) for v in dispatch_counts.values()),
         }
         entry_capacity = self.ctx._entry_capacity_snapshot()
         max_concurrent_positions = int(entry_capacity["max_concurrent_positions"])
@@ -1941,10 +1931,13 @@ class EntryGateRuntime:
                 sorted(execution_liquidity_blocked_counts.items())
             ),
             "entry_final_gate_blocked_counts": dict(
-                sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
+                sorted(final_gate_blocker_counts.items())
             ),
             "tradeable_selection_blocker_counts": dict(
                 sorted((str(k), int(v)) for k, v in tradeable_selection_blocker_counts.items())
+            ),
+            "entry_dispatch_blocked_counts": dict(
+                sorted((str(k), int(v)) for k, v in dispatch_counts.items())
             ),
             "entry_admission_blocker_counts": dict(
                 sorted(entry_admission_blocker_counts.items())
@@ -1983,6 +1976,7 @@ class EntryGateRuntime:
             "effective_entry_slot_count": payload["effective_entry_slot_count"],
             "remaining_slots": payload["remaining_slots"],
             "tradeable_selection_blocker_counts": payload["tradeable_selection_blocker_counts"],
+            "entry_dispatch_blocked_counts": payload["entry_dispatch_blocked_counts"],
             "entry_local_l2_primary_not_ready_reason_totals": payload.get(
                 "entry_local_l2_primary_not_ready_reason_totals", {},
             ),
@@ -2021,6 +2015,9 @@ class EntryGateRuntime:
             "tradeable_selection_blocker_keys": sorted(
                 payload["tradeable_selection_blocker_counts"].keys()
             ),
+            "entry_dispatch_blocker_keys": sorted(
+                payload["entry_dispatch_blocked_counts"].keys()
+            ),
             "entry_local_l2_primary_not_ready_reason_keys": sorted(
                 payload.get("entry_local_l2_primary_not_ready_reason_totals", {}).keys()
             ),
@@ -2054,6 +2051,9 @@ class EntryGateRuntime:
                     "tradeable_selection_blocker_counts": payload[
                         "tradeable_selection_blocker_counts"
                     ],
+                    "entry_dispatch_blocked_counts": payload[
+                        "entry_dispatch_blocked_counts"
+                    ],
                     "candidate_stage_blocked_counts": payload[
                         "candidate_stage_blocked_counts"
                     ],
@@ -2083,6 +2083,9 @@ class EntryGateRuntime:
                 "selection_bucket_counts": payload["selection_bucket_counts"],
                 "tradeable_selection_blocker_counts": payload[
                     "tradeable_selection_blocker_counts"
+                ],
+                "entry_dispatch_blocked_counts": payload[
+                    "entry_dispatch_blocked_counts"
                 ],
                 "candidate_stage_blocked_counts": payload[
                     "candidate_stage_blocked_counts"

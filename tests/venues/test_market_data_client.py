@@ -15,6 +15,7 @@ from lightfee.venues.market_data import (
     PublicTransportError,
     PublicTransportErrorCategory,
     _safe_float,
+    open_interest_evidence_status_from_error,
 )
 from lightfee.venues.specs import (
     VenueSpec,
@@ -154,10 +155,47 @@ class TestPublicTransportError:
     """Lightweight public transport error."""
 
     def test_construct(self):
-        e = PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, "timeout", status_code=408)
+        e = PublicTransportError(
+            PublicTransportErrorCategory.TRANSPORT_FAILURE,
+            "timeout",
+            status_code=408,
+            retry_after_ms=2500,
+        )
         assert "timeout" in str(e)
         assert e.category == "transport_failure"
         assert e.status_code == 408
+        assert e.retry_after_ms == 2500
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (
+                PublicTransportError(
+                    PublicTransportErrorCategory.TIMEOUT,
+                    "typed timeout",
+                ),
+                "timeout",
+            ),
+            (
+                PublicTransportError(
+                    PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                    "HTTP 429",
+                    status_code=429,
+                ),
+                "rate_limited",
+            ),
+            (
+                PublicTransportError(
+                    PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                    "HTTP 404: invalid symbol",
+                    status_code=404,
+                ),
+                "unsupported",
+            ),
+        ],
+    )
+    def test_open_interest_error_uses_one_status_classifier(self, error, expected):
+        assert open_interest_evidence_status_from_error(error) == expected
 
 
 class TestRateLimitScopesForNewEndpoints:
@@ -209,7 +247,7 @@ class TestRateLimitScopesForNewEndpoints:
         client = MarketDataClient(aster_spec())
         client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
-            with pytest.raises(PublicTransportError):
+            with pytest.raises(PublicTransportError) as exc_info:
                 await client._public_get(
                     "/fapi/v1/openInterest",
                     params={"symbol": "XCNUSDT"},
@@ -221,6 +259,8 @@ class TestRateLimitScopesForNewEndpoints:
 
         assert snap is not None
         assert snap["cooldown_until_ms"] > 0
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.retry_after_ms == 1000
 
 
 class TestParserFixtures:
@@ -305,7 +345,12 @@ class TestProductionSidecarParserRegressions:
     @pytest.mark.asyncio
     async def test_binance_entry_open_interest_budget_can_resolve_realistic_latency(self):
         class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.paths: list[str] = []
+
             async def _public_get(self, path, params=None):
+                self.paths.append(path)
                 if path == "/fapi/v1/ticker/bookTicker":
                     return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
                 if path == "/fapi/v1/premiumIndex":
@@ -317,13 +362,16 @@ class TestProductionSidecarParserRegressions:
                     return {"symbol": params["symbol"], "openInterest": "2500"}
                 return {}
 
-        client = FakeBinanceClient(binance_spec())
+        client = FakeBinanceClient()
         client.binance_style_open_interest_enrichment_budget_s = (
             BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S
         )
 
         result = await asyncio.wait_for(
-            client.fetch_entry_open_interest_evidence(["BTCUSDT"]),
+            client.fetch_entry_open_interest_evidence(
+                ["BTCUSDT"],
+                mark_prices={"BTCUSDT": 100.5},
+            ),
             timeout=1.0,
         )
 
@@ -332,6 +380,55 @@ class TestProductionSidecarParserRegressions:
         assert ticker.open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert ticker.oi_timeout_count == 0
         assert ticker.oi_refresh_attempt_count == 1
+        assert client.paths == ["/fapi/v1/openInterest"]
+
+    @pytest.mark.asyncio
+    async def test_entry_open_interest_429_preserves_rate_limit_evidence(self):
+        class FakeBinanceClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                assert path == "/fapi/v1/openInterest"
+                raise PublicTransportError(
+                    PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                    "HTTP 429: too many requests",
+                    status_code=429,
+                    retry_after_ms=3000,
+                )
+
+        result = await FakeBinanceClient(
+            binance_spec()
+        ).fetch_entry_open_interest_evidence(
+            ["BTCUSDT"],
+            mark_prices={"BTCUSDT": 100.5},
+        )
+
+        ticker = result["binance:BTCUSDT"]
+        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_evidence_status == "rate_limited"
+        assert ticker.open_interest_http_status_code == 429
+        assert ticker.open_interest_retry_after_ms == 3000
+
+    @pytest.mark.asyncio
+    async def test_entry_open_interest_transport_timeout_preserves_timeout_evidence(self):
+        import httpx
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("read timeout", request=request)
+
+        client = MarketDataClient(binance_spec())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await client.fetch_entry_open_interest_evidence(
+                ["BTCUSDT"],
+                mark_prices={"BTCUSDT": 100.5},
+            )
+        finally:
+            await client.close()
+
+        ticker = result["binance:BTCUSDT"]
+        assert ticker.open_interest_quote == 0.0
+        assert ticker.open_interest_evidence_status == "timeout"
+        assert ticker.open_interest_evidence_reason.startswith("timeout:")
+        assert ticker.oi_timeout_count == 1
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):
@@ -589,7 +686,10 @@ class TestProductionSidecarParserRegressions:
         full = await client._fetch_binance_style(symbols)
         assert full["binance:S7USDT"].open_interest_evidence_status == "deferred_by_cap"
 
-        refreshed = await client.fetch_entry_open_interest_evidence(["S7USDT"])
+        refreshed = await client.fetch_entry_open_interest_evidence(
+            ["S7USDT"],
+            mark_prices={"S7USDT": 100.5},
+        )
 
         assert client.oi_calls == ["S0USDT", "S7USDT"]
         ticker = refreshed["binance:S7USDT"]

@@ -997,7 +997,7 @@ async def test_pending_close_reconciliation_abandons_final_when_flat_but_fill_un
     assert abandoned["short_live_size"] == pytest.approx(0.0)
     assert runtime.state.lifecycle == EngineLifecycle.RUNNING
     assert runtime.state.last_error is None
-    allowed, reason = runtime._gate_pending_close_reconciliation(
+    allowed, reason = runtime._gate_recovery_ledger(
         SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
     )
     assert allowed is True
@@ -1033,14 +1033,16 @@ async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_que
     }
     exchange_truth = {
         "truth_available": True,
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
         "positions": [],
         "open_orders": [],
     }
-    runtime._last_recovery_exchange_truth = exchange_truth
-    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
-        local=runtime.state,
-        exchange_truth=exchange_truth,
-        owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        exchange_truth,
+        now_ms=2000,
     )
     ledger_before = runtime.recovery_ledger
 
@@ -1059,11 +1061,20 @@ async def test_pending_close_reconciliation_processor_normalizes_dict_shaped_que
     assert retained["reconciliation_status"] == "evidence_debt"
     assert retained["evidence_debt_reason"] == "missing_close_order_identity"
     assert retained["missing_close_order_identity"] is True
-    assert runtime.recovery_ledger is ledger_before
-    assert any(
-        item.kind == "pending_close_reconciliation"
+    assert runtime.recovery_ledger is not ledger_before
+    close_work = next(
+        item
         for item in runtime.recovery_ledger.work_items
+        if item.kind == "pending_close_reconciliation"
     )
+    assert close_work.blocking is False
+    assert runtime._gate_recovery_ledger(
+        SimpleNamespace(
+            symbol="BABYUSDT",
+            long_venue=Venue.OKX.value,
+            short_venue=Venue.BYBIT.value,
+        )
+    ) == (True, "")
 
 
 @pytest.mark.asyncio
@@ -1084,7 +1095,7 @@ async def test_pending_close_reconciliation_processor_keeps_ledger_for_single_di
         "symbol": "BABYUSDT",
         "kind": "final",
         "closed_at_ms": 1780771929000,
-        "created_cycle": 1,
+        "created_cycle": 2,
         "next_attempt_ms": 1000,
         "position_snapshot": {
             "position_id": "entry-single-dict",
@@ -1092,8 +1103,10 @@ async def test_pending_close_reconciliation_processor_keeps_ledger_for_single_di
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
         },
-        "long_legs": [],
-        "short_legs": [],
+        "long_legs": [{"venue": Venue.OKX.value, "order_id": "close-long"}],
+        "short_legs": [
+            {"venue": Venue.BYBIT.value, "order_id": "close-short"}
+        ],
     }
     raw_reconciliation = dict(runtime.state.pending_close_reconciliations)
     runtime.state.set_pending_close_reconciliations(raw_reconciliation)
@@ -1102,21 +1115,113 @@ async def test_pending_close_reconciliation_processor_keeps_ledger_for_single_di
         "positions": [],
         "open_orders": [],
     }
-    runtime._last_recovery_exchange_truth = exchange_truth
-    runtime.recovery_ledger = RecoveryLedger.from_local_and_exchange_truth(
-        local=runtime.state,
-        exchange_truth=exchange_truth,
-        owner_index=RecoveryOwnerIndex.from_state_and_journal(runtime.state, []),
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        exchange_truth,
+        now_ms=2000,
     )
     ledger_before = runtime.recovery_ledger
     runtime.state.pending_close_reconciliations = raw_reconciliation
+    fingerprint_before = runtime._pending_close_recovery_owner_fingerprint()
 
     await runtime._process_pending_close_reconciliations(now_ms=3000)
 
     assert runtime.state.pending_close_reconciliations[0]["position_id"] == (
         "entry-single-dict"
     )
+    assert runtime._pending_close_recovery_owner_fingerprint() == fingerprint_before
     assert runtime.recovery_ledger is ledger_before
+
+
+@pytest.mark.asyncio
+async def test_pending_close_owner_added_after_ledger_build_invalidates_cached_allow(
+    config, tmp_journal,
+):
+    """A prior lane's new close owner is visible before the next entry scan."""
+    _mark_live(config)
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(
+            position_id="entry-new-owner",
+            symbol="BEATUSDT",
+        )
+    ))
+    exchange_truth = {
+        "truth_available": True,
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": [],
+        "open_orders": [],
+    }
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        exchange_truth,
+        now_ms=2000,
+    )
+    ledger_before = runtime.recovery_ledger
+    runtime.state.set_pending_close_reconciliations([
+        _pending_close_reconciliation(
+            position_id="entry-new-owner",
+            next_attempt_ms=4000,
+            reconciliation_status="pending",
+        )
+    ])
+
+    await runtime._process_pending_close_reconciliations(now_ms=3000)
+
+    candidate = SimpleNamespace(
+        symbol="BEATUSDT",
+        long_venue="okx",
+        short_venue="bybit",
+    )
+    assert runtime.recovery_ledger is not ledger_before
+    assert runtime.recovery_ledger is not None
+    assert runtime.recovery_ledger.allows_new_entry(candidate) is False
+
+
+@pytest.mark.asyncio
+async def test_residual_owner_added_after_ledger_build_invalidates_cached_allow(
+    config, tmp_journal,
+):
+    """A queued residual that is not due still invalidates the cached ledger."""
+    _mark_live(config)
+    runtime = _runtime(config, tmp_journal, _CapturingReconciler(
+        PositionReconciliationResult(position_id="unused", symbol="BEATUSDT")
+    ))
+    exchange_truth = {
+        "truth_available": True,
+        "available": True,
+        "confidence": "high",
+        "has_nonzero_position": False,
+        "has_open_order": False,
+        "positions": [],
+        "open_orders": [],
+    }
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        exchange_truth,
+        now_ms=2000,
+    )
+    ledger_before = runtime.recovery_ledger
+    runtime.state.pending_residual_repairs.append({
+        "position_id": "entry-new-residual",
+        "pair_id": "beatusdt:okx->bybit",
+        "symbol": "BEATUSDT",
+        "origin": "entry_open",
+        "repair_venue": "bybit",
+        "repair_side": "buy",
+        "repair_quantity": 1.0,
+        "next_attempt_ms": 4000,
+    })
+
+    await runtime._recover_residual_repairs(now_ms=3000)
+
+    candidate = SimpleNamespace(
+        symbol="BEATUSDT",
+        long_venue="okx",
+        short_venue="bybit",
+    )
+    assert runtime.recovery_ledger is not ledger_before
+    assert runtime.recovery_ledger is not None
+    assert runtime.recovery_ledger.allows_new_entry(candidate) is False
 
 
 @pytest.mark.asyncio
@@ -1366,7 +1471,7 @@ async def test_pending_close_reconciliation_background_recovers_with_confirmed_o
     assert runtime.state.last_error is None
 
 
-def test_pending_close_reconciliation_gate_uses_v1_snapshot_work(config, tmp_journal):
+def test_recovery_ledger_gate_uses_v1_close_snapshot_work(config, tmp_journal):
     runtime = _runtime(config, tmp_journal, _CapturingReconciler(
         PositionReconciliationResult(position_id="pos-close-gate", symbol="BEATUSDT")
     ))
@@ -1382,20 +1487,24 @@ def test_pending_close_reconciliation_gate_uses_v1_snapshot_work(config, tmp_jou
         "short_legs": [],
     })
 
-    allowed, reason = runtime._gate_pending_close_reconciliation(
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        {"truth_available": True, "positions": [], "open_orders": []},
+        now_ms=1_000,
+    )
+    allowed, reason = runtime._gate_recovery_ledger(
         SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
     )
-    reversed_allowed, reversed_reason = runtime._gate_pending_close_reconciliation(
+    reversed_allowed, reversed_reason = runtime._gate_recovery_ledger(
         SimpleNamespace(symbol="BEATUSDT", long_venue="bybit", short_venue="okx")
     )
 
     assert allowed is False
-    assert reason == "pending_close_reconciliation_conflict"
+    assert reason == "recovery_ledger_blocked"
     assert reversed_allowed is False
-    assert reversed_reason == "pending_close_reconciliation_conflict"
+    assert reversed_reason == "recovery_ledger_blocked"
 
 
-def test_pending_close_reconciliation_gate_normalizes_dict_shaped_queue(config, tmp_journal):
+def test_recovery_ledger_gate_accepts_dict_shaped_close_queue(config, tmp_journal):
     runtime = _runtime(config, tmp_journal, _CapturingReconciler(
         PositionReconciliationResult(position_id="pos-close-gate", symbol="BEATUSDT")
     ))
@@ -1413,15 +1522,19 @@ def test_pending_close_reconciliation_gate_normalizes_dict_shaped_queue(config, 
         }
     }
 
-    allowed, reason = runtime._gate_pending_close_reconciliation(
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        {"truth_available": True, "positions": [], "open_orders": []},
+        now_ms=1_000,
+    )
+    allowed, reason = runtime._gate_recovery_ledger(
         SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
     )
 
     assert allowed is False
-    assert reason == "pending_close_reconciliation_conflict"
+    assert reason == "recovery_ledger_blocked"
 
 
-def test_pending_close_reconciliation_gate_blocks_malformed_task_with_top_level_evidence(config, tmp_journal):
+def test_recovery_ledger_gate_blocks_top_level_close_record(config, tmp_journal):
     runtime = _runtime(config, tmp_journal, _CapturingReconciler(
         PositionReconciliationResult(position_id="pos-close-gate", symbol="BEATUSDT")
     ))
@@ -1434,13 +1547,16 @@ def test_pending_close_reconciliation_gate_blocks_malformed_task_with_top_level_
         "closed_at_ms": 1780771929000,
     }
 
-    allowed, reason = runtime._gate_pending_close_reconciliation(
+    runtime._refresh_recovery_ledger_from_exchange_truth(
+        {"truth_available": True, "positions": [], "open_orders": []},
+        now_ms=1_000,
+    )
+    allowed, reason = runtime._gate_recovery_ledger(
         SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
     )
 
     assert allowed is False
-    assert reason == "pending_close_reconciliation_conflict"
-    assert isinstance(runtime.state.pending_close_reconciliations, list)
+    assert reason == "recovery_ledger_blocked"
 
 
 @pytest.mark.asyncio

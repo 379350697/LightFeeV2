@@ -450,6 +450,13 @@ class RecoveryLedger:
                 or ""
             )
             owner_id = position_id or f"compact-{index}"
+            reconciliation_status = str(
+                _get(reconciliation, "reconciliation_status", "") or ""
+            ).lower()
+            background_accounting_debt = (
+                reconciliation_status == "evidence_debt"
+                and _high_confidence_flat_exchange_truth(exchange_truth)
+            )
             add_work(
                 RecoveryWorkItem(
                     kind="pending_close_reconciliation",
@@ -463,10 +470,7 @@ class RecoveryLedger:
                         confidence="proven" if position_id else "inferred",
                         evidence={
                             "source": "local_pending_close_reconciliation",
-                            "reconciliation_status": str(
-                                _get(reconciliation, "reconciliation_status", "")
-                                or ""
-                            ),
+                            "reconciliation_status": reconciliation_status,
                             "evidence_debt_reason": str(
                                 _get(reconciliation, "evidence_debt_reason", "")
                                 or ""
@@ -474,11 +478,19 @@ class RecoveryLedger:
                         },
                     ),
                     decision=RecoveryDecision(
-                        outcome="background_accounting_reconciliation",
-                        reason="close_reconciliation_requires_accounting_evidence",
-                        blocking=False,
+                        outcome=(
+                            "background_accounting_reconciliation"
+                            if background_accounting_debt
+                            else "pending_close_reconciliation"
+                        ),
+                        reason=(
+                            "close_reconciliation_requires_accounting_evidence"
+                            if background_accounting_debt
+                            else "close_reconciliation_requires_terminal_resolution"
+                        ),
+                        blocking=not background_accounting_debt,
                     ),
-                    blocking=False,
+                    blocking=not background_accounting_debt,
                 )
             )
 
@@ -490,26 +502,10 @@ class RecoveryLedger:
         )
 
     def allows_new_entry(self, candidate: Any) -> bool:
-        if any(item.blocks_all_new_entries for item in self.work_items):
-            return False
-        candidate_symbol = _symbol(candidate)
-        candidate_venues = _venues_from_candidate(candidate)
-        for item in self.work_items:
-            if not item.blocking:
-                continue
-            if candidate_symbol and item.symbol and candidate_symbol == item.symbol:
-                if not candidate_venues or not item.venues or candidate_venues & item.venues:
-                    return False
-                continue
-            if (
-                candidate_symbol
-                and item.symbol
-                and candidate_symbol != item.symbol
-            ):
-                continue
-            if candidate_venues and item.venues and candidate_venues & item.venues:
-                return False
-        return True
+        return not any(
+            recovery_work_item_blocks_candidate(item, candidate)
+            for item in self.work_items
+        )
 
     def is_proven_flat(self, symbol: str) -> bool:
         normalized = str(symbol or "").upper()
@@ -521,6 +517,47 @@ class RecoveryLedger:
 
     def contains_positive_fill_evidence(self, symbol: str) -> bool:
         return str(symbol or "").upper() in self._positive_fill_symbols
+
+
+def recovery_work_item_blocks_candidate(item: Any, candidate: Any) -> bool:
+    """Apply the canonical V1-compatible scope of recovery work to a candidate."""
+    if not bool(_get(item, "blocking", True)):
+        return False
+    kind = str(_get(item, "kind", "") or "")
+    if kind in GLOBAL_BLOCKING_KINDS:
+        return True
+
+    candidate_symbol = _symbol(candidate)
+    item_symbol = _symbol(item)
+    candidate_venues = _venues_from_candidate(candidate)
+    raw_item_venues = _get(item, "venues", ()) or ()
+    if isinstance(raw_item_venues, str):
+        raw_item_venues = (raw_item_venues,)
+    item_venues = frozenset(
+        str(venue.value if hasattr(venue, "value") else venue or "").lower()
+        for venue in raw_item_venues
+        if str(venue.value if hasattr(venue, "value") else venue or "")
+    )
+
+    if candidate_symbol and item_symbol:
+        if candidate_symbol != item_symbol:
+            return False
+        if kind == "pending_close_reconciliation":
+            return (
+                not candidate_venues
+                or not item_venues
+                or candidate_venues == item_venues
+            )
+        return (
+            not candidate_venues
+            or not item_venues
+            or bool(candidate_venues & item_venues)
+        )
+    return bool(
+        candidate_venues
+        and item_venues
+        and candidate_venues & item_venues
+    )
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
@@ -558,6 +595,24 @@ def _truth_available(exchange_truth: Any) -> bool:
     if isinstance(exchange_truth, Mapping) and "available" in exchange_truth:
         return bool(exchange_truth.get("available"))
     return bool(_get(exchange_truth, "truth_available", True))
+
+
+def _high_confidence_flat_exchange_truth(exchange_truth: Any) -> bool:
+    if not _truth_available(exchange_truth):
+        return False
+    if str(_get(exchange_truth, "confidence", "") or "").lower() != "high":
+        return False
+    if bool(_get(exchange_truth, "has_nonzero_position", False)):
+        return False
+    if bool(_get(exchange_truth, "has_open_order", False)):
+        return False
+    if any(
+        abs(_float(_get(position, "quantity", _get(position, "size", 0.0))))
+        > EPSILON
+        for position in _exchange_positions(exchange_truth)
+    ):
+        return False
+    return not _exchange_open_orders(exchange_truth)
 
 
 def _exchange_positions(exchange_truth: Any) -> list[Any]:

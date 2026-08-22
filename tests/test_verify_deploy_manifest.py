@@ -61,7 +61,7 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
     assert 'REMOTE_PYTHONPATH="PYTHONPATH=$REMOTE_PATH"' in script
     assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check /opt/lightfee-v2" in script
     assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict" in script
-    assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --json" in script
+    assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --deployment-acceptance --json" in script
     assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy" in script
     assert "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json" not in script
 

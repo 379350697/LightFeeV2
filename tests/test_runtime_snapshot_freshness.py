@@ -1433,8 +1433,15 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
         def __init__(self):
             self.calls: list[tuple[str, str]] = []
 
-        async def refresh_open_interest(self, venue: str, symbol: str, *, now_ms: int):
-            self.calls.append((venue, symbol))
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            mark_price: float,
+            now_ms: int,
+        ):
+            self.calls.append((venue, symbol, mark_price))
             if venue == "binance" and symbol == "BTCUSDT":
                 return {
                     "open_interest_quote": 2_500_000.0,
@@ -1456,6 +1463,7 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
                 symbol="BTCUSDT",
                 bid=100.0,
                 ask=101.0,
+                mark_price=100.5,
                 observed_at_ms=69000,
                 volume_24h_quote=6_000_000.0,
                 open_interest=0.0,
@@ -1503,7 +1511,7 @@ async def test_runtime_targeted_oi_refresh_resolves_deferred_candidate_before_ga
     finally:
         runtime.journal.close()
 
-    assert refresher.calls == [("binance", "BTCUSDT")]
+    assert refresher.calls == [("binance", "BTCUSDT", 100.5)]
     assert stats["attempt_count"] == 1
     assert stats["resolved_count"] == 1
     assert filtered == [candidate]
@@ -1535,7 +1543,20 @@ def test_entry_open_interest_refresher_uses_targeted_public_budget():
 
 
 @pytest.mark.asyncio
-async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
+@pytest.mark.parametrize(
+    ("failure_status", "failure_reason", "status_code", "retry_after_ms"),
+    [
+        ("timeout", "timeout_waiting_for_oi", 0, 0),
+        ("rate_limited", "http_429", 429, 2_000),
+    ],
+)
+async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(
+    tmp_path,
+    failure_status,
+    failure_reason,
+    status_code,
+    retry_after_ms,
+):
     config = AppConfig(
         runtime=RuntimeConfig(
             mode="live",
@@ -1553,15 +1574,24 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
     candidate.long_venue = "binance"
     candidate.short_venue = "aster"
 
-    class TimeoutOiRefresher:
-        async def refresh_open_interest(self, venue: str, symbol: str, *, now_ms: int):
+    class FailedOiRefresher:
+        async def refresh_open_interest(
+            self,
+            venue: str,
+            symbol: str,
+            *,
+            mark_price: float,
+            now_ms: int,
+        ):
             return {
                 "open_interest_quote": 0.0,
-                "open_interest_evidence_status": "timeout",
-                "open_interest_evidence_reason": "timeout_waiting_for_oi",
+                "open_interest_evidence_status": failure_status,
+                "open_interest_evidence_reason": failure_reason,
+                "open_interest_http_status_code": status_code,
+                "open_interest_retry_after_ms": retry_after_ms,
             }
 
-    runtime.entry_open_interest_refresher = TimeoutOiRefresher()
+    runtime.entry_open_interest_refresher = FailedOiRefresher()
     snapshot = SidecarSnapshot(
         published_at_ms=69000,
         market_observed_at_ms=69000,
@@ -1575,8 +1605,8 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
                 observed_at_ms=69000,
                 volume_24h_quote=6_000_000.0,
                 open_interest=0.0,
-                open_interest_evidence_status="timeout",
-                open_interest_evidence_reason="timeout_waiting_for_oi",
+                open_interest_evidence_status=failure_status,
+                open_interest_evidence_reason=failure_reason,
             ),
             "aster:BTCUSDT": _quote_with_liquidity(
                 "aster",
@@ -1620,18 +1650,36 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(tmp_path):
         runtime.journal.close()
 
     assert stats["failed_count"] == 1
+    assert stats["timeout_count"] == int(failure_status == "timeout")
+    assert stats["rate_limited_count"] == int(failure_status == "rate_limited")
     assert filtered == []
     records = _read_journal_records(tmp_path / "events.jsonl")
-    assert "runtime.entry_oi_targeted_refresh_failed" in [
-        record["kind"] for record in records
-    ]
+    failed = next(
+        record["payload"]
+        for record in records
+        if record["kind"] == "runtime.entry_oi_targeted_refresh_failed"
+    )
+    assert failed["open_interest_evidence_status"] == failure_status
+    assert failed["open_interest_http_status_code"] == status_code
+    assert failed["open_interest_retry_after_ms"] == retry_after_ms
     decision = next(
         record["payload"]
         for record in records
         if record["kind"] == "runtime.snapshot_freshness_decision"
         and record["payload"]["reason"] == "oi_evidence_unavailable"
     )
-    assert decision["open_interest_evidence_status"] == "timeout"
+    assert decision["open_interest_evidence_status"] == failure_status
+
+    snapshot.quotes["binance:BTCUSDT"].open_interest_evidence_status = "available"
+    cleared = await runtime._refresh_entry_candidate_open_interest_evidence(
+        [candidate],
+        snapshot=snapshot,
+        now_ms=71000,
+    )
+    assert cleared["target_count"] == 0
+    assert runtime.state.last_scan["oi_targeted_refresh_timeout_count"] == 0
+    assert runtime.state.last_scan["oi_targeted_refresh_rate_limited_count"] == 0
+    assert runtime.state.last_scan["oi_targeted_refresh_http_error_count"] == 0
 
 
 def test_runtime_structural_entry_liquidity_suppression_probes_on_v1_interval(tmp_path):

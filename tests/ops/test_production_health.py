@@ -10,6 +10,7 @@ from lightfee.ops.production_health import (
     analyze_resolver_config,
     analyze_sidecar_snapshot,
     analyze_systemd_unit,
+    deployment_acceptance_ok,
     summarize_reports,
 )
 from scripts.diagnose_live import _build_state_consistency
@@ -144,6 +145,11 @@ def test_current_state_background_reconciliation_is_visible_but_deploy_safe_when
         "pending_close_count": 0,
         "pending_passive_close_count": 0,
         "pending_close_reconciliation_count": 1,
+        "pending_close_reconciliation_summary": {
+            "total_count": 1,
+            "unknown_status_count": 0,
+            "evidence_debt_count": 1,
+        },
         "pending_residual_repair_count": 0,
         "exchange_truth": {
             "available": True,
@@ -162,8 +168,9 @@ def test_current_state_background_reconciliation_is_visible_but_deploy_safe_when
         require_exchange_truth=True,
     )
 
-    assert report.ok is True
-    assert "pending_close_owner_present" not in report.fingerprints
+    assert report.ok is False
+    assert report.severity == "warning"
+    assert "pending_close_owner_present" in report.fingerprints
     assert report.details["pending_close_reconciliation_count"] == 1
     assert report.details["pending_close_owner_count"] == 1
     assert report.details["background_close_reconciliation_pending"] is True
@@ -172,6 +179,104 @@ def test_current_state_background_reconciliation_is_visible_but_deploy_safe_when
         "background_close_reconciliation"
     )
     assert report.details["recovery_decision"]["entry_allowed"] is True
+
+
+def test_current_state_active_reconciliation_is_not_deploy_safe_when_flat():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "last_scan": {"ts_ms": 1778786999000},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_close_reconciliation_count": 1,
+        "pending_close_reconciliations": [
+            {
+                "position_id": "pos-active",
+                "symbol": "COTIUSDT",
+                "long_venue": "okx",
+                "short_venue": "bybit",
+                "reconciliation_status": "pending",
+            }
+        ],
+        "pending_close_reconciliation_summary": {
+            "total_count": 1,
+            "unknown_status_count": 0,
+            "evidence_debt_count": 0,
+        },
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+    summary = summarize_reports([report])
+
+    assert report.details["background_close_reconciliation_pending"] is False
+    assert report.details["recovery_decision"]["kind"] == "RUNNING_WITH_EVIDENCE_GAP"
+    assert report.details["recovery_decision"]["entry_allowed"] is True
+    assert deployment_acceptance_ok(summary) is False
+
+
+def test_current_state_mixed_reconciliation_is_not_deploy_safe_when_flat():
+    state = {
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": 1778786999000,
+        "last_scan": {"ts_ms": 1778786999000},
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "pending_passive_close_count": 0,
+        "pending_close_reconciliation_count": 2,
+        "pending_close_reconciliations": [
+            {
+                "position_id": "pos-debt",
+                "reconciliation_status": "evidence_debt",
+            },
+            {
+                "position_id": "pos-active",
+                "reconciliation_status": "pending",
+            },
+        ],
+        "pending_close_reconciliation_summary": {
+            "total_count": 2,
+            "unknown_status_count": 0,
+            "evidence_debt_count": 1,
+        },
+        "pending_residual_repair_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }
+
+    report = analyze_current_state(
+        state,
+        now_ms=1778787000000,
+        max_tick_age_ms=10_000,
+        require_exchange_truth=True,
+    )
+
+    assert report.details["background_close_reconciliation_pending"] is False
+    assert deployment_acceptance_ok(summarize_reports([report])) is False
 
 
 def test_current_state_background_reconciliation_does_not_hide_live_order():
@@ -185,6 +290,11 @@ def test_current_state_background_reconciliation_does_not_hide_live_order():
         "pending_close_count": 0,
         "pending_passive_close_count": 0,
         "pending_close_reconciliation_count": 1,
+        "pending_close_reconciliation_summary": {
+            "total_count": 1,
+            "unknown_status_count": 0,
+            "evidence_debt_count": 1,
+        },
         "pending_residual_repair_count": 0,
         "exchange_truth": {
             "available": True,
@@ -662,7 +772,7 @@ def test_verify_production_services_cli_json_success(tmp_path):
     assert payload["ok"] is True
 
 
-def test_verify_production_services_cli_allows_flat_background_reconciliation(tmp_path):
+def test_verify_production_services_cli_requires_explicit_deploy_acceptance_for_flat_background_reconciliation(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()
     (unit_dir / "lightfee-sidecar.service").write_text(
@@ -693,6 +803,11 @@ def test_verify_production_services_cli_allows_flat_background_reconciliation(tm
         "pending_close_count": 0,
         "pending_passive_close_count": 0,
         "pending_close_reconciliation_count": 1,
+        "pending_close_reconciliation_summary": {
+            "total_count": 1,
+            "unknown_status_count": 0,
+            "evidence_debt_count": 1,
+        },
         "pending_residual_repair_count": 0,
         "exchange_truth": {
             "available": True,
@@ -721,13 +836,36 @@ def test_verify_production_services_cli_allows_flat_background_reconciliation(tm
         capture_output=True,
     )
 
-    assert result.returncode == 0, result.stderr + result.stdout
+    assert result.returncode == 1, result.stderr + result.stdout
     payload = json.loads(result.stdout)
     current_report = next(
         report for report in payload["reports"] if report["name"] == "current_state"
     )
-    assert current_report["ok"] is True
+    assert payload["ok"] is False
+    assert payload["deployment_acceptable"] is True
+    assert current_report["ok"] is False
+    assert current_report["fingerprints"] == ["pending_close_owner_present"]
     assert current_report["details"]["background_close_reconciliation_pending"] is True
+
+    accepted = subprocess.run(
+        [
+            sys.executable,
+            "scripts/verify_production_services.py",
+            "--unit-dir", str(unit_dir),
+            "--snapshot", str(snapshot),
+            "--current-state", str(current),
+            "--resolv-conf", str(resolv),
+            "--now-ms", "1778787000000",
+            "--deployment-acceptance",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr + accepted.stdout
+    accepted_payload = json.loads(accepted.stdout)
+    assert accepted_payload["ok"] is False
+    assert accepted_payload["deployment_acceptable"] is True
 
 
 def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_path):

@@ -14,6 +14,7 @@ from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.runtime_context import MarketDataRuntimeContext
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
+from lightfee.venues.market_data import open_interest_evidence_status_from_error
 
 
 class EntryOpenInterestRefresher:
@@ -57,6 +58,7 @@ class EntryOpenInterestRefresher:
         venue: str,
         symbol: str,
         *,
+        mark_price: float,
         now_ms: int,
     ) -> dict[str, Any] | None:
         venue_key = str(venue or "").strip().lower()
@@ -70,12 +72,21 @@ class EntryOpenInterestRefresher:
         try:
             result = await self._client_for_venue(
                 venue_key
-            ).fetch_entry_open_interest_evidence([symbol_key])
+            ).fetch_entry_open_interest_evidence(
+                [symbol_key],
+                mark_prices={symbol_key: mark_price},
+            )
         except Exception as exc:
+            status_code = int(getattr(exc, "status_code", 0) or 0)
+            status = open_interest_evidence_status_from_error(exc)
             return {
                 "open_interest_quote": 0.0,
-                "open_interest_evidence_status": "timeout",
+                "open_interest_evidence_status": status,
                 "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                "open_interest_http_status_code": status_code,
+                "open_interest_retry_after_ms": int(
+                    getattr(exc, "retry_after_ms", 0) or 0
+                ),
             }
         ticker = result.get(f"{venue_key}:{symbol_key}")
         if ticker is None:
@@ -94,6 +105,12 @@ class EntryOpenInterestRefresher:
             "open_interest_evidence_reason": str(
                 getattr(ticker, "open_interest_evidence_reason", "")
                 or "targeted_refresh"
+            ),
+            "open_interest_http_status_code": int(
+                getattr(ticker, "open_interest_http_status_code", 0) or 0
+            ),
+            "open_interest_retry_after_ms": int(
+                getattr(ticker, "open_interest_retry_after_ms", 0) or 0
             ),
             "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
             "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
@@ -1255,6 +1272,8 @@ class MarketDataRuntime:
             "failed_count": 0,
             "unsupported_count": 0,
             "timeout_count": 0,
+            "rate_limited_count": 0,
+            "http_error_count": 0,
             "blocked_after_targeted_refresh_count": 0,
             "targets": [],
         }
@@ -1267,6 +1286,22 @@ class MarketDataRuntime:
             return stats
         if getattr(self.ctx.state, "last_scan", None) is None:
             self.ctx.state.last_scan = {}
+
+        def publish_stats() -> None:
+            for field, key in (
+                ("attempt_count", "oi_targeted_refresh_attempt_count"),
+                ("resolved_count", "oi_targeted_refresh_resolved_count"),
+                ("failed_count", "oi_targeted_refresh_failed_count"),
+                ("timeout_count", "oi_targeted_refresh_timeout_count"),
+                ("rate_limited_count", "oi_targeted_refresh_rate_limited_count"),
+                ("http_error_count", "oi_targeted_refresh_http_error_count"),
+                ("unsupported_count", "oi_targeted_refresh_unsupported_count"),
+                (
+                    "blocked_after_targeted_refresh_count",
+                    "entry_blocked_after_targeted_refresh_count",
+                ),
+            ):
+                self.ctx.state.last_scan[key] = stats[field]
 
         quote_lookup = self._market_quote_lookup(getattr(snapshot, "quotes", {}) or {})
         targets: list[tuple[str, str, Any, str]] = []
@@ -1311,14 +1346,13 @@ class MarketDataRuntime:
             for venue, symbol, _quote, status in targets[:24]
         ]
         if not targets:
-            self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = 0
-            self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = 0
-            self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = 0
+            publish_stats()
             return stats
 
         refresher = self._entry_open_interest_refresher()
         refresh = getattr(refresher, "refresh_open_interest", None)
         if not callable(refresh):
+            publish_stats()
             return stats
 
         self.ctx.journal.append(
@@ -1333,12 +1367,23 @@ class MarketDataRuntime:
             stats["attempt_count"] += 1
             started_ms = wall_clock_now_ms()
             try:
-                result = await refresh(venue, symbol, now_ms=now_ms)
+                result = await refresh(
+                    venue,
+                    symbol,
+                    mark_price=float(getattr(quote, "mark_price", 0.0) or 0.0),
+                    now_ms=now_ms,
+                )
             except Exception as exc:  # pragma: no cover - defensive telemetry
+                status_code = int(getattr(exc, "status_code", 0) or 0)
+                status = open_interest_evidence_status_from_error(exc)
                 result = {
                     "open_interest_quote": 0.0,
-                    "open_interest_evidence_status": "timeout",
+                    "open_interest_evidence_status": status,
                     "open_interest_evidence_reason": f"{type(exc).__name__}: {exc}"[:200],
+                    "open_interest_http_status_code": status_code,
+                    "open_interest_retry_after_ms": int(
+                        getattr(exc, "retry_after_ms", 0) or 0
+                    ),
                 }
             elapsed_ms = int(
                 (result or {}).get(
@@ -1365,6 +1410,12 @@ class MarketDataRuntime:
                 "open_interest_evidence_status": status,
                 "open_interest_evidence_reason": reason,
                 "open_interest_quote": open_interest_quote,
+                "open_interest_http_status_code": int(
+                    (result or {}).get("open_interest_http_status_code", 0) or 0
+                ),
+                "open_interest_retry_after_ms": int(
+                    (result or {}).get("open_interest_retry_after_ms", 0) or 0
+                ),
                 "elapsed_ms": elapsed_ms,
                 "ts_ms": now_ms,
             }
@@ -1396,6 +1447,10 @@ class MarketDataRuntime:
                 stats["blocked_after_targeted_refresh_count"] += 1
                 if status == "timeout":
                     stats["timeout_count"] += 1
+                if status == "rate_limited":
+                    stats["rate_limited_count"] += 1
+                if status == "http_error":
+                    stats["http_error_count"] += 1
                 if status == "unsupported":
                     stats["unsupported_count"] += 1
                 self.ctx.journal.append(
@@ -1403,24 +1458,7 @@ class MarketDataRuntime:
                     payload,
                 )
 
-        self.ctx.state.last_scan["oi_targeted_refresh_attempt_count"] = stats[
-            "attempt_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_resolved_count"] = stats[
-            "resolved_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_failed_count"] = stats[
-            "failed_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_timeout_count"] = stats[
-            "timeout_count"
-        ]
-        self.ctx.state.last_scan["oi_targeted_refresh_unsupported_count"] = stats[
-            "unsupported_count"
-        ]
-        self.ctx.state.last_scan[
-            "entry_blocked_after_targeted_refresh_count"
-        ] = stats["blocked_after_targeted_refresh_count"]
+        publish_stats()
         return stats
 
     @staticmethod
