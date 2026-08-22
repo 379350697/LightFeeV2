@@ -79,6 +79,9 @@ evidence must map to the matrix before runtime code changes.
 - a terminal `evidence_debt` is globally background work but its exact pair
   remains blocked because the ledger expects diagnostics-only
   `confidence`/`has_*` keys that the live symbol-truth producer never emits.
+- the exact-pair predicate is deployed, but a normal running-state restart
+  never probes a terminal close debt because startup recovery symbol discovery
+  omits `pending_close_reconciliations`.
 
 ## Current Effective Rule
 
@@ -177,6 +180,14 @@ collections, `probe_evidence`, `errors`) and the diagnostics projection
 one recovery-core predicate; tests must traverse the real producer path, not
 only construct diagnostics-shaped fixtures.  This pair-scoped rule never
 clears an account-level live-artifact latch.
+
+Startup truth discovery must project every recovery owner that can consume
+symbol-scoped truth.  This includes pending close reconciliation symbols from
+both the current top-level field and the legacy `position_snapshot` shape,
+matching V1 `position_management_symbols()`.  A helper test that explicitly
+passes the symbol to the collector does not prove restart reachability; the
+persisted `runtime.start()` path must also make the probe and update the pair
+gate.
 
 Venue order truth is layered. ACK/order accepted, order detail/status, actual
 fills/executions, and live position truth are different evidence classes. OKX
@@ -292,7 +303,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-06-14 | HOME positive-fill/live-truth conflict and owned single-leg cleanup | fixed, deployed; current cloud watch | CL-078/CL-080 close the recurrence where OKX order detail/local fill evidence and Bybit IOC/hedge ACK could disagree with live account truth, and where an owned pending live-conflict still needed an execution path before pending release. OKX now requires `/api/v5/trade/fills` aggregation and `ctVal` conversion before fill truth; empty fills remain `execution_not_found`. Bybit ACK/order ids are reconciled through execution list before counting hedge filled. Bitget positive fill without valid side fails closed. Pending positive-fill live single legs are owned as `owned_pending_entry_live_conflict`, block as live artifacts, project through lifecycle closure, run owner-scoped reduce-only cleanup when open-order truth is empty and exactly one direction-correct live leg remains, and clear only after fresh account flat plus open-order truth. Cloud `793d28d` verified the old positive-fill cleanup chain through `owned_live_conflict_cleanup_succeeded` and `removed_by_v1_lifecycle_closure`. Zero-fill direct cleanup is code/test closed on the same deployed line, but the post-deploy window has no fresh zero-fill sample that exercised the specialized direct-cleanup event path. A later docs-backfill recheck saw a new HOME matched open position, not a pending live-conflict recurrence, so current cloud acceptance is watch until that active exposure closes; the same recheck exposed and locally fixed an unmapped `reconciliation.entry_flat_not_found_terminal_cleared` lifecycle event. |
 | 2026-08-09 | KAITO cleanup followed by stale `owned_pending_entry_live_conflict` with COTI background evidence debt | fixed locally, deploy pending | Complete all-account flat/no-open-order truth was already sufficient for the core to allow `RUNNING_WITH_EVIDENCE_GAP`, but the old live-artifact latch was excluded from evidence-gap release. Core now has one strict release predicate: complete non-partial account truth must show all positions and orders empty; non-blocking accounting debt remains a warning rather than global `risk_only`. |
 | 2026-08-20 | Post-terminal close owner remained in recovery ledger | local-green; `79db9b4` committed, deploy blocked | Direct reconciliation removal and passive close owner transitions can leave a pre-built recovery ledger stale. The shared owner-count refresh covers reconciliation removal, direct passive completion, and handoff to accounting; incomplete close evidence remains retained and does not become a safe release. A read-only pre-deploy gate found `entry-1787237547671-COTIUSDT` with a local open-position owner and a pending passive-close owner, so no pull/restart was permitted. |
-| 2026-08-22 | Terminal close evidence debt permanently blocked its matching pair while active/unknown reconciliation was nonblocking in the ledger | local-green worktree; deploy pending | CL-119 makes RecoveryLedger the sole exact-pair gate. Active, unknown, or truth-gap close reconciliation blocks the unordered exact venue pair; the same symbol on another complete venue pair remains eligible. `evidence_debt` becomes nonblocking only with high-confidence flat/no-open-order truth. A ledger-build semantic fingerprint now invalidates prior-lane owner additions, status transitions, and removals; unchanged queue normalization does not churn the cache. Global recovery remains warning-visible/running when no earlier account-wide live-artifact latch requires complete truth, the duplicate direct dispatch gate is removed, and no historical COTI/ONG evidence is altered. |
+| 2026-08-22 | Terminal close evidence debt permanently blocked its matching pair while active/unknown reconciliation was nonblocking in the ledger | local-green after two production REDs; redeploy pending | CL-119 makes RecoveryLedger the sole exact-pair gate. Active, unknown, or truth-gap close reconciliation blocks the unordered exact venue pair; the same symbol on another complete venue pair remains eligible. `evidence_debt` becomes nonblocking only with complete exact-pair flat/no-order truth. The first deployment exposed diagnostics/runtime truth-schema drift; `3fc91f68` then exposed startup omission of pending-close reconciliation symbols. The shared startup owner projection now covers top-level and legacy snapshot symbols through persisted `runtime.start()`. A ledger-build semantic fingerprint still owns cache invalidation, the duplicate direct dispatch gate remains removed, and no historical COTI/ONG evidence is altered. |
 
 ## Recurrences
 

@@ -2648,6 +2648,91 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_startup_discovers_terminal_close_debt_symbol_and_releases_pair_gate(self):
+        """Restart must probe close-debt owners without an explicit symbol argument."""
+
+        class FlatSymbolTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue):
+                super().__init__(venue)
+                self.open_order_scopes: list[str | None] = []
+
+            async def fetch_open_orders(self, symbol: str | None):
+                self.open_order_scopes.append(symbol)
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            SnapshotStore(config.persistence.snapshot_path).write({
+                "lifecycle": "running",
+                "risk_mode": "running",
+                "open_positions": {},
+                "pending_entries": {},
+                "pending_closes": {},
+                "pending_passive_closes": {},
+                "pending_residual_repairs": [],
+                "pending_close_reconciliations": [
+                    {
+                        "position_id": "entry-coti-billing-debt",
+                        "symbol": "COTIUSDT",
+                        "long_venue": "bybit",
+                        "short_venue": "okx",
+                        "reconciliation_status": "evidence_debt",
+                        "evidence_debt_reason": "missing_close_order_identity",
+                    }
+                ],
+            })
+            bybit = FlatSymbolTruthAdapter(Venue.BYBIT)
+            okx = FlatSymbolTruthAdapter(Venue.OKX)
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BYBIT: bybit, Venue.OKX: okx},
+            )
+
+            await runtime.start()
+
+            closure = runtime._current_v1_lifecycle_closure()
+            debt_row = next(
+                row for row in closure["rows"]
+                if row["row_key"].startswith(
+                    "recovery_work:pending_close_reconciliation:"
+                )
+            )
+            candidate = _admissible_dispatch_candidate(
+                symbol="COTIUSDT",
+                long_venue="bybit",
+                short_venue="okx",
+            )
+            assert "COTIUSDT" in bybit.open_order_scopes
+            assert "COTIUSDT" in okx.open_order_scopes
+            assert debt_row["entry_policy"] == "allow_new_risk_background_work"
+            assert debt_row["details"]["blocking"] is False
+            assert runtime._gate_recovery_ledger(candidate) == (True, "")
+            await runtime.stop()
+
+    def test_startup_recovery_symbols_cover_every_close_reconciliation_shape(self):
+        """Top-level and legacy snapshot symbols share one owner projection."""
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(make_test_config(td))
+            runtime.state.set_pending_close_reconciliations([
+                {"position_id": "top-level", "symbol": "COTIUSDT"},
+                {
+                    "position_id": "snapshot-only",
+                    "position_snapshot": {"symbol": "ONGUSDT"},
+                },
+                {"position_id": "duplicate", "symbol": "COTIUSDT"},
+                {"position_id": "malformed-without-symbol"},
+            ])
+
+            assert runtime._startup_recovery_ledger_symbols({}) == [
+                "COTIUSDT",
+                "ONGUSDT",
+            ]
+            assert runtime._truth_required_recovery_probe_symbol_sources([]) == {
+                "pending_close_reconciliation": ["COTIUSDT", "ONGUSDT"],
+            }
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("slow_probe", "expected_classification"),
         [

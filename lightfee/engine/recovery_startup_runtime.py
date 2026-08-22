@@ -898,6 +898,8 @@ class RecoveryStartupRuntime:
         for pending in self.ctx.state.pending_passive_closes.values():
             snapshot = getattr(pending, "position_snapshot", None)
             add_symbol(getattr(snapshot, "symbol", ""))
+        for pending in self.ctx.state.pending_close_reconciliations:
+            add_symbol(self._pending_close_reconciliation_symbol(pending))
         for repair in getattr(self.ctx.state, "pending_residual_repairs", []) or []:
             if isinstance(repair, dict):
                 add_symbol(repair.get("symbol", ""))
@@ -954,6 +956,11 @@ class RecoveryStartupRuntime:
             snapshot = getattr(pending, "position_snapshot", None)
             add_symbol("pending_passive_close", getattr(snapshot, "symbol", ""))
             add_symbol("pending_passive_close", getattr(pending, "symbol", ""))
+        for pending in self.ctx.state.pending_close_reconciliations:
+            add_symbol(
+                "pending_close_reconciliation",
+                self._pending_close_reconciliation_symbol(pending),
+            )
         for repair in getattr(self.ctx.state, "pending_residual_repairs", []) or []:
             if isinstance(repair, dict):
                 add_symbol("pending_residual_repair", repair.get("symbol", ""))
@@ -968,6 +975,22 @@ class RecoveryStartupRuntime:
             else:
                 add_symbol("recent_live_mismatch_cleanup", getattr(item, "symbol", ""))
         return sources
+
+    @staticmethod
+    def _pending_close_reconciliation_symbol(pending: Any) -> str:
+        """Return the persisted owner symbol across current and legacy shapes."""
+
+        if isinstance(pending, dict):
+            snapshot = pending.get("position_snapshot")
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            return str(pending.get("symbol") or snapshot.get("symbol") or "")
+        snapshot = getattr(pending, "position_snapshot", None)
+        return str(
+            getattr(pending, "symbol", "")
+            or getattr(snapshot, "symbol", "")
+            or ""
+        )
 
     async def _recover_startup_live_positions(
         self,
