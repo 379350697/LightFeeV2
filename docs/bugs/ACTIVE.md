@@ -34,17 +34,20 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `3fc91f683ab30fef9f985824ceaab723e47be96c`
-- Checked on: `2026-08-22` after the second CL-119 deployment: remote
+- Last production SHA checked: `b4b934e610c54af56818db9885d789262547867a`
+- Checked on: `2026-08-22` after the third CL-119 deployment: remote
   compileall/manifest and singleton checks passed; one live and one sidecar
   were active with zero restarts; exchange truth was flat/no-order.  Ordinary
   health correctly retained the background-debt warning (`ok=false`) while
   explicit deployment admission returned `deployment_acceptable=true`.
-  COTI/ONG debt rows still remained pair-blocking because startup symbol
-  discovery omitted `pending_close_reconciliations`, so the repaired runtime
-  truth predicate was deployed but never received those debt symbols after a
-  normal running-state restart.  CL-121/122 still need natural scenario
-  evidence.
+  COTI/ONG debt rows still remained pair-blocking.  Startup now discovered and
+  requested both symbols, but the symbol collector required a non-contract
+  `adapter.fetch_open_orders()` method that the production Binance/Bybit
+  adapters do not expose.  A credentialed read-only collector proved position
+  truth flat while both order probes were classified unsupported.  The local
+  follow-up now routes symbol and account-wide order truth through the same
+  official venue-operation contract/parser owner.  CL-121/122 still need
+  natural scenario evidence.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -82,7 +85,7 @@ do not rewrite the daily evidence just to change status.
 | CL-116 | closed | `f174bce` | shared health/diagnosis-gate RED/GREEN (`7 passed`), related suite (`220 passed`), full suite (`4359 passed, 9 skipped`) | `76e6f914` production probe: manifest/singleton passed; verifier green and `diagnose_live --since-deploy` reported a passing acceptance gate with no blockers. The one visible COTI bill remains a separate evidence-retrieval task. | [2026-08-21](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate) |
 | CL-117 | deployed-awaiting-verification | `9e7c982` | live `CloseRuntime` handoff/replay and duplicate-query regression (`21 passed`); diagnosis/lifecycle matrix (`133 passed`); full suite (`4367 passed, 9 skipped`) | `9e7c982` production probe passed manifest, singleton, verifier, and acceptance gate with flat/no-order exchange truth. Needs a real future complete partial-to-final handoff observation; the separate COTI evidence debt still needs exact Binance import evidence. | [2026-08-21](daily/2026-08-21.md#cluster-cl-117-close-evidence-lineage-and-residual-classification) |
 | CL-118 | deployed-awaiting-verification | `1e66dc1` | producer-to-consumer live-flat regression (`22 passed`); billing-evidence import suite (`35 passed`); full validation profile (`1,568 passed`); cloud compile/manifest/singleton/health/diagnose checks | `1e66dc1` is live: all 14 critical deployment hashes, singleton, health, and high-confidence all-venue flat/no-order truth passed. Production must still observe a V2-owned close with one attributed leg and one unknown exchange leg, retaining an `unattributed_exchange_execution` debt with no automatic attribution. | [2026-08-22](daily/2026-08-22.md#cluster-cl-118-unattributed-exchange-close-provenance) |
-| CL-119 | local-green | worktree on `3fc91f68` (uncommitted owner-symbol follow-up) | two production REDs: diagnostics/runtime truth-schema split, then deployed predicate unreachable because startup omitted close-reconciliation symbols; persisted `runtime.start()` → symbol collector → ledger → closure → candidate gate GREEN; top-level/snapshot symbol matrix and 7 pair-truth fail-closed cases; adjacent `319 passed`; close `444 passed`; complete `4398 passed, 9 skipped`; full profile `1571 passed` | `3fc91f68` proved the shared predicate was live but did not refresh COTI/ONG on normal startup. Needs redeploy proof that both debts remain visible with `blocking=false`; historical accounting debts remain unsettled. | [2026-08-22](daily/2026-08-22.md#cluster-cl-119-terminal-close-debt-entry-gate-semantics) |
+| CL-119 | local-green | worktree on `b4b934e6` (uncommitted shared order-contract follow-up) | three production REDs: diagnostics/runtime truth-schema split, startup close-owner symbol omission, then a production-adapter capability mismatch for symbol open-order truth; persisted `runtime.start()` now exercises official Bybit/Binance private order endpoints through the shared operation contract/parser; metadata-only adapters remain unsupported rather than becoming false probe errors; focused `2 passed`; adjacent recovery/startup/closure `343 passed`; complete `4398 passed, 9 skipped`; full profile 10/10, `1571 passed` | `b4b934e6` proved both debt symbols reached production probes, but their order truth stayed unsupported because production adapters lack the fake-only method. Needs redeploy proof that COTI/ONG remain visible with `blocking=false`; historical accounting debts remain unsettled. | [2026-08-22](daily/2026-08-22.md#cluster-cl-119-terminal-close-debt-entry-gate-semantics) |
 | CL-120 | closed | `2377193c` | default production health retained one warning and `ok=false`; explicit deployment admission independently returned `deployment_acceptable=true`; prior full suite/profile green | Required production split observed with no hidden extra warning. Accounting evidence debt is not settled by this closure. | [2026-08-22](daily/2026-08-22.md#cluster-cl-120-background-debt-health-and-deploy-admission-split) |
 | CL-121 | deployed-awaiting-verification | `2377193c` | direct per-symbol OI request, snapshot mark-price reuse, shared typed 429/retry-after classifier, stale-counter reset, runtime fail-closed regression; prior full suite/profile green | Needs a natural production targeted-OI success or 429 sample showing exact causality; no forced request/order is required. | [2026-08-22](daily/2026-08-22.md#cluster-cl-121-targeted-oi-refresh-rate-limit-causality) |
 | CL-122 | deployed-awaiting-verification | `2377193c` | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; prior full suite/profile green | Needs a future selected-candidate zero-dispatch scan to expose the final dispatch blocker breakdown without changing admission. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |

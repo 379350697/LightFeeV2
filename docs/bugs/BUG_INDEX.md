@@ -69,6 +69,20 @@ including legacy `position_snapshot.symbol`, and covers the persisted
 `runtime.start()` path.  This is `startup-close-debt-symbol-omission`, the same
 CL-119 family rather than a new exchange incident.
 
+The following deployment, `b4b934e6`, proved that owner projection was live:
+the current production run requested both COTIUSDT and ONGUSDT.  It also
+exposed a third same-family boundary mismatch.  Symbol truth called an
+optional `adapter.fetch_open_orders(symbol)` method that production
+Binance/Bybit adapters do not implement, while account-wide recovery already
+owned their official private open-order requests and strict response parsers.
+A credentialed read-only collector returned flat positions for all four
+venue/symbol legs but classified every order probe unsupported.  The repair
+narrows the existing account-wide order-truth owner by optional symbol and
+uses it from the symbol collector; no alternate endpoint, parser, gate, or
+venue-specific branch is added.  Capability absence remains unsupported, not
+a completed probe.  This stable recurrence fingerprint is
+`symbol-open-order-noncontract-adapter-method`.
+
 CL-117 close-evidence lineage and residual classification, 2026-08-21: a
 read-only production review found two distinct sources of apparent historical
 debt. ONT's `passive_close_unhedged_residual` is a passive retry marker that

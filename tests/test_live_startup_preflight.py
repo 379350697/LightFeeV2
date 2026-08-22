@@ -2651,14 +2651,21 @@ class TestRuntimePreflight:
     async def test_startup_discovers_terminal_close_debt_symbol_and_releases_pair_gate(self):
         """Restart must probe close-debt owners without an explicit symbol argument."""
 
+        class ContractOpenOrderTransport:
+            def __init__(self, venue: Venue):
+                self.venue = venue
+                self.calls: list[tuple[str, str, dict]] = []
+
+            async def _request(self, method: str, path: str, **kwargs):
+                self.calls.append((method, path, kwargs))
+                if self.venue == Venue.BYBIT:
+                    return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
+                return []
+
         class FlatSymbolTruthAdapter(FakeVenueAdapter):
             def __init__(self, venue: Venue):
                 super().__init__(venue)
-                self.open_order_scopes: list[str | None] = []
-
-            async def fetch_open_orders(self, symbol: str | None):
-                self.open_order_scopes.append(symbol)
-                return []
+                self._transport = ContractOpenOrderTransport(venue)
 
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
@@ -2675,17 +2682,17 @@ class TestRuntimePreflight:
                         "position_id": "entry-coti-billing-debt",
                         "symbol": "COTIUSDT",
                         "long_venue": "bybit",
-                        "short_venue": "okx",
+                        "short_venue": "binance",
                         "reconciliation_status": "evidence_debt",
                         "evidence_debt_reason": "missing_close_order_identity",
                     }
                 ],
             })
             bybit = FlatSymbolTruthAdapter(Venue.BYBIT)
-            okx = FlatSymbolTruthAdapter(Venue.OKX)
+            binance = FlatSymbolTruthAdapter(Venue.BINANCE)
             runtime = LiveRuntime(
                 config,
-                venue_adapters={Venue.BYBIT: bybit, Venue.OKX: okx},
+                venue_adapters={Venue.BYBIT: bybit, Venue.BINANCE: binance},
             )
 
             await runtime.start()
@@ -2700,10 +2707,29 @@ class TestRuntimePreflight:
             candidate = _admissible_dispatch_candidate(
                 symbol="COTIUSDT",
                 long_venue="bybit",
-                short_venue="okx",
+                short_venue="binance",
             )
-            assert "COTIUSDT" in bybit.open_order_scopes
-            assert "COTIUSDT" in okx.open_order_scopes
+            assert bybit._transport.calls == [
+                (
+                    "GET",
+                    "/v5/order/realtime",
+                    {
+                        "params": {
+                            "category": "linear",
+                            "settleCoin": "USDT",
+                            "symbol": "COTIUSDT",
+                        },
+                        "private": True,
+                    },
+                )
+            ]
+            assert binance._transport.calls == [
+                (
+                    "GET",
+                    "/fapi/v1/openOrders",
+                    {"params": {"symbol": "COTIUSDT"}, "private": True},
+                )
+            ]
             assert debt_row["entry_policy"] == "allow_new_risk_background_work"
             assert debt_row["details"]["blocking"] is False
             assert runtime._gate_recovery_ledger(candidate) == (True, "")

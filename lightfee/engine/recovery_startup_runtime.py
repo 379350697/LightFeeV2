@@ -467,17 +467,27 @@ class RecoveryStartupRuntime:
         self,
         venue: Venue,
         adapter: VenueAdapter,
+        *,
+        symbol: str | None = None,
     ) -> tuple[list[Any], str]:
+        """Fetch trusted private open-order truth through one venue contract.
+
+        ``symbol=None`` requests account-wide truth.  A symbol keeps the same
+        official request/parser owner while narrowing the exchange request.
+        """
         transport = getattr(adapter, "_transport", None)
         request = getattr(transport, "_request", None)
 
         if venue == Venue.ASTER:
             fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
             if callable(fetch_open_orders):
-                rows = await fetch_open_orders(None)
+                rows = await fetch_open_orders(symbol)
                 if isinstance(rows, dict) and rows.get("error"):
                     raise RuntimeError(str(rows.get("error")))
-                return self.ctx._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"
+                return (
+                    self.ctx._recovery_ledger_order_rows(rows),
+                    f"fetch_open_orders({symbol or 'None'})",
+                )
 
         if callable(request):
             credential = getattr(transport, "_credential", None)
@@ -493,6 +503,7 @@ class RecoveryStartupRuntime:
                 transport,
                 venue,
                 VenueOperation.OPEN_ORDERS,
+                symbol=str(symbol or ""),
                 account_address=account,
                 agent_wallet_address=agent_wallet,
             )
@@ -507,11 +518,14 @@ class RecoveryStartupRuntime:
 
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if not callable(fetch_open_orders):
-            raise RuntimeError("fetch_open_orders_unavailable")
-        rows = await fetch_open_orders(None)
+            raise NotImplementedError("fetch_open_orders_unavailable")
+        rows = await fetch_open_orders(symbol)
         if isinstance(rows, dict) and rows.get("error"):
             raise RuntimeError(str(rows.get("error")))
-        return self.ctx._recovery_ledger_order_rows(rows), "fetch_open_orders(None)"
+        return (
+            self.ctx._recovery_ledger_order_rows(rows),
+            f"fetch_open_orders({symbol or 'None'})",
+        )
 
     async def _collect_recovery_ledger_exchange_truth(
         self,
@@ -586,21 +600,14 @@ class RecoveryStartupRuntime:
                             }
                         )
 
-                fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
-                if not callable(fetch_open_orders):
-                    probe_evidence.append(
-                        {
-                            "venue": venue_name,
-                            "symbol": symbol,
-                            "endpoint": "fetch_open_orders",
-                            "method": "fetch_open_orders",
-                            "finished_at_ms": now_ms,
-                            "classification": "open_order_truth_unsupported",
-                        }
-                    )
-                    continue
                 try:
-                    rows = await fetch_open_orders(symbol)
+                    rows, endpoint = (
+                        await self.ctx._fetch_recovery_ledger_account_open_orders(
+                            venue,
+                            adapter,
+                            symbol=symbol,
+                        )
+                    )
                     truth_probe_count += 1
                     for row in self.ctx._recovery_ledger_open_order_payloads(
                         rows,
@@ -612,7 +619,7 @@ class RecoveryStartupRuntime:
                         {
                             "venue": venue_name,
                             "symbol": symbol,
-                            "endpoint": "fetch_open_orders",
+                            "endpoint": endpoint,
                             "method": "fetch_open_orders",
                             "finished_at_ms": now_ms,
                             "classification": "open_order_truth",
