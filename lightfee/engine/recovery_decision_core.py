@@ -688,6 +688,133 @@ class V1RecoveryDecisionCore:
         return self.is_complete_account_flat_truth(exchange_truth)
 
 
+def complete_flat_truth_for_pair(
+    exchange_truth: Any | None,
+    *,
+    symbol: str,
+    venues: Any,
+) -> bool:
+    """Whether current truth completely proves one exact venue pair flat.
+
+    Runtime recovery probes and operational diagnostics intentionally expose
+    different payload shapes.  This predicate is the shared recovery contract
+    for both: account-wide truth may prove every pair, while symbol-scoped truth
+    must contain successful position and open-order probes for both venues of
+    the requested pair.  Missing coverage never means flat.
+    """
+
+    if V1RecoveryDecisionCore.is_complete_account_flat_truth(exchange_truth):
+        return True
+
+    scope = str(_get(exchange_truth, "truth_scope", "") or "").strip().lower()
+    if not scope:
+        return _legacy_high_confidence_flat_truth(exchange_truth)
+    if scope != RecoveryTruthScope.SYMBOLS.value:
+        return False
+    if not V1RecoveryDecisionCore._truth_explicitly_supported(exchange_truth):
+        return False
+    if (
+        _get(exchange_truth, "positions", None) is None
+        or _get(exchange_truth, "open_orders", None) is None
+        or _has_items(_get(exchange_truth, "missing_evidence", ()))
+    ):
+        return False
+
+    normalized_symbol = str(symbol or "").upper()
+    normalized_venues = {
+        str(venue.value if hasattr(venue, "value") else venue or "").lower()
+        for venue in _as_items(venues)
+        if str(venue.value if hasattr(venue, "value") else venue or "")
+    }
+    if not normalized_symbol or len(normalized_venues) != 2:
+        return False
+
+    probes = _as_items(_get(exchange_truth, "probe_evidence", ()))
+    has_any_probe_gap = any(_probe_is_gap(probe) for probe in probes)
+    if (
+        not V1RecoveryDecisionCore._truth_available(exchange_truth)
+        or _has_items(_get(exchange_truth, "errors", ()))
+    ) and not has_any_probe_gap:
+        # A producer that reports an unavailable/error result without locating
+        # the gap in probe evidence cannot prove which pair is safe.
+        return False
+
+    covered: set[tuple[str, str]] = set()
+    for probe in probes:
+        probe_venue = _venue(probe)
+        probe_symbol = _symbol(probe)
+        if probe_venue not in normalized_venues or probe_symbol != normalized_symbol:
+            continue
+        if _probe_is_gap(probe):
+            return False
+        classification = str(_get(probe, "classification", "") or "").lower()
+        if classification == "position_truth" and not _get(probe, "error", ""):
+            covered.add((probe_venue, "position"))
+        elif classification == "open_order_truth" and not _get(probe, "error", ""):
+            covered.add((probe_venue, "open_order"))
+    required = {
+        (venue, evidence_kind)
+        for venue in normalized_venues
+        for evidence_kind in ("position", "open_order")
+    }
+    if covered != required:
+        return False
+
+    position_venues: set[str] = set()
+    for position in _exchange_positions(exchange_truth):
+        position_venue = _venue(position)
+        position_symbol = _symbol(position)
+        if not position_venue or not position_symbol:
+            return False
+        if (
+            position_venue not in normalized_venues
+            or position_symbol != normalized_symbol
+        ):
+            continue
+        quantity = V1RecoveryDecisionCore._finite_position_quantity(position)
+        if quantity is None or abs(quantity) > EPSILON:
+            return False
+        position_venues.add(position_venue)
+    if position_venues != normalized_venues:
+        return False
+
+    for order in _exchange_open_orders(exchange_truth):
+        order_venue = _venue(order)
+        order_symbol = _symbol(order)
+        if not order_venue or not order_symbol:
+            return False
+        if order_venue in normalized_venues and order_symbol == normalized_symbol:
+            return False
+    return True
+
+
+def _legacy_high_confidence_flat_truth(exchange_truth: Any | None) -> bool:
+    """Accept the account-wide diagnostics shape without weakening evidence."""
+
+    if not isinstance(exchange_truth, Mapping):
+        return False
+    if not bool(
+        exchange_truth.get("available", exchange_truth.get("truth_available"))
+    ):
+        return False
+    if str(exchange_truth.get("confidence", "") or "").lower() != "high":
+        return False
+    if V1RecoveryDecisionCore._has_partial_evidence_gap(exchange_truth):
+        return False
+    if (
+        exchange_truth.get("positions") is None
+        or exchange_truth.get("open_orders") is None
+        or bool(exchange_truth.get("has_nonzero_position"))
+        or bool(exchange_truth.get("has_open_order"))
+    ):
+        return False
+    for position in _exchange_positions(exchange_truth):
+        quantity = V1RecoveryDecisionCore._finite_position_quantity(position)
+        if quantity is None or abs(quantity) > EPSILON:
+            return False
+    return not _exchange_open_orders(exchange_truth)
+
+
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, Mapping):
         return obj.get(key, default)

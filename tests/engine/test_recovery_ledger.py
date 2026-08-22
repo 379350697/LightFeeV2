@@ -362,6 +362,216 @@ def test_close_reconciliation_is_visible_background_work_without_global_entry_bl
     assert ledger.allows_new_entry(SimpleNamespace(symbol="HOMEUSDT")) is True
 
 
+def test_terminal_close_debt_releases_from_runtime_symbol_truth_contract():
+    """The live recovery producer shape must prove the exact debt pair flat."""
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-billing-debt",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "okx",
+                    "reconciliation_status": "evidence_debt",
+                    "evidence_debt_reason": "missing_close_order_identity",
+                }
+            ]
+        },
+        exchange_truth={
+            "truth_scope": "symbols",
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": [
+                {
+                    "venue": venue,
+                    "symbol": "COTIUSDT",
+                    "quantity": 0.0,
+                }
+                for venue in ("bybit", "okx")
+            ],
+            "open_orders": [],
+            "probe_evidence": [
+                {
+                    "venue": venue,
+                    "symbol": "COTIUSDT",
+                    "classification": classification,
+                    "error": "",
+                }
+                for venue in ("bybit", "okx")
+                for classification in ("position_truth", "open_order_truth")
+            ],
+            "errors": [],
+        },
+    )
+
+    item = next(
+        item for item in ledger.work_items
+        if item.kind == "pending_close_reconciliation"
+    )
+    assert item.blocking is False
+    assert ledger.allows_new_entry(
+        SimpleNamespace(
+            symbol="COTIUSDT",
+            long_venue="bybit",
+            short_venue="okx",
+        )
+    ) is True
+
+
+def test_terminal_close_debt_ignores_unrelated_runtime_probe_gap():
+    """A third venue's probe failure cannot widen an exact-pair debt gate."""
+
+    probe_evidence = [
+        {
+            "venue": venue,
+            "symbol": "COTIUSDT",
+            "classification": classification,
+            "error": "",
+        }
+        for venue in ("bybit", "okx")
+        for classification in ("position_truth", "open_order_truth")
+    ]
+    probe_evidence.append(
+        {
+            "venue": "aster",
+            "symbol": "ONGUSDT",
+            "classification": "position_truth_error",
+            "error": "timeout",
+        }
+    )
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-billing-debt",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "okx",
+                    "reconciliation_status": "evidence_debt",
+                }
+            ]
+        },
+        exchange_truth={
+            "truth_scope": "symbols",
+            "truth_supported": True,
+            "truth_available": False,
+            "positions": [
+                {"venue": venue, "symbol": "COTIUSDT", "quantity": 0.0}
+                for venue in ("bybit", "okx")
+            ],
+            "open_orders": [],
+            "probe_evidence": probe_evidence,
+            "errors": ["aster:ONGUSDT:position:timeout"],
+        },
+    )
+
+    item = next(
+        item for item in ledger.work_items
+        if item.kind == "pending_close_reconciliation"
+    )
+    assert item.blocking is False
+    assert ledger.allows_new_entry(
+        SimpleNamespace(
+            symbol="COTIUSDT",
+            long_venue="bybit",
+            short_venue="okx",
+        )
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "truth_mutation",
+    [
+        "different_symbol",
+        "missing_open_order_probe",
+        "unsupported_position_probe",
+        "truth_unavailable",
+        "nonzero_position",
+        "open_order",
+        "malformed_position",
+    ],
+)
+def test_terminal_close_debt_runtime_truth_remains_blocking_without_exact_complete_pair(
+    truth_mutation,
+):
+    probe_evidence = [
+        {
+            "venue": venue,
+            "symbol": "COTIUSDT",
+            "classification": classification,
+            "error": "",
+        }
+        for venue in ("bybit", "okx")
+        for classification in ("position_truth", "open_order_truth")
+    ]
+    truth = {
+        "truth_scope": "symbols",
+        "truth_supported": True,
+        "truth_available": True,
+        "positions": [
+            {"venue": venue, "symbol": "COTIUSDT", "quantity": 0.0}
+            for venue in ("bybit", "okx")
+        ],
+        "open_orders": [],
+        "probe_evidence": probe_evidence,
+        "errors": [],
+    }
+    if truth_mutation == "different_symbol":
+        for item in truth["probe_evidence"]:
+            item["symbol"] = "BTCUSDT"
+    elif truth_mutation == "missing_open_order_probe":
+        truth["probe_evidence"] = [
+            item
+            for item in truth["probe_evidence"]
+            if not (
+                item["venue"] == "okx"
+                and item["classification"] == "open_order_truth"
+            )
+        ]
+    elif truth_mutation == "unsupported_position_probe":
+        truth["probe_evidence"][0]["classification"] = (
+            "position_truth_unsupported"
+        )
+    elif truth_mutation == "truth_unavailable":
+        truth["truth_available"] = False
+        truth["errors"] = ["bybit:COTIUSDT:position:timeout"]
+    elif truth_mutation == "nonzero_position":
+        truth["positions"][0]["quantity"] = 1.0
+    elif truth_mutation == "open_order":
+        truth["open_orders"] = [
+            {
+                "venue": "bybit",
+                "symbol": "COTIUSDT",
+                "order_id": "live-order",
+                "quantity": 0.0,
+            }
+        ]
+    elif truth_mutation == "malformed_position":
+        truth["positions"][0]["quantity"] = "not-a-number"
+
+    ledger = RecoveryLedger.from_local_and_exchange_truth(
+        local={
+            "pending_close_reconciliations": [
+                {
+                    "position_id": "pos-billing-debt",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "okx",
+                    "reconciliation_status": "evidence_debt",
+                }
+            ]
+        },
+        exchange_truth=truth,
+    )
+
+    item = next(
+        item for item in ledger.work_items
+        if item.kind == "pending_close_reconciliation"
+    )
+    assert item.blocking is True
+
+
 @pytest.mark.parametrize(
     ("reconciliation", "exchange_truth"),
     [

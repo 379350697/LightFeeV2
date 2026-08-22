@@ -6,7 +6,7 @@ their historical status text must not be used to decide whether a fix is
 deployed or closed.
 
 Scope: current operational status begins with the post-regression batch
-`CL-093` through `CL-117`. The explicit pre-CL-093 historical boundary below
+`CL-093` through `CL-122`. The explicit pre-CL-093 historical boundary below
 prevents older nonterminal prose from being mistaken for current work. New
 production/parity bugs must be added here when they are discovered.
 
@@ -34,12 +34,14 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `1e66dc140b92ec08fa60f39f4acd0f5091dbfc65`
-- Checked on: `2026-08-22` after the CL-118 deployment: remote compileall and
-  the 426-file manifest passed; all 14 critical hashes matched; one live and
-  one sidecar restarted active with zero restarts; singleton, verifier, and
-  diagnostic acceptance gate were green with high-confidence flat/no-order
-  exchange truth.
+- Last production SHA checked: `2377193c5c07563ac4d7646493232fb1bada9fb9`
+- Checked on: `2026-08-22` after the CL-119 through CL-122 deployment: remote
+  compileall/manifest and singleton checks passed; one live and one sidecar
+  were active with zero restarts; exchange truth was flat/no-order.  Ordinary
+  health correctly retained the background-debt warning (`ok=false`) while
+  explicit deployment admission returned `deployment_acceptable=true`.
+  Post-deploy closure-table review re-opened CL-119 because COTI/ONG debt rows
+  remained pair-blocking; CL-121/122 still need natural scenario evidence.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -77,10 +79,10 @@ do not rewrite the daily evidence just to change status.
 | CL-116 | closed | `f174bce` | shared health/diagnosis-gate RED/GREEN (`7 passed`), related suite (`220 passed`), full suite (`4359 passed, 9 skipped`) | `76e6f914` production probe: manifest/singleton passed; verifier green and `diagnose_live --since-deploy` reported a passing acceptance gate with no blockers. The one visible COTI bill remains a separate evidence-retrieval task. | [2026-08-21](daily/2026-08-21.md#cluster-cl-116-background-accounting-debt-deploy-gate) |
 | CL-117 | deployed-awaiting-verification | `9e7c982` | live `CloseRuntime` handoff/replay and duplicate-query regression (`21 passed`); diagnosis/lifecycle matrix (`133 passed`); full suite (`4367 passed, 9 skipped`) | `9e7c982` production probe passed manifest, singleton, verifier, and acceptance gate with flat/no-order exchange truth. Needs a real future complete partial-to-final handoff observation; the separate COTI evidence debt still needs exact Binance import evidence. | [2026-08-21](daily/2026-08-21.md#cluster-cl-117-close-evidence-lineage-and-residual-classification) |
 | CL-118 | deployed-awaiting-verification | `1e66dc1` | producer-to-consumer live-flat regression (`22 passed`); billing-evidence import suite (`35 passed`); full validation profile (`1,568 passed`); cloud compile/manifest/singleton/health/diagnose checks | `1e66dc1` is live: all 14 critical deployment hashes, singleton, health, and high-confidence all-venue flat/no-order truth passed. Production must still observe a V2-owned close with one attributed leg and one unknown exchange leg, retaining an `unattributed_exchange_execution` debt with no automatic attribution. | [2026-08-22](daily/2026-08-22.md#cluster-cl-118-unattributed-exchange-close-provenance) |
-| CL-119 | local-green | worktree on `a5ef64a` (uncommitted) | exact/reversed/different venue-pair matrix; active/unknown/truth-gap vs terminal proven-flat debt; ledger-build owner add/transition/remove invalidation; full runtime dispatch; complete suite `4386 passed, 9 skipped`; full profile `1571 passed` | Not deployed. Needs post-deploy proof that terminal proven-flat debt remains visible but does not permanently block its pair, while active/unknown close work still blocks. Historical COTI/ONG debts remain unsettled. | [2026-08-22](daily/2026-08-22.md#cluster-cl-119-terminal-close-debt-entry-gate-semantics) |
-| CL-120 | local-green | worktree on `a5ef64a` (uncommitted) | default health non-green plus exact explicit deployment-acceptance RED/GREEN; generated deploy command regression; complete suite `4386 passed, 9 skipped`; full profile `1571 passed` | Not deployed. Needs ordinary health to retain the accounting warning and explicit deploy admission to accept only the all-evidence-debt proven-flat sole-warning case. | [2026-08-22](daily/2026-08-22.md#cluster-cl-120-background-debt-health-and-deploy-admission-split) |
-| CL-121 | local-green | worktree on `a5ef64a` (uncommitted) | direct per-symbol OI request, snapshot mark-price reuse, shared typed 429/retry-after classifier, stale-counter reset, runtime fail-closed regression; complete suite `4386 passed, 9 skipped`; full profile `1571 passed` | Not deployed. Needs a production targeted-OI success or 429 sample showing exact causality; no forced request/order is required. | [2026-08-22](daily/2026-08-22.md#cluster-cl-121-targeted-oi-refresh-rate-limit-causality) |
-| CL-122 | local-green | worktree on `a5ef64a` (uncommitted) | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; complete suite `4386 passed, 9 skipped`; full profile `1571 passed` | Not deployed. Needs a future zero-dispatch scan to expose the final dispatch blocker breakdown without changing the admission decision. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |
+| CL-119 | local-green | worktree on `2377193c` (uncommitted follow-up) | production RED: global `entry_allowed=true` but COTI/ONG closure rows remained blocking; actual runtime symbol-truth producer → ledger → closure → live candidate gate; exact-pair release plus 7 fail-closed and unrelated-probe cases; adjacent `402 passed`; close `444 passed`; complete `4396 passed, 9 skipped`; full profile `1571 passed` | First fix deployed but not semantically closed: it consumed diagnostics-only keys absent from the runtime producer. Needs redeploy proof that both historical debt rows remain visible with `blocking=false`; debts remain unsettled. | [2026-08-22](daily/2026-08-22.md#cluster-cl-119-terminal-close-debt-entry-gate-semantics) |
+| CL-120 | closed | `2377193c` | default production health retained one warning and `ok=false`; explicit deployment admission independently returned `deployment_acceptable=true`; prior full suite/profile green | Required production split observed with no hidden extra warning. Accounting evidence debt is not settled by this closure. | [2026-08-22](daily/2026-08-22.md#cluster-cl-120-background-debt-health-and-deploy-admission-split) |
+| CL-121 | deployed-awaiting-verification | `2377193c` | direct per-symbol OI request, snapshot mark-price reuse, shared typed 429/retry-after classifier, stale-counter reset, runtime fail-closed regression; prior full suite/profile green | Needs a natural production targeted-OI success or 429 sample showing exact causality; no forced request/order is required. | [2026-08-22](daily/2026-08-22.md#cluster-cl-121-targeted-oi-refresh-rate-limit-causality) |
+| CL-122 | deployed-awaiting-verification | `2377193c` | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; prior full suite/profile green | Needs a future selected-candidate zero-dispatch scan to expose the final dispatch blocker breakdown without changing admission. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |
 
 ## Pre-CL-093 Historical Boundary
 

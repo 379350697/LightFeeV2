@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 
 from lightfee.engine.recovery_decision_core import (
     LIVE_ARTIFACT_BLOCK_REASONS,
+    complete_flat_truth_for_pair,
     pending_close_reconciliation_evidence,
 )
 from lightfee.venues.specs import canonical_symbol_from_venue
@@ -455,7 +456,11 @@ class RecoveryLedger:
             ).lower()
             background_accounting_debt = (
                 reconciliation_status == "evidence_debt"
-                and _high_confidence_flat_exchange_truth(exchange_truth)
+                and complete_flat_truth_for_pair(
+                    exchange_truth,
+                    symbol=_symbol(reconciliation),
+                    venues=_venues_from_close(reconciliation),
+                )
             )
             add_work(
                 RecoveryWorkItem(
@@ -595,24 +600,6 @@ def _truth_available(exchange_truth: Any) -> bool:
     if isinstance(exchange_truth, Mapping) and "available" in exchange_truth:
         return bool(exchange_truth.get("available"))
     return bool(_get(exchange_truth, "truth_available", True))
-
-
-def _high_confidence_flat_exchange_truth(exchange_truth: Any) -> bool:
-    if not _truth_available(exchange_truth):
-        return False
-    if str(_get(exchange_truth, "confidence", "") or "").lower() != "high":
-        return False
-    if bool(_get(exchange_truth, "has_nonzero_position", False)):
-        return False
-    if bool(_get(exchange_truth, "has_open_order", False)):
-        return False
-    if any(
-        abs(_float(_get(position, "quantity", _get(position, "size", 0.0))))
-        > EPSILON
-        for position in _exchange_positions(exchange_truth)
-    ):
-        return False
-    return not _exchange_open_orders(exchange_truth)
 
 
 def _exchange_positions(exchange_truth: Any) -> list[Any]:

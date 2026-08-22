@@ -76,6 +76,9 @@ evidence must map to the matrix before runtime code changes.
   position truth is flat on both close venues.
 - pending-close reconciliation drops close venues from supervision after
   `open_positions` is empty.
+- a terminal `evidence_debt` is globally background work but its exact pair
+  remains blocked because the ledger expects diagnostics-only
+  `confidence`/`has_*` keys that the live symbol-truth producer never emits.
 
 ## Current Effective Rule
 
@@ -161,6 +164,19 @@ unfiltered **account-level** truth: every position and every open order
 (including reduce-only) must be zero/empty and no probe may be partial or
 missing. This preserves the V1 background-accounting rule without allowing a
 symbol-scoped or position-only flat probe to erase a live-artifact blocker.
+
+Terminal close `evidence_debt` has a narrower pair-scoped release contract.  It
+remains visible for billing, but it may stop blocking only its exact symbol and
+unordered two-venue pair when current runtime truth contains successful
+position and open-order probes for both venues, finite zero position rows, and
+no matching live order.  Missing/unsupported/error probes, malformed rows,
+nonzero positions, and any matching order remain fail-closed.  The runtime
+producer payload (`truth_scope`, `truth_supported`, `truth_available`,
+collections, `probe_evidence`, `errors`) and the diagnostics projection
+(`confidence`, `has_nonzero_position`, `has_open_order`) must be consumed by
+one recovery-core predicate; tests must traverse the real producer path, not
+only construct diagnostics-shaped fixtures.  This pair-scoped rule never
+clears an account-level live-artifact latch.
 
 Venue order truth is layered. ACK/order accepted, order detail/status, actual
 fills/executions, and live position truth are different evidence classes. OKX

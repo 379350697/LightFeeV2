@@ -2588,6 +2588,66 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_runtime_symbol_truth_releases_terminal_debt_through_live_gate_and_closure(self):
+        """Exercise collector -> ledger -> closure -> candidate gate wiring."""
+
+        class FlatSymbolTruthAdapter(FakeVenueAdapter):
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol == "COTIUSDT"
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(
+                make_test_config(td),
+                venue_adapters={
+                    Venue.BYBIT: FlatSymbolTruthAdapter(Venue.BYBIT),
+                    Venue.OKX: FlatSymbolTruthAdapter(Venue.OKX),
+                },
+            )
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RUNNING
+            runtime.state.risk_mode = GlobalRiskMode.RUNNING
+            runtime.state.set_pending_close_reconciliations([
+                {
+                    "position_id": "entry-coti-billing-debt",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "bybit",
+                    "short_venue": "okx",
+                    "reconciliation_status": "evidence_debt",
+                    "evidence_debt_reason": "missing_close_order_identity",
+                }
+            ])
+
+            ledger = await runtime._refresh_recovery_ledger_for_symbols(
+                ["COTIUSDT"],
+                1700000005000,
+            )
+            candidate = _admissible_dispatch_candidate(
+                symbol="COTIUSDT",
+                long_venue="bybit",
+                short_venue="okx",
+            )
+
+            assert ledger is not None
+            item = next(
+                item for item in ledger.work_items
+                if item.kind == "pending_close_reconciliation"
+            )
+            assert item.blocking is False
+            assert runtime._gate_recovery_ledger(candidate) == (True, "")
+            closure = runtime.state.v1_lifecycle_closure
+            debt_row = next(
+                row for row in closure["rows"]
+                if row["row_key"].startswith(
+                    "recovery_work:pending_close_reconciliation:"
+                )
+            )
+            assert debt_row["entry_policy"] == "allow_new_risk_background_work"
+            assert debt_row["details"]["blocking"] is False
+            assert closure["summary"]["blocking_row_count"] == 0
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("slow_probe", "expected_classification"),
         [
