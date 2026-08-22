@@ -15,6 +15,7 @@ from lightfee.core.domain import (
     AccountRiskSnapshot,
     AssetTransferStatus,
     ExecutionLiquiditySnapshot,
+    HistoricalCloseEvidenceDiscovery,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
@@ -100,6 +101,23 @@ class VenueAdapter(ABC):
         order_id: str,
         client_order_id: Optional[str] = None,
     ) -> Optional[OrderFillReconciliation]:
+        return None
+
+    async def discover_historical_close_fill_reconciliation(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        position_side: str,
+        quantity: float,
+        closed_at_ms: int,
+    ) -> Optional[HistoricalCloseEvidenceDiscovery]:
+        """Discover one old close, then recheck it through the exact fill API.
+
+        The default means the venue does not support safe automatic discovery.
+        Implementations must return the full candidate cardinality and may only
+        attach a reconciliation after exact order/execution and fee retrieval.
+        """
         return None
 
     async def fetch_order_status(

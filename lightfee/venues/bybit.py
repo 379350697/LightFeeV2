@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import math
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountFeeSnapshot,
+    HistoricalCloseEvidenceDiscovery,
     OrderFill,
     OrderRequest,
     PositionSnapshot,
+    Side,
     Venue,
     VenueMarketSnapshot,
+    close_order_side_for_position,
 )
 from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.venues.entry_tradability import (
@@ -24,6 +29,93 @@ from lightfee.venues.transport import LiveCredential, VenueTransport
 
 if TYPE_CHECKING:
     from lightfee.core.domain import OrderFillReconciliation
+
+
+def _bybit_history_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+
+def _bybit_history_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _bybit_reduce_only(value: Any) -> bool:
+    return value is True or (isinstance(value, str) and value.lower() == "true")
+
+
+def find_bybit_historical_close_order_candidates(
+    orders: Iterable[dict[str, Any]],
+    *,
+    symbol: str,
+    side: Side | str,
+    position_side: str,
+    quantity: float,
+    closed_at_ms: int,
+    time_window_ms: int = 300_000,
+    quantity_relative_tolerance: float = 1e-9,
+) -> list[dict[str, Any]]:
+    """Return every Bybit history row satisfying the close identity contract."""
+    expected_side = "Buy" if (side == Side.BUY or str(side).upper() == "BUY") else "Sell"
+    expected_position_idx = 1 if str(position_side).upper() == "LONG" else 2
+    quantity_tolerance = max(quantity * quantity_relative_tolerance, 1e-12)
+    candidates: list[dict[str, Any]] = []
+    for raw in orders:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("orderId") or "").strip()
+        client_order_id = str(raw.get("orderLinkId") or "").strip()
+        executed_quantity = _bybit_history_float(raw.get("cumExecQty"))
+        updated_at_ms = _bybit_history_int(raw.get("updatedTime"))
+        try:
+            position_idx = int(raw.get("positionIdx"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        position_side_matches = position_idx == expected_position_idx or (
+            position_idx == 0 and _bybit_reduce_only(raw.get("reduceOnly"))
+        )
+        if (
+            str(raw.get("symbol") or "").upper() != symbol.upper()
+            or str(raw.get("side") or "") != expected_side
+            or not position_side_matches
+            or not _bybit_reduce_only(raw.get("reduceOnly"))
+            or str(raw.get("orderStatus") or "") != "Filled"
+            or executed_quantity is None
+            or executed_quantity <= 1e-12
+            or updated_at_ms is None
+            or not order_id
+        ):
+            continue
+        quantity_delta = abs(executed_quantity - quantity)
+        time_delta_ms = updated_at_ms - closed_at_ms
+        if quantity_delta > quantity_tolerance or abs(time_delta_ms) > time_window_ms:
+            continue
+        candidates.append(
+            {
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "system_client_order_id": client_order_id.startswith("lf"),
+                "executed_quantity": executed_quantity,
+                "updated_at_ms": updated_at_ms,
+                "time_delta_ms": time_delta_ms,
+                "quantity_delta": quantity_delta,
+            }
+        )
+    candidates.sort(
+        key=lambda candidate: (
+            abs(int(candidate["time_delta_ms"])),
+            float(candidate["quantity_delta"]),
+            str(candidate["order_id"]),
+        )
+    )
+    return candidates
 
 
 class BybitAdapter(VenueAdapter):
@@ -222,6 +314,136 @@ class BybitAdapter(VenueAdapter):
         if status is not None:
             return status
         return None
+
+    async def discover_historical_close_fill_reconciliation(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        position_side: str,
+        quantity: float,
+        closed_at_ms: int,
+    ) -> HistoricalCloseEvidenceDiscovery:
+        """Find one paginated order-history row, then re-read exact executions."""
+        if side != close_order_side_for_position(position_side):
+            raise ValueError("Bybit historical close side contradicts position side")
+        if not math.isfinite(quantity) or quantity <= 1e-12 or closed_at_ms <= 0:
+            raise ValueError("Bybit historical close query requires quantity and closed_at_ms")
+        venue_symbol = self._transport._venue_symbol(symbol)
+        time_window_ms = 300_000
+        rows: list[dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        page_count = 0
+        while True:
+            params: dict[str, Any] = {
+                "category": "linear",
+                "symbol": venue_symbol,
+                "startTime": max(0, closed_at_ms - time_window_ms),
+                "endTime": closed_at_ms + time_window_ms,
+                "limit": 50,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            raw = await self._transport._request(
+                "GET",
+                "/v5/order/history",
+                params=params,
+                private=True,
+            )
+            page_count += 1
+            if (
+                not isinstance(raw, dict)
+                or str(raw.get("retCode", 0)) != "0"
+                or not isinstance(raw.get("result"), dict)
+                or not isinstance(raw["result"].get("list"), list)
+            ):
+                raise ValueError("Bybit order history response is malformed")
+            rows.extend(
+                row for row in raw["result"]["list"] if isinstance(row, dict)
+            )
+            next_cursor = str(raw["result"].get("nextPageCursor") or "")
+            if not next_cursor:
+                break
+            if page_count >= 20:
+                return HistoricalCloseEvidenceDiscovery(
+                    classification="history_incomplete",
+                    candidate_count=0,
+                )
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise ValueError("Bybit order history cursor repeated")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
+        candidates = find_bybit_historical_close_order_candidates(
+            rows,
+            symbol=venue_symbol,
+            side=side,
+            position_side=position_side,
+            quantity=quantity,
+            closed_at_ms=closed_at_ms,
+            time_window_ms=time_window_ms,
+        )
+        if len(candidates) != 1:
+            return HistoricalCloseEvidenceDiscovery(
+                classification=(
+                    "ambiguous_candidates" if candidates else "no_candidate"
+                ),
+                candidate_count=len(candidates),
+            )
+
+        candidate = candidates[0]
+        reconciliation = await self.fetch_order_fill_reconciliation(
+            symbol,
+            str(candidate["order_id"]),
+            str(candidate["client_order_id"]),
+        )
+        if reconciliation is None:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_unavailable",
+                candidate_count=1,
+            )
+        if (
+            reconciliation.symbol.upper() != venue_symbol.upper()
+            or reconciliation.order_id != str(candidate["order_id"])
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_identity_mismatch",
+                candidate_count=1,
+            )
+        metadata = dict(reconciliation.metadata or {})
+        fee_quote = reconciliation.fee_quote
+        if (
+            metadata.get("fee_evidence_complete") is not True
+            or fee_quote is None
+            or not math.isfinite(fee_quote)
+            or fee_quote < 0.0
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_incomplete",
+                candidate_count=1,
+            )
+        execution_types = {
+            str(value) for value in metadata.get("execution_types", []) if str(value)
+        }
+        if "BustTrade" in execution_types:
+            provenance = "exchange_takeover_execution"
+        elif candidate["system_client_order_id"]:
+            provenance = "system_client_id_execution"
+        else:
+            provenance = "exchange_execution_unattributed"
+        metadata.update(
+            {
+                "historical_candidate_endpoint": "/v5/order/history",
+                "historical_candidate_updated_at_ms": candidate["updated_at_ms"],
+                "historical_evidence_provenance": provenance,
+            }
+        )
+        return HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=replace(reconciliation, metadata=metadata),
+        )
 
     async def shutdown(self) -> None:
         await self._transport.close()

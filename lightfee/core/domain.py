@@ -74,6 +74,16 @@ class Side(Enum):
         return quantity if self == Side.BUY else -quantity
 
 
+def close_order_side_for_position(position_side: str) -> Side:
+    """Return the reduce-close order side for a hedge-mode position side."""
+    normalized = str(position_side).upper()
+    if normalized == "LONG":
+        return Side.SELL
+    if normalized == "SHORT":
+        return Side.BUY
+    raise ValueError(f"unsupported hedge position side: {position_side!r}")
+
+
 class TimeInForce(Enum):
     """Order time-in-force. V1 parity: GTC for maker, IOC for hedge/close."""
 
@@ -168,6 +178,20 @@ class OrderFillReconciliation:
     fee_quote: Optional[float] = None
     filled_at_ms: int = 0
     metadata: Optional[dict] = field(default=None)
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalCloseEvidenceDiscovery:
+    """Result of a bounded history lookup followed by an exact execution recheck.
+
+    ``candidate_count`` describes the history match cardinality.  A
+    reconciliation is present only when that cardinality is exactly one and
+    the venue's normal exact order/execution endpoint confirmed the fill.
+    """
+
+    classification: str
+    candidate_count: int
+    reconciliation: Optional[OrderFillReconciliation] = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1156,10 +1156,11 @@ def pending_close_reconciliation_evidence_debt_reason(
     """Return the non-retryable evidence gap for a billing-close task.
 
     V1 constructs reconciliation work from typed position snapshots and durable
-    close-leg identities.  A legacy V2 record without those routing facts can
-    never be repaired by another execution-history request.  It remains a
-    fail-closed accounting owner, but must be classified once as an evidence
-    debt instead of being retried forever.
+    close-leg identities.  A legacy V2 record without those routing facts cannot
+    enter the ordinary exact-ID request.  It remains a fail-closed accounting
+    owner.  Missing-identity and unattributed-execution debts are eligible only
+    for bounded unique-history discovery followed by the same exact execution
+    and fee recheck; other evidence gaps remain operator-owned.
     """
     if not isinstance(reconciliation, dict):
         return "invalid_reconciliation_item"

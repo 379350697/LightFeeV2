@@ -5512,21 +5512,36 @@ class VenueTransport(MarketDataClient):
         total_qty = 0.0
         weighted_notional = 0.0
         total_fee = 0.0
+        fee_evidence_complete = True
         latest_fill_ms = 0
         resolved_side: Optional[Side] = None
+        execution_types: set[str] = set()
+        execution_ids: list[str] = []
 
         for ex in executions:
             if not isinstance(ex, dict):
                 continue
+            execution_order_id = str(ex.get("orderId") or "")
+            if execution_order_id != order_id:
+                continue
             qty = _safe_float(ex.get("execQty", "0"))
             price = _safe_float(ex.get("execPrice", "0"))
-            fee = _safe_float(ex.get("execFee", "0"))
+            fee = _parse_optional_float(ex.get("execFee"))
             ex_time = int(ex.get("execTime", 0))
             total_qty += qty
             weighted_notional += price * qty
-            total_fee += abs(fee)
+            if fee is None or not math.isfinite(fee):
+                fee_evidence_complete = False
+            else:
+                total_fee += abs(fee)
             if ex_time > latest_fill_ms:
                 latest_fill_ms = ex_time
+            execution_type = str(ex.get("execType") or "")
+            if execution_type:
+                execution_types.add(execution_type)
+            execution_id = str(ex.get("execId") or "")
+            if execution_id:
+                execution_ids.append(execution_id)
 
             # V1: parse side from execution (docs: side=Buy|Sell)
             side_raw = str(ex.get("side", "")).strip()
@@ -5567,8 +5582,13 @@ class VenueTransport(MarketDataClient):
             average_price=weighted_notional / total_qty,
             order_id=order_id,
             client_order_id=client_order_id or None,
-            fee_quote=total_fee if total_fee > 0 else None,
+            fee_quote=total_fee if fee_evidence_complete else None,
             filled_at_ms=latest_fill_ms if latest_fill_ms > 0 else now_ms,
+            metadata={
+                "fee_evidence_complete": fee_evidence_complete,
+                "execution_types": sorted(execution_types),
+                "execution_ids": execution_ids,
+            },
         )
 
     def _parse_order_status_bitget(

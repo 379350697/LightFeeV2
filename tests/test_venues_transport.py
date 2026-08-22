@@ -8728,6 +8728,7 @@ class TestVenueSpecificOrderReconciliationEvidence:
                         "retCode": 0,
                         "retMsg": "OK",
                         "result": {"list": [{
+                            "orderId": "bybit-real-order-id",
                             "execQty": "1496",
                             "execPrice": "0.01070068",
                             "execFee": "0.01",
@@ -9180,6 +9181,7 @@ class TestBybitAdapterHttpRedLight:
                 return httpx.Response(200, json={
                     "retCode": 0, "retMsg": "OK",
                     "result": {"list": [{
+                        "orderId": "oid-1",
                         "execQty": "0.5", "execPrice": "50000",
                         "execFee": "0.1", "execTime": "2000",
                         "side": "Sell", "symbol": "BTCUSDT",
@@ -9326,6 +9328,7 @@ class TestBybitAdapterHttpRedLight:
                     "retCode": 0,
                     "retMsg": "OK",
                     "result": {"list": [{
+                        "orderId": "oid-history",
                         "execQty": "400",
                         "execPrice": "0.011",
                         "execFee": "0.02",
@@ -9637,7 +9640,7 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0.5", "execPrice": "50000", "side": "Buy",
+                {"orderId": "oid-1", "execQty": "0.5", "execPrice": "50000", "side": "Buy",
                  "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
             ]},
         }
@@ -9660,7 +9663,7 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0.5", "execPrice": "50000", "side": "Sell",
+                {"orderId": "oid-1", "execQty": "0.5", "execPrice": "50000", "side": "Sell",
                  "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
             ]},
         }
@@ -9682,7 +9685,7 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0.5", "execPrice": "50000",
+                {"orderId": "oid-1", "execQty": "0.5", "execPrice": "50000",
                  "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
             ]},
         }
@@ -9703,7 +9706,7 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0.5", "execPrice": "50000", "side": "Hold",
+                {"orderId": "oid-1", "execQty": "0.5", "execPrice": "50000", "side": "Hold",
                  "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
             ]},
         }
@@ -9728,7 +9731,7 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0.5", "execPrice": "50000", "side": "buy",
+                {"orderId": "oid-1", "execQty": "0.5", "execPrice": "50000", "side": "buy",
                  "execFee": "0.1", "execTime": "2000", "symbol": "BTCUSDT"},
             ]},
         }
@@ -9749,9 +9752,9 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0.3", "execPrice": "50000", "side": "Buy",
+                {"orderId": "oid-1", "execQty": "0.3", "execPrice": "50000", "side": "Buy",
                  "execFee": "0.05", "execTime": "2000", "symbol": "BTCUSDT"},
-                {"execQty": "0.2", "execPrice": "51000", "side": "Sell",
+                {"orderId": "oid-1", "execQty": "0.2", "execPrice": "51000", "side": "Sell",
                  "execFee": "0.05", "execTime": "2001", "symbol": "BTCUSDT"},
             ]},
         }
@@ -9775,7 +9778,7 @@ class TestBybitExecutionSideRedLight:
         raw = {
             "retCode": 0, "retMsg": "OK",
             "result": {"list": [
-                {"execQty": "0", "execPrice": "0",
+                {"orderId": "oid-1", "execQty": "0", "execPrice": "0",
                  "execFee": "0", "execTime": "0", "symbol": "BTCUSDT"},
             ]},
         }

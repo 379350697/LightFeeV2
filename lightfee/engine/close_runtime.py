@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from lightfee.core.domain import Venue
+from lightfee.core.domain import Venue, close_order_side_for_position
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.lifecycle import set_lifecycle
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
@@ -19,6 +19,7 @@ from lightfee.engine.state import (
     is_unattributed_recovered_live_flat_reconciliation,
     pending_close_reconciliation_evidence_debt_reason,
     pending_close_reconciliation_identity_evidence,
+    pending_close_reconciliation_missing_legs,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -276,13 +277,14 @@ class CloseRuntime:
         long_venue: Venue | None = None,
         short_venue: Venue | None = None,
     ) -> bool:
-        """Persist one non-retryable close-accounting evidence debt.
+        """Persist one fail-closed close-accounting evidence debt.
 
         A task without its typed position routing or close-order identity cannot
-        gain that fact by polling execution history again.  Keep it as a
-        visible close-work owner, but transition it out of the retry loop once.
-        The journal includes the full task so a crash before the next snapshot
-        preserves the state transition during recovery.
+        use the ordinary exact-ID lookup.  Keep it as a visible close-work owner.
+        Missing-identity and unattributed-execution debts may later enter the
+        bounded unique-history + exact-execution path; every other debt stays
+        operator-owned.  The journal includes the full task so a crash before
+        the next snapshot preserves the state transition during recovery.
         """
         if reconciliation.get("reconciliation_status") == "evidence_debt":
             return False
@@ -334,6 +336,15 @@ class CloseRuntime:
                 "terminal_accounting_status": "evidence_debt_requires_operator",
                 "terminal_reason": reason,
                 "reconciliation_status": "evidence_debt",
+                "resolution_policy": (
+                    "automatic_unique_history_exact_recheck_or_operator_import"
+                    if reason
+                    in {
+                        "missing_close_order_identity",
+                        "unattributed_exchange_execution",
+                    }
+                    else "operator_import_required"
+                ),
                 "operator_action": "supply_typed_snapshot_and_close_leg_identity",
                 "billing_reconciliation_required": True,
                 "long_venue": (
@@ -418,6 +429,328 @@ class CloseRuntime:
                 evidence = "open_orders_flat"
             return terminal_sizes, evidence
         return terminal_sizes, None
+
+    def _record_automatic_history_evidence_block(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+        *,
+        classification: str,
+        candidate_count: int | None = None,
+        leg: str = "",
+        error: str = "",
+    ) -> None:
+        reconciliation["automatic_history_last_classification"] = classification
+        reconciliation["automatic_history_last_attempt_ms"] = now_ms
+        payload: dict[str, Any] = {
+            "position_id": str(reconciliation.get("position_id") or ""),
+            "symbol": str(reconciliation.get("symbol") or ""),
+            "kind": str(reconciliation.get("kind") or "final"),
+            "classification": classification,
+            "leg": leg,
+            "retryable": True,
+        }
+        if candidate_count is not None:
+            payload["candidate_count"] = candidate_count
+        if error:
+            payload["error"] = error
+        self.ctx.journal.append(
+            "reconciliation.automatic_historical_evidence_blocked",
+            payload,
+        )
+
+    @classmethod
+    def _close_leg_evidence_complete(
+        cls,
+        fills: list[Any] | None,
+        *,
+        venue: Venue,
+        side: Any,
+        expected_quantity: float,
+        require_historical_provenance: bool,
+    ) -> bool:
+        """Validate exact close identities, quantities, prices, and fees."""
+        if not fills:
+            return False
+        total_quantity = 0.0
+        for fill in fills:
+            fill_quantity = cls._close_reconciliation_fill_qty(fill)
+            fill_price = _recon_fill_price(fill)
+            metadata = getattr(fill, "metadata", None)
+            metadata = metadata if isinstance(metadata, dict) else {}
+            try:
+                fill_fee = float(getattr(fill, "fee_quote", None))
+            except (TypeError, ValueError):
+                return False
+            identity = cls._close_reconciliation_leg_identity(
+                {
+                    "order_id": getattr(fill, "order_id", ""),
+                    "client_order_id": getattr(fill, "client_order_id", ""),
+                }
+            )
+            if (
+                getattr(fill, "venue", None) != venue
+                or getattr(fill, "side", None) != side
+                or fill_quantity <= 1e-12
+                or not math.isfinite(fill_price)
+                or fill_price <= 0.0
+                or not math.isfinite(fill_fee)
+                or fill_fee < 0.0
+                or metadata.get("fee_evidence_complete") is not True
+                or not (identity[0] or identity[1])
+                or (
+                    require_historical_provenance
+                    and not str(metadata.get("historical_evidence_provenance") or "")
+                )
+            ):
+                return False
+            total_quantity += fill_quantity
+        return math.isclose(
+            total_quantity,
+            expected_quantity,
+            rel_tol=1e-9,
+            abs_tol=1e-12,
+        )
+
+    async def _fetch_automatic_historical_close_evidence(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+        *,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> tuple[list[Any], list[Any], dict[str, Any]] | None:
+        """Resolve a final debt without promoting a fuzzy match to evidence.
+
+        Exchange position/open-order truth gates discovery.  Each missing leg
+        must have one history candidate and the venue adapter must then return
+        its normal exact order/execution reconciliation with complete fees.
+        """
+        if str(reconciliation.get("kind") or "final") != "final":
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="unsupported_partial_evidence_debt",
+            )
+            return None
+        debt_reason = str(
+            reconciliation.get("evidence_debt_reason")
+            or pending_close_reconciliation_evidence_debt_reason(reconciliation)
+            or ""
+        )
+        if debt_reason not in {
+            "missing_close_order_identity",
+            "unattributed_exchange_execution",
+        }:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="unsupported_evidence_debt_reason",
+            )
+            return None
+
+        terminal_sizes, open_order_evidence = (
+            await self._fetch_pending_close_terminal_live_flat_truth(
+                symbol=symbol,
+                long_venue=long_venue,
+                short_venue=short_venue,
+            )
+        )
+        if terminal_sizes is None:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="terminal_position_truth_unavailable",
+            )
+            return None
+        long_live_size, short_live_size = terminal_sizes
+        if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="terminal_position_not_flat",
+            )
+            return None
+        if open_order_evidence is not None:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="terminal_open_order_truth_not_flat",
+                error=open_order_evidence,
+            )
+            return None
+
+        snapshot = reconciliation.get("position_snapshot")
+        if not isinstance(snapshot, dict):
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="missing_position_snapshot",
+            )
+            return None
+        expected_quantities = self._close_reconciliation_expected_quantities(
+            reconciliation,
+            snapshot,
+        )
+        if expected_quantities is None:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="missing_expected_close_quantities",
+            )
+            return None
+
+        missing_legs = set(pending_close_reconciliation_missing_legs(reconciliation))
+        historical_resolution: dict[str, Any] = {}
+        resolved_fills: dict[str, list[Any]] = {}
+        closed_at_ms = self._safe_reconciliation_int(
+            reconciliation.get("closed_at_ms")
+        )
+        if closed_at_ms <= 0:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="missing_closed_at_ms",
+            )
+            return None
+
+        for leg, venue, expected_quantity, position_side in (
+            ("long", long_venue, expected_quantities[0], "LONG"),
+            ("short", short_venue, expected_quantities[1], "SHORT"),
+        ):
+            if expected_quantity <= 1e-12:
+                resolved_fills[leg] = []
+                continue
+            expected_side = close_order_side_for_position(position_side)
+            replaced_incomplete_known_identity = False
+            if leg not in missing_legs:
+                try:
+                    fills = await self._call_fetch_close_leg_reconciliations(
+                        symbol=symbol,
+                        venue=venue,
+                        legs=reconciliation.get(f"{leg}_legs"),
+                    )
+                except Exception as exc:
+                    self._record_automatic_history_evidence_block(
+                        reconciliation,
+                        now_ms,
+                        classification="known_leg_exact_query_error",
+                        leg=leg,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return None
+                if self._close_leg_evidence_complete(
+                    fills,
+                    venue=venue,
+                    side=expected_side,
+                    expected_quantity=expected_quantity,
+                    require_historical_provenance=False,
+                ):
+                    resolved_fills[leg] = fills or []
+                    continue
+                # A stale or incomplete stored CID is not an exchange fill.
+                # Re-enter the same bounded unique-history path used for a
+                # wholly missing identity, then require an exact recheck.
+                replaced_incomplete_known_identity = True
+
+            adapter = self.ctx.venue_adapters.get(venue)
+            discover = getattr(
+                adapter,
+                "discover_historical_close_fill_reconciliation",
+                None,
+            )
+            if not callable(discover):
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification="history_discovery_unsupported",
+                    leg=leg,
+                )
+                return None
+            try:
+                discovery = await discover(
+                    symbol=symbol,
+                    side=expected_side,
+                    position_side=position_side,
+                    quantity=expected_quantity,
+                    closed_at_ms=closed_at_ms,
+                )
+                self._flush_adapter_order_diagnostics(adapter)
+            except Exception as exc:
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification="history_query_error",
+                    leg=leg,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return None
+            candidate_count = self._safe_reconciliation_int(
+                getattr(discovery, "candidate_count", 0)
+            )
+            classification = str(
+                getattr(discovery, "classification", "history_discovery_unsupported")
+            )
+            fill = getattr(discovery, "reconciliation", None)
+            if candidate_count != 1 or fill is None:
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification=classification,
+                    candidate_count=candidate_count,
+                    leg=leg,
+                )
+                return None
+
+            metadata = getattr(fill, "metadata", None)
+            metadata = metadata if isinstance(metadata, dict) else {}
+            identity = self._close_reconciliation_leg_identity(
+                {
+                    "order_id": getattr(fill, "order_id", ""),
+                    "client_order_id": getattr(fill, "client_order_id", ""),
+                }
+            )
+            provenance = str(metadata.get("historical_evidence_provenance") or "")
+            if not self._close_leg_evidence_complete(
+                [fill],
+                venue=venue,
+                side=expected_side,
+                expected_quantity=expected_quantity,
+                require_historical_provenance=True,
+            ):
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification="unique_candidate_exact_recheck_incomplete",
+                    candidate_count=1,
+                    leg=leg,
+                )
+                return None
+            resolved_fills[leg] = [fill]
+            historical_resolution[leg] = {
+                "classification": classification,
+                "candidate_count": candidate_count,
+                "provenance": provenance,
+                "order_id": identity[0],
+                "client_order_id": identity[1],
+                "replaced_incomplete_known_identity": (
+                    replaced_incomplete_known_identity
+                ),
+            }
+
+        if not historical_resolution:
+            self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="no_missing_leg_to_discover",
+            )
+            return None
+        return (
+            resolved_fills.get("long", []),
+            resolved_fills.get("short", []),
+            historical_resolution,
+        )
 
     async def _try_terminalize_billing_evidence_gap(
         self,
@@ -1410,7 +1743,26 @@ class CloseRuntime:
                 changed = True
                 continue
             if reconciliation.get("reconciliation_status") == "evidence_debt":
-                retained.append(reconciliation)
+                auto_reason = str(
+                    reconciliation.get("evidence_debt_reason")
+                    or pending_close_reconciliation_evidence_debt_reason(reconciliation)
+                    or ""
+                )
+                if (
+                    str(reconciliation.get("kind") or "final") != "final"
+                    or auto_reason
+                    not in {
+                        "missing_close_order_identity",
+                        "unattributed_exchange_execution",
+                    }
+                    or self._safe_reconciliation_int(
+                        reconciliation.get("next_attempt_ms")
+                    )
+                    > now_ms
+                ):
+                    retained.append(reconciliation)
+                    continue
+                eligible.append(reconciliation)
                 continue
             if str(reconciliation.get("kind") or "final") != "accepted_order_truth_gap":
                 evidence_debt_reason = (
@@ -1483,9 +1835,6 @@ class CloseRuntime:
                 str(item.get("position_id") or ""),
             ),
         ):
-            if reconciliation.get("reconciliation_status") == "evidence_debt":
-                retained.append(reconciliation)
-                continue
             snapshot = reconciliation.get("position_snapshot") or {}
             if not isinstance(snapshot, dict):
                 snapshot = {}
@@ -1508,39 +1857,63 @@ class CloseRuntime:
                 continue
 
             symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
-            has_leg_identity = (
-                self._has_close_reconciliation_leg_identity(
-                    reconciliation.get("long_legs")
-                )
-                or self._has_close_reconciliation_leg_identity(
-                    reconciliation.get("short_legs")
-                )
+            historical_resolution: dict[str, Any] = {}
+            automatic_evidence_debt = (
+                reconciliation.get("reconciliation_status") == "evidence_debt"
             )
-            if not has_leg_identity:
-                changed = (
-                    self._mark_pending_close_reconciliation_evidence_debt(
+            if automatic_evidence_debt:
+                automatic_evidence = (
+                    await self._fetch_automatic_historical_close_evidence(
                         reconciliation,
-                        reason="missing_close_order_identity",
-                        now_ms=now_ms,
+                        now_ms,
                         symbol=symbol,
                         long_venue=long_venue,
                         short_venue=short_venue,
                     )
-                    or changed
                 )
-                retained.append(reconciliation)
-                continue
+                if automatic_evidence is None:
+                    self._call_apply_pending_close_reconciliation_backoff(
+                        reconciliation,
+                        now_ms,
+                    )
+                    retained.append(reconciliation)
+                    changed = True
+                    continue
+                long_fills, short_fills, historical_resolution = automatic_evidence
+            else:
+                has_leg_identity = (
+                    self._has_close_reconciliation_leg_identity(
+                        reconciliation.get("long_legs")
+                    )
+                    or self._has_close_reconciliation_leg_identity(
+                        reconciliation.get("short_legs")
+                    )
+                )
+                if not has_leg_identity:
+                    changed = (
+                        self._mark_pending_close_reconciliation_evidence_debt(
+                            reconciliation,
+                            reason="missing_close_order_identity",
+                            now_ms=now_ms,
+                            symbol=symbol,
+                            long_venue=long_venue,
+                            short_venue=short_venue,
+                        )
+                        or changed
+                    )
+                    retained.append(reconciliation)
+                    continue
 
-            long_fills = await self._call_fetch_close_leg_reconciliations(
-                symbol=symbol,
-                venue=long_venue,
-                legs=reconciliation.get("long_legs"),
-            )
-            short_fills = await self._call_fetch_close_leg_reconciliations(
-                symbol=symbol,
-                venue=short_venue,
-                legs=reconciliation.get("short_legs"),
-            )
+                long_fills = await self._call_fetch_close_leg_reconciliations(
+                    symbol=symbol,
+                    venue=long_venue,
+                    legs=reconciliation.get("long_legs"),
+                )
+                short_fills = await self._call_fetch_close_leg_reconciliations(
+                    symbol=symbol,
+                    venue=short_venue,
+                    legs=reconciliation.get("short_legs"),
+                )
             if long_fills is not None and short_fills is not None and (long_fills or short_fills):
                 settled_reconciliation = self._reclassify_full_uncertain_submission(
                     reconciliation,
@@ -1569,6 +1942,9 @@ class CloseRuntime:
                     payload["unresolved_submission_legs"] = list(
                         reconciliation.get("unresolved_submission_legs") or []
                     )
+                if historical_resolution:
+                    payload["source"] = "automatic_historical_close_evidence"
+                    payload["historical_evidence_resolution"] = historical_resolution
                 if not payload["venue_statement_reconciled"]:
                     self.ctx.journal.append(
                         "exit.billing_unreconciled",

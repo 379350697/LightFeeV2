@@ -14,6 +14,8 @@ from typing import Any, Iterable
 
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.risk.operator import OperatorCommand, apply_operator_command
+from lightfee.core.domain import close_order_side_for_position
+from lightfee.venues.binance import find_binance_historical_close_order_candidates
 
 
 def _finite_nonnegative_float(value: Any) -> float | None:
@@ -30,10 +32,6 @@ def _positive_int(value: Any) -> int | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if parsed > 0 else None
-
-
-def _binance_reduce_only(value: Any) -> bool:
-    return value is True or (isinstance(value, str) and value.lower() == "true")
 
 
 def _close_leg_quantity(
@@ -155,11 +153,13 @@ def discover_binance_close_evidence_candidates(
             snapshot,
             leg,
         )
-        expected_side = "SELL" if leg == "long" else "BUY"
+        expected_position_side = "LONG" if leg == "long" else "SHORT"
+        expected_side = close_order_side_for_position(expected_position_side).value.upper()
         item: dict[str, Any] = {
             "leg": leg,
             "venue": venue,
             "expected_side": expected_side,
+            "expected_position_side": expected_position_side,
             "expected_quantity": expected_quantity,
             "expected_quantity_source": expected_quantity_source,
             "time_window_ms": time_window_ms,
@@ -176,48 +176,15 @@ def discover_binance_close_evidence_candidates(
             legs.append(item)
             continue
 
-        quantity_tolerance = max(expected_quantity * quantity_relative_tolerance, 1e-12)
-        candidates: list[dict[str, Any]] = []
-        for raw in order_rows:
-            order_id = str(raw.get("orderId") or "").strip()
-            client_order_id = str(raw.get("clientOrderId") or "").strip()
-            executed_quantity = _finite_nonnegative_float(raw.get("executedQty"))
-            updated_at_ms = _positive_int(raw.get("updateTime"))
-            if (
-                str(raw.get("symbol") or "") != symbol
-                or str(raw.get("side") or "").upper() != expected_side
-                or not _binance_reduce_only(raw.get("reduceOnly"))
-                or str(raw.get("status") or "").upper() != "FILLED"
-                or executed_quantity is None
-                or executed_quantity <= 1e-12
-                or updated_at_ms is None
-                or not (order_id or client_order_id)
-            ):
-                continue
-            quantity_delta = abs(executed_quantity - expected_quantity)
-            time_delta_ms = updated_at_ms - closed_at_ms
-            if quantity_delta > quantity_tolerance or abs(time_delta_ms) > time_window_ms:
-                continue
-            average_price = _finite_nonnegative_float(raw.get("avgPrice"))
-            candidates.append(
-                {
-                    "order_id": order_id,
-                    "client_order_id": client_order_id,
-                    "system_client_order_id": client_order_id.startswith("lfx"),
-                    "executed_quantity": executed_quantity,
-                    "average_price": average_price,
-                    "updated_at_ms": updated_at_ms,
-                    "time_delta_ms": time_delta_ms,
-                    "quantity_delta": quantity_delta,
-                }
-            )
-        candidates.sort(
-            key=lambda candidate: (
-                abs(int(candidate["time_delta_ms"])),
-                float(candidate["quantity_delta"]),
-                str(candidate["order_id"]),
-                str(candidate["client_order_id"]),
-            )
+        candidates = find_binance_historical_close_order_candidates(
+            order_rows,
+            symbol=symbol,
+            side=expected_side,
+            position_side=expected_position_side,
+            quantity=expected_quantity,
+            closed_at_ms=closed_at_ms,
+            time_window_ms=time_window_ms,
+            quantity_relative_tolerance=quantity_relative_tolerance,
         )
         item["candidates"] = candidates
         item["candidate_count"] = len(candidates)

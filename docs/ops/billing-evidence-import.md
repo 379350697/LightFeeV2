@@ -13,8 +13,30 @@ The import has one business boundary:
 3. the live runtime still fetches exchange execution history using the supplied
    `order_id`/`client_order_id`; only that result can emit `exit.reconciled`.
 
-Never infer a venue, order ID, fill, fee, or owner from symbol, timestamp, or
-quantity. One evidence pack cannot target multiple owners.
+For a manual evidence pack, never infer a venue, order ID, fill, fee, or owner
+from symbol, timestamp, or quantity. One evidence pack cannot target multiple
+owners. The automatic runtime path below may use those fields only to select
+one candidate; it still re-queries that candidate by exact exchange order ID
+and rejects incomplete execution or fee evidence.
+
+## Automatic Runtime Resolution
+
+A `final` debt with reason `missing_close_order_identity` or
+`unattributed_exchange_execution` is eligible for automatic resolution only
+after both routed venues return trusted zero positions and zero open orders.
+The runtime then filters a bounded five-minute history window by exact symbol,
+close side, position side, fully executed quantity, and close time. Exactly one
+candidate must remain, history pagination must be complete, and the ordinary
+adapter reconciliation must re-read that exact order's trades/executions,
+price, aggregate quantity, and complete nonnegative fees.
+
+No candidate, ambiguity, an incomplete page/cursor walk, API failure, stale
+truth, non-flat position, open order, wrong side/quantity, missing order ID,
+or missing fee retains the debt with backoff. A stale saved CID can fall back
+to the same unique-history/exact-recheck path; it is not itself fill evidence.
+Bybit `BustTrade` without a V2 client ID is retained as exchange-takeover
+provenance and is never labeled a V2 submission. Partial debts and venues
+without the discovery contract still require the manual procedure below.
 
 ## Evidence Pack
 
@@ -103,8 +125,10 @@ not exact execution evidence.
 For a Binance `missing_close_order_identity` debt with no retained exact order
 key, `lightfee-ops discover-binance-close-evidence` can narrow an offline
 investigation using a separately captured `allOrders` JSON export. It compares
-only the persisted owner, symbol, close side, `reduceOnly=TRUE`, full executed
-quantity, and a bounded close-time window. It is deliberately **not** an
+only the persisted owner, symbol, close side, position-mode close semantics,
+full executed quantity, and a bounded close-time window. Hedge Mode requires
+the exact `LONG`/`SHORT` `positionSide` and does not require `reduceOnly`;
+One-way `BOTH` requires an explicit reduce/close-only marker. It is deliberately **not** an
 evidence import: it does not call an exchange, take the writer lease, open a
 journal, write a snapshot, or change accounting state.
 

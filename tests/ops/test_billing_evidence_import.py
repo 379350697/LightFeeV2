@@ -197,6 +197,7 @@ def _binance_order(**overrides: object) -> dict[str, object]:
     order: dict[str, object] = {
         "symbol": "COWUSDT",
         "side": "SELL",
+        "positionSide": "LONG",
         "reduceOnly": True,
         "status": "FILLED",
         "executedQty": "100",
@@ -213,7 +214,7 @@ def _binance_order(**overrides: object) -> dict[str, object]:
 def test_binance_close_evidence_discovery_returns_read_only_unique_candidate():
     result = discover_binance_close_evidence_candidates(
         _binance_close_debt(),
-        [_binance_order()],
+        [_binance_order(reduceOnly=False)],
         time_window_ms=5_000,
     )
 
@@ -238,11 +239,13 @@ def test_binance_close_evidence_discovery_returns_read_only_unique_candidate():
     [
         {"symbol": "OTHERUSDT"},
         {"side": "BUY"},
-        {"reduceOnly": False},
+        {"positionSide": "SHORT"},
+        {"positionSide": "BOTH", "reduceOnly": False},
         {"executedQty": "0"},
         {"executedQty": "99"},
         {"updateTime": CLOSED_AT_MS + 5_001},
         {"orderId": "", "clientOrderId": ""},
+        {"orderId": "", "clientOrderId": "lfx-client-only"},
     ],
 )
 def test_binance_close_evidence_discovery_rejects_non_proof_candidates(overrides):

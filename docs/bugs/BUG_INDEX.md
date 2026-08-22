@@ -22,6 +22,21 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Investigations
 
+CL-123 automatic historical close evidence, 2026-08-22: COTI and ONG were
+physically flat/no-order but remained accounting debts even though read-only
+history could uniquely identify their closes. The earlier Binance discovery
+command was an offline candidate-only tool and `CloseRuntime` skipped terminal
+evidence debts; ONG also had a stale saved CID before its valid CID, causing
+exact-leg retrieval to return before any fallback. The root repair admits
+only eligible final debts after trusted terminal truth, requires one bounded
+symbol/side/position-side/quantity/time candidate, then reuses exact
+order/trade/execution and fee reconciliation before the existing billing gate.
+Ambiguous, incomplete, non-flat, open-order, or fee-incomplete cases remain
+fail-closed. Binance Hedge/One-way semantics and strict Bybit execution
+`orderId` scoping are covered in the same production-path matrix. The change
+is local-green and accounting-only, not yet deployed; see
+[CL-123](daily/2026-08-22.md#cluster-cl-123-automatic-historical-close-evidence-exact-recheck).
+
 CL-119 through CL-122 post-deploy zero-entry/root-closure review, 2026-08-22:
 the historical COTI/ONG records remain physically flat accounting evidence
 debts, but their permanence exposed a V2 gate-owner regression.  Retryable or
@@ -2234,6 +2249,7 @@ Latest Task-7 closure evidence, 2026-05-27: local full gate is green on code clo
 
 | Bug ID | Status | Severity | Component | Fingerprint | First Seen | First Seen Commit | Fixed In | Last Verified | Related Refactor | Latest Outcome |
 |---|---|---:|---|---|---|---|---|---|---|---|
+| [CL-123-automatic-historical-close-evidence-exact-recheck](daily/2026-08-22.md#cluster-cl-123-automatic-historical-close-evidence-exact-recheck) | local-green; deploy pending | high | `close-runtime`, `venue-binance`, `venue-bybit`, `billing`, `historical-evidence`, `exchange-docs` | `offline-candidate-workflow-unreachable-from-runtime + evidence-debt-unconditional-skip + stale-known-cid-short-circuit` | 2026-08-22 | COTI/ONG persisted owners, exact read-only Binance/Bybit order/execution/fee history, V1 exact-identity semantics, and official exchange API contracts | pending | real runtime-to-adapter regressions cover COTI/ONG, stale CID fallback, Hedge/One-way, pagination, ambiguity, fees, exact execution identity scoping, and terminal truth (dedicated `11 passed`; related selection `191 passed, 338 deselected`); complete suite `4411 passed, 9 skipped`; full profile 10/10, `1571` tests | unique bounded candidate followed by existing exact order/trade/execution recheck and billing gate | Accounting-only: no order action. Candidate fields never become evidence directly; every ambiguity/incomplete/truth-failure path retains the debt. Deploy/production settlement remain open. |
 | [CL-122-final-entry-dispatch-blocker-observability](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) | closed; deployed and naturally observed | high | `live-runtime`, `entry-dispatch`, `production-observability` | `selected-candidate-final-gate-reason-collapsed-to-no-entry-dispatched` | 2026-08-22 | post-deploy zero-entry log/code review at `a5ef64a` | `2377193c` | run `lightfee-1787395032184-4057959`: ONG selected 1, dispatched 0, exact RecoveryLedger reason present in dispatch/final/stage counters | existing entry-gate reasons and bounded scan diagnostics | Final gate order/outcomes were unchanged; production proved the exact dispatch blocker survives into the bounded scan diagnostic. |
 | [CL-121-targeted-oi-refresh-rate-limit-causality](daily/2026-08-22.md#cluster-cl-121-targeted-oi-refresh-rate-limit-causality) | deployed; awaiting natural targeted-OI sample | high | `market-data`, `entry-readiness`, `venue-binance`, `venue-aster`, `rate-limit-observability` | `targeted-oi-full-ticker-fanout + http-429-collapsed-to-timeout` | 2026-08-22 | production Aster 429 plus code-path review at `a5ef64a` | `2377193c` | direct OI-only request, mark-price reuse, shared 429/retry-after classifier, stale-counter reset, and runtime fail-closed regressions green | official per-symbol OI endpoint and existing client limiter/cache | Candidate OI refresh no longer calls book/premium/24h endpoints and preserves typed rate-limit causality; unavailable OI still blocks entry. Natural post-fix sample remains pending. |
 | [CL-120-background-debt-health-and-deploy-admission-split](daily/2026-08-22.md#cluster-cl-120-background-debt-health-and-deploy-admission-split) | closed; deployed and production verified | high | `production-health`, `deployment`, `recovery-accounting` | `background-close-owner-hidden-to-make-health-ok` | 2026-08-22 | CL-116/118 post-deploy semantic review at `a5ef64a` | `2377193c` | ordinary health retained the sole debt warning while explicit deployment acceptance passed | shared recovery evidence plus explicit verifier policy boundary | Background debt stays visible in ordinary health; only the proven-flat sole-warning shape passes explicit deployment admission. |
