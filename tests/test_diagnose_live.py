@@ -1058,6 +1058,51 @@ def test_run_diagnose_maps_normal_production_startup_events(monkeypatch):
                 "kind": "runtime.local_l2_phase_complete",
                 "payload": {"symbol_count": 12},
             },
+            {
+                "ts_ms": 1787421699300,
+                "kind": "runtime.entry_local_l2_readiness_diagnostics",
+                "payload": {"candidate_count": 1},
+            },
+            {
+                "ts_ms": 1787421699400,
+                "kind": "runtime.local_l2_bootstrap_worker_done",
+                "payload": {"venue": "binance"},
+            },
+            {
+                "ts_ms": 1787421699500,
+                "kind": "runtime.local_l2_dynamic_ws_started",
+                "payload": {"venue": "binance"},
+            },
+            {
+                "ts_ms": 1787421699600,
+                "kind": "runtime.local_l2_freshness_state",
+                "payload": {"venue": "binance", "state": "fresh"},
+            },
+            {
+                "ts_ms": 1787421699700,
+                "kind": "runtime.local_l2_hot_stale_awaiting_ws_delta",
+                "payload": {"venue": "binance"},
+            },
+            {
+                "ts_ms": 1787421699800,
+                "kind": "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
+                "payload": {"venue": "binance"},
+            },
+            {
+                "ts_ms": 1787421699900,
+                "kind": "runtime.local_l2_snapshot_ok",
+                "payload": {"venue": "binance"},
+            },
+            {
+                "ts_ms": 1787421700000,
+                "kind": "runtime.local_l2_stream_only_bootstrap_skipped",
+                "payload": {"venue": "binance"},
+            },
+            {
+                "ts_ms": 1787421700100,
+                "kind": "runtime.local_l2_ws_transport",
+                "payload": {"venue": "binance", "status": "connected"},
+            },
         ])
         monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
 

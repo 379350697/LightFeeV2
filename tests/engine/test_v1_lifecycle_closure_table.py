@@ -380,6 +380,16 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
         "runtime.account_fee_snapshot_refresh_unavailable",
         "runtime.local_l2_phase_start",
         "runtime.local_l2_phase_complete",
+        "runtime.entry_local_l2_readiness_diagnostics",
+        "runtime.local_l2_bootstrap_worker_done",
+        "runtime.local_l2_dynamic_ws_started",
+        "runtime.local_l2_freshness_state",
+        "runtime.local_l2_hot_stale_awaiting_ws_delta",
+        "runtime.local_l2_rest_bootstrap_deferred_for_ws_snapshot",
+        "runtime.local_l2_snapshot_ok",
+        "runtime.local_l2_stream_only_bootstrap_skipped",
+        "runtime.local_l2_ws_transport",
+        "runtime.local_l2_snapshot_error",
         "runtime.reconciling",
         "runtime.recovery_block_reconcile_attempt",
         "runtime.recovery_fail_closed",
@@ -547,6 +557,14 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     assert (
         map_lifecycle_event_kind("runtime.local_l2_phase_complete")
         == "RUNTIME_PROGRESS"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.entry_local_l2_readiness_diagnostics")
+        == "DIAGNOSTIC_ONLY"
+    )
+    assert (
+        map_lifecycle_event_kind("runtime.local_l2_snapshot_error")
+        == "DIAGNOSTIC_ONLY"
     )
 
 
