@@ -83,6 +83,17 @@ venue-specific branch is added.  Capability absence remains unsupported, not
 a completed probe.  This stable recurrence fingerprint is
 `symbol-open-order-noncontract-adapter-method`.
 
+Final production closure on `0474ca28` passed compile/manifest integrity,
+singleton, service, deployment-acceptance, and since-deploy diagnosis.  All
+seven venues returned high-confidence flat/no-open-order truth.  COTI/ONG
+remained visible as accounting evidence debts, but both exact-pair rows became
+`blocking=false` with `allow_new_risk_background_work`, and the shared closure
+reported zero blocking rows.  The post-deploy no-entry samples contained no
+RecoveryLedger or final-dispatch blocker: no candidate passed the unchanged
+strategy edge thresholds.  CL-119 is therefore closed for pair-gate semantics;
+it does not claim a natural real-order open/close sample or settle the two
+historical billing debts.
+
 CL-117 close-evidence lineage and residual classification, 2026-08-21: a
 read-only production review found two distinct sources of apparent historical
 debt. ONT's `passive_close_unhedged_residual` is a passive retry marker that
