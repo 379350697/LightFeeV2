@@ -162,6 +162,7 @@ class LiveRuntime:
     _PASSIVE_POST_ONLY_WIDE_SPREAD_BPS = 20.0
     _PASSIVE_POST_ONLY_RETRY_BACKOFF_MS = (500, 1000, 2000, 4000, 6000, 8000, 10000)
     _MAKER_EDGE_AWARE_FULL_AGGRESSION_HEADROOM_BPS_FLOOR = 2.0
+    _PRIVATE_WS_ACTIVATION_RETRY_MS = 15_000
 
     @property
     def venue_contracts(self) -> Any:
@@ -255,10 +256,9 @@ class LiveRuntime:
         # V1 rate-limit reload tracking
         self._last_rate_limit_reload_ms: int = 0
 
-        # V1 private WS tracking: each venue gets workers started once.
-        # Tracked per venue to handle reconfiguration gracefully.
+        # Private streams are owned by venue lifecycle, never candidate churn.
         self._private_ws_started: set[Venue] = set()
-        self._private_ws_symbols: dict[Venue, set[str]] = {}
+        self._private_ws_retry_after_ms: dict[Venue, int] = {}
 
         # V1 per-venue risk snapshot runtime cache
         #   key: venue → {fetched_at_ms, result: OK(Optional[ARS]) | Err(str)}
@@ -1852,16 +1852,24 @@ class LiveRuntime:
                 },
             )
 
-        # Phase 5 – Local-L2 startup activation (V1: local-L2 phased activation)
+        # Phase 5 – Private stream startup activation.  This mirrors V1's
+        # startup-only private-stream phase: candidate-pool churn must never
+        # own a private connection's lifecycle.
+        await self._run_startup_phase_with_timeout(
+            "private_ws_activation",
+            self._activate_private_ws_startup_phase(),
+        )
+
+        # Phase 6 – Local-L2 startup activation (V1: local-L2 phased activation)
         await self._run_startup_phase_with_timeout(
             "local_l2_activation",
             self._activate_local_l2_phase(wall_clock_now_ms()),
         )
 
-        # Phase 6 – Recover retained local-L2 state
+        # Phase 7 – Recover retained local-L2 state
         await self._restore_local_l2_state()
 
-        # Phase 7 – Instantiate passive close executor
+        # Phase 8 – Instantiate passive close executor
         if self._venue_adapters:
             from lightfee.engine.passive_close import PassiveCloseExecutor
             self.passive_close_executor = PassiveCloseExecutor(
@@ -1884,7 +1892,7 @@ class LiveRuntime:
             if self.close_executor is not None:
                 self.passive_close_executor.set_close_executor(self.close_executor)
 
-        # Phase 8 – Recover pending passive closes
+        # Phase 9 – Recover pending passive closes
         await self._recover_passive_closes()
         await self._refresh_risk_only_lifecycle_from_account_truth(
             wall_clock_now_ms(),
@@ -2181,6 +2189,7 @@ class LiveRuntime:
         symbols: list[str],
         *,
         skip_event_kind: str,
+        allow_unfiltered_when_catalog_unavailable: bool = True,
     ) -> list[str]:
         """Filter symbols through a venue-provided trading catalog when present."""
         ensure_loaded = getattr(adapter, "ensure_supported_symbols_loaded", None)
@@ -2205,6 +2214,12 @@ class LiveRuntime:
             catalog_error = str(exc)
             catalog_unavailable_reason = "supported_symbols_failed"
         supported = {str(symbol) for symbol in supported_raw if str(symbol)}
+        # Recovery historically permits a cached catalog after a refresh error;
+        # preserve that compatibility by default.  Private-stream activation is
+        # different: subscribing with an unconfirmed catalog can create an
+        # authenticated connection for an invalid symbol, so it must defer.
+        if catalog_unavailable_reason and not allow_unfiltered_when_catalog_unavailable:
+            return []
         if not supported:
             if not catalog_unavailable_reason:
                 catalog_unavailable_reason = (
@@ -2255,7 +2270,7 @@ class LiveRuntime:
                             "reason": "catalog_unavailable",
                         },
                     )
-            return symbols
+            return symbols if allow_unfiltered_when_catalog_unavailable else []
 
         transport = getattr(adapter, "_transport", None)
         to_venue_symbol = getattr(transport, "_venue_symbol", None)
@@ -3813,7 +3828,15 @@ class LiveRuntime:
             if getattr(adapter, "supports_private_health", False):
                 transport = getattr(adapter, "_transport", None)
                 if transport is not None:
-                    transport.stop_private_ws()
+                    stop_and_wait = getattr(transport, "stop_private_ws_and_wait", None)
+                    if callable(stop_and_wait):
+                        await _await_shutdown_task(
+                            "close_network",
+                            f"private_ws.stop:{venue.value}",
+                            stop_and_wait(_remaining_shutdown_timeout_s()),
+                        )
+                    else:
+                        transport.stop_private_ws()
                     self.journal.append(
                         "runtime.private_ws_stopped",
                         {"venue": venue.value},
@@ -6731,7 +6754,7 @@ class LiveRuntime:
             short_venue=short_venue,
         )
 
-    async def _try_abandon_stale_pending_close_reconciliation(
+    async def _try_register_terminal_fill_evidence_debt(
         self,
         reconciliation: dict[str, Any],
         now_ms: int,
@@ -6739,15 +6762,13 @@ class LiveRuntime:
         symbol: str,
         long_venue: Venue,
         short_venue: Venue,
-        error: str,
     ) -> bool:
-        return await self.close_runtime._try_abandon_stale_pending_close_reconciliation(
+        return await self.close_runtime._try_register_terminal_fill_evidence_debt(
             reconciliation,
             now_ms,
             symbol=symbol,
             long_venue=long_venue,
             short_venue=short_venue,
-            error=error,
         )
 
     def _venue_private_position_confirmed(self, venue: Venue, symbol: str) -> bool:
@@ -10178,61 +10199,161 @@ class LiveRuntime:
     # Housekeeping
     # ------------------------------------------------------------------
 
-    def _ensure_private_ws_started(self, now_ms: int) -> None:
-        """V1: start private WS workers for live adapters when credentials/symbols ready.
+    async def _activate_private_ws_startup_phase(
+        self,
+        *,
+        now_ms: Optional[int] = None,
+    ) -> None:
+        """Start each live venue's private stream once from stable startup state.
 
-        Called each tick until all live adapters with private health support have
-        workers running. Tracked symbol changes trigger worker replacement.
-        Idempotent: skips venues that already have workers for the same symbol set.
+        V1 activates private streams during startup with its market-symbol set,
+        then leaves network reconnects to the long-lived venue worker.  A V2
+        candidate is an entry decision, not a connection-lifecycle owner:
+        replacing a worker whenever the candidate set changes repeatedly tears
+        down authenticated private streams and can overlap their cleanup with a
+        replacement connection.
+
+        The stable set combines the resolved runtime universe with recovered
+        position or pending-work symbols. Candidate-pool membership is
+        intentionally excluded. Each venue gets its own bounded activation
+        attempt, so a slow catalog cannot block other private streams.
         """
-        if self.config.runtime.mode == "paper":
+        if str(self.config.runtime.mode).lower() != "live":
             return
 
-        tracked_symbols = self._current_tracked_private_symbols()
-        for venue, adapter in self._venue_adapters.items():
-            if not getattr(adapter, 'supports_private_health', False):
-                continue
+        now_ms = wall_clock_now_ms() if now_ms is None else now_ms
+        configured_symbols = {
+            str(symbol).upper()
+            for symbol in self.config.symbols
+            if str(symbol)
+        }
+        recovered_symbols = self._current_tracked_private_symbols(
+            include_candidate_pairs=False,
+        )
+        per_venue_timeout_s = max(
+            int(self.config.runtime.live_startup_phase_timeout_ms or 1),
+            1,
+        ) / 1000.0
 
-            transport = getattr(adapter, '_transport', None)
-            if transport is None:
-                continue
-
-            symbols = tracked_symbols.get(venue, set())
-            prev_symbols = self._private_ws_symbols.get(venue, set())
-
-            # V1: empty symbols → stop any existing workers, clear tracking
-            if not symbols:
-                if prev_symbols:
-                    transport.stop_private_ws()
-                    self._private_ws_started.discard(venue)
-                    self._private_ws_symbols.pop(venue, None)
-                    self.journal.append(
-                        "runtime.private_ws_stopped",
-                        {
-                            "venue": venue.value,
-                            "reason": "no tracked symbols",
-                        },
-                    )
-                continue
-
-            # Start if never started or symbols changed
-            if venue not in self._private_ws_started or symbols != prev_symbols:
-                if symbols != prev_symbols and venue in self._private_ws_started:
-                    # V1: worker replacement on symbol change
-                    transport.stop_private_ws()
-
-                transport.start_private_ws(list(symbols))
-                self._private_ws_started.add(venue)
-                self._private_ws_symbols[venue] = set(symbols)
+        async def _activate_one(venue: Venue, adapter: VenueAdapter) -> None:
+            try:
+                await asyncio.wait_for(
+                    self._activate_private_ws_for_venue(
+                        venue,
+                        adapter,
+                        configured_symbols,
+                        recovered_symbols.get(venue, set()),
+                        now_ms,
+                    ),
+                    timeout=per_venue_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                self._private_ws_retry_after_ms[venue] = (
+                    now_ms + self._PRIVATE_WS_ACTIVATION_RETRY_MS
+                )
                 self.journal.append(
-                    "runtime.private_ws_started",
+                    "runtime.private_ws_activation_timeout",
                     {
                         "venue": venue.value,
-                        "symbol_count": len(symbols),
+                        "timeout_ms": int(per_venue_timeout_s * 1000),
                     },
                 )
+            except Exception as exc:
+                self._private_ws_retry_after_ms[venue] = (
+                    now_ms + self._PRIVATE_WS_ACTIVATION_RETRY_MS
+                )
+                self.journal.append(
+                    "runtime.private_ws_activation_error",
+                    {"venue": venue.value, "error": str(exc)},
+                )
 
-    def _current_tracked_private_symbols(self) -> dict[Venue, set[str]]:
+        await asyncio.gather(
+            *[
+                _activate_one(venue, adapter)
+                for venue, adapter in self._venue_adapters.items()
+                if getattr(adapter, "supports_private_health", False)
+            ],
+        )
+
+    async def _activate_private_ws_for_venue(
+        self,
+        venue: Venue,
+        adapter: VenueAdapter,
+        configured_symbols: set[str],
+        recovered_symbols: set[str],
+        now_ms: int,
+    ) -> None:
+        """Perform one strict, rate-bounded activation attempt for a venue."""
+        transport = getattr(adapter, "_transport", None)
+        if transport is None:
+            return
+
+        if venue in self._private_ws_started:
+            # A registered venue worker owns its reconnect loop.  Runtime
+            # must not turn a transient worker health observation into a new
+            # authenticated connection lifecycle on every housekeeping tick.
+            return
+
+        if now_ms < self._private_ws_retry_after_ms.get(venue, 0):
+            return
+
+        requested_symbols = sorted(configured_symbols | recovered_symbols)
+        if not requested_symbols:
+            return
+
+        symbols = await self._filter_symbols_supported_by_venue(
+            venue,
+            adapter,
+            requested_symbols,
+            skip_event_kind="",
+            allow_unfiltered_when_catalog_unavailable=False,
+        )
+        if not symbols:
+            self._private_ws_retry_after_ms[venue] = (
+                now_ms + self._PRIVATE_WS_ACTIVATION_RETRY_MS
+            )
+            self.journal.append(
+                "runtime.private_ws_activation_skipped",
+                {
+                    "venue": venue.value,
+                    "reason": "catalog_unavailable_or_no_supported_symbols",
+                    "requested_symbol_count": len(requested_symbols),
+                },
+            )
+            return
+
+        transport.start_private_ws(symbols)
+        worker_count = getattr(transport, "private_ws_worker_count", None)
+        if callable(worker_count) and worker_count() <= 0:
+            self._private_ws_retry_after_ms[venue] = (
+                now_ms + self._PRIVATE_WS_ACTIVATION_RETRY_MS
+            )
+            self.journal.append(
+                "runtime.private_ws_activation_deferred",
+                {
+                    "venue": venue.value,
+                    "reason": "worker_not_created",
+                    "symbol_count": len(symbols),
+                },
+            )
+            return
+
+        self._private_ws_started.add(venue)
+        self._private_ws_retry_after_ms.pop(venue, None)
+        self.journal.append(
+            "runtime.private_ws_started",
+            {
+                "venue": venue.value,
+                "symbol_count": len(symbols),
+                "reason": "startup_activation",
+            },
+        )
+
+    def _current_tracked_private_symbols(
+        self,
+        *,
+        include_candidate_pairs: bool = True,
+    ) -> dict[Venue, set[str]]:
         """Collect symbols that need private WS tracking from current state.
 
         V1: symbols from primary tracked entry pairs, open positions, and
@@ -10251,41 +10372,43 @@ class LiveRuntime:
                 if short_v is not None and isinstance(short_v, Venue):
                     result.setdefault(short_v, set()).add(sym)
 
-        # from tracked entry pairs (V1: symbols tracked for entry)
+        # Candidate tracking remains useful for diagnostics, but it is not a
+        # private-connection lifecycle owner.
         # pair_id format: "{symbol.lower()}:{long_venue}->{short_venue}"
         # (see entry_local_l2.py:make_candidate_pair_id)
         # IMPORTANT: make_candidate_pair_id() lowercases the symbol for stable
         # identity, so we must canonicalize it back to V2 internal uppercase
         # (e.g. "ethusdt" → "ETHUSDT") before passing to venue private WS.
-        for pair_id in getattr(self, '_tracked_primary_pair_ids', set()):
-            if not pair_id:
-                continue
-            # Try canonical format first: "sym:long->short"
-            sym = ""
-            long_v = None
-            short_v = None
-            if "->" in pair_id:
-                try:
-                    before_arrow, short_str = pair_id.rsplit("->", 1)
-                    sym, long_str = before_arrow.split(":", 1)
-                    sym = sym.upper()  # canonical V2 symbol (was lowercased by make_candidate_pair_id)
-                    long_v = Venue(long_str)
-                    short_v = Venue(short_str)
-                except (ValueError, KeyError):
-                    pass
-            # Fallback: pipe-delimited format (backward compat / tests)
-            if long_v is None:
-                parts = pair_id.split("|")
-                if len(parts) >= 3:
-                    sym = parts[0].upper()  # canonical V2 symbol
+        if include_candidate_pairs:
+            for pair_id in getattr(self, '_tracked_primary_pair_ids', set()):
+                if not pair_id:
+                    continue
+                # Try canonical format first: "sym:long->short"
+                sym = ""
+                long_v = None
+                short_v = None
+                if "->" in pair_id:
                     try:
-                        long_v = Venue(parts[1])
-                        short_v = Venue(parts[2])
-                    except ValueError:
-                        continue
-            if long_v is not None and short_v is not None and sym:
-                result.setdefault(long_v, set()).add(sym)
-                result.setdefault(short_v, set()).add(sym)
+                        before_arrow, short_str = pair_id.rsplit("->", 1)
+                        sym, long_str = before_arrow.split(":", 1)
+                        sym = sym.upper()  # canonical V2 symbol (was lowercased by make_candidate_pair_id)
+                        long_v = Venue(long_str)
+                        short_v = Venue(short_str)
+                    except (ValueError, KeyError):
+                        pass
+                # Fallback: pipe-delimited format (backward compat / tests)
+                if long_v is None:
+                    parts = pair_id.split("|")
+                    if len(parts) >= 3:
+                        sym = parts[0].upper()  # canonical V2 symbol
+                        try:
+                            long_v = Venue(parts[1])
+                            short_v = Venue(parts[2])
+                        except ValueError:
+                            continue
+                if long_v is not None and short_v is not None and sym:
+                    result.setdefault(long_v, set()).add(sym)
+                    result.setdefault(short_v, set()).add(sym)
 
         # from pending entries (entries being executed that haven't opened yet)
         for entry in getattr(self.state, 'pending_entries', {}).values():
@@ -10335,9 +10458,6 @@ class LiveRuntime:
 
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
-        # V1: ensure private WS workers are running for live adapters
-        self._ensure_private_ws_started(now_ms)
-
         # Risk-line supervision — V1: refresh_venue_health_supervisor + recompute_global_risk_mode
         # CRITICAL: risk_snapshot_cache must be injected BEFORE supervise() so
         # _collect_venue_health_views() sees current-tick AccountRiskSnapshot data.
@@ -10358,6 +10478,10 @@ class LiveRuntime:
 
         # Detect false-clean state where exchanges hold positions but V2 missed them.
         await self._maybe_recover_clean_live_positions(now_ms)
+
+        # Retry only failed activation attempts, on a fixed bound. This uses
+        # the stable startup inputs, never the candidate pool.
+        await self._activate_private_ws_startup_phase(now_ms=now_ms)
 
         # Periodic Prometheus & state exports
         maybe_export_runtime_metrics(

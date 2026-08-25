@@ -17,6 +17,9 @@ Expected:
 - one sidecar process
 - sidecar snapshot with 7 venues
 - current state `lifecycle=running`, `risk_mode=running`
+- process-owned FD and `CLOSE_WAIT` counts below the health limits
+- no venue with more than three private-WS worker starts in the last hour
+- a Binance listenKey success no older than 35 minutes and not expired
 
 Exception: a known, physically flat close-accounting evidence debt intentionally
 keeps ordinary health at `ok: false`.  In that case the only acceptable shape is
@@ -44,6 +47,25 @@ Record the current deploy identity (`git rev-parse --short HEAD` and
 `.deploy_version`), live/sidecar process state, open/pending/recovery counts, and
 the first failing health field. Do not include secrets, raw account identifiers,
 or long journal excerpts in the bug ledger.
+
+## Continuous Resource Gate
+
+The deployment installs `lightfee-production-health.timer`. It runs the same
+read-only deployment-acceptance verifier every five minutes and writes a failed
+oneshot result to the system journal when resource evidence is missing or bad.
+It never submits, cancels, or alters orders.
+
+```bash
+systemctl is-active lightfee-production-health.timer
+systemctl list-timers lightfee-production-health.timer
+systemctl status lightfee-production-health.service --no-pager
+journalctl -u lightfee-production-health.service -n 100 --no-pager
+```
+
+The collector attributes `CLOSE_WAIT` sockets by each service PID's socket
+inode. Do not diagnose from a global host `CLOSE_WAIT` count: unrelated
+processes would be a false positive. A failure is fail-closed for deployment
+acceptance; inspect its JSON report before restarting either trading service.
 
 ## Remediate Sidecar Config Drift
 
@@ -86,9 +108,10 @@ bash scripts/deploy.sh
 ```
 
 The script syncs code, uploads `.deploy_manifest.json`, writes `.deploy_version`,
-runs remote verification with `/opt/lightfee-v2/.venv/bin/python3`, restarts the
-live services, and collects `diagnose_live.py --since-deploy` evidence. Any step
-failure exits non-zero.
+runs remote verification with `/opt/lightfee-v2/.venv/bin/python3`, installs the
+health timer, restarts the live services, runs the health gate once immediately,
+and collects `diagnose_live.py --since-deploy` evidence. Any step failure exits
+non-zero.
 
 ## Post-Deploy Verification
 

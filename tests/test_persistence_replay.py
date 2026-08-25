@@ -90,6 +90,35 @@ class TestJournalReplayEngine:
 
         assert result["open_position_count"] == 0
 
+    def test_replay_historical_fill_abandonment_keeps_registered_billing_owner(self):
+        records = [
+            {
+                "seq": 1, "run_id": "r1", "ts_ms": 1_000,
+                "kind": "exit.pending_close_reconciliation_registered",
+                "payload": {
+                    "position_id": "pos-historical-bill",
+                    "reconciliation": {
+                        "position_id": "pos-historical-bill",
+                        "kind": "final",
+                        "closed_at_ms": 900,
+                        "long_legs": [{"order_id": "binance-close"}],
+                        "short_legs": [{"order_id": "bybit-close"}],
+                    },
+                },
+            },
+            {
+                "seq": 2, "run_id": "r1", "ts_ms": 2_000,
+                "kind": "exit.reconciliation_abandoned",
+                "payload": {"position_id": "pos-historical-bill"},
+            },
+        ]
+
+        result = replay_journal_records(records)
+
+        assert result["open_position_count"] == 0
+        assert result["pending_close_reconciliation_count"] == 1
+        assert result["pending_close_reconciliation_ids"] == ["pos-historical-bill"]
+
     def test_replay_partial_close_reduces_quantity(self):
         records = [
             {

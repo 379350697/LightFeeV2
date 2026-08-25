@@ -29,6 +29,17 @@ class CloseRuntime:
     _RECONCILE_RETRY_BASE_MS = 30_000
     _RECONCILE_RETRY_MAX_MS = 300_000
     _RECONCILE_HARD_DEADLINE_MS = 600_000  # 10 min hard deadline
+    _AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS = frozenset({
+        "missing_close_order_identity",
+        "unattributed_exchange_execution",
+    })
+    _EXACT_ID_RETRY_EVIDENCE_DEBT_REASON = (
+        "known_close_fill_temporarily_unavailable"
+    )
+    _AUTOMATIC_EVIDENCE_DEBT_REASONS = (
+        _AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
+        | {_EXACT_ID_RETRY_EVIDENCE_DEBT_REASON}
+    )
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -55,13 +66,13 @@ class CloseRuntime:
             return await override(**kwargs)
         return await self._fetch_pending_close_terminal_live_sizes(**kwargs)
 
-    async def _call_try_abandon_stale_pending_close_reconciliation(self, *args, **kwargs):
+    async def _call_try_register_terminal_fill_evidence_debt(self, *args, **kwargs):
         override = self._runtime_method_override(
-            "_try_abandon_stale_pending_close_reconciliation"
+            "_try_register_terminal_fill_evidence_debt"
         )
         if override is not None:
             return await override(*args, **kwargs)
-        return await self._try_abandon_stale_pending_close_reconciliation(*args, **kwargs)
+        return await self._try_register_terminal_fill_evidence_debt(*args, **kwargs)
 
     def _call_venue_private_position_confirmed(self, *args, **kwargs) -> bool:
         override = self._runtime_method_override("_venue_private_position_confirmed")
@@ -202,7 +213,7 @@ class CloseRuntime:
             self._close_reconciliation_live_size(long_position),
             self._close_reconciliation_live_size(short_position),
         )
-    async def _try_abandon_stale_pending_close_reconciliation(
+    async def _try_register_terminal_fill_evidence_debt(
         self,
         reconciliation: dict[str, Any],
         now_ms: int,
@@ -210,8 +221,16 @@ class CloseRuntime:
         symbol: str,
         long_venue: Venue,
         short_venue: Venue,
-        error: str,
     ) -> bool:
+        """Keep exact close IDs after terminal flat truth lacks fill evidence.
+
+        V1 clears this work after a zero-size probe. That is safe for exposure
+        but discards the only durable route to fill and fee evidence. V2 keeps
+        the physical-close result unchanged and turns only the accounting owner
+        into an automatic exact-ID retry debt.
+        """
+        if reconciliation.get("reconciliation_status") == "evidence_debt":
+            return False
         if str(reconciliation.get("kind") or "final") != "final":
             return False
         position_id = str(reconciliation.get("position_id") or "")
@@ -221,9 +240,6 @@ class CloseRuntime:
         ):
             return False
 
-        next_attempt_count = self._safe_reconciliation_int(
-            reconciliation.get("attempt_count")
-        ) + 1
         terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
             symbol=symbol,
             long_venue=long_venue,
@@ -234,38 +250,14 @@ class CloseRuntime:
         long_live_size, short_live_size = terminal_sizes
         if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
             return False
-
-        self.ctx.journal.append_critical(
-            now_ms,
-            "exit.reconciliation_abandoned",
-            {
-                "position_id": position_id,
-                "symbol": symbol,
-                "kind": "final",
-                "reason": reconciliation.get("reason", ""),
-                "closed_at_ms": self._safe_reconciliation_int(
-                    reconciliation.get("closed_at_ms")
-                ),
-                "attempt_count": next_attempt_count,
-                "terminal_reason": "fill_reconciliation_unavailable_after_terminal_budget",
-                "error": error,
-                "lifetime_ms": max(
-                    0,
-                    now_ms
-                    - max(
-                        0,
-                        self._safe_reconciliation_int(
-                            reconciliation.get("closed_at_ms")
-                        ),
-                    ),
-                ),
-                "long_venue": long_venue.value,
-                "short_venue": short_venue.value,
-                "long_live_size": long_live_size,
-                "short_live_size": short_live_size,
-            },
+        return self._mark_pending_close_reconciliation_evidence_debt(
+            reconciliation,
+            reason=self._EXACT_ID_RETRY_EVIDENCE_DEBT_REASON,
+            now_ms=now_ms,
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
         )
-        return True
 
     def _mark_pending_close_reconciliation_evidence_debt(
         self,
@@ -282,9 +274,11 @@ class CloseRuntime:
         A task without its typed position routing or close-order identity cannot
         use the ordinary exact-ID lookup.  Keep it as a visible close-work owner.
         Missing-identity and unattributed-execution debts may later enter the
-        bounded unique-history + exact-execution path; every other debt stays
-        operator-owned.  The journal includes the full task so a crash before
-        the next snapshot preserves the state transition during recovery.
+        bounded unique-history + exact-execution path. A complete task whose
+        exact fill is temporarily unavailable retries that exact ID. Every
+        other debt stays operator-owned. The journal includes the full task so
+        a crash before the next snapshot preserves the state transition during
+        recovery.
         """
         if reconciliation.get("reconciliation_status") == "evidence_debt":
             return False
@@ -298,10 +292,7 @@ class CloseRuntime:
         reconciliation["evidence_debt_at_ms"] = now_ms
         reconciliation["next_attempt_ms"] = 0
         reconciliation["billing_reconciliation_required"] = True
-        if reason in {
-            "missing_close_order_identity",
-            "unattributed_exchange_execution",
-        }:
+        if reason in self._AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS:
             reconciliation["missing_close_order_identity"] = True
         identity_evidence = pending_close_reconciliation_identity_evidence(
             reconciliation
@@ -338,14 +329,18 @@ class CloseRuntime:
                 "reconciliation_status": "evidence_debt",
                 "resolution_policy": (
                     "automatic_unique_history_exact_recheck_or_operator_import"
-                    if reason
-                    in {
-                        "missing_close_order_identity",
-                        "unattributed_exchange_execution",
-                    }
-                    else "operator_import_required"
+                    if reason in self._AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
+                    else (
+                        "automatic_exact_order_recheck"
+                        if reason == self._EXACT_ID_RETRY_EVIDENCE_DEBT_REASON
+                        else "operator_import_required"
+                    )
                 ),
-                "operator_action": "supply_typed_snapshot_and_close_leg_identity",
+                "operator_action": (
+                    "none_automatic_exact_order_recheck"
+                    if reason == self._EXACT_ID_RETRY_EVIDENCE_DEBT_REASON
+                    else "supply_typed_snapshot_and_close_leg_identity"
+                ),
                 "billing_reconciliation_required": True,
                 "long_venue": (
                     long_venue.value
@@ -1750,11 +1745,7 @@ class CloseRuntime:
                 )
                 if (
                     str(reconciliation.get("kind") or "final") != "final"
-                    or auto_reason
-                    not in {
-                        "missing_close_order_identity",
-                        "unattributed_exchange_execution",
-                    }
+                    or auto_reason not in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
                     or self._safe_reconciliation_int(
                         reconciliation.get("next_attempt_ms")
                     )
@@ -1858,10 +1849,12 @@ class CloseRuntime:
 
             symbol = str(reconciliation.get("symbol") or snapshot.get("symbol") or "")
             historical_resolution: dict[str, Any] = {}
-            automatic_evidence_debt = (
+            automatic_history_evidence_debt = (
                 reconciliation.get("reconciliation_status") == "evidence_debt"
+                and str(reconciliation.get("evidence_debt_reason") or "")
+                in self._AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
             )
-            if automatic_evidence_debt:
+            if automatic_history_evidence_debt:
                 automatic_evidence = (
                     await self._fetch_automatic_historical_close_evidence(
                         reconciliation,
@@ -2010,17 +2003,17 @@ class CloseRuntime:
                 changed = True
                 continue
 
-            abandoned = await self._call_try_abandon_stale_pending_close_reconciliation(
-                reconciliation,
-                now_ms,
-                symbol=symbol,
-                long_venue=long_venue,
-                short_venue=short_venue,
-                error="close fill reconciliation not yet available",
+            registered_evidence_debt = (
+                await self._call_try_register_terminal_fill_evidence_debt(
+                    reconciliation,
+                    now_ms,
+                    symbol=symbol,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                )
             )
-            if abandoned:
+            if registered_evidence_debt:
                 changed = True
-                continue
 
             self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
             retained.append(reconciliation)

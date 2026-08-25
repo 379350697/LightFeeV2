@@ -39,6 +39,8 @@ CRITICAL_FILES = [
     "scripts/verify_production_services.py",
     "deploy/systemd/lightfee-live.service",
     "deploy/systemd/lightfee-sidecar.service",
+    "deploy/systemd/lightfee-production-health.service",
+    "deploy/systemd/lightfee-production-health.timer",
     "deploy/network/NetworkManager-lightfee-dns.conf",
 ]
 
@@ -282,8 +284,11 @@ echo "{head}" | ssh $SSH_OPTS {remote_host} "cat > {remote_path}/.deploy_version
 echo "=== Verifying deployment integrity on remote ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_deploy_manifest.py --check {remote_path}"
 
+echo "=== Installing production health monitor ==="
+ssh $SSH_OPTS {remote_host} "install -m 0644 {remote_path}/deploy/systemd/lightfee-production-health.service /etc/systemd/system/lightfee-production-health.service && install -m 0644 {remote_path}/deploy/systemd/lightfee-production-health.timer /etc/systemd/system/lightfee-production-health.timer && systemctl daemon-reload && systemctl enable --now lightfee-production-health.timer"
+
 echo "=== Restarting production services ==="
-ssh $SSH_OPTS {remote_host} "systemctl daemon-reload && systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service"
+ssh $SSH_OPTS {remote_host} "systemctl restart lightfee-sidecar.service && systemctl restart lightfee-live.service"
 
 echo "=== Verifying production health ==="
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/check_process_singleton.py --strict"
@@ -292,6 +297,7 @@ if ! ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE
   ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
   exit 1
 fi
+ssh $SSH_OPTS {remote_host} "systemctl start lightfee-production-health.service"
 ssh $SSH_OPTS {remote_host} "cd {remote_path} && $REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy"
 
 echo "=== Deploy complete: {head} ==="

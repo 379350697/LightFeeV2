@@ -825,6 +825,236 @@ class TestBinanceWorkerLifecycle:
             # push_worker replaces existing workers; count should stay 1
             assert transport.private_ws_state.worker_count() == 1
 
+    @pytest.mark.asyncio
+    async def test_idle_stream_does_not_treat_an_unconfirmed_ping_as_health_success(self):
+        """An idle stream is healthy only after the WS library confirms its heartbeat."""
+        transport = _FakeTransport()
+        ws = _BlockingFakeWebSocket()
+        connect_kwargs: list[dict] = []
+
+        def _connect(url, **kwargs):
+            connect_kwargs.append(kwargs)
+            return ws
+
+        with (
+            patch(
+                "lightfee.venues.binance_private_ws.BINANCE_PRIVATE_PING_INTERVAL_SECS",
+                0.01,
+            ),
+            patch(
+                "lightfee.venues.binance_private_ws.websockets.connect",
+                side_effect=_connect,
+            ),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _sleep_short()
+            await asyncio.sleep(0.04)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert ws.pings == 0
+        assert transport._success_count == 1
+        assert connect_kwargs == [{"ping_interval": 0.01, "ping_timeout": 0.01}]
+
+    @pytest.mark.asyncio
+    async def test_keepalive_success_records_last_success_and_expiry(self):
+        """A successful PUT leaves operator-readable expiry evidence."""
+        transport = _FakeTransport()
+        put_attempts = 0
+
+        async def _request(method: str, path: str, **kwargs):
+            nonlocal put_attempts
+            if method == "POST":
+                return {"listenKey": "lk-observable"}
+            if method == "PUT":
+                put_attempts += 1
+            return {}
+
+        transport._request = _request
+        with (
+            patch("lightfee.venues.binance_private_ws.BINANCE_LISTEN_KEY_KEEPALIVE_SECS", 0.01),
+            patch(
+                "lightfee.venues.binance_private_ws.websockets.connect",
+                side_effect=_fake_connect(_BlockingFakeWebSocket()),
+            ),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: put_attempts >= 1)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        keepalive_events = [
+            event["payload"]
+            for event in transport._diagnostics
+            if event["kind"] == "binance.listen_key_keepalive_ok"
+        ]
+        creation_events = [
+            event["payload"]
+            for event in transport._diagnostics
+            if event["kind"] == "binance.listen_key_created"
+        ]
+        assert creation_events
+        created = creation_events[-1]
+        assert created["listen_key_expires_at"] == (
+            created["last_listen_key_success_at"] + 60 * 60 * 1000
+        )
+        assert keepalive_events
+        latest = keepalive_events[-1]
+        assert latest["last_keepalive_ok_at"] > 0
+        assert latest["listen_key_expires_at"] == (
+            latest["last_keepalive_ok_at"] + 60 * 60 * 1000
+        )
+        assert latest["keepalive_attempt_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_transient_listen_key_keepalive_retries_without_recreating_stream(self):
+        """One REST timeout retries the PUT on the existing Binance listenKey."""
+        transport = _FakeTransport()
+        requests: list[tuple[str, Optional[str]]] = []
+        connect_urls: list[str] = []
+        put_attempts = 0
+
+        async def _request(method: str, path: str, **kwargs):
+            nonlocal put_attempts
+            params = kwargs.get("params") or {}
+            requests.append((method, params.get("listenKey")))
+            if method == "POST":
+                return {"listenKey": "lk-stable"}
+            if method == "PUT":
+                put_attempts += 1
+                if put_attempts == 1:
+                    raise RuntimeError("temporary keepalive timeout")
+            return {}
+
+        ws = _BlockingFakeWebSocket()
+
+        def _connect(url, **kwargs):
+            connect_urls.append(url)
+            return ws
+
+        transport._request = _request
+        with (
+            patch("lightfee.venues.binance_private_ws.BINANCE_LISTEN_KEY_KEEPALIVE_SECS", 0.01),
+            patch("lightfee.marketdata.resilience.compute_backoff_ms", return_value=1),
+            patch("lightfee.venues.binance_private_ws.websockets.connect", side_effect=_connect),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: put_attempts >= 2)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert ws.closed is True
+        assert connect_urls == ["wss://fstream.binance.com/ws/lk-stable"]
+        assert requests.count(("POST", None)) == 1
+        assert put_attempts >= 2
+
+    @pytest.mark.asyncio
+    async def test_keepalive_retry_budget_rotates_binance_private_stream(self):
+        """Repeated keepalive failures mark the stream unhealthy and rotate its key."""
+        transport = _FakeTransport()
+        listen_keys = ["lk-old", "lk-new"]
+        requests: list[tuple[str, Optional[str]]] = []
+        connect_urls: list[str] = []
+        put_attempts = 0
+
+        async def _request(method: str, path: str, **kwargs):
+            nonlocal put_attempts
+            params = kwargs.get("params") or {}
+            listen_key = params.get("listenKey")
+            requests.append((method, listen_key))
+            if method == "POST":
+                return {"listenKey": listen_keys.pop(0)}
+            if method == "PUT" and listen_key == "lk-old":
+                put_attempts += 1
+                raise RuntimeError("keepalive network timeout")
+            return {}
+
+        old_ws = _BlockingFakeWebSocket()
+        new_ws = _BlockingFakeWebSocket()
+        sockets = [old_ws, new_ws]
+
+        def _connect(url, **kwargs):
+            connect_urls.append(url)
+            return sockets[len(connect_urls) - 1]
+
+        transport._request = _request
+        with (
+            patch("lightfee.venues.binance_private_ws.BINANCE_LISTEN_KEY_KEEPALIVE_SECS", 0.01),
+            patch("lightfee.marketdata.resilience.compute_backoff_ms", return_value=1),
+            patch("lightfee.venues.binance_private_ws.websockets.connect", side_effect=_connect),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: old_ws.closed and len(connect_urls) >= 2)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert put_attempts == 3
+        assert connect_urls == [
+            "wss://fstream.binance.com/ws/lk-old",
+            "wss://fstream.binance.com/ws/lk-new",
+        ]
+        assert requests.count(("POST", None)) == 2
+        assert "keepalive retry budget exhausted" in transport._last_error
+        assert transport._failure_count == 1
+        rotation_events = [
+            event["payload"]
+            for event in transport._diagnostics
+            if event["kind"] == "binance.listen_key_rotation"
+        ]
+        assert rotation_events
+        rotation = rotation_events[-1]
+        assert rotation["reason"] == "keepalive_retry_budget_exhausted"
+        assert rotation["keepalive_attempt_count"] == 3
+        assert rotation["reconnect_result"] == "success"
+        assert rotation["listen_key_created_at"] is not None
+        assert rotation["last_keepalive_ok_at"] is None
+        assert rotation["new_listen_key_created_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_listen_key_expired_event_rotates_binance_private_stream(self):
+        """Binance's explicit expiry event must not be recorded as WS success."""
+        transport = _FakeTransport()
+        listen_keys = ["lk-expired", "lk-replacement"]
+        connect_urls: list[str] = []
+
+        async def _request(method: str, path: str, **kwargs):
+            if method == "POST":
+                return {"listenKey": listen_keys.pop(0)}
+            return {}
+
+        old_ws = _MessageThenBlockingFakeWebSocket(
+            messages=[json.dumps({"e": "listenKeyExpired"})]
+        )
+        new_ws = _BlockingFakeWebSocket()
+        sockets = [old_ws, new_ws]
+
+        def _connect(url, **kwargs):
+            connect_urls.append(url)
+            return sockets[len(connect_urls) - 1]
+
+        transport._request = _request
+        with (
+            patch("lightfee.marketdata.resilience.compute_backoff_ms", return_value=1),
+            patch("lightfee.venues.binance_private_ws.websockets.connect", side_effect=_connect),
+        ):
+            transport.start_private_ws(["ETHUSDT"])
+            await _wait_until(lambda: old_ws.closed and len(connect_urls) >= 2)
+            transport.stop_private_ws()
+            await _sleep_short()
+
+        assert connect_urls == [
+            "wss://fstream.binance.com/ws/lk-expired",
+            "wss://fstream.binance.com/ws/lk-replacement",
+        ]
+        assert "listenKey expired" in transport._last_error
+        rotation_events = [
+            event["payload"]
+            for event in transport._diagnostics
+            if event["kind"] == "binance.listen_key_rotation"
+        ]
+        assert rotation_events[-1]["reason"] == "listen_key_expired_event"
+        assert rotation_events[-1]["reconnect_result"] == "success"
+
 
 class TestOkxWorkerLifecycle:
     """OKX private WS worker lifecycle with fake websocket."""
@@ -1741,6 +1971,278 @@ class TestOkxCtValMap:
 
 class TestRuntimePrivateSymbols:
     """_current_tracked_private_symbols: pending_passive_closes, tracked pairs, etc."""
+
+    @staticmethod
+    def _make_private_activation_runtime(tmp_path, adapters, *, timeout_ms: int = 200):
+        from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig
+        from lightfee.engine.runtime import LiveRuntime
+
+        return LiveRuntime(
+            AppConfig(
+                runtime=RuntimeConfig(
+                    mode="live",
+                    live_startup_phase_timeout_ms=timeout_ms,
+                ),
+                persistence=PersistenceConfig(
+                    event_log_path=str(tmp_path / "events.jsonl"),
+                    snapshot_path=str(tmp_path / "state.json"),
+                ),
+                symbols=["ETHUSDT"],
+            ),
+            venue_adapters=adapters,
+        )
+
+    class _ActivationTransport:
+        def __init__(self, *, create_worker: bool = True):
+            self.start_calls: list[list[str]] = []
+            self.started = asyncio.Event()
+            self._create_worker = create_worker
+            self._worker_count = 0
+
+        def _venue_symbol(self, symbol: str) -> str:
+            return symbol
+
+        def start_private_ws(self, symbols: list[str]) -> None:
+            self.start_calls.append(list(symbols))
+            if self._create_worker:
+                self._worker_count = 1
+            self.started.set()
+
+        def private_ws_worker_count(self) -> int:
+            return self._worker_count
+
+    class _ActivationAdapter:
+        def __init__(
+            self,
+            venue: Venue,
+            transport,
+            *,
+            catalog_symbols: list[str] | None = None,
+            catalog_delay_s: float = 0.0,
+            catalog_error: bool = False,
+            catalog_entered: asyncio.Event | None = None,
+        ):
+            self._venue = venue
+            self._transport = transport
+            self._catalog_symbols = catalog_symbols or ["ETHUSDT"]
+            self._catalog_delay_s = catalog_delay_s
+            self._catalog_error = catalog_error
+            self._catalog_entered = catalog_entered
+
+        @property
+        def supports_private_health(self) -> bool:
+            return True
+
+        async def ensure_supported_symbols_loaded(self) -> None:
+            if self._catalog_entered is not None:
+                self._catalog_entered.set()
+            if self._catalog_delay_s:
+                await asyncio.sleep(self._catalog_delay_s)
+            if self._catalog_error:
+                raise RuntimeError("catalog refresh unavailable")
+
+        def supported_symbols(self) -> list[str]:
+            return self._catalog_symbols
+
+    @pytest.mark.asyncio
+    async def test_private_ws_catalog_activation_is_parallel_per_venue(self, tmp_path):
+        """A slow catalog cannot consume another venue's startup window."""
+        slow_catalog_entered = asyncio.Event()
+        slow_transport = self._ActivationTransport()
+        fast_transport = self._ActivationTransport()
+        runtime = self._make_private_activation_runtime(
+            tmp_path,
+            {
+                Venue.BINANCE: self._ActivationAdapter(
+                    Venue.BINANCE,
+                    slow_transport,
+                    catalog_delay_s=1.0,
+                    catalog_entered=slow_catalog_entered,
+                ),
+                Venue.BYBIT: self._ActivationAdapter(Venue.BYBIT, fast_transport),
+            },
+        )
+        runtime.journal.open()
+        try:
+            activation = asyncio.create_task(
+                runtime._activate_private_ws_startup_phase(now_ms=100)
+            )
+            await asyncio.wait_for(slow_catalog_entered.wait(), timeout=0.05)
+            await asyncio.wait_for(fast_transport.started.wait(), timeout=0.05)
+            await activation
+        finally:
+            runtime.journal.close()
+
+        assert fast_transport.start_calls == [["ETHUSDT"]]
+        assert slow_transport.start_calls == []
+
+    @pytest.mark.asyncio
+    async def test_private_ws_does_not_subscribe_when_catalog_refresh_fails(self, tmp_path):
+        """Private WS uses the strict catalog branch, unlike recovery probes."""
+        transport = self._ActivationTransport()
+        runtime = self._make_private_activation_runtime(
+            tmp_path,
+            {
+                Venue.BINANCE: self._ActivationAdapter(
+                    Venue.BINANCE,
+                    transport,
+                    catalog_error=True,
+                ),
+            },
+        )
+        runtime.journal.open()
+        try:
+            await runtime._activate_private_ws_startup_phase(now_ms=100)
+            await runtime._activate_private_ws_startup_phase(now_ms=101)
+        finally:
+            runtime.journal.close()
+
+        assert transport.start_calls == []
+        assert Venue.BINANCE not in runtime._private_ws_started
+
+    @pytest.mark.asyncio
+    async def test_private_ws_retries_only_failed_worker_creation_with_stable_symbols(
+        self, tmp_path,
+    ):
+        """Calling a starter is not success until it has registered a worker."""
+        transport = self._ActivationTransport(create_worker=False)
+        runtime = self._make_private_activation_runtime(
+            tmp_path,
+            {Venue.BINANCE: self._ActivationAdapter(Venue.BINANCE, transport)},
+        )
+        runtime.journal.open()
+        try:
+            await runtime._activate_private_ws_startup_phase(now_ms=100)
+            runtime._tracked_primary_pair_ids = {"btcusdt:binance->bybit"}
+            await runtime._activate_private_ws_startup_phase(now_ms=101)
+            await runtime._activate_private_ws_startup_phase(now_ms=15_100)
+        finally:
+            runtime.journal.close()
+
+        assert transport.start_calls == [["ETHUSDT"], ["ETHUSDT"]]
+        assert Venue.BINANCE not in runtime._private_ws_started
+
+    @pytest.mark.asyncio
+    async def test_private_ws_worker_reconnect_is_not_restarted_by_housekeeping(
+        self, tmp_path,
+    ):
+        """Once registered, connection recovery stays inside the venue worker."""
+        transport = self._ActivationTransport()
+        runtime = self._make_private_activation_runtime(
+            tmp_path,
+            {Venue.BINANCE: self._ActivationAdapter(Venue.BINANCE, transport)},
+        )
+        runtime.journal.open()
+        try:
+            await runtime._activate_private_ws_startup_phase(now_ms=100)
+            transport._worker_count = 0
+            runtime._tracked_primary_pair_ids = {"btcusdt:binance->bybit"}
+            await runtime._activate_private_ws_startup_phase(now_ms=20_000)
+        finally:
+            runtime.journal.close()
+
+        assert transport.start_calls == [["ETHUSDT"]]
+
+    @pytest.mark.asyncio
+    async def test_private_ws_is_started_once_and_ignores_candidate_churn(
+        self, tmp_path, monkeypatch,
+    ):
+        """V1 startup ownership: candidate changes cannot replace private workers.
+
+        This exercises the live ``start()`` → post-tick-housekeeping path.  It
+        uses 100 alternating candidate sets after startup, the production path
+        that previously issued ``stop_private_ws()`` followed by
+        ``start_private_ws()`` on every set change.
+        """
+        from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig
+        from lightfee.engine.recovery import build_persistent_state_view
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.engine.state import OpenPosition
+        from tests.fake_adapters import FakeVenueAdapter
+
+        class RecordingTransport:
+            def __init__(self):
+                self.start_calls: list[list[str]] = []
+                self.stop_calls = 0
+
+            def _venue_symbol(self, symbol: str) -> str:
+                return symbol
+
+            def start_private_ws(self, symbols: list[str]) -> None:
+                self.start_calls.append(list(symbols))
+
+            def stop_private_ws(self) -> None:
+                self.stop_calls += 1
+
+        class RecordingAdapter(FakeVenueAdapter):
+            def __init__(self, transport: RecordingTransport):
+                super().__init__(Venue.BINANCE)
+                self._transport = transport
+
+            @property
+            def supports_private_health(self) -> bool:
+                return True
+
+            async def ensure_supported_symbols_loaded(self) -> None:
+                return None
+
+            def supported_symbols(self) -> list[str]:
+                return ["ETHUSDT", "SOLUSDT"]
+
+        config = AppConfig(
+            runtime=RuntimeConfig(mode="live", poll_interval_ms=10),
+            persistence=PersistenceConfig(
+                event_log_path=str(tmp_path / "events.jsonl"),
+                snapshot_path=str(tmp_path / "state.json"),
+            ),
+            symbols=["ETHUSDT"],
+        )
+        transport = RecordingTransport()
+        runtime = LiveRuntime(
+            config,
+            venue_adapters={Venue.BINANCE: RecordingAdapter(transport)},
+        )
+        runtime.state.open_positions["recovered-sol"] = OpenPosition(
+            position_id="recovered-sol",
+            symbol="SOLUSDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.BINANCE,
+            long_quantity=1.0,
+            short_quantity=1.0,
+            long_entry_price=100.0,
+            short_entry_price=100.0,
+            opened_at_ms=1,
+        )
+        runtime.snapshot_store.write(build_persistent_state_view(runtime.state))
+
+        await runtime.start()
+
+        # The stable universe includes the configured symbol plus recovered
+        # work, which protects a recovered position outside today's candidates.
+        assert transport.start_calls == [["ETHUSDT", "SOLUSDT"]]
+
+        monkeypatch.setattr(runtime.supervisor, "supervise", lambda *args, **kwargs: None)
+        monkeypatch.setattr(runtime, "_reconcile_pending_state", AsyncMock())
+        monkeypatch.setattr(runtime, "_recover_residual_repairs", AsyncMock())
+        monkeypatch.setattr(runtime, "_maybe_recover_clean_live_positions", AsyncMock())
+        monkeypatch.setattr(
+            runtime, "_maybe_export_current_state_snapshot", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(
+            "lightfee.engine.runtime.maybe_export_runtime_metrics",
+            lambda *args, **kwargs: None,
+        )
+
+        for index in range(100):
+            runtime._tracked_primary_pair_ids = {
+                "btcusdt:binance->bybit"
+                if index % 2
+                else "ethusdt:binance->bybit"
+            }
+            await runtime._post_tick_housekeeping(10_000 + index)
+
+        assert transport.start_calls == [["ETHUSDT", "SOLUSDT"]]
+        assert transport.stop_calls == 0
 
     def _make_runtime(self):
         from lightfee.engine.state import EngineState

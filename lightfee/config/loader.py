@@ -32,6 +32,11 @@ def load_config(path: str | Path) -> AppConfig:
     """Load and validate a TOML config file. Raises ConfigError on failure."""
     raw = _read_toml(path)
 
+    if "daily_universe" in raw:
+        raise ConfigError(
+            "daily_universe must be declared under [runtime.daily_universe]"
+        )
+
     # Check for removed Chillybot fields first
     chillybot_errors = check_raw_toml_for_chillybot(raw)
     if chillybot_errors:
@@ -77,7 +82,12 @@ def _merge_defaults(base: Any, raw: dict[str, Any]) -> None:
 
 def _load_runtime(raw: dict[str, Any]) -> RuntimeConfig:
     cfg = default_runtime()
+    raw = dict(raw)
+    daily_universe_raw = raw.pop("daily_universe", {})
+    if not isinstance(daily_universe_raw, dict):
+        raise ConfigError("runtime.daily_universe must be a TOML table")
     _merge_defaults(cfg, raw)
+    _merge_defaults(cfg.daily_universe, daily_universe_raw)
     return cfg
 
 

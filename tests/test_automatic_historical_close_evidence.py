@@ -171,7 +171,7 @@ def _ctx(task: dict, adapters: dict[Venue, object]) -> MagicMock:
     for name in (
         "_fetch_close_leg_reconciliations",
         "_fetch_pending_close_terminal_live_sizes",
-        "_try_abandon_stale_pending_close_reconciliation",
+        "_try_register_terminal_fill_evidence_debt",
         "_venue_private_position_confirmed",
         "_open_positions_private_confirmation_ready",
         "_resolve_local_l2_mid",

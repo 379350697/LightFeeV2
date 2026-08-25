@@ -1737,6 +1737,16 @@ class VenueTransport(MarketDataClient):
         """Stop all private WS workers for this venue."""
         self._private_ws_state.abort_workers()
 
+    async def stop_private_ws_and_wait(self, timeout_s: float) -> bool:
+        """Stop private workers and wait for their network cleanup to finish."""
+        completed = await self._private_ws_state.abort_workers_and_wait(timeout_s)
+        if not completed:
+            raise TimeoutError(
+                f"{self._spec.venue_id.value} private WS workers did not stop "
+                f"within {timeout_s:.3f}s"
+            )
+        return True
+
     def private_ws_worker_count(self) -> int:
         """V1: number of active private WS workers for this venue."""
         return self._private_ws_state.worker_count()

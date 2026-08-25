@@ -963,14 +963,20 @@ async def test_pending_close_reconciliation_drain_restores_running_lifecycle(
 
 
 @pytest.mark.asyncio
-async def test_pending_close_reconciliation_abandons_final_when_flat_but_fill_unavailable(
+async def test_pending_close_reconciliation_keeps_flat_final_fill_evidence_debt_until_exact_recheck_succeeds(
     config, tmp_journal,
 ):
+    """A proved-flat COTI close must retain its exact-ID accounting owner.
+
+    Physical exposure is already zero, so the debt must not alter trading
+    state.  But a temporarily unavailable fill endpoint cannot erase the only
+    durable link to the closing order and its fees.
+    """
     _mark_live(config)
-    long_adapter = _UnavailableCloseLegAdapter(Venue.OKX, live_quantity=0.0)
+    long_adapter = _UnavailableCloseLegAdapter(Venue.BINANCE, live_quantity=0.0)
     short_adapter = _UnavailableCloseLegAdapter(Venue.BYBIT, live_quantity=0.0)
     runtime = LiveRuntime(config, venue_adapters={
-        Venue.OKX: long_adapter,
+        Venue.BINANCE: long_adapter,
         Venue.BYBIT: short_adapter,
     })
     runtime.journal = tmp_journal
@@ -979,29 +985,217 @@ async def test_pending_close_reconciliation_abandons_final_when_flat_but_fill_un
     runtime.state.risk_mode = GlobalRiskMode.RUNNING
     runtime.state.last_error = "pending_close_reconciliations_active"
     runtime.state.tick_count = 2
-    runtime.state.pending_close_reconciliations.append(_pending_close_reconciliation())
+    runtime.state.pending_close_reconciliations.append(_pending_close_reconciliation(
+        position_id="entry-coti-fill-delay",
+        symbol="COTIUSDT",
+        position_snapshot={
+            "position_id": "entry-coti-fill-delay",
+            "symbol": "COTIUSDT",
+            "long_venue": Venue.BINANCE.value,
+            "short_venue": Venue.BYBIT.value,
+            "long_entry_price": 0.05,
+            "short_entry_price": 0.051,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
+        },
+        long_legs=[{
+            "venue": Venue.BINANCE.value,
+            "order_id": "binance-coti-close",
+            "client_order_id": "binance-coti-close-cid",
+        }],
+        short_legs=[{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-coti-close",
+            "client_order_id": "bybit-coti-close-cid",
+        }],
+    ))
+
+    await runtime._reconcile_pending_state(now_ms=3000)
+
+    assert len(runtime.state.pending_close_reconciliations) == 1
+    retained = runtime.state.pending_close_reconciliations[0]
+    assert retained["reconciliation_status"] == "evidence_debt"
+    assert retained["evidence_debt_reason"] == "known_close_fill_temporarily_unavailable"
+    assert retained["attempt_count"] == 1
+    assert retained["next_attempt_ms"] > 3000
+    assert long_adapter.position_calls == ["COTIUSDT"]
+    assert short_adapter.position_calls == ["COTIUSDT"]
+    records = tmp_journal.read_all()
+    debt = [
+        record["payload"] for record in records
+        if record["kind"] == "exit.billing_evidence_debt_registered"
+    ][0]
+    assert debt["terminal_reason"] == "known_close_fill_temporarily_unavailable"
+    assert debt["resolution_policy"] == "automatic_exact_order_recheck"
+    assert not [
+        record for record in records
+        if record["kind"] == "exit.reconciliation_abandoned"
+    ]
+    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+    assert runtime.state.last_error is None
+    allowed, reason = runtime._gate_recovery_ledger(
+        SimpleNamespace(symbol="COTIUSDT", long_venue="binance", short_venue="bybit")
+    )
+    assert allowed is True
+    assert reason == ""
+
+    # The journal event is the crash boundary: restart must preserve the exact
+    # order identities and resume the ordinary exact-ID query, not resurrect a
+    # position or discard the accounting owner.
+    from lightfee.engine.recovery import _apply_journal_replay_to_state
+
+    restored = EngineState()
+    _apply_journal_replay_to_state(restored, tmp_journal.read_all())
+    assert len(restored.pending_close_reconciliations) == 1
+    assert restored.pending_close_reconciliations[0]["evidence_debt_reason"] == (
+        "known_close_fill_temporarily_unavailable"
+    )
+    runtime.state = restored
+
+    long_adapter.fills[("binance-coti-close", "binance-coti-close-cid")] = (
+        OrderFillReconciliation(
+            venue=Venue.BINANCE,
+            symbol="COTIUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            average_price=0.052,
+            order_id="binance-coti-close",
+            client_order_id="binance-coti-close-cid",
+            fee_quote=0.01,
+            filled_at_ms=4000,
+        )
+    )
+    short_adapter.fills[("bybit-coti-close", "bybit-coti-close-cid")] = (
+        OrderFillReconciliation(
+            venue=Venue.BYBIT,
+            symbol="COTIUSDT",
+            side=Side.BUY,
+            quantity=20.0,
+            average_price=0.051,
+            order_id="bybit-coti-close",
+            client_order_id="bybit-coti-close-cid",
+            fee_quote=0.01,
+            filled_at_ms=4001,
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=retained["next_attempt_ms"])
+
+    assert runtime.state.pending_close_reconciliations == []
+    assert long_adapter.fill_reconciliation_calls == [
+        {
+            "symbol": "COTIUSDT",
+            "order_id": "binance-coti-close",
+            "client_order_id": "binance-coti-close-cid",
+        },
+        {
+            "symbol": "COTIUSDT",
+            "order_id": "binance-coti-close",
+            "client_order_id": "binance-coti-close-cid",
+        },
+    ]
+    assert short_adapter.fill_reconciliation_calls == [
+        {
+            "symbol": "COTIUSDT",
+            "order_id": "bybit-coti-close",
+            "client_order_id": "bybit-coti-close-cid",
+        },
+        {
+            "symbol": "COTIUSDT",
+            "order_id": "bybit-coti-close",
+            "client_order_id": "bybit-coti-close-cid",
+        },
+    ]
+    assert "exit.reconciled" in [record["kind"] for record in tmp_journal.read_all()]
+
+
+@pytest.mark.asyncio
+async def test_journal_replay_revives_historical_flat_fill_abandonment_for_exact_reconciliation(
+    config, tmp_journal,
+):
+    """A V1 abandonment marker may clear exposure, never a prior exact-ID bill."""
+    _mark_live(config)
+    from lightfee.engine.recovery import _apply_journal_replay_to_state
+
+    historical_task = _pending_close_reconciliation(
+        position_id="entry-coti-historical-abandonment",
+        symbol="COTIUSDT",
+        position_snapshot={
+            "position_id": "entry-coti-historical-abandonment",
+            "symbol": "COTIUSDT",
+            "long_venue": Venue.BINANCE.value,
+            "short_venue": Venue.BYBIT.value,
+            "long_entry_price": 0.05,
+            "short_entry_price": 0.051,
+            "total_entry_fee_quote": 0.0,
+            "entry_fee_evidence_complete": True,
+        },
+        long_legs=[{
+            "venue": Venue.BINANCE.value,
+            "order_id": "binance-coti-historical-close",
+            "client_order_id": "binance-coti-historical-cid",
+        }],
+        short_legs=[{
+            "venue": Venue.BYBIT.value,
+            "order_id": "bybit-coti-historical-close",
+            "client_order_id": "bybit-coti-historical-cid",
+        }],
+    )
+    restored = EngineState()
+    _apply_journal_replay_to_state(restored, [
+        {
+            "kind": "exit.pending_close_reconciliation_registered",
+            "ts_ms": 1000,
+            "payload": {"reconciliation": historical_task},
+        },
+        {
+            "kind": "exit.reconciliation_abandoned",
+            "ts_ms": 2000,
+            "payload": {"position_id": historical_task["position_id"]},
+        },
+    ])
+
+    assert not restored.open_positions
+    assert restored.pending_close_reconciliations == [historical_task]
+
+    long_adapter = _CloseLegFillAdapter(Venue.BINANCE, {
+        ("binance-coti-historical-close", "binance-coti-historical-cid"):
+            OrderFillReconciliation(
+                venue=Venue.BINANCE,
+                symbol="COTIUSDT",
+                side=Side.SELL,
+                quantity=20.0,
+                average_price=0.052,
+                order_id="binance-coti-historical-close",
+                client_order_id="binance-coti-historical-cid",
+                fee_quote=0.01,
+            ),
+    })
+    short_adapter = _CloseLegFillAdapter(Venue.BYBIT, {
+        ("bybit-coti-historical-close", "bybit-coti-historical-cid"):
+            OrderFillReconciliation(
+                venue=Venue.BYBIT,
+                symbol="COTIUSDT",
+                side=Side.BUY,
+                quantity=20.0,
+                average_price=0.051,
+                order_id="bybit-coti-historical-close",
+                client_order_id="bybit-coti-historical-cid",
+                fee_quote=0.01,
+            ),
+    })
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.BINANCE: long_adapter,
+        Venue.BYBIT: short_adapter,
+    })
+    runtime.journal = tmp_journal
+    runtime.reconciler = None
+    runtime.state = restored
 
     await runtime._reconcile_pending_state(now_ms=3000)
 
     assert runtime.state.pending_close_reconciliations == []
-    assert long_adapter.position_calls == ["BEATUSDT"]
-    assert short_adapter.position_calls == ["BEATUSDT"]
-    records = tmp_journal.read_all()
-    abandoned = [
-        record["payload"] for record in records
-        if record["kind"] == "exit.reconciliation_abandoned"
-    ][0]
-    assert abandoned["terminal_reason"] == "fill_reconciliation_unavailable_after_terminal_budget"
-    assert abandoned["attempt_count"] == 1
-    assert abandoned["long_live_size"] == pytest.approx(0.0)
-    assert abandoned["short_live_size"] == pytest.approx(0.0)
-    assert runtime.state.lifecycle == EngineLifecycle.RUNNING
-    assert runtime.state.last_error is None
-    allowed, reason = runtime._gate_recovery_ledger(
-        SimpleNamespace(symbol="BEATUSDT", long_venue="okx", short_venue="bybit")
-    )
-    assert allowed is True
-    assert reason == ""
+    assert "exit.reconciled" in [record["kind"] for record in tmp_journal.read_all()]
 
 
 @pytest.mark.asyncio

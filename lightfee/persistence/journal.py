@@ -400,9 +400,12 @@ def replay_journal_records(
                 open_ids.discard(pid)
             pending_close_ids.discard(pid)
             if not (
-                kind == "recovery.flat"
+                kind in {"recovery.flat", "exit.reconciliation_abandoned"}
                 and (
-                    payload.get("billing_reconciliation_pending") is True
+                    (
+                        kind == "recovery.flat"
+                        and payload.get("billing_reconciliation_pending") is True
+                    )
                     or str(pid) in pending_close_reconciliation_ids
                 )
             ):

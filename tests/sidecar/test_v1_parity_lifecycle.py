@@ -194,30 +194,14 @@ class TestAcquisitionModeReflectsDegradation:
         assert _resolve_acquisition_mode({"binance"}, {}) != "fresh_sidecar"
 
 
-class TestLiquiditySourceWiredIntoRefresh:
-    """LiquiditySource and sidecar_liquidity_timeout_s must be in the refresh path."""
+class TestLiquidityLifecycleUsesTickerAcquisition:
+    """The coarse lifecycle must not trigger a second ticker acquisition."""
 
-    def test_fetch_liquidity_all_venues_method_exists(self):
+    def test_sidecar_has_no_second_liquidity_fetch_owner(self):
         from lightfee.sidecar.service import SidecarService
-        svc = object.__new__(SidecarService)
-        assert hasattr(svc, "_fetch_liquidity_all_venues")
 
-    def test_liquidity_timeout_s_read_from_runtime(self):
-        from lightfee.sidecar.service import SidecarService, DEFAULT_LIQUIDITY_TIMEOUT_S
         svc = object.__new__(SidecarService)
-        svc.config = type("c", (), {"runtime": type("r", (), {"sidecar_snapshot_path": "/tmp"})(), "venues": [], "symbols": []})()
-        svc._liquidity_sources = {}
-        svc._exchange_sources = {}
-        svc._transfer_sources = []
-        svc._last_good_quotes = {}
-        svc._funding_timeout_s = 10
-        svc._liquidity_timeout_s = 7.0
-        svc._transfer_timeout_s = 5
-        assert svc._liquidity_timeout_s == 7.0
-
-    def test_liquidity_timeout_default(self):
-        from lightfee.sidecar.service import DEFAULT_LIQUIDITY_TIMEOUT_S
-        assert DEFAULT_LIQUIDITY_TIMEOUT_S == 10.0
+        assert not hasattr(svc, "_fetch_liquidity_all_venues")
 
 
 class TestRefreshPublicationSemantics:
@@ -231,7 +215,6 @@ class TestRefreshPublicationSemantics:
         svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
-        svc._liquidity_timeout_s = 10.0
         svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
@@ -248,11 +231,7 @@ class TestRefreshPublicationSemantics:
                 set(),
             )]
 
-        async def fake_fetch_liquidity_all_venues(symbols, timeout_s):
-            return [("binance", {"binance:BTCUSDT": object()}, None, set())]
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
         times = iter([1.0, 4.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -263,7 +242,7 @@ class TestRefreshPublicationSemantics:
         assert svc._last_good_at_ms == 7000
         assert snapshot.quotes["binance:BTCUSDT"].observed_at_ms == 4000
         assert snapshot.quotes["binance:BTCUSDT"].source == "sidecar_quote"
-        assert snapshot.liquidity_lifecycle[0].observed_at_ms == 1000
+        assert snapshot.liquidity_lifecycle[0].observed_at_ms == 4000
         assert snapshot.liquidity_lifecycle[0].published_at_ms == 7000
         assert snapshot.liquidity_lifecycle[0].publish_interval_ms == 6000
         assert snapshot.liquidity_lifecycle[0].domain == "perp_liquidity"
@@ -277,14 +256,14 @@ class TestRefreshPublicationSemantics:
         svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
-        svc._liquidity_timeout_s = 10.0
         svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
         svc._last_liquidity_publish_at_ms = 1000
 
-        async def fake_fetch_all_venues(symbols, timeout_s):
-            return [(
+        outcomes = [
+            ("binance", None, TimeoutError("funding timeout 10.0s"), set()),
+            (
                 "binance",
                 {"binance:BTCUSDT": QuoteSnapshot(
                     venue="binance", symbol="BTCUSDT", bid=50000, ask=50001,
@@ -292,16 +271,13 @@ class TestRefreshPublicationSemantics:
                 )},
                 None,
                 set(),
-            )]
+            ),
+        ]
 
-        async def failed_liquidity(symbols, timeout_s):
-            return [("binance", None, TimeoutError("liquidity timeout 10.0s"), set())]
-
-        async def successful_liquidity(symbols, timeout_s):
-            return [("binance", {"binance:BTCUSDT": object()}, None, set())]
+        async def fake_fetch_all_venues(symbols, timeout_s):
+            return [outcomes.pop(0)]
 
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = failed_liquidity
         times = iter([2.0, 4.0, 7.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -311,7 +287,6 @@ class TestRefreshPublicationSemantics:
         assert failed.liquidity_lifecycle[0].publish_interval_ms == 0
         assert svc._last_liquidity_publish_at_ms == 1000
 
-        svc._fetch_liquidity_all_venues = successful_liquidity
         times = iter([8.0, 9.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -329,7 +304,6 @@ class TestRefreshPublicationSemantics:
         svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
-        svc._liquidity_timeout_s = 10.0
         svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
@@ -351,14 +325,7 @@ class TestRefreshPublicationSemantics:
                 )}, None, set()),
             ]
 
-        async def mixed_liquidity(symbols, timeout_s):
-            return [
-                ("okx", {"okx:BTCUSDT": object()}, None, set()),
-                ("bybit", None, TimeoutError("liquidity timeout 10.0s"), set()),
-            ]
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = mixed_liquidity
         times = iter([8.0, 9.0, 11.0])
         monkeypatch.setattr("lightfee.sidecar.service.time.time", lambda: next(times))
 
@@ -368,15 +335,15 @@ class TestRefreshPublicationSemantics:
         assert rows["okx"].coverage_usable == 1
         assert rows["okx"].publish_interval_ms == 10000
         assert rows["okx"].published_at_ms == 11000
-        assert rows["bybit"].coverage_usable == 0
-        assert rows["bybit"].publish_interval_ms == 0
-        assert rows["bybit"].published_at_ms == 4000
+        assert rows["bybit"].coverage_usable == 1
+        assert rows["bybit"].publish_interval_ms == 7000
+        assert rows["bybit"].published_at_ms == 11000
         assert svc._last_liquidity_publish_at_ms_by_key[
             ("perp_liquidity", "sidecar_perp_liquidity", "okx")
         ] == 11000
         assert svc._last_liquidity_publish_at_ms_by_key[
             ("perp_liquidity", "sidecar_perp_liquidity", "bybit")
-        ] == 4000
+        ] == 11000
 
     def test_candidate_sizing_liquidity_source_roundtrip(self, tmp_path):
         candidate = CandidateInput(
@@ -408,7 +375,6 @@ class TestRefreshPublicationSemantics:
         svc.config = type("c", (), {"symbols": ["BTCUSDT"], "venues": []})()
         svc.snapshot_path = tmp_path / "sidecar.json"
         svc._funding_timeout_s = 10.0
-        svc._liquidity_timeout_s = 10.0
         svc._transfer_sources = []
         svc._last_good_quotes = {}
         svc._last_good_at_ms = 0
@@ -422,11 +388,7 @@ class TestRefreshPublicationSemantics:
                 )}, None, set()),
             ]
 
-        async def fake_fetch_liquidity_all_venues(symbols, timeout_s):
-            return []
-
         svc._fetch_all_venues = fake_fetch_all_venues
-        svc._fetch_liquidity_all_venues = fake_fetch_liquidity_all_venues
 
         snapshot = await svc.refresh_once()
 

@@ -96,6 +96,11 @@ _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
 OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S = 0.2
 
+# The largest known per-client fan-out is OKX funding (40).  Leave headroom for
+# the accompanying public requests while preventing cancelled/slow requests
+# from creating an unbounded socket population.
+MARKET_DATA_MAX_CONNECTIONS = 48
+
 # V1 parity: OKX funding cache TTL (10 min) — src/live/okx.rs OKX_FUNDING_CACHE_MAX_OBSERVED_AGE_MS
 _FUNDING_CACHE_MAX_OBSERVED_AGE_MS = 10 * 60 * 1_000  # 10 minutes
 # V1 parity: funding timestamp must be at least this far in the future to be cache-usable.
@@ -172,7 +177,10 @@ class MarketDataClient:
             timeout_s = self._exchange_http_timeout_ms / 1000.0
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout_s),
-                limits=httpx.Limits(max_keepalive_connections=4),
+                limits=httpx.Limits(
+                    max_connections=MARKET_DATA_MAX_CONNECTIONS,
+                    max_keepalive_connections=4,
+                ),
             )
         return self._client
 

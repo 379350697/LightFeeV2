@@ -164,7 +164,7 @@ def validate_config(config: AppConfig) -> list[str]:
             issues.append("daily_universe.path must not be empty when enabled")
         if not _is_valid_generate_time(du.generate_time_local):
             issues.append(
-                f"daily_universe.generate_time_local must be HH:MM:SS (00:00:00–23:59:59), "
+                f"daily_universe.generate_time_local must be HH:MM or HH:MM:SS (24-hour), "
                 f"got: {du.generate_time_local!r}"
             )
         if du.max_symbols == 0:

@@ -64,6 +64,14 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
     assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/verify_production_services.py --deployment-acceptance --json" in script
     assert "$REMOTE_PYTHONPATH $REMOTE_PYTHON scripts/diagnose_live.py --json --since-deploy" in script
     assert "cd /opt/lightfee-v2 && python3 scripts/verify_production_services.py --json" not in script
+    assert "lightfee-production-health.service" in script
+    assert "lightfee-production-health.timer" in script
+    assert "systemctl enable --now lightfee-production-health.timer" in script
+
+
+def test_health_monitor_templates_are_manifest_critical():
+    assert "deploy/systemd/lightfee-production-health.service" in manifest.CRITICAL_FILES
+    assert "deploy/systemd/lightfee-production-health.timer" in manifest.CRITICAL_FILES
 
 
 def test_verify_remote_manifest_uses_configured_ssh_port(monkeypatch):

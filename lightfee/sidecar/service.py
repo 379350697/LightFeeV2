@@ -12,7 +12,6 @@ from lightfee.core.domain import Venue
 from lightfee.sidecar.pairing import build_same_symbol_pairs
 from lightfee.sidecar.publisher import publish_snapshot
 from lightfee.sidecar.snapshot import (
-    CandidateInput,
     FundingLifecycle,
     LiquidityLifecycle,
     MarketLifecycle,
@@ -21,13 +20,11 @@ from lightfee.sidecar.snapshot import (
     TransferLifecycle,
 )
 from lightfee.sidecar.sources.exchange import ExchangeSource
-from lightfee.sidecar.sources.liquidity import LiquiditySource
 from lightfee.sidecar.sources.transfer import TransferSource
 from lightfee.venues.specs import get_spec
 
 # V1 parity: per-domain timeout defaults (matching V1 sidecar_budget_ms configs)
 DEFAULT_FUNDING_TIMEOUT_S = 30.0  # V1 parity: allow cold-cache warm for large-universe venues (OKX has 620 symbols)
-DEFAULT_LIQUIDITY_TIMEOUT_S = 10.0
 DEFAULT_TRANSFER_TIMEOUT_S = 5.0
 DEFAULT_PER_VENUE_TIMEOUT_S = 15.0
 
@@ -46,11 +43,9 @@ class SidecarService:
         self.snapshot_path = config.runtime.sidecar_snapshot_path
         runtime = config.runtime
         self._funding_timeout_s = getattr(runtime, "sidecar_funding_timeout_s", DEFAULT_FUNDING_TIMEOUT_S)
-        self._liquidity_timeout_s = getattr(runtime, "sidecar_liquidity_timeout_s", DEFAULT_LIQUIDITY_TIMEOUT_S)
         self._transfer_timeout_s = getattr(runtime, "sidecar_transfer_timeout_s", DEFAULT_TRANSFER_TIMEOUT_S)
 
         self._exchange_sources: dict[str, ExchangeSource] = {}
-        self._liquidity_sources: dict[str, LiquiditySource] = {}
         self._transfer_sources: list[TransferSource] = []
         from lightfee.venues.transport import EndpointRateLimiter
 
@@ -62,10 +57,6 @@ class SidecarService:
             rate_limiter = EndpointRateLimiter(1000, 8000, 50)
             self._public_rate_limiters[vc.venue] = rate_limiter
             self._exchange_sources[vc.venue] = ExchangeSource(
-                spec,
-                rate_limiter=rate_limiter,
-            )
-            self._liquidity_sources[vc.venue] = LiquiditySource(
                 spec,
                 rate_limiter=rate_limiter,
             )
@@ -89,12 +80,14 @@ class SidecarService:
         self._last_liquidity_publish_at_ms_by_key: dict[tuple[str, str, str], int] = {}
 
     async def close(self) -> None:
-        for src in self._exchange_sources.values():
-            await src.close()
-        for src in self._liquidity_sources.values():
-            await src.close()
-        for src in self._transfer_sources:
-            await src.close()
+        """Close every owned client even when one close operation fails."""
+        results = await asyncio.gather(
+            *(src.close() for src in (*self._exchange_sources.values(), *self._transfer_sources)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     # ------------------------------------------------------------------
     # Main refresh
@@ -116,9 +109,8 @@ class SidecarService:
         funding_results = await self._fetch_all_venues(
             symbols, timeout_s=self._funding_timeout_s,
         )
-        # V1's market freshness is the completed market-view observation, not
-        # the beginning of the refresh or the later snapshot publication.  The
-        # liquidity stage is independent and must not age market evidence.
+        # Market and coarse liquidity are derived from the same ticker payload,
+        # so they share the completed acquisition timestamp.
         market_observed_ms = int(time.time() * 1000)
 
         for venue_name, venue_quotes, error, failed_symbols in funding_results:
@@ -138,6 +130,10 @@ class SidecarService:
                     coverage_usable=len(fallback), degraded_reason=str(error),
                 ))
                 market_lifecycle.append(MarketLifecycle(
+                    venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=len(fallback),
+                    coverage_usable=len(fallback), degraded_reason=str(error),
+                ))
+                liquidity_lifecycle.append(LiquidityLifecycle(
                     venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=len(fallback),
                     coverage_usable=len(fallback), degraded_reason=str(error),
                 ))
@@ -167,30 +163,10 @@ class SidecarService:
                 coverage_usable=usable,
                 degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
-
-        # --- Liquidity fetch (independent domain, own timeout, own source) ---
-        liquidity_results = await self._fetch_liquidity_all_venues(
-            symbols, timeout_s=self._liquidity_timeout_s,
-        )
-        for venue_name, liq_data, liq_error, liq_failed_symbols in liquidity_results:
-            if liq_error is not None:
-                degraded_venues.add(venue_name)
-                liquidity_lifecycle.append(LiquidityLifecycle(
-                    venue=venue_name, observed_at_ms=observed_ms, symbol_count=0,
-                    coverage_usable=0, degraded_reason=str(liq_error),
-                ))
-                continue
-
-            if liq_failed_symbols:
-                existing = degraded_symbols.get(venue_name, [])
-                degraded_symbols[venue_name] = sorted(set(existing) | liq_failed_symbols)
-
-            count = len(liq_data) if liq_data else 0
-            usable = count - len(liq_failed_symbols)
             liquidity_lifecycle.append(LiquidityLifecycle(
-                venue=venue_name, observed_at_ms=observed_ms, symbol_count=count,
-                coverage_usable=max(0, usable),
-                degraded_reason="; ".join(f"{s}: fetch failed" for s in liq_failed_symbols) if liq_failed_symbols else "",
+                venue=venue_name, observed_at_ms=market_observed_ms, symbol_count=count,
+                coverage_usable=usable,
+                degraded_reason="; ".join(f"{s}: fetch failed" for s in failed_symbols) if failed_symbols else "",
             ))
 
         # --- Transfer lifecycle (empty-compatible, independent) ---
@@ -281,33 +257,6 @@ class SidecarService:
                 return (venue_name, result, None, set())
             except asyncio.TimeoutError:
                 return (venue_name, None, TimeoutError(f"funding timeout {timeout_s}s"), set())
-            except Exception as e:
-                return (venue_name, None, e, set())
-
-        results = await asyncio.gather(
-            *[_fetch_one(vc.venue) for vc in self.config.venues],
-            return_exceptions=False,
-        )
-        return list(results)
-
-    # ------------------------------------------------------------------
-    # Per-venue liquidity fetch (independent timeout, independent source)
-    # ------------------------------------------------------------------
-
-    async def _fetch_liquidity_all_venues(
-        self, symbols: list[str], timeout_s: float,
-    ) -> list[tuple[str, Optional[dict], Optional[Exception], set[str]]]:
-        """Fetch perp liquidity from all venues concurrently with independent timeout."""
-
-        async def _fetch_one(venue_name: str) -> tuple[str, Optional[dict], Optional[Exception], set[str]]:
-            source = self._liquidity_sources.get(venue_name)
-            if source is None:
-                return (venue_name, None, None, set())
-            try:
-                result = await asyncio.wait_for(source.fetch_perp_liquidity(symbols), timeout=timeout_s)
-                return (venue_name, result, None, set())
-            except asyncio.TimeoutError:
-                return (venue_name, None, TimeoutError(f"liquidity timeout {timeout_s}s"), set())
             except Exception as e:
                 return (venue_name, None, e, set())
 

@@ -6,8 +6,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-# V1: src/runtime_state/config.rs  DailyUniverseConfig.generate_time_local
-_GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+# V1 parses ``HH:MM``.  Keep the older V2 seconds form loadable as well so a
+# validation tightening cannot turn an otherwise unchanged production config
+# into a restart failure.
+_GENERATE_TIME_RE = re.compile(r"^\d{2}:\d{2}(?::\d{2})?$")
 V1_ENTRY_VOLUME_FLOOR_DEFAULT_QUOTE = 1_000_000.0
 V1_ENTRY_VOLUME_FLOOR_QUOTE_BY_VENUE = {
     "bitget": 2_000_000.0,
@@ -22,7 +24,8 @@ def _is_valid_generate_time(s: str) -> bool:
     if not _GENERATE_TIME_RE.match(s):
         return False
     parts = s.split(":")
-    h, m, sec = int(parts[0]), int(parts[1]), int(parts[2])
+    h, m = int(parts[0]), int(parts[1])
+    sec = int(parts[2]) if len(parts) == 3 else 0
     return 0 <= h <= 23 and 0 <= m <= 59 and 0 <= sec <= 59
 
 
@@ -70,6 +73,8 @@ class RuntimeConfig:
     sidecar_refresh_ms: int = 3000
     sidecar_perp_liquidity_budget_ms: int = 30000
     sidecar_funding_timeout_s: float = 30.0
+    # Compatibility-only: the sidecar derives coarse liquidity from the same
+    # funding ticker fetch, so this must never create a second HTTP lifecycle.
     sidecar_liquidity_timeout_s: float = 10.0
     sidecar_transfer_timeout_s: float = 5.0
     sidecar_hint_budget_ms: int = 500

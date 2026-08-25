@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 from lightfee.ops.production_health import (
+    analyze_runtime_resources,
     analyze_current_state,
     analyze_resolver_config,
     analyze_sidecar_snapshot,
@@ -712,6 +713,158 @@ def test_summary_is_failed_when_any_report_critical():
     assert summary.critical_count == 1
 
 
+def _healthy_runtime_resource_evidence(now_ms: int) -> dict:
+    return {
+        "processes": {
+            "sidecar": {
+                "pid": 101,
+                "fd_count": 77,
+                "socket_count": 75,
+                "close_wait_count": 0,
+            },
+            "live": {
+                "pid": 202,
+                "fd_count": 27,
+                "socket_count": 23,
+                "close_wait_count": 0,
+            },
+        },
+        "private_ws_worker_starts": {
+            "binance": 1,
+            "bybit": 1,
+        },
+        "private_ws_window_ms": 60 * 60 * 1000,
+        "binance_listen_key": {
+            "last_success_at_ms": now_ms - (30 * 60 * 1000),
+            "expires_at_ms": now_ms + (30 * 60 * 1000),
+        },
+        "collection_errors": [],
+    }
+
+
+def test_runtime_resources_accepts_process_owned_socket_and_current_listen_key_evidence():
+    now_ms = 1_778_787_000_000
+    report = analyze_runtime_resources(
+        _healthy_runtime_resource_evidence(now_ms),
+        now_ms=now_ms,
+    )
+
+    assert report.ok
+    assert report.details["processes"]["sidecar"]["close_wait_count"] == 0
+    assert report.details["binance_listen_key"]["last_success_age_ms"] == 30 * 60 * 1000
+
+
+def test_runtime_resources_fails_closed_for_the_resource_blind_spot_family():
+    now_ms = 1_778_787_000_000
+    cases = [
+        (
+            "sidecar_fd_count_exceeded",
+            lambda evidence: evidence["processes"]["sidecar"].update(fd_count=513),
+        ),
+        (
+            "live_close_wait_count_exceeded",
+            lambda evidence: evidence["processes"]["live"].update(close_wait_count=11),
+        ),
+        (
+            "private_ws_worker_start_rate_exceeded:binance",
+            lambda evidence: evidence["private_ws_worker_starts"].update(binance=4),
+        ),
+        (
+            "private_ws_worker_start_rate_exceeded",
+            lambda evidence: evidence["private_ws_worker_starts"].update(
+                aster=1,
+                binance=2,
+                bitget=1,
+                gate=1,
+                hyperliquid=1,
+                okx=1,
+            ),
+        ),
+        (
+            "private_ws_worker_start_evidence_missing",
+            lambda evidence: evidence["private_ws_worker_starts"].update({1: 1}),
+        ),
+        (
+            "binance_listen_key_success_stale_or_missing",
+            lambda evidence: evidence["binance_listen_key"].update(
+                last_success_at_ms=now_ms - (35 * 60 * 1000) - 1
+            ),
+        ),
+        (
+            "binance_listen_key_expired_or_missing",
+            lambda evidence: evidence["binance_listen_key"].update(expires_at_ms=now_ms),
+        ),
+        (
+            "runtime_resource_collection_failed",
+            lambda evidence: evidence["collection_errors"].append("journalctl failed"),
+        ),
+    ]
+
+    for fingerprint, mutate in cases:
+        evidence = _healthy_runtime_resource_evidence(now_ms)
+        mutate(evidence)
+        report = analyze_runtime_resources(evidence, now_ms=now_ms)
+        assert report.ok is False
+        assert report.severity == "critical"
+        assert fingerprint in report.fingerprints
+
+
+def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and_parses_journal_evidence(tmp_path):
+    now_ms = 1_778_787_000_000
+    proc_root = tmp_path / "proc"
+    for pid, socket_inode, state in ((101, 1001, "08"), (202, 2002, "01")):
+        fd_dir = proc_root / str(pid) / "fd"
+        net_dir = proc_root / str(pid) / "net"
+        fd_dir.mkdir(parents=True)
+        net_dir.mkdir()
+        os.symlink(f"socket:[{socket_inode}]", fd_dir / "3")
+        (net_dir / "tcp").write_text(
+            "sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n"
+            f"0: 0100007F:1F90 00000000:0000 {state} 00000000:00000000 "
+            f"00:00000000 00000000 0 0 {socket_inode} 1 0000000000000000\n"
+        )
+        (net_dir / "tcp6").write_text(
+            "sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n"
+        )
+
+    def command_runner(command: list[str]) -> str:
+        if command[:2] == ["systemctl", "show"]:
+            return "101\n" if command[2] == "lightfee-sidecar.service" else "202\n"
+        if command[0] == "journalctl":
+            return "\n".join([
+                "binance private WS worker started for 4 symbols",
+                "bybit private WS worker started for 4 symbols",
+                "binance.listen_key_keepalive_ok {'last_listen_key_success_at': "
+                f"{now_ms - (30 * 60 * 1000)}, 'listen_key_expires_at': "
+                f"{now_ms + (30 * 60 * 1000)}}}",
+            ])
+        raise AssertionError(command)
+
+    evidence = vps.collect_runtime_resource_evidence(
+        command_runner=command_runner,
+        proc_root=proc_root,
+    )
+    report = analyze_runtime_resources(evidence, now_ms=now_ms)
+
+    assert evidence["processes"]["sidecar"]["close_wait_count"] == 1
+    assert evidence["processes"]["live"]["close_wait_count"] == 0
+    assert evidence["private_ws_worker_starts"] == {"binance": 1, "bybit": 1}
+    assert report.ok
+
+
+def test_runtime_resource_collector_converts_command_timeout_to_a_critical_report():
+    now_ms = 1_778_787_000_000
+
+    def command_runner(command: list[str]) -> str:
+        raise subprocess.TimeoutExpired(command, timeout=20)
+
+    evidence = vps.collect_runtime_resource_evidence(command_runner=command_runner)
+    report = analyze_runtime_resources(evidence, now_ms=now_ms)
+
+    assert report.ok is False
+    assert "runtime_resource_collection_failed" in report.fingerprints
+
+
 def test_verify_production_services_cli_json_success(tmp_path):
     unit_dir = tmp_path / "systemd"
     unit_dir.mkdir()
@@ -1279,8 +1432,13 @@ def test_verify_production_services_cli_json_failure(tmp_path):
 def test_deploy_systemd_templates_pass_contract():
     sidecar = Path("deploy/systemd/lightfee-sidecar.service").read_text()
     live = Path("deploy/systemd/lightfee-live.service").read_text()
+    health = Path("deploy/systemd/lightfee-production-health.service").read_text()
+    timer = Path("deploy/systemd/lightfee-production-health.timer").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
+    assert "verify_production_services.py --deployment-acceptance --json" in health
+    assert "OnUnitActiveSec=5min" in timer
+    assert "Unit=lightfee-production-health.service" in timer
 
 
 def test_deploy_dns_template_prefers_verified_resolver():

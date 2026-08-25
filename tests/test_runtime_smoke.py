@@ -4,6 +4,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -102,10 +103,18 @@ class TestImportSmoke:
                     raise StopSidecar
                 await asyncio.sleep(0.08)
 
+            async def close(self):
+                return None
+
         config = SimpleNamespace(
             runtime=SimpleNamespace(sidecar_refresh_ms=80),
         )
+
+        async def no_op_prepare(_config):
+            return None
+
         monkeypatch.setattr(sidecar, "load_config", lambda _path: config)
+        monkeypatch.setattr(sidecar, "prepare_runtime_symbols", no_op_prepare)
         monkeypatch.setattr(sidecar, "SidecarService", lambda _config: SlowService())
         monkeypatch.setattr(sys, "argv", ["sidecar", "--config", "ignored.toml"])
 
@@ -115,6 +124,84 @@ class TestImportSmoke:
         # The old loop waited another 80ms after the 80ms refresh (~160ms).
         # A V1-style fixed cadence begins the next overrun refresh immediately.
         assert starts[1] - starts[0] < 0.13
+
+    @pytest.mark.asyncio
+    async def test_sidecar_run_applies_daily_universe_before_constructing_service_and_closes(self, monkeypatch, tmp_path):
+        from lightfee.apps import sidecar
+
+        universe_path = tmp_path / "daily-universe.json"
+        universe_path.write_text(
+            json.dumps(
+                {
+                    "trading_date": date.today().isoformat(),
+                    "generated_at_ms": 1_765_000_000_000,
+                    "selector_version": 1,
+                    "source_symbol_count": 3,
+                    "selected_symbol_count": 3,
+                    "selected_symbols": ["AUSDT", "BUSDT", "CUSDT"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_path = tmp_path / "sidecar.toml"
+        config_path.write_text(
+            f'''\
+symbols = ["BTCUSDT", "ETHUSDT"]
+
+[runtime.daily_universe]
+enabled = true
+path = "{universe_path}"
+max_symbols = 2
+''',
+            encoding="utf-8",
+        )
+        config = load_config(config_path)
+        observed: dict[str, object] = {}
+
+        class ProbeService:
+            def __init__(self, service_config):
+                observed["symbols_at_construction"] = list(service_config.symbols)
+
+            async def refresh_once(self):
+                observed["refreshed"] = True
+
+            async def close(self):
+                observed["closed"] = True
+
+        monkeypatch.setattr(sidecar, "SidecarService", ProbeService)
+
+        await sidecar._run(config, once=True)
+
+        assert observed == {
+            "symbols_at_construction": ["AUSDT", "BUSDT"],
+            "refreshed": True,
+            "closed": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_sidecar_run_closes_service_when_refresh_fails(self, monkeypatch):
+        from lightfee.apps import sidecar
+
+        config = AppConfig()
+        closed = False
+
+        class FailingService:
+            def __init__(self, _config):
+                return None
+
+            async def refresh_once(self):
+                raise RuntimeError("refresh failed")
+
+            async def close(self):
+                nonlocal closed
+                closed = True
+
+        monkeypatch.setattr(sidecar, "SidecarService", FailingService)
+
+        with pytest.raises(RuntimeError, match="refresh failed"):
+            await sidecar._run(config, once=True)
+
+        assert closed is True
 
     def test_ops_imports(self):
         from lightfee.ops import commands

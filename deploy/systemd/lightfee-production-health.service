@@ -1,0 +1,14 @@
+[Unit]
+Description=LightFee V2 Production Health Gate
+After=network-online.target lightfee-sidecar.service lightfee-live.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/lightfee-v2
+EnvironmentFile=/etc/lightfee/lightfee.env
+Environment=LIGHTFEE_PRODUCTION_GUARD=1
+ExecStart=/opt/lightfee-v2/.venv/bin/python3 /opt/lightfee-v2/scripts/verify_production_services.py --deployment-acceptance --json
+StandardOutput=journal
+StandardError=journal

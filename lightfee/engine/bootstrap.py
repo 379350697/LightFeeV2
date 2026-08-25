@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
+from lightfee.config.universe import resolve_universe_symbols
 from lightfee.risk.modes import EngineLifecycle
 
 
@@ -70,17 +71,13 @@ def startup_market_warmup_ms(
 async def prepare_runtime_symbols(config: AppConfig) -> Optional[dict]:
     """Resolve runtime trading symbols before adapter construction.
 
-    When the daily-universe feature is enabled (Task 23), loads the persisted
-    daily universe JSON and mutates config.symbols.  Today this is a passthrough
-    that returns the static symbol list.
+    The resolver is the sole owner of daily-universe fallback and capping
+    semantics.  Both live and sidecar startup call this boundary before they
+    construct clients that fan out over ``config.symbols``.
     """
-    symbols = list(config.symbols)
+    resolved = resolve_universe_symbols(config)
+    symbols = list(resolved["resolved_symbols"])
+    config.symbols = symbols
     if not symbols:
         return None
-
-    return {
-        "daily_universe_enabled": False,
-        "global_symbol_count": len(symbols),
-        "resolved_symbol_count": len(symbols),
-        "resolved_symbols": symbols,
-    }
+    return resolved

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,17 @@ def _write_toml(path: str, content: str) -> None:
 def _write_daily_universe(path: str, symbols: list[str]) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        json.dump({"symbols": symbols, "generated_at": "2026-05-12T08:00:00Z"}, f)
+        json.dump(
+            {
+                "trading_date": date.today().isoformat(),
+                "generated_at_ms": 1_765_000_000_000,
+                "selector_version": 1,
+                "source_symbol_count": len(symbols),
+                "selected_symbol_count": len(symbols),
+                "selected_symbols": symbols,
+            },
+            f,
+        )
 
 
 # ── CONFIG-001: Directed Pairs Restrict Direction ──────────────────────────
@@ -188,6 +199,47 @@ class TestDailyUniverseConfig:
             symbols = load_daily_universe(path)
             assert symbols == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
+    def test_load_daily_universe_rejects_undated_legacy_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "universe.json")
+            Path(path).write_text('{"symbols": ["BTCUSDT"]}')
+
+            assert load_daily_universe(path) is None
+
+    def test_stale_valid_universe_is_explicit_bounded_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "universe.json")
+            Path(path).write_text(
+                json.dumps(
+                    {
+                        "trading_date": (
+                            date.today() - timedelta(days=1)
+                        ).isoformat(),
+                        "generated_at_ms": 1_765_000_000_000,
+                        "selector_version": 1,
+                        "source_symbol_count": 3,
+                        "selected_symbol_count": 3,
+                        "selected_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+                    }
+                )
+            )
+            config = AppConfig(
+                symbols=["XRPUSDT"],
+                runtime=RuntimeConfig(
+                    daily_universe=DailyUniverseConfig(
+                        enabled=True,
+                        max_symbols=2,
+                        fallback_to_last_good=True,
+                        path=path,
+                    )
+                ),
+            )
+
+            result = resolve_universe_symbols(config)
+
+            assert result["used_fallback"] is True
+            assert result["resolved_symbols"] == ["BTCUSDT", "ETHUSDT"]
+
     def test_load_daily_universe_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "nonexistent.json")
@@ -200,6 +252,33 @@ class TestDailyUniverseConfig:
             Path(path).write_text("not json")
             symbols = load_daily_universe(path)
             assert symbols is None
+
+    def test_load_daily_universe_rejects_invalid_trading_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "invalid-date.json")
+            _write_daily_universe(path, ["BTCUSDT"])
+            payload = json.loads(Path(path).read_text())
+            payload["trading_date"] = "not-a-date"
+            Path(path).write_text(json.dumps(payload))
+
+            assert load_daily_universe(path) is None
+
+    def test_load_daily_universe_rejects_missing_v1_required_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing-field.json")
+            _write_daily_universe(path, ["BTCUSDT"])
+            payload = json.loads(Path(path).read_text())
+            del payload["source_symbol_count"]
+            Path(path).write_text(json.dumps(payload))
+
+            assert load_daily_universe(path) is None
+
+    def test_load_daily_universe_uses_v1_symbol_normalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "normalized.json")
+            _write_daily_universe(path, ["btc-usdt"])
+
+            assert load_daily_universe(path) == ["BTCUSDT"]
 
     def test_resolve_universe_symbols_with_enabled_daily_universe(self):
         with tempfile.TemporaryDirectory() as tmp:

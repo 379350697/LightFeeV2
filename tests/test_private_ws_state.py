@@ -285,6 +285,25 @@ class TestPrivateWsStateWorkers:
         assert state.worker_count() == 0
         assert all(t.cancelled() for t in tasks)
 
+    @pytest.mark.asyncio
+    async def test_abort_workers_and_wait_waits_for_worker_finally(self):
+        """Shutdown does not return before the worker releases its resources."""
+        state = PrivateWsState()
+        cleaned_up = asyncio.Event()
+
+        async def _worker():
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                cleaned_up.set()
+
+        state.push_worker(asyncio.create_task(_worker()))
+        await asyncio.sleep(0)
+
+        assert await state.abort_workers_and_wait(timeout_s=0.5)
+        assert cleaned_up.is_set()
+        assert state.worker_count() == 0
+
 
 # ---------------------------------------------------------------------------
 # enrich_fill_from_private

@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -21,6 +23,7 @@ from lightfee.ops.production_health import (
     HealthReport,
     analyze_current_state,
     analyze_resolver_config,
+    analyze_runtime_resources,
     analyze_sidecar_snapshot,
     analyze_systemd_unit,
     deployment_acceptance_ok,
@@ -30,6 +33,21 @@ from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from scripts.diagnose_live import _environment_file_scope
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
+RUNTIME_RESOURCE_JOURNAL_WINDOW = "-1h"
+_SOCKET_LINK_RE = re.compile(r"^socket:\[(?P<inode>\d+)\]$")
+_PRIVATE_WS_STARTED_RE = re.compile(
+    r"\b(?P<venue>aster|binance|bitget|bybit|gate|hyperliquid|okx)\s+"
+    r"private\s+WS\s+worker\s+started\b",
+    re.IGNORECASE,
+)
+_BINANCE_LISTEN_KEY_EVENT_RE = re.compile(
+    r"\bbinance\.listen_key_(?:created|keepalive_ok)\b",
+    re.IGNORECASE,
+)
+_BINANCE_LISTEN_KEY_FIELD_RE = re.compile(
+    r"['\"](?P<name>last_listen_key_success_at|listen_key_created_at|"
+    r"listen_key_expires_at)['\"]\s*:\s*(?P<value>\d+)"
+)
 
 
 def _read_json(path: str) -> dict:
@@ -38,6 +56,138 @@ def _read_json(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"JSON root must be object: {path}")
     return data
+
+
+def _run_readonly_command(command: list[str]) -> str:
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"{' '.join(command[:2])} failed with {result.returncode}: {message[:300]}"
+        )
+    return result.stdout
+
+
+def _systemd_main_pid(unit: str, command_runner) -> int:
+    output = command_runner([
+        "systemctl",
+        "show",
+        unit,
+        "--property=MainPID",
+        "--value",
+    ])
+    try:
+        return int(output.strip().splitlines()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _process_socket_metrics(pid: int, *, proc_root: Path) -> dict[str, int]:
+    process_root = proc_root / str(pid)
+    fd_dir = process_root / "fd"
+    socket_inodes: set[str] = set()
+    fd_count = 0
+    for fd_path in fd_dir.iterdir():
+        fd_count += 1
+        target = os.readlink(fd_path)
+        match = _SOCKET_LINK_RE.match(target)
+        if match is not None:
+            socket_inodes.add(match.group("inode"))
+
+    close_wait_count = 0
+    for name in ("tcp", "tcp6"):
+        table = (process_root / "net" / name).read_text()
+        for raw in table.splitlines()[1:]:
+            fields = raw.split()
+            if len(fields) > 9 and fields[3] == "08" and fields[9] in socket_inodes:
+                close_wait_count += 1
+    return {
+        "pid": pid,
+        "fd_count": fd_count,
+        "socket_count": len(socket_inodes),
+        "close_wait_count": close_wait_count,
+    }
+
+
+def _live_journal_resource_evidence(lines: str) -> tuple[dict[str, int], dict[str, int]]:
+    starts: dict[str, int] = {}
+    listen_key: dict[str, int] = {}
+    latest_success_at_ms = -1
+    for raw in lines.splitlines():
+        started = _PRIVATE_WS_STARTED_RE.search(raw)
+        if started is not None:
+            venue = started.group("venue").lower()
+            starts[venue] = starts.get(venue, 0) + 1
+        if _BINANCE_LISTEN_KEY_EVENT_RE.search(raw) is None:
+            continue
+        fields = {
+            match.group("name"): int(match.group("value"))
+            for match in _BINANCE_LISTEN_KEY_FIELD_RE.finditer(raw)
+        }
+        success_at_ms = (
+            fields.get("last_listen_key_success_at")
+            or fields.get("listen_key_created_at")
+        )
+        if success_at_ms is None or success_at_ms < latest_success_at_ms:
+            continue
+        latest_success_at_ms = success_at_ms
+        listen_key = {
+            "last_success_at_ms": success_at_ms,
+            "expires_at_ms": fields.get("listen_key_expires_at", 0),
+        }
+    return starts, listen_key
+
+
+def collect_runtime_resource_evidence(
+    *,
+    command_runner=None,
+    proc_root: Path = Path("/proc"),
+) -> dict:
+    """Collect bounded, read-only OS and journal evidence for the health gate."""
+    if command_runner is None:
+        command_runner = _run_readonly_command
+    evidence: dict = {
+        "processes": {},
+        "private_ws_worker_starts": {},
+        "private_ws_window_ms": 60 * 60 * 1000,
+        "binance_listen_key": {},
+        "collection_errors": [],
+    }
+    for name, unit in (
+        ("sidecar", "lightfee-sidecar.service"),
+        ("live", "lightfee-live.service"),
+    ):
+        try:
+            pid = _systemd_main_pid(unit, command_runner)
+            if pid <= 0:
+                raise RuntimeError(f"{unit} has no active MainPID")
+            evidence["processes"][name] = _process_socket_metrics(
+                pid,
+                proc_root=proc_root,
+            )
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            evidence["collection_errors"].append(f"{name}:{str(exc)[:300]}")
+
+    try:
+        lines = command_runner([
+            "journalctl",
+            "--unit=lightfee-live.service",
+            f"--since={RUNTIME_RESOURCE_JOURNAL_WINDOW}",
+            "--no-pager",
+            "--output=cat",
+        ])
+        starts, listen_key = _live_journal_resource_evidence(lines)
+        evidence["private_ws_worker_starts"] = starts
+        evidence["binance_listen_key"] = listen_key
+    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+        evidence["collection_errors"].append(f"live-journal:{str(exc)[:300]}")
+    return evidence
 
 
 def _environment_file_paths(unit_texts: dict[str, str]) -> list[Path]:
@@ -172,6 +322,15 @@ def main() -> None:
             "Default: enabled for the production default current-state path."
         ),
     )
+    parser.add_argument(
+        "--runtime-resources",
+        action="store_true",
+        help=(
+            "Collect process-owned FD/CLOSE_WAIT and bounded private-stream "
+            "journal evidence for a non-default current-state path. The "
+            "production default path always collects it."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--deployment-acceptance",
@@ -243,6 +402,12 @@ def main() -> None:
             severity="warning",
             fingerprints=["resolver_file_missing"],
             details={"path": args.resolv_conf},
+        ))
+
+    if args.runtime_resources or args.current_state == default_current_state:
+        reports.append(analyze_runtime_resources(
+            collect_runtime_resource_evidence(),
+            now_ms=now_ms,
         ))
 
     summary = summarize_reports(reports)

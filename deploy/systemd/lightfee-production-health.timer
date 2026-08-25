@@ -1,0 +1,11 @@
+[Unit]
+Description=Run LightFee V2 Production Health Gate
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=lightfee-production-health.service
+
+[Install]
+WantedBy=timers.target

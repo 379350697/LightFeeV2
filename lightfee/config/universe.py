@@ -2,18 +2,18 @@
 
 V1 parity: CONFIG-001 through CONFIG-006.
 Keep symbol selection here instead of scattering pair filtering in runtime code.
-Expose functions for Worker E to consume later. Do NOT wire runtime.py directly.
+Startup code calls this module through the shared bootstrap boundary.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
+from datetime import date
 from typing import Any, Optional
 
 from lightfee.config.schema import AppConfig, DirectedPairConfig
 from lightfee.core.domain import Venue
+from lightfee.strategy.universe import PersistedDailyUniverse
 
 logger = logging.getLogger(__name__)
 
@@ -65,26 +65,38 @@ def validate_directed_pairs(
     return issues
 
 
-def load_daily_universe(path: str) -> Optional[list[str]]:
-    """Load a daily universe JSON file. Returns symbol list or None if missing/malformed.
-
-    V1 semantics (CONFIG-002): path resolution, fallback-to-last-good.
-    Expected JSON shape: {"symbols": ["BTCUSDT", ...], "generated_at": "..."}
-    """
-    p = Path(path)
-    if not p.exists():
-        return None
+def _load_persisted_daily_universe(path: str) -> Optional[tuple[date, list[str]]]:
+    """Read the V1 persisted daily-universe contract without judging its day."""
     try:
-        data = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        logger.warning("daily_universe: malformed JSON at %s", path)
+        persisted = PersistedDailyUniverse.load(path)
+        if persisted is None:
+            return None
+        return date.fromisoformat(persisted.trading_date), persisted.canonical_selected_symbols()
+    except (AttributeError, OSError, TypeError, ValueError):
+        logger.warning("daily_universe: invalid V1 payload at %s", path)
         return None
-    if not isinstance(data, dict):
+
+
+def load_daily_universe(path: str) -> Optional[list[str]]:
+    """Load today's V1-format daily universe, otherwise return ``None``.
+
+    A JSON array without a trading date used to be treated as permanently
+    current.  That silently disabled daily selection after a bad deployment.
+    """
+    persisted = _load_persisted_daily_universe(path)
+    if persisted is None:
         return None
-    symbols = data.get("symbols", [])
-    if not isinstance(symbols, list):
+    trading_date, symbols = persisted
+    today = date.today()
+    if trading_date != today:
+        logger.warning(
+            "daily_universe: stale universe at %s (trading_date=%s today=%s)",
+            path,
+            trading_date,
+            today,
+        )
         return None
-    return [str(s) for s in symbols if isinstance(s, str)]
+    return symbols
 
 
 def resolve_universe_symbols(config: AppConfig) -> Optional[dict[str, Any]]:
@@ -114,8 +126,21 @@ def resolve_universe_symbols(config: AppConfig) -> Optional[dict[str, Any]]:
 
     symbols: Optional[list[str]] = None
     used_fallback = False
+    today = date.today()
 
-    symbols = load_daily_universe(daily.path)
+    persisted = _load_persisted_daily_universe(daily.path)
+    if persisted is not None and persisted[0] == today:
+        symbols = list(persisted[1])
+    elif persisted is not None and daily.fallback_to_last_good:
+        # V1 first tries to generate today's universe.  V2 resolves before
+        # adapters exist, so a stale validated persisted selection is the
+        # bounded fallback rather than pretending it is today's selection.
+        symbols = list(persisted[1])
+        used_fallback = True
+        logger.warning(
+            "daily_universe: using stale validated fallback (%d symbols)",
+            len(symbols),
+        )
 
     if symbols is None and daily.fallback_to_last_good:
         cached = _last_good_cache.get(daily.path)

@@ -10,6 +10,7 @@ from lightfee.core.domain import Venue
 from lightfee.venues.market_data import (
     BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
     FundingTicker,
+    MARKET_DATA_MAX_CONNECTIONS,
     MarketDataClient,
     PerpLiquidity,
     PublicTransportError,
@@ -58,6 +59,18 @@ class TestMarketDataClientConstruction:
         client = MarketDataClient(spec)
         # Should not raise even though _client is None
         asyncio.run(client.close())
+
+    @pytest.mark.asyncio
+    async def test_http_client_caps_total_connections(self):
+        client = MarketDataClient(binance_spec())
+        try:
+            http_client = await client._get_client()
+            assert (
+                http_client._transport._pool._max_connections
+                == MARKET_DATA_MAX_CONNECTIONS
+            )
+        finally:
+            await client.close()
 
 
 class TestFundingTickerType:

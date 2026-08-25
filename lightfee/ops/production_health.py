@@ -20,6 +20,12 @@ from lightfee.ops.position_side_semantics import side_matches_business_leg
 EXPECTED_VENUES = {"aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"}
 KNOWN_GOOD_RESOLVERS = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"}
 FIXTURE_MARKET_OBSERVED_AT_MS = 1710000075000
+MAX_PROCESS_FD_COUNT = 512
+MAX_PROCESS_CLOSE_WAIT_COUNT = 10
+PRIVATE_WS_START_WINDOW_MS = 60 * 60 * 1000
+MAX_PRIVATE_WS_STARTS_PER_VENUE = 3
+MAX_PRIVATE_WS_STARTS_PER_WINDOW = len(EXPECTED_VENUES)
+BINANCE_LISTEN_KEY_MAX_SUCCESS_AGE_MS = 35 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,133 @@ class HealthSummary:
     critical_count: int
     warning_count: int
     reports: list[HealthReport]
+
+
+def _nonnegative_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def analyze_runtime_resources(
+    evidence: dict[str, Any],
+    *,
+    now_ms: int,
+) -> HealthReport:
+    """Assess process-owned sockets and private-stream lifecycle evidence.
+
+    The caller is responsible for collecting OS and journal facts.  Missing or
+    malformed facts are critical: a deployment gate cannot treat unavailable
+    resource evidence as healthy.
+    """
+    fingerprints: list[str] = []
+    raw_collection_errors = evidence.get("collection_errors")
+    collection_errors = (
+        list(raw_collection_errors)
+        if isinstance(raw_collection_errors, (list, tuple))
+        else ["invalid_collection_error_shape"]
+        if raw_collection_errors is not None
+        else []
+    )
+    details: dict[str, Any] = {
+        "processes": {},
+        "private_ws_worker_starts": {},
+        "private_ws_worker_start_total": 0,
+        "private_ws_window_ms": evidence.get("private_ws_window_ms"),
+        "binance_listen_key": {},
+        "collection_errors": collection_errors,
+    }
+    if details["collection_errors"]:
+        fingerprints.append("runtime_resource_collection_failed")
+
+    processes = evidence.get("processes")
+    if not isinstance(processes, dict):
+        processes = {}
+    for name in ("sidecar", "live"):
+        raw = processes.get(name)
+        if not isinstance(raw, dict):
+            fingerprints.append(f"{name}_process_metrics_missing")
+            continue
+        pid = _nonnegative_int_or_none(raw.get("pid"))
+        fd_count = _nonnegative_int_or_none(raw.get("fd_count"))
+        socket_count = _nonnegative_int_or_none(raw.get("socket_count"))
+        close_wait_count = _nonnegative_int_or_none(raw.get("close_wait_count"))
+        details["processes"][name] = {
+            "pid": pid,
+            "fd_count": fd_count,
+            "socket_count": socket_count,
+            "close_wait_count": close_wait_count,
+        }
+        if (
+            pid is None
+            or pid <= 0
+            or fd_count is None
+            or socket_count is None
+            or close_wait_count is None
+        ):
+            fingerprints.append(f"{name}_process_metrics_missing")
+            continue
+        if fd_count > MAX_PROCESS_FD_COUNT:
+            fingerprints.append(f"{name}_fd_count_exceeded")
+        if close_wait_count > MAX_PROCESS_CLOSE_WAIT_COUNT:
+            fingerprints.append(f"{name}_close_wait_count_exceeded")
+
+    starts = evidence.get("private_ws_worker_starts")
+    if not isinstance(starts, dict):
+        fingerprints.append("private_ws_worker_start_evidence_missing")
+    else:
+        window_ms = _nonnegative_int_or_none(evidence.get("private_ws_window_ms"))
+        if window_ms != PRIVATE_WS_START_WINDOW_MS:
+            fingerprints.append("private_ws_worker_start_window_invalid")
+        for venue, raw_count in starts.items():
+            count = _nonnegative_int_or_none(raw_count)
+            if not isinstance(venue, str) or not venue or count is None:
+                fingerprints.append("private_ws_worker_start_evidence_missing")
+                continue
+            normalized_venue = venue.lower()
+            details["private_ws_worker_starts"][normalized_venue] = count
+            if count > MAX_PRIVATE_WS_STARTS_PER_VENUE:
+                fingerprints.append(
+                    f"private_ws_worker_start_rate_exceeded:{normalized_venue}"
+                )
+        total_starts = sum(details["private_ws_worker_starts"].values())
+        details["private_ws_worker_start_total"] = total_starts
+        if total_starts > MAX_PRIVATE_WS_STARTS_PER_WINDOW:
+            fingerprints.append("private_ws_worker_start_rate_exceeded")
+
+    listen_key = evidence.get("binance_listen_key")
+    if not isinstance(listen_key, dict):
+        listen_key = {}
+    last_success_at_ms = _nonnegative_int_or_none(listen_key.get("last_success_at_ms"))
+    expires_at_ms = _nonnegative_int_or_none(listen_key.get("expires_at_ms"))
+    last_success_age_ms = (
+        now_ms - last_success_at_ms if last_success_at_ms is not None else None
+    )
+    details["binance_listen_key"] = {
+        "last_success_at_ms": last_success_at_ms,
+        "expires_at_ms": expires_at_ms,
+        "last_success_age_ms": last_success_age_ms,
+    }
+    if (
+        last_success_age_ms is None
+        or last_success_age_ms < 0
+        or last_success_age_ms > BINANCE_LISTEN_KEY_MAX_SUCCESS_AGE_MS
+    ):
+        fingerprints.append("binance_listen_key_success_stale_or_missing")
+    if expires_at_ms is None or expires_at_ms <= now_ms:
+        fingerprints.append("binance_listen_key_expired_or_missing")
+
+    return HealthReport(
+        name="runtime_resources",
+        ok=not fingerprints,
+        severity="critical" if fingerprints else "info",
+        fingerprints=fingerprints,
+        details=details,
+    )
 
 
 def _execstart_lines(unit_text: str) -> list[str]:

@@ -27,6 +27,14 @@ from lightfee.marketdata.resilience import ConnectionHealth
 DEFAULT_MAX_ORDER_ENTRIES: int = 512
 
 
+def _consume_worker_result(task: asyncio.Task) -> None:
+    """Consume a late cancelled worker result after shutdown has timed out."""
+    try:
+        task.result()
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Private order / position update types (V1 exact equivalents)
 # ---------------------------------------------------------------------------
@@ -437,6 +445,33 @@ class PrivateWsState:
         for worker in self._workers:
             worker.cancel()
         self._workers.clear()
+
+    async def abort_workers_and_wait(self, timeout_s: float) -> bool:
+        """Cancel workers and wait for their ``finally`` blocks to close sockets."""
+        self._prune_finished_workers()
+        workers = list(self._workers)
+        self._workers.clear()
+        for worker in workers:
+            worker.cancel()
+        if not workers:
+            return True
+
+        done, pending = await asyncio.wait(
+            workers,
+            timeout=max(timeout_s, 0.001),
+        )
+        for worker in done:
+            try:
+                worker.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # The venue worker already records its failure; shutdown must
+                # still wait for every worker rather than fail on the first.
+                pass
+        for worker in pending:
+            worker.add_done_callback(_consume_worker_result)
+        return not pending
 
     def worker_count(self) -> int:
         """V1 worker_count()."""

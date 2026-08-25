@@ -29,6 +29,47 @@ logger = logging.getLogger(__name__)
 
 BINANCE_LISTEN_KEY_KEEPALIVE_SECS = 30 * 60  # 30 minutes
 BINANCE_PRIVATE_PING_INTERVAL_SECS = 20
+BINANCE_LISTEN_KEY_KEEPALIVE_MAX_FAILURES = 3
+BINANCE_LISTEN_KEY_VALIDITY_SECS = 60 * 60
+
+
+def _record_binance_private_ws_event(
+    transport,
+    kind: str,
+    payload: dict[str, Any],
+) -> None:
+    record = getattr(transport, "_record_order_diagnostic", None)
+    if record is not None:
+        record(kind, payload)
+    logger.info("%s %s", kind, payload)
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+
+def _is_binance_listen_key_expired_event(raw: str) -> bool:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("e") == "listenKeyExpired"
+
+
+def _binance_listen_key_expires_at(
+    listen_key_created_at: int | None,
+    last_keepalive_ok_at: int | None,
+) -> int | None:
+    last_success_at = last_keepalive_ok_at or listen_key_created_at
+    if last_success_at is None:
+        return None
+    return last_success_at + (BINANCE_LISTEN_KEY_VALIDITY_SECS * 1000)
 
 
 # ---------------------------------------------------------------------------
@@ -429,112 +470,269 @@ async def _binance_private_ws_loop(
     from lightfee.marketdata.resilience import compute_backoff_ms
 
     failures = 0
+    rotation_count = 0
+    pending_rotation: Optional[dict[str, Any]] = None
     while True:
         # 1) Start listenKey
         listen_key: Optional[str] = None
+        listen_key_created_at: Optional[int] = None
         try:
             listen_key = await _start_binance_listen_key(transport, api_key)
+            listen_key_created_at = _now_ms()
+            _record_binance_private_ws_event(
+                transport,
+                "binance.listen_key_created",
+                {
+                    "listen_key_created_at": listen_key_created_at,
+                    "last_listen_key_success_at": listen_key_created_at,
+                    "last_keepalive_ok_at": None,
+                    "listen_key_expires_at": _binance_listen_key_expires_at(
+                        listen_key_created_at,
+                        None,
+                    ),
+                    "rotation_count": rotation_count,
+                    "reconnect_result": (
+                        "pending" if pending_rotation is not None else "initial"
+                    ),
+                },
+            )
         except Exception:
             failures += 1
+            if pending_rotation is not None:
+                pending_rotation["reconnect_result"] = "failed_listen_key_create"
+                _record_binance_private_ws_event(
+                    transport,
+                    "binance.listen_key_rotation",
+                    pending_rotation,
+                )
             delay = compute_backoff_ms(reconnect_initial_ms, reconnect_max_ms, failures)
             await asyncio.sleep(delay / 1000.0)
             continue
 
-        # 2) Spawn keepalive task
+        # 2) Keep the key alive. A single REST failure is retried on the same
+        # key; only a bounded retry-budget breach rotates the private stream.
         keepalive_done = asyncio.Event()
+        rotate_listen_key = asyncio.Event()
+        rotation_reason: Optional[str] = None
+        keepalive_attempt_count = 0
+        last_keepalive_ok_at: Optional[int] = None
+        private_ws_last_ok_at: Optional[int] = None
 
-        async def _keepalive_loop():
+        async def _keepalive_loop() -> None:
+            nonlocal keepalive_attempt_count, last_keepalive_ok_at, rotation_reason
+            delay_secs = BINANCE_LISTEN_KEY_KEEPALIVE_SECS
             try:
                 while not keepalive_done.is_set():
                     try:
                         await asyncio.wait_for(
-                            keepalive_done.wait(),
-                            timeout=BINANCE_LISTEN_KEY_KEEPALIVE_SECS,
+                            keepalive_done.wait(), timeout=delay_secs
                         )
-                        break
+                        return
                     except asyncio.TimeoutError:
                         pass
                     try:
                         await _keepalive_binance_listen_key(
                             transport, api_key, listen_key
                         )
-                    except Exception:
-                        break
-            except Exception:
-                pass
+                    except Exception as exc:
+                        keepalive_attempt_count += 1
+                        if (
+                            keepalive_attempt_count
+                            >= BINANCE_LISTEN_KEY_KEEPALIVE_MAX_FAILURES
+                        ):
+                            rotation_reason = "keepalive_retry_budget_exhausted"
+                            transport.record_private_ws_failure(
+                                _now_ms(),
+                                "binance listenKey keepalive retry budget exhausted "
+                                f"after {keepalive_attempt_count} attempts: {exc}",
+                                1,
+                            )
+                            rotate_listen_key.set()
+                            return
+                        retry_ms = compute_backoff_ms(
+                            reconnect_initial_ms,
+                            reconnect_max_ms,
+                            keepalive_attempt_count,
+                        )
+                        _record_binance_private_ws_event(
+                            transport,
+                            "binance.listen_key_keepalive_retry",
+                            {
+                                "listen_key_created_at": listen_key_created_at,
+                                "last_listen_key_success_at": (
+                                    last_keepalive_ok_at or listen_key_created_at
+                                ),
+                                "last_keepalive_ok_at": last_keepalive_ok_at,
+                                "listen_key_expires_at": _binance_listen_key_expires_at(
+                                    listen_key_created_at,
+                                    last_keepalive_ok_at,
+                                ),
+                                "keepalive_attempt_count": keepalive_attempt_count,
+                                "retry_after_ms": retry_ms,
+                            },
+                        )
+                        delay_secs = retry_ms / 1000.0
+                        continue
+                    last_keepalive_ok_at = _now_ms()
+                    keepalive_attempt_count = 0
+                    _record_binance_private_ws_event(
+                        transport,
+                        "binance.listen_key_keepalive_ok",
+                        {
+                            "listen_key_created_at": listen_key_created_at,
+                            "last_listen_key_success_at": last_keepalive_ok_at,
+                            "last_keepalive_ok_at": last_keepalive_ok_at,
+                            "listen_key_expires_at": _binance_listen_key_expires_at(
+                                listen_key_created_at,
+                                last_keepalive_ok_at,
+                            ),
+                            "keepalive_attempt_count": keepalive_attempt_count,
+                        },
+                    )
+                    delay_secs = BINANCE_LISTEN_KEY_KEEPALIVE_SECS
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                rotation_reason = "keepalive_worker_error"
+                transport.record_private_ws_failure(
+                    _now_ms(),
+                    f"binance listenKey keepalive worker failed: {exc}",
+                    1,
+                )
+                rotate_listen_key.set()
 
         keepalive_task = asyncio.create_task(_keepalive_loop())
 
         # 3) Connect
         url = f"{ws_base_url}/ws/{listen_key}"
         try:
-            async with websockets.connect(url) as ws:
-                transport.record_private_ws_success(_now_ms())
+            async with websockets.connect(
+                url,
+                ping_interval=BINANCE_PRIVATE_PING_INTERVAL_SECS,
+                ping_timeout=BINANCE_PRIVATE_PING_INTERVAL_SECS,
+            ) as ws:
+                now_ms = _now_ms()
+                private_ws_last_ok_at = now_ms
+                transport.record_private_ws_success(now_ms)
                 failures = 0
                 logger.debug("binance private websocket connected")
+                if pending_rotation is not None:
+                    pending_rotation.update(
+                        {
+                            "new_listen_key_created_at": listen_key_created_at,
+                            "reconnect_result": "success",
+                        }
+                    )
+                    _record_binance_private_ws_event(
+                        transport,
+                        "binance.listen_key_rotation",
+                        pending_rotation,
+                    )
+                    pending_rotation = None
 
-                # 4) Message loop
-                while True:
-                    try:
-                        message = await asyncio.wait_for(
-                            ws.recv(), timeout=BINANCE_PRIVATE_PING_INTERVAL_SECS
+                async def _rotate_current_stream(reason: str) -> None:
+                    nonlocal pending_rotation, rotation_count
+                    now = _now_ms()
+                    rotation_count += 1
+                    pending_rotation = {
+                        "reason": reason,
+                        "rotation_count": rotation_count,
+                        "listen_key_created_at": listen_key_created_at,
+                        "last_listen_key_success_at": (
+                            last_keepalive_ok_at or listen_key_created_at
+                        ),
+                        "last_keepalive_ok_at": last_keepalive_ok_at,
+                        "listen_key_expires_at": _binance_listen_key_expires_at(
+                            listen_key_created_at,
+                            last_keepalive_ok_at,
+                        ),
+                        "keepalive_attempt_count": keepalive_attempt_count,
+                        "private_ws_silent_age": (
+                            now - private_ws_last_ok_at
+                            if private_ws_last_ok_at is not None
+                            else None
+                        ),
+                        "reconnect_result": "pending",
+                    }
+                    health_error = (
+                        "binance listenKey expired; rotating"
+                        if reason == "listen_key_expired_event"
+                        else f"binance listenKey {reason.replace('_', ' ')}; rotating"
+                    )
+                    if reason not in {
+                        "keepalive_retry_budget_exhausted",
+                        "keepalive_worker_error",
+                    }:
+                        transport.record_private_ws_failure(
+                            now,
+                            health_error,
+                            1,
                         )
-                    except asyncio.TimeoutError:
-                        # Send ping
-                        try:
-                            await ws.ping()
-                            transport.record_private_ws_success(_now_ms())
-                        except Exception as e:
-                            transport.record_private_ws_failure(
-                                _now_ms(),
-                                f"binance private ws ping failed: {e}",
-                                unhealthy_after_failures,
-                            )
-                            break
-                        continue
+                    await ws.close()
 
+                # 4) Message loop. ``websockets`` owns Ping/Pong and closes a
+                # dead connection on its configured pong timeout. Health is
+                # therefore updated only by connect or an actual user event.
+                while True:
+                    recv_task = asyncio.create_task(ws.recv())
+                    rotate_task = asyncio.create_task(rotate_listen_key.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            {recv_task, rotate_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except asyncio.CancelledError:
+                        await _cancel_task(recv_task)
+                        await _cancel_task(rotate_task)
+                        raise
+                    if rotate_task in done and rotate_listen_key.is_set():
+                        await _cancel_task(recv_task)
+                        await _cancel_task(rotate_task)
+                        await _rotate_current_stream(
+                            rotation_reason or "keepalive_rotation_requested"
+                        )
+                        break
+                    await _cancel_task(rotate_task)
+
+                    message = recv_task.result()
                     if isinstance(message, bytes):
                         continue
+                    if _is_binance_listen_key_expired_event(message):
+                        await _rotate_current_stream("listen_key_expired_event")
+                        break
 
                     # Dispatch message
                     try:
                         handle_binance_private_message(
                             private_state, symbol_map, message
                         )
-                        transport.record_private_ws_success(_now_ms())
-                    except Exception as e:
+                        now_ms = _now_ms()
+                        private_ws_last_ok_at = now_ms
+                        transport.record_private_ws_success(now_ms)
+                    except Exception as exc:
                         logger.debug(
-                            "binance private websocket message ignored: %s", e
+                            "binance private websocket message ignored: %s", exc
                         )
 
-        except ConnectionClosed as e:
+        except ConnectionClosed as exc:
             transport.record_private_ws_failure(
                 _now_ms(),
-                f"binance private ws closed: {e}",
+                f"binance private ws closed: {exc}",
                 unhealthy_after_failures,
             )
-        except Exception as e:
+        except Exception as exc:
             transport.record_private_ws_failure(
                 _now_ms(),
-                f"binance private ws connect/recv failed: {e}",
+                f"binance private ws connect/recv failed: {exc}",
                 unhealthy_after_failures,
             )
-
-        # 5) Cleanup
-        keepalive_done.set()
-        keepalive_task.cancel()
-        try:
-            await keepalive_task
-        except asyncio.CancelledError:
-            pass
-
-        if listen_key:
-            try:
+        finally:
+            keepalive_done.set()
+            await _cancel_task(keepalive_task)
+            if listen_key:
                 await _close_binance_listen_key(transport, api_key, listen_key)
-            except Exception:
-                pass
 
-        # 6) Backoff & reconnect
+        # 5) Backoff & reconnect
         failures += 1
         delay = compute_backoff_ms(reconnect_initial_ms, reconnect_max_ms, failures)
         await asyncio.sleep(delay / 1000.0)

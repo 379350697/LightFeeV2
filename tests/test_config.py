@@ -76,7 +76,46 @@ class TestConfigLoading:
         assert config.strategy.max_concurrent_positions == 3
         assert config.runtime.max_order_quote_age_ms == 15_000
 
+    def test_loads_nested_daily_universe_as_typed_runtime_config(self, tmp_path):
+        universe_path = tmp_path / "daily-universe.json"
+        universe_path.write_text('{"symbols": ["AUSDT", "BUSDT"]}', encoding="utf-8")
+        path = tmp_path / "live.toml"
+        path.write_text(
+            f'''\
+symbols = ["BTCUSDT", "ETHUSDT"]
 
+[runtime.daily_universe]
+enabled = true
+path = "{universe_path}"
+generate_time_local = "08:00"
+max_symbols = 1
+''',
+            encoding="utf-8",
+        )
+
+        config = load_config(path)
+
+        assert config.runtime.daily_universe.enabled is True
+        assert config.runtime.daily_universe.path == str(universe_path)
+        assert config.runtime.daily_universe.generate_time_local == "08:00"
+        assert config.runtime.daily_universe.max_symbols == 1
+
+    def test_rejects_top_level_daily_universe_table(self, tmp_path):
+        path = tmp_path / "live.toml"
+        path.write_text(
+            '''\
+symbols = ["BTCUSDT"]
+
+[daily_universe]
+enabled = true
+path = "/tmp/daily-universe.json"
+max_symbols = 96
+''',
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError, match=r"runtime\.daily_universe"):
+            load_config(path)
 
     def test_removed_entry_readiness_config_is_rejected(self, tmp_path):
         path = tmp_path / "live.toml"

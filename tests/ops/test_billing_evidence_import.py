@@ -727,7 +727,7 @@ async def test_imported_evidence_uses_exact_order_ids_before_terminal_reconcilia
     for attribute in (
         "_fetch_close_leg_reconciliations",
         "_fetch_pending_close_terminal_live_sizes",
-        "_try_abandon_stale_pending_close_reconciliation",
+        "_try_register_terminal_fill_evidence_debt",
         "_venue_private_position_confirmed",
         "_open_positions_private_confirmation_ready",
     ):
@@ -814,7 +814,7 @@ async def test_operator_can_terminalize_orphan_partial_only_after_exact_dual_leg
     for attribute in (
         "_fetch_close_leg_reconciliations",
         "_fetch_pending_close_terminal_live_sizes",
-        "_try_abandon_stale_pending_close_reconciliation",
+        "_try_register_terminal_fill_evidence_debt",
         "_venue_private_position_confirmed",
         "_open_positions_private_confirmation_ready",
     ):

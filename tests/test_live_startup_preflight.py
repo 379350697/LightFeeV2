@@ -9,6 +9,7 @@ Rust references:
 import asyncio
 import json
 import tempfile
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -165,6 +166,36 @@ class TestBootstrapHelpers:
             assert result is not None
             assert result["resolved_symbol_count"] == 1
             assert "BTCUSDT" in result["resolved_symbols"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_runtime_symbols_applies_daily_universe_to_runtime_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            universe_path = Path(td) / "daily-universe.json"
+            with open(universe_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "trading_date": date.today().isoformat(),
+                        "generated_at_ms": 1_765_000_000_000,
+                        "selector_version": 1,
+                        "source_symbol_count": 3,
+                        "selected_symbol_count": 3,
+                        "selected_symbols": ["AUSDT", "BUSDT", "CUSDT"],
+                    },
+                    f,
+                )
+            config = make_test_config(td)
+            config.symbols = ["BTCUSDT", "ETHUSDT"]
+            config.runtime.daily_universe.enabled = True
+            config.runtime.daily_universe.path = str(universe_path)
+            config.runtime.daily_universe.max_symbols = 2
+
+            result = await prepare_runtime_symbols(config)
+
+            assert result is not None
+            assert result["daily_universe_enabled"] is True
+            assert result["global_symbol_count"] == 2
+            assert result["resolved_symbols"] == ["AUSDT", "BUSDT"]
+            assert config.symbols == ["AUSDT", "BUSDT"]
 
 
 class TestRuntimePreflight:

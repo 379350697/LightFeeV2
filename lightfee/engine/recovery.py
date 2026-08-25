@@ -1078,9 +1078,21 @@ def _apply_journal_replay_to_state(
             pid = payload.get("position_id", "")
             if pid:
                 if (
-                    kind == "recovery.flat"
+                    kind in {
+                        "recovery.flat",
+                        # V1's historical terminal-flat marker proves the
+                        # physical position is gone, but its preceding
+                        # reconciliation registration still carries the only
+                        # exact close-order identities.  Keep that accounting
+                        # owner so V2 can retry the exact fill query after a
+                        # restart instead of replaying the old evidence loss.
+                        "exit.reconciliation_abandoned",
+                    }
                     and (
-                        payload.get("billing_reconciliation_pending") is True
+                        (
+                            kind == "recovery.flat"
+                            and payload.get("billing_reconciliation_pending") is True
+                        )
                         or any(
                             str(item.get("position_id") or "") == str(pid)
                             and str(item.get("kind") or "final")
