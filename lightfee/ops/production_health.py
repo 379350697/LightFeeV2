@@ -80,6 +80,7 @@ def analyze_runtime_resources(
         "private_ws_worker_starts": {},
         "private_ws_worker_start_total": 0,
         "private_ws_window_ms": evidence.get("private_ws_window_ms"),
+        "private_ws_journal_since_ms": evidence.get("private_ws_journal_since_ms"),
         "binance_listen_key": {},
         "collection_errors": collection_errors,
     }

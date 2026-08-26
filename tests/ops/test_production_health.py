@@ -809,8 +809,10 @@ def test_runtime_resources_fails_closed_for_the_resource_blind_spot_family():
         assert fingerprint in report.fingerprints
 
 
-def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and_parses_journal_evidence(tmp_path):
+def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and_parses_journal_evidence(tmp_path, monkeypatch):
     now_ms = 1_778_787_000_000
+    active_entered_at_ms = now_ms - 10_000
+    monkeypatch.setattr(vps.time, "time", lambda: now_ms / 1000.0)
     proc_root = tmp_path / "proc"
     for pid, socket_inode, state in ((101, 1001, "08"), (202, 2002, "01")):
         fd_dir = proc_root / str(pid) / "fd"
@@ -829,8 +831,11 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
 
     def command_runner(command: list[str]) -> str:
         if command[:2] == ["systemctl", "show"]:
+            if any("ActiveEnterTimestampUSec" in arg for arg in command):
+                return f"{active_entered_at_ms * 1_000}\n"
             return "101\n" if command[2] == "lightfee-sidecar.service" else "202\n"
         if command[0] == "journalctl":
+            assert f"--since=@{active_entered_at_ms / 1000.0:.3f}" in command
             return "\n".join([
                 "binance private WS worker started for 4 symbols",
                 "bybit private WS worker started for 4 symbols",
@@ -849,6 +854,60 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
     assert evidence["processes"]["sidecar"]["close_wait_count"] == 1
     assert evidence["processes"]["live"]["close_wait_count"] == 0
     assert evidence["private_ws_worker_starts"] == {"binance": 1, "bybit": 1}
+    assert evidence["private_ws_journal_since_ms"] == active_entered_at_ms
+    assert report.ok
+
+
+def test_runtime_resource_collector_excludes_private_ws_starts_before_current_service_activation(tmp_path, monkeypatch):
+    now_ms = 1_778_787_000_000
+    active_entered_at_ms = now_ms - 30_000
+    monkeypatch.setattr(vps.time, "time", lambda: now_ms / 1000.0)
+    proc_root = tmp_path / "proc"
+    for pid, socket_inode in ((101, 1001), (202, 2002)):
+        fd_dir = proc_root / str(pid) / "fd"
+        net_dir = proc_root / str(pid) / "net"
+        fd_dir.mkdir(parents=True)
+        net_dir.mkdir()
+        os.symlink(f"socket:[{socket_inode}]", fd_dir / "3")
+        for name in ("tcp", "tcp6"):
+            (net_dir / name).write_text(
+                "sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n"
+            )
+
+    def command_runner(command: list[str]) -> str:
+        if command[:2] == ["systemctl", "show"]:
+            if any("ActiveEnterTimestampUSec" in arg for arg in command):
+                return f"{active_entered_at_ms * 1_000}\n"
+            return "101\n" if command[2] == "lightfee-sidecar.service" else "202\n"
+        if command[0] == "journalctl":
+            assert f"--since=@{active_entered_at_ms / 1000.0:.3f}" in command
+            return "\n".join(
+                [
+                    f"{venue} private WS worker started"
+                    for venue in ("binance", "bybit", "bitget", "gate", "okx", "hyperliquid")
+                ]
+                + [
+                    "binance.listen_key_keepalive_ok "
+                    + "{'last_listen_key_success_at': "
+                    + f"{now_ms - 1_000}, 'listen_key_expires_at': {now_ms + 1_000}}}"
+                ]
+            )
+        raise AssertionError(command)
+
+    evidence = vps.collect_runtime_resource_evidence(
+        command_runner=command_runner,
+        proc_root=proc_root,
+    )
+    report = analyze_runtime_resources(evidence, now_ms=now_ms)
+
+    assert evidence["private_ws_worker_starts"] == {
+        "binance": 1,
+        "bybit": 1,
+        "bitget": 1,
+        "gate": 1,
+        "okx": 1,
+        "hyperliquid": 1,
+    }
     assert report.ok
 
 

@@ -88,6 +88,20 @@ def _systemd_main_pid(unit: str, command_runner) -> int:
         return 0
 
 
+def _systemd_active_enter_timestamp_ms(unit: str, command_runner) -> int:
+    output = command_runner([
+        "systemctl",
+        "show",
+        unit,
+        "--property=ActiveEnterTimestampUSec",
+        "--value",
+    ])
+    try:
+        return max(int(output.strip().splitlines()[0]) // 1_000, 0)
+    except (IndexError, ValueError):
+        return 0
+
+
 def _process_socket_metrics(pid: int, *, proc_root: Path) -> dict[str, int]:
     process_root = proc_root / str(pid)
     fd_dir = process_root / "fd"
@@ -156,6 +170,7 @@ def collect_runtime_resource_evidence(
         "processes": {},
         "private_ws_worker_starts": {},
         "private_ws_window_ms": 60 * 60 * 1000,
+        "private_ws_journal_since_ms": 0,
         "binance_listen_key": {},
         "collection_errors": [],
     }
@@ -175,10 +190,21 @@ def collect_runtime_resource_evidence(
             evidence["collection_errors"].append(f"{name}:{str(exc)[:300]}")
 
     try:
+        now_ms = int(time.time() * 1000)
+        window_start_ms = now_ms - (60 * 60 * 1000)
+        # One private worker per venue is expected after an intentional deploy;
+        # only count churn from the current live-service lifecycle.
+        active_entered_at_ms = _systemd_active_enter_timestamp_ms(
+            "lightfee-live.service",
+            command_runner,
+        )
+        if active_entered_at_ms > 0:
+            window_start_ms = max(window_start_ms, min(active_entered_at_ms, now_ms))
+        evidence["private_ws_journal_since_ms"] = window_start_ms
         lines = command_runner([
             "journalctl",
             "--unit=lightfee-live.service",
-            f"--since={RUNTIME_RESOURCE_JOURNAL_WINDOW}",
+            f"--since=@{window_start_ms / 1000.0:.3f}",
             "--no-pager",
             "--output=cat",
         ])
