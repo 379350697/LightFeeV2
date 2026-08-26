@@ -332,8 +332,8 @@ class TestDailyUniverseConfig:
             assert set(result2["resolved_symbols"]) == {"BTCUSDT", "ETHUSDT"}
             assert result2.get("used_fallback") is True
 
-    def test_resolve_universe_missing_no_fallback(self):
-        """When current universe is missing and fallback disabled, return empty."""
+    def test_resolve_universe_missing_no_fallback_fails_closed(self):
+        """A reader cannot turn a missing daily snapshot into static trading symbols."""
         with tempfile.TemporaryDirectory() as tmp:
             universe_path = os.path.join(tmp, "nonexistent.json")
             config = AppConfig(
@@ -348,11 +348,8 @@ class TestDailyUniverseConfig:
                     )
                 ),
             )
-            result = resolve_universe_symbols(config)
-            # Uses static symbols when daily universe not available and no fallback
-            assert result is not None
-            assert result["daily_universe_enabled"] is True
-            assert result.get("used_fallback") is True  # fell back to static
+            with pytest.raises(RuntimeError, match="no last-good fallback"):
+                resolve_universe_symbols(config)
 
 
 # ── CONFIG-003: Runtime Opportunity Modes ──────────────────────────────────

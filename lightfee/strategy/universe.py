@@ -172,32 +172,3 @@ def today_trading_date(tz: timezone | None = None) -> str:
     if tz is None:
         tz = timezone(timedelta(hours=8))  # UTC+8 (Shanghai)
     return datetime.now(tz).strftime("%Y-%m-%d")
-
-
-async def resolve_runtime_symbols(
-    config, adapters, universe_path: str | None = None
-) -> RuntimeSymbolResolutionSummary:
-    """Resolve which symbols to trade today.
-
-    If daily universe is enabled and a persisted JSON exists for today,
-    returns its symbol list. Otherwise falls back to config.symbols.
-    """
-    symbols = list(getattr(config, "symbols", []))
-    summary = RuntimeSymbolResolutionSummary(
-        daily_universe_enabled=getattr(config, "daily_universe_enabled", False),
-        global_symbol_count=len(symbols),
-    )
-
-    # Try loading persisted daily universe
-    if universe_path and os.path.exists(universe_path):
-        persisted = PersistedDailyUniverse.load(universe_path)
-        if persisted is not None and persisted.trading_date == today_trading_date():
-            summary.resolved_symbol_count = persisted.selected_symbol_count
-            summary.selector_adapter_count = 1
-            return summary
-
-    # Fallback: use config symbols as-is
-    summary.resolved_symbol_count = len(symbols)
-    if adapters and hasattr(adapters, "__len__"):
-        summary.selector_adapter_count = len(adapters)
-    return summary

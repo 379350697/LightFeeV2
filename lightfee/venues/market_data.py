@@ -765,53 +765,59 @@ class MarketDataClient:
                 for sym in refresh_symbols
             ]
             if tasks:
-                refresh_started_ms = _now_ms()
-                oi_budget_s = float(
-                    getattr(
-                        self,
-                        "binance_style_open_interest_enrichment_budget_s",
-                        BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S,
+                try:
+                    refresh_started_ms = _now_ms()
+                    oi_budget_s = float(
+                        getattr(
+                            self,
+                            "binance_style_open_interest_enrichment_budget_s",
+                            BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S,
+                        )
+                        or 0.0
                     )
-                    or 0.0
-                )
-                done, pending = await asyncio.wait(
-                    tasks,
-                    timeout=max(oi_budget_s, 0.0),
-                )
-                oi_refresh_elapsed_ms = max(_now_ms() - refresh_started_ms, 0)
-                for task in done:
-                    try:
-                        venue_sym, open_interest_quote, status = task.result()
-                    except Exception:
-                        continue
-                    oi_evidence_status[venue_sym] = status
-                    oi_evidence_reason[venue_sym] = status
-                    if status == "available":
-                        oi_map[venue_sym] = open_interest_quote
-                        mark_price = _safe_float(
-                            pi_map.get(venue_sym, {}).get("markPrice", 0)
-                        )
-                        self._binance_style_store_open_interest(
-                            venue_sym,
-                            open_interest_quote=open_interest_quote,
-                            mark_price=mark_price,
-                            observed_at_ms=now_ms,
-                            status=status,
-                            reason="fresh_refresh",
-                        )
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    try:
-                        venue_sym = task.get_name()
-                    except Exception:
-                        venue_sym = ""
-                    if venue_sym:
-                        oi_evidence_status[venue_sym] = "timeout"
-                        oi_evidence_reason[venue_sym] = "timeout_waiting_for_oi"
-                oi_timeout_count = len(pending)
-                if pending:
-                    await asyncio.gather(*pending, return_exceptions=True)
+                    done, pending = await asyncio.wait(
+                        tasks,
+                        timeout=max(oi_budget_s, 0.0),
+                    )
+                    oi_refresh_elapsed_ms = max(_now_ms() - refresh_started_ms, 0)
+                    for task in done:
+                        try:
+                            venue_sym, open_interest_quote, status = task.result()
+                        except Exception:
+                            continue
+                        oi_evidence_status[venue_sym] = status
+                        oi_evidence_reason[venue_sym] = status
+                        if status == "available":
+                            oi_map[venue_sym] = open_interest_quote
+                            mark_price = _safe_float(
+                                pi_map.get(venue_sym, {}).get("markPrice", 0)
+                            )
+                            self._binance_style_store_open_interest(
+                                venue_sym,
+                                open_interest_quote=open_interest_quote,
+                                mark_price=mark_price,
+                                observed_at_ms=now_ms,
+                                status=status,
+                                reason="fresh_refresh",
+                            )
+                    for task in pending:
+                        try:
+                            venue_sym = task.get_name()
+                        except Exception:
+                            venue_sym = ""
+                        if venue_sym:
+                            oi_evidence_status[venue_sym] = "timeout"
+                            oi_evidence_reason[venue_sym] = "timeout_waiting_for_oi"
+                    oi_timeout_count = len(pending)
+                finally:
+                    # The sidecar owns this whole fetch through an outer timeout.
+                    # Its cancellation can interrupt asyncio.wait before the local
+                    # budget expires, so every child must be cancelled and awaited
+                    # here rather than only on the normal timeout path.
+                    remaining = [task for task in tasks if not task.done()]
+                    for task in remaining:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
         else:
             oi_candidate_count = 0
             oi_cache_hit_count = 0

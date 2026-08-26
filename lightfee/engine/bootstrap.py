@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import Optional
 
 from lightfee.config.schema import AppConfig
-from lightfee.config.universe import resolve_universe_symbols
+from lightfee.config.universe import resolve_or_generate_universe_symbols
+from lightfee.core.domain import Venue
 from lightfee.risk.modes import EngineLifecycle
+from lightfee.venues.market_data import MarketDataClient
+from lightfee.venues.specs import get_spec
+from lightfee.venues.transport import EndpointRateLimiter
+
+
+logger = logging.getLogger(__name__)
 
 
 def wall_clock_now_ms() -> int:
@@ -69,13 +78,54 @@ def startup_market_warmup_ms(
 
 
 async def prepare_runtime_symbols(config: AppConfig) -> Optional[dict]:
-    """Resolve runtime trading symbols before adapter construction.
+    """Resolve runtime trading symbols before startup workers fan out.
 
     The resolver is the sole owner of daily-universe fallback and capping
-    semantics.  Both live and sidecar startup call this boundary before they
-    construct clients that fan out over ``config.symbols``.
+    semantics.  Both live and sidecar startup call this boundary before a
+    sidecar or runtime worker can fan out over ``config.symbols``.
     """
-    resolved = resolve_universe_symbols(config)
+    async def fetch_liquidity(symbols: list[str]) -> dict[str, dict]:
+        clients: dict[str, MarketDataClient] = {}
+        for venue_config in config.venues:
+            venue = Venue.from_str(venue_config.venue)
+            clients[venue.value] = MarketDataClient(
+                get_spec(venue),
+                exchange_http_timeout_ms=config.runtime.exchange_http_timeout_ms,
+                rate_limiter=EndpointRateLimiter(1000, 8000, 50),
+            )
+
+        timeout_s = max(float(config.runtime.sidecar_funding_timeout_s), 0.001)
+
+        async def fetch_one(venue_name: str, client: MarketDataClient):
+            try:
+                rows = await asyncio.wait_for(
+                    client.fetch_perp_liquidity(symbols), timeout=timeout_s
+                )
+                return venue_name, rows
+            except Exception as exc:
+                logger.warning(
+                    "daily_universe: liquidity fetch failed venue=%s error=%s",
+                    venue_name,
+                    exc,
+                )
+                return venue_name, None
+
+        try:
+            results = await asyncio.gather(
+                *(fetch_one(venue_name, client) for venue_name, client in clients.items())
+            )
+            return {
+                venue_name: rows
+                for venue_name, rows in results
+                if rows is not None
+            }
+        finally:
+            await asyncio.gather(
+                *(client.close() for client in clients.values()),
+                return_exceptions=True,
+            )
+
+    resolved = await resolve_or_generate_universe_symbols(config, fetch_liquidity)
     symbols = list(resolved["resolved_symbols"])
     config.symbols = symbols
     if not symbols:

@@ -249,6 +249,64 @@ class TestSidecarServiceRateLimitWiring:
         assert quote.oi_timeout_count == 1
 
     @pytest.mark.asyncio
+    async def test_outer_venue_timeout_cancels_and_awaits_open_interest_children(self, tmp_path):
+        """The sidecar timeout owns every child created by its market fetch."""
+        from lightfee.config.schema import AppConfig, RuntimeConfig, VenueConfig
+        from lightfee.sidecar.service import SidecarService
+        from lightfee.venues.market_data import MarketDataClient
+
+        oi_started = asyncio.Event()
+        oi_finished = asyncio.Event()
+        oi_tasks: list[asyncio.Task] = []
+
+        class BlockingOpenInterestClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [{"symbol": "BTCUSDT", "lastFundingRate": "0.0001", "markPrice": "100.5"}]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    task = asyncio.current_task()
+                    if task is not None:
+                        oi_tasks.append(task)
+                    oi_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        oi_finished.set()
+                return {}
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+                sidecar_funding_timeout_s=0.05,
+            ),
+            venues=[VenueConfig(venue="binance")],
+        )
+        service = SidecarService(config)
+        client = BlockingOpenInterestClient(binance_spec())
+        client.binance_style_open_interest_enrichment_budget_s = 10.0
+        service._exchange_sources["binance"]._client = client
+
+        try:
+            snapshot = await service.refresh_once()
+            assert snapshot.degraded_venues == ["binance"]
+            await asyncio.wait_for(oi_started.wait(), timeout=0.2)
+            await asyncio.wait_for(oi_finished.wait(), timeout=0.2)
+            assert oi_tasks
+            assert all(task.done() for task in oi_tasks)
+        finally:
+            for task in oi_tasks:
+                if not task.done():
+                    task.cancel()
+            if oi_tasks:
+                await asyncio.gather(*oi_tasks, return_exceptions=True)
+            await service.close()
+
+    @pytest.mark.asyncio
     async def test_refresh_once_derives_liquidity_from_one_market_fetch(
         self, tmp_path
     ):

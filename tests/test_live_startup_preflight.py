@@ -9,13 +9,20 @@ Rust references:
 import asyncio
 import json
 import tempfile
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
+from lightfee.config.schema import (
+    AppConfig,
+    DailyUniverseConfig,
+    PersistenceConfig,
+    RuntimeConfig,
+    StrategyConfig,
+    VenueConfig,
+)
 from lightfee.core.domain import PositionSnapshot, Side, Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.bootstrap import (
@@ -196,6 +203,154 @@ class TestBootstrapHelpers:
             assert result["global_symbol_count"] == 2
             assert result["resolved_symbols"] == ["AUSDT", "BUSDT"]
             assert config.symbols == ["AUSDT", "BUSDT"]
+
+    @pytest.mark.asyncio
+    async def test_prepare_runtime_symbols_generates_and_persists_current_daily_universe(
+        self, monkeypatch, tmp_path
+    ):
+        """A missing daily snapshot must be generated before either runtime fans out."""
+        from lightfee.engine import bootstrap
+        from lightfee.strategy.universe import PersistedDailyUniverse
+        from lightfee.venues.market_data import PerpLiquidity
+
+        universe_path = tmp_path / "daily-universe.json"
+        config = AppConfig(
+            symbols=["AUSDT", "BUSDT", "CUSDT", "DUSDT"],
+            runtime=RuntimeConfig(
+                daily_universe=DailyUniverseConfig(
+                    enabled=True,
+                    generate_time_local="08:00:00",
+                    max_symbols=2,
+                    fallback_to_last_good=True,
+                    path=str(universe_path),
+                )
+            ),
+            strategy=StrategyConfig(),
+            venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
+        )
+
+        liquidity = {
+            "binance": {
+                "AUSDT": (2_000_000.0, 2_000_000.0),
+                "BUSDT": (10_000_000.0, 2_000_000.0),
+                "CUSDT": (8_000_000.0, 5_000_000.0),
+                "DUSDT": (float("nan"), 99_000_000.0),
+            },
+            "bybit": {
+                "AUSDT": (2_000_000.0, 2_000_000.0),
+                "BUSDT": (3_000_000.0, 3_000_000.0),
+                "CUSDT": (7_000_000.0, 6_000_000.0),
+                "DUSDT": (99_000_000.0, 99_000_000.0),
+            },
+        }
+
+        class FakeMarketDataClient:
+            instances: list["FakeMarketDataClient"] = []
+
+            def __init__(self, spec, **_kwargs):
+                self.venue = spec.venue_id
+                self.closed = False
+                self.instances.append(self)
+
+            async def fetch_perp_liquidity(self, symbols):
+                venue = self.venue.value
+                return {
+                    f"{venue}:{symbol}": PerpLiquidity(
+                        venue=venue,
+                        symbol=symbol,
+                        volume_24h_quote=liquidity[venue][symbol][0],
+                        open_interest_quote=liquidity[venue][symbol][1],
+                        observed_at_ms=1,
+                    )
+                    for symbol in symbols
+                }
+
+            async def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(bootstrap, "MarketDataClient", FakeMarketDataClient)
+
+        result = await prepare_runtime_symbols(config)
+
+        assert result is not None
+        assert result["used_fallback"] is False
+        assert result["resolved_symbols"] == ["CUSDT", "BUSDT"]
+        assert config.symbols == ["CUSDT", "BUSDT"]
+        persisted = PersistedDailyUniverse.load(str(universe_path))
+        assert persisted is not None
+        assert persisted.selected_symbols == ["CUSDT", "BUSDT"]
+        assert len(FakeMarketDataClient.instances) == 2
+        assert all(client.closed for client in FakeMarketDataClient.instances)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fallback_to_last_good", [False, True])
+    async def test_prepare_runtime_symbols_fails_closed_when_generation_fails_without_last_good(
+        self, monkeypatch, tmp_path, fallback_to_last_good
+    ):
+        from lightfee.venues.market_data import MarketDataClient
+
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                daily_universe=DailyUniverseConfig(
+                    enabled=True,
+                    generate_time_local="08:00:00",
+                    max_symbols=1,
+                    fallback_to_last_good=fallback_to_last_good,
+                    path=str(tmp_path / "daily-universe.json"),
+                )
+            ),
+            venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
+        )
+
+        async def unavailable(*_args, **_kwargs):
+            raise RuntimeError("selector source unavailable")
+
+        monkeypatch.setattr(MarketDataClient, "fetch_perp_liquidity", unavailable)
+
+        with pytest.raises(RuntimeError, match="daily universe generation failed"):
+            await prepare_runtime_symbols(config)
+
+    @pytest.mark.asyncio
+    async def test_prepare_runtime_symbols_uses_stale_last_good_after_generation_failure(
+        self, monkeypatch, tmp_path
+    ):
+        from lightfee.strategy.universe import PersistedDailyUniverse
+        from lightfee.venues.market_data import MarketDataClient
+
+        universe_path = tmp_path / "daily-universe.json"
+        PersistedDailyUniverse(
+            trading_date=(date.today() - timedelta(days=1)).isoformat(),
+            generated_at_ms=1,
+            source_symbol_count=1,
+            selected_symbol_count=1,
+            selected_symbols=["STALEUSDT"],
+        ).save(str(universe_path))
+        config = AppConfig(
+            symbols=["BTCUSDT"],
+            runtime=RuntimeConfig(
+                daily_universe=DailyUniverseConfig(
+                    enabled=True,
+                    generate_time_local="08:00:00",
+                    max_symbols=1,
+                    fallback_to_last_good=True,
+                    path=str(universe_path),
+                )
+            ),
+            venues=[VenueConfig(venue="binance"), VenueConfig(venue="bybit")],
+        )
+
+        async def unavailable(*_args, **_kwargs):
+            raise RuntimeError("selector source unavailable")
+
+        monkeypatch.setattr(MarketDataClient, "fetch_perp_liquidity", unavailable)
+
+        result = await prepare_runtime_symbols(config)
+
+        assert result is not None
+        assert result["used_fallback"] is True
+        assert result["resolved_symbols"] == ["STALEUSDT"]
+        assert config.symbols == ["STALEUSDT"]
 
 
 class TestRuntimePreflight:
