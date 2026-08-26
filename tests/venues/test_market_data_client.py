@@ -9,6 +9,7 @@ import pytest
 from lightfee.core.domain import Venue
 from lightfee.venues.market_data import (
     BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S,
+    BINANCE_STYLE_OPEN_INTEREST_FAILURE_CACHE_MAX_AGE_MS,
     FundingTicker,
     MARKET_DATA_MAX_CONNECTIONS,
     MarketDataClient,
@@ -605,6 +606,138 @@ class TestProductionSidecarParserRegressions:
         assert first["binance:BTCUSDT"].open_interest_evidence_status == "available"
         assert second["binance:BTCUSDT"].open_interest_quote == pytest.approx(2500.0 * 100.5)
         assert second["binance:BTCUSDT"].open_interest_evidence_status == "available"
+
+    @pytest.mark.asyncio
+    async def test_binance_open_interest_timeout_is_cooled_before_the_next_sidecar_cycle(self):
+        """Timed-out evidence is fail-closed, but must not reopen every socket per tick."""
+
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls = 0
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "100.5",
+                        }
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls += 1
+                    await asyncio.Event().wait()
+                return {}
+
+        client = FakeBinanceClient()
+
+        first = await client._fetch_binance_style(["BTCUSDT"])
+        second = await client._fetch_binance_style(["BTCUSDT"])
+
+        assert client.oi_calls == 1
+        assert first["binance:BTCUSDT"].open_interest_evidence_status == "timeout"
+        assert second["binance:BTCUSDT"].open_interest_evidence_status == "timeout"
+        assert second["binance:BTCUSDT"].oi_cache_hit_count == 1
+        assert second["binance:BTCUSDT"].oi_refresh_attempt_count == 0
+
+    @pytest.mark.asyncio
+    async def test_binance_entry_open_interest_refresh_ignores_cached_timeout(self):
+        """A sidecar timeout must not suppress the slower, targeted entry check."""
+
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls = 0
+                self.timeout_sidecar_oi = True
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "100.5",
+                        }
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls += 1
+                    if self.timeout_sidecar_oi:
+                        await asyncio.Event().wait()
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+        sidecar = await client._fetch_binance_style(["BTCUSDT"])
+        assert sidecar["binance:BTCUSDT"].open_interest_evidence_status == "timeout"
+
+        client.timeout_sidecar_oi = False
+        targeted = await client.fetch_entry_open_interest_evidence(
+            ["BTCUSDT"],
+            mark_prices={"BTCUSDT": 100.5},
+        )
+
+        assert client.oi_calls == 2
+        assert targeted["binance:BTCUSDT"].open_interest_evidence_status == "available"
+        assert targeted["binance:BTCUSDT"].open_interest_quote == pytest.approx(
+            2500.0 * 100.5
+        )
+
+    @pytest.mark.asyncio
+    async def test_binance_open_interest_timeout_cooldown_expires_and_retries(self):
+        class FakeBinanceClient(MarketDataClient):
+            def __init__(self):
+                super().__init__(binance_spec())
+                self.oi_calls = 0
+                self.timeout_sidecar_oi = True
+
+            async def _public_get(self, path, params=None):
+                if path == "/fapi/v1/ticker/bookTicker":
+                    return [{"symbol": "BTCUSDT", "bidPrice": "100", "askPrice": "101"}]
+                if path == "/fapi/v1/premiumIndex":
+                    return [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastFundingRate": "0.0001",
+                            "markPrice": "100.5",
+                        }
+                    ]
+                if path == "/fapi/v1/ticker/24hr":
+                    return [{"symbol": "BTCUSDT", "quoteVolume": "12345"}]
+                if path == "/fapi/v1/openInterest":
+                    self.oi_calls += 1
+                    if self.timeout_sidecar_oi:
+                        await asyncio.Event().wait()
+                    return {"symbol": params["symbol"], "openInterest": "2500"}
+                return {}
+
+        client = FakeBinanceClient()
+        await client._fetch_binance_style(["BTCUSDT"])
+        cache_key = "binance:BTCUSDT"
+        value, mark_price, observed_at_ms, status, reason = (
+            client._binance_style_open_interest_cache[cache_key]
+        )
+        client._binance_style_open_interest_cache[cache_key] = (
+            value,
+            mark_price,
+            observed_at_ms - BINANCE_STYLE_OPEN_INTEREST_FAILURE_CACHE_MAX_AGE_MS - 1,
+            status,
+            reason,
+        )
+        client.timeout_sidecar_oi = False
+
+        recovered = await client._fetch_binance_style(["BTCUSDT"])
+
+        assert client.oi_calls == 2
+        assert recovered["binance:BTCUSDT"].open_interest_evidence_status == "available"
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_refresh_is_capped_and_deferred_symbols_are_explicit(self):

@@ -298,6 +298,9 @@ class TestSidecarServiceRateLimitWiring:
             await asyncio.wait_for(oi_finished.wait(), timeout=0.2)
             assert oi_tasks
             assert all(task.done() for task in oi_tasks)
+            cached = client._binance_style_open_interest_cache.get("binance:BTCUSDT")
+            assert cached is not None
+            assert cached[3] == "timeout"
         finally:
             for task in oi_tasks:
                 if not task.done():

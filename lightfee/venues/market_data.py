@@ -90,7 +90,14 @@ _BINANCE_STYLE_OPEN_INTEREST_CONCURRENCY = 16
 BINANCE_STYLE_OPEN_INTEREST_ENRICHMENT_BUDGET_S = 0.1
 BINANCE_STYLE_ENTRY_OPEN_INTEREST_BUDGET_S = 2.0
 BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS = 10 * 60 * 1_000
+# A failed sidecar OI sample is still fail-closed evidence, but retrying every
+# symbol on every three-second cycle turns one venue outage into a socket storm.
+# Match V1's one-minute OI refresh cadence for this bounded retry cooldown.
+BINANCE_STYLE_OPEN_INTEREST_FAILURE_CACHE_MAX_AGE_MS = 60 * 1_000
 BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP = 128
+_BINANCE_STYLE_TRANSIENT_OPEN_INTEREST_STATUSES = frozenset(
+    {"timeout", "rate_limited", "http_error"}
+)
 # V1 parity: per-symbol OKX funding-rate concurrency limit
 _OKX_FUNDING_RATE_SEMAPHORE = 40
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
@@ -407,7 +414,7 @@ class MarketDataClient:
                 mark_price=mark_price,
                 now_ms=now_ms,
             )
-            if cached is not None:
+            if cached is not None and cached[1] == "available":
                 open_interest_quote, status, reason = cached
                 return symbol, FundingTicker(
                     **common,
@@ -620,7 +627,12 @@ class MarketDataClient:
         if entry is None:
             return None
         open_interest_quote, cached_mark_price, observed_at_ms, status, reason = entry
-        if now_ms - int(observed_at_ms or 0) > BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS:
+        max_age_ms = (
+            BINANCE_STYLE_OPEN_INTEREST_CACHE_MAX_AGE_MS
+            if status == "available"
+            else BINANCE_STYLE_OPEN_INTEREST_FAILURE_CACHE_MAX_AGE_MS
+        )
+        if now_ms - int(observed_at_ms or 0) > max_age_ms:
             return None
         if mark_price <= 0.0 or cached_mark_price <= 0.0:
             return None
@@ -636,7 +648,9 @@ class MarketDataClient:
         status: str,
         reason: str,
     ) -> None:
-        if status != "available" or open_interest_quote <= 0.0 or mark_price <= 0.0:
+        is_available = status == "available" and open_interest_quote > 0.0
+        is_transient_failure = status in _BINANCE_STYLE_TRANSIENT_OPEN_INTEREST_STATUSES
+        if not (is_available or is_transient_failure) or mark_price <= 0.0:
             return
         self._binance_style_open_interest_cache[
             self._binance_style_oi_cache_key(venue_sym)
@@ -706,6 +720,18 @@ class MarketDataClient:
             oi_timeout_count = 0
             oi_refresh_elapsed_ms = 0
 
+            def _cache_timeout(venue_sym: str) -> None:
+                self._binance_style_store_open_interest(
+                    venue_sym,
+                    open_interest_quote=0.0,
+                    mark_price=_safe_float(
+                        pi_map.get(venue_sym, {}).get("markPrice", 0)
+                    ),
+                    observed_at_ms=now_ms,
+                    status="timeout",
+                    reason="timeout_waiting_for_oi",
+                )
+
             async def _fetch_oi(venue_sym: str) -> tuple[str, float, str]:
                 async with sem:
                     try:
@@ -740,7 +766,8 @@ class MarketDataClient:
                 if cached is not None:
                     oi_cache_hit_count += 1
                     oi_value, status, reason = cached
-                    oi_map[sym] = oi_value
+                    if status == "available":
+                        oi_map[sym] = oi_value
                     oi_evidence_status[sym] = status
                     oi_evidence_reason[sym] = reason or "cache_hit"
                     continue
@@ -789,17 +816,17 @@ class MarketDataClient:
                         oi_evidence_reason[venue_sym] = status
                         if status == "available":
                             oi_map[venue_sym] = open_interest_quote
-                            mark_price = _safe_float(
-                                pi_map.get(venue_sym, {}).get("markPrice", 0)
-                            )
-                            self._binance_style_store_open_interest(
-                                venue_sym,
-                                open_interest_quote=open_interest_quote,
-                                mark_price=mark_price,
-                                observed_at_ms=now_ms,
-                                status=status,
-                                reason="fresh_refresh",
-                            )
+                        mark_price = _safe_float(
+                            pi_map.get(venue_sym, {}).get("markPrice", 0)
+                        )
+                        self._binance_style_store_open_interest(
+                            venue_sym,
+                            open_interest_quote=open_interest_quote,
+                            mark_price=mark_price,
+                            observed_at_ms=now_ms,
+                            status=status,
+                            reason="fresh_refresh" if status == "available" else status,
+                        )
                     for task in pending:
                         try:
                             venue_sym = task.get_name()
@@ -808,6 +835,7 @@ class MarketDataClient:
                         if venue_sym:
                             oi_evidence_status[venue_sym] = "timeout"
                             oi_evidence_reason[venue_sym] = "timeout_waiting_for_oi"
+                            _cache_timeout(venue_sym)
                     oi_timeout_count = len(pending)
                 finally:
                     # The sidecar owns this whole fetch through an outer timeout.
@@ -816,6 +844,8 @@ class MarketDataClient:
                     # here rather than only on the normal timeout path.
                     remaining = [task for task in tasks if not task.done()]
                     for task in remaining:
+                        venue_sym = task.get_name()
+                        _cache_timeout(venue_sym)
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
         else:
