@@ -2269,6 +2269,14 @@ class PassiveCloseExecutor:
         pending.phase_state.maker_client_order_id = ack.client_order_id or maker_cid
         pending.phase_state.maker_resting_limit_price = aligned_price
         pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
+        self._acknowledge_close_order_identity(
+            pending,
+            position,
+            leg_label=maker_leg_label,
+            order_id=ack.order_id,
+            client_order_id=pending.phase_state.maker_client_order_id,
+            operation="submit_passive_order",
+        )
 
         self._journal.append(
             "exit.passive_close_maker_submitted",
@@ -2388,6 +2396,79 @@ class PassiveCloseExecutor:
         )
         return submit_started_at_ms
 
+    def _acknowledge_close_order_identity(
+        self,
+        pending: PendingPassiveClose,
+        position: OpenPosition,
+        *,
+        leg_label: str,
+        order_id: str,
+        client_order_id: str,
+        operation: str,
+    ) -> None:
+        """Durably bind an exchange ACK to the leg that submitted it.
+
+        A close can become live-flat before its execution history is available.
+        The ACK is nevertheless durable exchange identity, not a fill.  Keep
+        every distinct acknowledged order ID: cancel/replace or amend may
+        produce more than one order for the same client ID, and collapsing
+        them would recreate the attribution loss this boundary prevents.
+        """
+        if leg_label not in {"long", "short"}:
+            raise ValueError(f"unknown close leg: {leg_label}")
+        resolved_order_id = str(order_id or "")
+        resolved_client_order_id = str(client_order_id or "")
+        if not resolved_order_id:
+            return
+
+        legs = pending.long_legs if leg_label == "long" else pending.short_legs
+        for leg in legs:
+            if (
+                leg.order_id == resolved_order_id
+                and leg.client_order_id == resolved_client_order_id
+            ):
+                return
+
+        for leg in legs:
+            if (
+                leg.client_order_id == resolved_client_order_id
+                and not leg.order_id
+            ):
+                leg.order_id = resolved_order_id
+                break
+        else:
+            legs.append(
+                PersistedCloseExecutionLeg(
+                    fill=None,
+                    order_id=resolved_order_id,
+                    client_order_id=resolved_client_order_id,
+                    submit_started_at_ms=self._now_ms(),
+                )
+            )
+
+        acknowledged_at_ms = self._now_ms()
+        self._journal.append_critical(
+            acknowledged_at_ms,
+            "exit.close_order_identity_acknowledged",
+            {
+                "position_id": position.position_id,
+                "symbol": position.symbol,
+                "venue": (
+                    position.long_venue.value
+                    if leg_label == "long"
+                    else position.short_venue.value
+                ),
+                "leg": leg_label,
+                "operation": operation,
+                "order_id": resolved_order_id,
+                "client_order_id": resolved_client_order_id,
+                "pending_passive_close": self._pending_passive_close_recovery_payload(
+                    pending,
+                    position,
+                ),
+            },
+        )
+
     @staticmethod
     def _serialize_close_order_fill(fill: OrderFill | None) -> dict[str, Any] | None:
         if fill is None:
@@ -2437,6 +2518,7 @@ class PassiveCloseExecutor:
             return {
                 "fill": self._serialize_close_order_fill(leg.fill),
                 "fee_evidence_complete": fee_evidence_complete,
+                "order_id": leg.order_id,
                 "client_order_id": leg.client_order_id,
                 "submit_started_at_ms": leg.submit_started_at_ms,
                 "latency_ms": leg.latency_ms,
@@ -2518,9 +2600,19 @@ class PassiveCloseExecutor:
     ) -> None:
         """Attach execution truth to its pre-submit intent without duplicates."""
         legs = pending.long_legs if leg_label == "long" else pending.short_legs
+        fill_order_id = str(fill.order_id or "")
         for leg in legs:
-            if leg.client_order_id == client_order_id and leg.fill is None:
+            if (
+                leg.client_order_id == client_order_id
+                and leg.fill is None
+                and (
+                    not fill_order_id
+                    or not leg.order_id
+                    or leg.order_id == fill_order_id
+                )
+            ):
                 leg.fill = fill
+                leg.order_id = leg.order_id or fill_order_id
                 leg.fee_evidence_complete = PassiveCloseExecutor._fee_evidence_complete(
                     fill.fee_quote
                 )
@@ -2532,7 +2624,6 @@ class PassiveCloseExecutor:
             if existing is None:
                 continue
             existing_order_id = str(existing.order_id or "")
-            fill_order_id = str(fill.order_id or "")
             same_identity = (
                 existing.venue == fill.venue
                 and (
@@ -2566,6 +2657,7 @@ class PassiveCloseExecutor:
                 fee_evidence_complete=PassiveCloseExecutor._fee_evidence_complete(
                     fill.fee_quote
                 ),
+                order_id=str(fill.order_id or ""),
                 client_order_id=client_order_id,
                 submit_started_at_ms=submitted_at_ms,
             )
@@ -3274,6 +3366,16 @@ class PassiveCloseExecutor:
                             error="duplicate_client_order_id_retry_failed",
                             order_id=duplicate_reconcile.order_id,
                         ), reconciled=True)
+                    self._acknowledge_close_order_identity(
+                        pending,
+                        position,
+                        leg_label=hedge_leg_label,
+                        order_id=str(getattr(retry_fill, "order_id", "") or ""),
+                        client_order_id=str(
+                            getattr(retry_fill, "client_order_id", "") or retry_cid
+                        ),
+                        operation="place_order_duplicate_retry",
+                    )
                     if retry_fill.quantity > 0:
                         retry_fill = replace(
                             retry_fill,
@@ -3573,6 +3675,14 @@ class PassiveCloseExecutor:
         filled_qty = fill.quantity if fill.quantity > 0 else 0.0
         ack_order_id = str(getattr(fill, "order_id", "") or "")
         ack_client_order_id = str(getattr(fill, "client_order_id", "") or hedge_cid)
+        self._acknowledge_close_order_identity(
+            pending,
+            position,
+            leg_label=hedge_leg_label,
+            order_id=ack_order_id,
+            client_order_id=ack_client_order_id,
+            operation="place_order",
+        )
         if (
             filled_qty <= 1e-12
             and hedge_venue == Venue.BYBIT
@@ -3928,6 +4038,14 @@ class PassiveCloseExecutor:
             pending.phase_state.maker_client_order_id = ack.client_order_id
             pending.phase_state.maker_resting_limit_price = target_price
             pending.phase_state.maker_resting_since_ms = ack.accepted_at_ms
+            self._acknowledge_close_order_identity(
+                pending,
+                position,
+                leg_label=maker_leg_label,
+                order_id=ack.order_id,
+                client_order_id=ack.client_order_id or amend_req.client_order_id,
+                operation="amend_passive_order",
+            )
 
             self._journal.append(
                 "exit.passive_close_amend_succeeded",
@@ -4879,11 +4997,12 @@ class PassiveCloseExecutor:
             # rejected; dropping it would lose the exact ACK-loss case this
             # recovery path exists to reconcile.
             for leg in legs:
-                if leg.fill is None and leg.client_order_id:
+                if leg.fill is None and (leg.order_id or leg.client_order_id):
                     add_record(
                         target,
                         self._close_reconciliation_record(
                             venue=venue,
+                            order_id=leg.order_id,
                             client_order_id=leg.client_order_id,
                         ),
                     )
@@ -5241,6 +5360,15 @@ class PassiveCloseExecutor:
         )
         if not accepted_order_id and not accepted_client_order_id:
             return
+
+        self._acknowledge_close_order_identity(
+            pending,
+            position,
+            leg_label=leg_label,
+            order_id=accepted_order_id,
+            client_order_id=accepted_client_order_id,
+            operation=operation,
+        )
 
         record = self._close_reconciliation_record(
             venue=venue,
@@ -6322,6 +6450,16 @@ class PassiveCloseExecutor:
                 return True
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
+        self._acknowledge_close_order_identity(
+            pending,
+            position,
+            leg_label=leg_label,
+            order_id=str(getattr(fill, "order_id", "") or ""),
+            client_order_id=str(
+                getattr(fill, "client_order_id", "") or client_order_id
+            ),
+            operation="place_order_live_one_sided",
+        )
         self._journal.append(
             "exit.passive_close_live_one_sided_flatten",
             {
@@ -6615,6 +6753,16 @@ class PassiveCloseExecutor:
             pending.next_retry_at_ms = self._now_ms() + 5_000
             return False
 
+        self._acknowledge_close_order_identity(
+            pending,
+            position,
+            leg_label=excess_leg,
+            order_id=str(getattr(fill, "order_id", "") or ""),
+            client_order_id=str(
+                getattr(fill, "client_order_id", "") or client_order_id
+            ),
+            operation="place_order_live_imbalanced_excess",
+        )
         self._record_close_execution_leg(
             pending,
             leg_label=excess_leg,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -918,10 +919,10 @@ class TestProductionSidecarParserRegressions:
                 return {}
 
         client = FakeOkxClient()
-        result = await client._fetch_okx_style([f"S{i}USDT" for i in range(8)])
+        result = await client.fetch_funding_tickers([f"S{i}USDT" for i in range(8)])
 
         assert len(result) == 8
-        assert client.max_active_funding > 1
+        assert 1 < client.max_active_funding <= 4
 
     @pytest.mark.asyncio
     async def test_hyperliquid_meta_dict_universe_is_parsed(self):
@@ -997,8 +998,8 @@ class TestProductionSidecarParserRegressions:
     async def test_okx_large_universe_funding_fetched_with_bounded_concurrency(self):
         """OKX large universe (620-like) MUST fetch per-symbol funding via bounded concurrency.
 
-        V1 parity: funding_rate coverage must be non-zero for large universes.
-        The semaphore bounds concurrency; individual failures must not drop quotes.
+        V1 compatibility: a cold multi-symbol refresh starts only the bounded
+        fallback batch. Later rounds fill the remaining cache misses.
         """
         symbols = [f"S{i}USDT" for i in range(64)]
 
@@ -1024,7 +1025,7 @@ class TestProductionSidecarParserRegressions:
                     return {
                         "data": [{
                             "fundingRate": "0.0002",
-                            "fundingTime": "1700000000000",
+                            "fundingTime": str(int(time.time() * 1_000) + 3_600_000),
                             "markPrice": "10.5",
                             "indexPrice": "10.4",
                         }]
@@ -1034,28 +1035,30 @@ class TestProductionSidecarParserRegressions:
                 return {}
 
         client = FakeOkxClient()
-        result = await client._fetch_okx_style(symbols)
+        first_result = await client.fetch_funding_tickers(symbols)
 
-        assert len(result) == len(symbols)
-        # V1 parity: funding_rate_bps must be non-zero for large universe
-        assert result["okx:S0USDT"].funding_rate_bps == 2.0  # 0.0002 * 10000
-        assert result["okx:S63USDT"].funding_rate_bps == 2.0
-        # mark/index must be populated from per-symbol funding response
-        assert result["okx:S0USDT"].mark_price == 10.5
-        assert result["okx:S0USDT"].index_price == 10.4
-        # funding_timestamp_ms must be from funding response
-        assert result["okx:S0USDT"].funding_timestamp_ms == 1700000000000
-        # Bounded concurrency: concurrent requests > 1 to prove parallelism
-        assert client.max_active_funding > 1
+        assert len(first_result) == len(symbols)
+        assert client.max_active_funding <= 4
+        assert first_result["okx:S0USDT"].funding_rate_bps == 2.0
+        assert first_result["okx:S63USDT"].funding_rate_bps == 0.0
+
+        for _ in range(15):
+            result = await client.fetch_funding_tickers(symbols)
+
+        assert all(ticker.funding_rate_bps == 2.0 for ticker in result.values())
 
     @pytest.mark.asyncio
     async def test_okx_slow_funding_enrichment_does_not_block_quote_return(self):
-        symbols = [f"S{i}USDT" for i in range(64)]
+        import httpx
 
-        class FakeOkxClient(MarketDataClient):
-            async def _public_get(self, path, params=None):
-                if path == "/api/v5/market/tickers":
-                    return {
+        symbols = [f"S{i}USDT" for i in range(64)]
+        metrics = {"active": 0, "max_active": 0, "started": 0, "completed": 0, "cancelled": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v5/market/tickers":
+                return httpx.Response(
+                    200,
+                    json={
                         "data": [
                             {
                                 "instId": f"S{i}-USDT-SWAP",
@@ -1065,31 +1068,105 @@ class TestProductionSidecarParserRegressions:
                             }
                             for i in range(64)
                         ]
-                    }
-                if path == "/api/v5/public/funding-rate":
-                    await asyncio.sleep(1.0)
-                    return {
+                    },
+                )
+            if request.url.path == "/api/v5/public/funding-rate":
+                metrics["active"] += 1
+                metrics["max_active"] = max(metrics["max_active"], metrics["active"])
+                metrics["started"] += 1
+                try:
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    metrics["cancelled"] += 1
+                    raise
+                else:
+                    metrics["completed"] += 1
+                finally:
+                    metrics["active"] -= 1
+                return httpx.Response(
+                    200,
+                    json={
                         "data": [{
                             "fundingRate": "0.0003",
-                            "fundingTime": "1700000000000",
+                            "fundingTime": str(int(time.time() * 1_000) + 3_600_000),
                             "markPrice": "10.5",
                         }]
-                    }
-                if path == "/api/v5/public/open-interest":
-                    return {"data": []}
-                return {}
+                    },
+                )
+            if request.url.path == "/api/v5/public/open-interest":
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(404, json={"error": "unexpected request"})
 
-        result = await asyncio.wait_for(
-            FakeOkxClient(okx_spec())._fetch_okx_style(symbols),
-            timeout=0.5,
-        )
+        client = MarketDataClient(okx_spec())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await asyncio.wait_for(
+                client.fetch_funding_tickers(symbols),
+                timeout=1.0,
+            )
+        finally:
+            await client.close()
 
         assert len(result) == len(symbols)
+        assert metrics == {
+            "active": 0,
+            "max_active": 4,
+            "started": 4,
+            "completed": 4,
+            "cancelled": 0,
+        }
         ticker = result["okx:S0USDT"]
         assert ticker.bid == 10.0
         assert ticker.ask == 11.0
-        assert ticker.mark_price == 10.2
-        assert ticker.funding_rate_bps == 0.0
+        assert ticker.mark_price == 10.5
+        assert ticker.funding_rate_bps == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_okx_outer_cancellation_awaits_bounded_funding_children(self):
+        import httpx
+
+        started = asyncio.Event()
+        metrics = {"active": 0, "started": 0, "cancelled": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v5/market/tickers":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"instId": f"S{i}-USDT-SWAP", "bidPx": "10", "askPx": "11"}
+                            for i in range(8)
+                        ]
+                    },
+                )
+            if request.url.path == "/api/v5/public/funding-rate":
+                metrics["active"] += 1
+                metrics["started"] += 1
+                if metrics["started"] == 4:
+                    started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    metrics["cancelled"] += 1
+                    raise
+                finally:
+                    metrics["active"] -= 1
+            if request.url.path == "/api/v5/public/open-interest":
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(404, json={"error": "unexpected request"})
+
+        client = MarketDataClient(okx_spec())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        task = asyncio.create_task(client.fetch_funding_tickers([f"S{i}USDT" for i in range(8)]))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=0.5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            await client.close()
+
+        assert metrics == {"active": 0, "started": 4, "cancelled": 4}
 
     @pytest.mark.asyncio
     async def test_okx_funding_partial_failure_does_not_drop_quotes(self):
@@ -1127,7 +1204,7 @@ class TestProductionSidecarParserRegressions:
                     return {"data": []}
                 return {}
 
-        result = await FakeOkxClient(okx_spec())._fetch_okx_style(symbols)
+        result = await FakeOkxClient(okx_spec()).fetch_funding_tickers(symbols)
 
         assert len(result) == len(symbols)
         # Successful symbols get funding

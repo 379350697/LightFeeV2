@@ -781,6 +781,10 @@ class PersistedCloseExecutionLeg:
     # of in-memory test fixtures that predate this field; recovered snapshots
     # always materialize a boolean and therefore fail closed when absent.
     fee_evidence_complete: bool | None = None
+    # Exchange acknowledgement identity is evidence even before an execution
+    # exists.  Keep it on the leg that submitted the order so final accounting
+    # never has to guess which leg a later global order ID belongs to.
+    order_id: str = ""
     client_order_id: str = ""
     submit_started_at_ms: int = 0
     latency_ms: int = 0
@@ -1480,10 +1484,21 @@ class EngineState:
                     item.get("reconciliation_status") == "evidence_debt"
                     and existing.get("reconciliation_status") != "evidence_debt"
                 )
+                records_irrecoverable_audit_debt = (
+                    item.get("automatic_history_terminal_status")
+                    == "irrecoverable_audit_debt"
+                    and existing.get("automatic_history_terminal_status")
+                    != "irrecoverable_audit_debt"
+                )
                 if (
                     candidate_keys != existing_keys
                     and identity_evidence_not_weaker
-                ) or stronger_mode or replaces_evidence_debt or records_evidence_debt:
+                ) or (
+                    stronger_mode
+                    or replaces_evidence_debt
+                    or records_evidence_debt
+                    or records_irrecoverable_audit_debt
+                ):
                     index = self.pending_close_reconciliations.index(existing)
                     self.pending_close_reconciliations[index] = dict(item)
                 return

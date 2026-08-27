@@ -1055,6 +1055,356 @@ class TestCloseChunkExecutor:
             record for record in journal.read_all() if record["kind"] == "exit.reconciled"
         ]) == 1
 
+    @pytest.mark.asyncio
+    async def test_zero_fill_ack_keeps_exchange_order_id_for_exact_close_reconciliation(self):
+        """A zero-fill ACK is uncertain, not an empty order identity.
+
+        This exercises the aggressive close path end to end: the first response
+        includes a real exchange order ID but no local fill, compensation sees
+        both venues flat, and reconciliation must re-query that exact ID.
+        """
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        class _LongZeroAckButFilledAdapter(FakeVenueAdapter):
+            async def place_order(self, request):
+                self.place_order_call_count += 1
+                return OrderFill(
+                    venue=Venue.BINANCE,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=0.0,
+                    price=0.0,
+                    order_id="binance-close-ack",
+                    client_order_id=request.client_order_id,
+                    filled_at_ms=2_000,
+                )
+
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                assert symbol == "BTCUSDT"
+                assert order_id == "binance-close-ack"
+                assert client_order_id
+                return OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.01,
+                    average_price=50_100.0,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fee_quote=0.1,
+                    filled_at_ms=2_001,
+                )
+
+        class _ShortFilledAdapter(FakeVenueAdapter):
+            async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id=None):
+                return OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.01,
+                    average_price=49_900.0,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fee_quote=0.1,
+                    filled_at_ms=2_000,
+                )
+
+        long_adapter = _LongZeroAckButFilledAdapter(Venue.BINANCE)
+        short_adapter = _ShortFilledAdapter(Venue.OKX)
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.BUY,
+                0.01,
+                price=49_900.0,
+                order_id="okx-confirmed-fill",
+                fee_quote=0.1,
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        state = EngineState()
+        position = _make_position(
+            entry_fee_evidence_complete=True,
+            total_entry_fee_quote=0.2,
+            long_entry_fee_quote=0.1,
+            short_entry_fee_quote=0.1,
+        )
+        state.open_positions[position.position_id] = position
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+
+        await executor.execute_close(
+            position,
+            "funding_capture",
+            2_000,
+            long_price_hint=50_000.0,
+            short_price_hint=50_000.0,
+            state=state,
+        )
+
+        pending = state.pending_close_reconciliations[0]
+        assert pending["long_legs"] == [
+            {
+                "venue": "binance",
+                "order_id": "binance-close-ack",
+                "client_order_id": pending["long_legs"][0]["client_order_id"],
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": 0.0,
+                "filled_at_ms": 0,
+            }
+        ]
+
+        ctx = SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            _flush_adapter_order_diagnostics=lambda _adapter: None,
+        )
+        await CloseRuntime(ctx)._process_pending_close_reconciliations(2_100)
+
+        assert state.pending_close_reconciliations == []
+        assert position.position_id not in state.open_positions
+        assert len([
+            record for record in journal.read_all() if record["kind"] == "exit.reconciled"
+        ]) == 1
+
+    @pytest.mark.asyncio
+    async def test_compensation_zero_ack_keeps_exact_order_id_for_reconciliation(self):
+        """A flat compensation probe cannot erase that compensation order's ACK.
+
+        The normal long close is rejected after the short fills. Compensation
+        then submits a long reduce-only order that ACKs with zero local fill;
+        exchange position truth is flat, but the final bill must retain and
+        query that exact compensation order ID.
+        """
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        class _LongRejectThenCompensationZeroAckAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BINANCE)
+                self._position_queries = 0
+
+            async def place_order(self, request):
+                self.place_order_call_count += 1
+                if self.place_order_call_count == 1:
+                    raise _make_rejected_error("close rejected")
+                return OrderFill(
+                    venue=Venue.BINANCE,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=0.0,
+                    price=0.0,
+                    order_id="binance-compensation-ack",
+                    client_order_id=request.client_order_id,
+                    filled_at_ms=2_000,
+                )
+
+            async def fetch_position(self, symbol):
+                self._position_queries += 1
+                if self._position_queries == 1:
+                    return PositionSnapshot(
+                        venue=Venue.BINANCE,
+                        symbol=symbol,
+                        side=Side.BUY,
+                        quantity=0.01,
+                        entry_price=50_000.0,
+                        observed_at_ms=2_000,
+                    )
+                return PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=2_001,
+                )
+
+            async def fetch_order_fill_reconciliation(
+                self, symbol, order_id, client_order_id=None,
+            ):
+                assert order_id == "binance-compensation-ack"
+                return OrderFillReconciliation(
+                    venue=Venue.BINANCE,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=0.01,
+                    average_price=50_100.0,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fee_quote=0.1,
+                    filled_at_ms=2_001,
+                )
+
+        class _ShortFilledAdapter(FakeVenueAdapter):
+            async def fetch_order_fill_reconciliation(
+                self, symbol, order_id, client_order_id=None,
+            ):
+                return OrderFillReconciliation(
+                    venue=Venue.OKX,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.01,
+                    average_price=49_900.0,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    fee_quote=0.1,
+                    filled_at_ms=2_000,
+                )
+
+        long_adapter = _LongRejectThenCompensationZeroAckAdapter()
+        short_adapter = _ShortFilledAdapter(Venue.OKX)
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.BUY,
+                0.01,
+                price=49_900.0,
+                order_id="okx-confirmed-fill",
+                fee_quote=0.1,
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        state = EngineState()
+        position = _make_position(
+            entry_fee_evidence_complete=True,
+            total_entry_fee_quote=0.2,
+            long_entry_fee_quote=0.1,
+            short_entry_fee_quote=0.1,
+        )
+        state.open_positions[position.position_id] = position
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+
+        await executor.execute_close(
+            position,
+            "funding_capture",
+            2_000,
+            long_price_hint=50_000.0,
+            short_price_hint=50_000.0,
+            state=state,
+        )
+
+        pending = state.pending_close_reconciliations[0]
+        assert pending["unresolved_submission_legs"] == ["long"]
+        assert pending["long_legs"] == [
+            {
+                "venue": "binance",
+                "order_id": "binance-compensation-ack",
+                "client_order_id": pending["long_legs"][0]["client_order_id"],
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": 0.0,
+                "filled_at_ms": 0,
+            }
+        ]
+
+        ctx = SimpleNamespace(
+            state=state,
+            config=SimpleNamespace(runtime=SimpleNamespace(mode="live")),
+            venue_adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            _flush_adapter_order_diagnostics=lambda _adapter: None,
+        )
+        await CloseRuntime(ctx)._process_pending_close_reconciliations(2_100)
+
+        assert state.pending_close_reconciliations == []
+        assert position.position_id not in state.open_positions
+        assert len([
+            record for record in journal.read_all() if record["kind"] == "exit.reconciled"
+        ]) == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_fill_does_not_erase_prior_zero_ack_identity(self, monkeypatch):
+        """A retry fill cannot prove that an earlier acknowledged order was empty."""
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        async def no_sleep(_delay):
+            return None
+
+        monkeypatch.setattr("lightfee.engine.close_executor.asyncio.sleep", no_sleep)
+        long_adapter = FakeVenueAdapter(Venue.BINANCE)
+        short_adapter = FakeVenueAdapter(Venue.OKX)
+        long_adapter.place_order_outcomes = [
+            OrderFill(
+                venue=Venue.BINANCE,
+                symbol="BTCUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                price=0.0,
+                order_id="binance-first-ack",
+                filled_at_ms=2_000,
+            ),
+            _fake_fill(
+                Venue.BINANCE,
+                "BTCUSDT",
+                Side.SELL,
+                0.01,
+                price=50_100.0,
+                order_id="binance-retry-fill",
+                fee_quote=0.1,
+            ),
+        ]
+        short_adapter.place_order_outcomes = [
+            _fake_fill(
+                Venue.OKX,
+                "BTCUSDT",
+                Side.BUY,
+                0.01,
+                price=49_900.0,
+                order_id="okx-confirmed-fill",
+                fee_quote=0.1,
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        state = EngineState()
+        position = _make_position(
+            entry_fee_evidence_complete=True,
+            total_entry_fee_quote=0.2,
+            long_entry_fee_quote=0.1,
+            short_entry_fee_quote=0.1,
+        )
+        state.open_positions[position.position_id] = position
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 2},
+        )
+
+        await executor.execute_close(
+            position,
+            "funding_capture",
+            2_000,
+            long_price_hint=50_000.0,
+            short_price_hint=50_000.0,
+            state=state,
+        )
+
+        pending = state.pending_close_reconciliations[0]
+        assert pending["unresolved_submission_legs"] == ["long"]
+        assert {leg["order_id"] for leg in pending["long_legs"]} == {
+            "binance-first-ack",
+            "binance-retry-fill",
+        }
+        assert not [
+            record for record in journal.read_all() if record["kind"] == "exit.closed"
+        ]
+
     def test_uncertain_submission_shortfill_is_not_promoted_to_a_final_bill(self):
         """Exact CID lookup must retain a partial debt unless both legs are full."""
         reconciliation = {
@@ -1822,6 +2172,91 @@ class TestCompensateFailedFullClose:
         # Legs should be added
         assert len(short_legs) == 1
         assert len(long_legs) == 1
+
+    @pytest.mark.asyncio
+    async def test_compensation_partial_fill_survives_retry(self):
+        """Compensation records both a partial close and its retry fill.
+
+        Previously the first accepted partial fill was discarded whenever the
+        residual needed another retry, producing an incomplete close bill even
+        after exchange exposure reached zero.
+        """
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.engine.state import EngineState
+
+        class _PartialThenFullCompensationAdapter(FakeCompensationAdapter):
+            def __init__(self):
+                super().__init__(Venue.OKX, position_qty=0.01, side=Side.SELL)
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                if len(self.place_order_calls) == 1:
+                    self.position = PositionSnapshot(
+                        venue=Venue.OKX,
+                        symbol=request.symbol,
+                        side=Side.SELL,
+                        quantity=0.006,
+                        entry_price=50_000.0,
+                        observed_at_ms=1_001,
+                    )
+                    return OrderFill(
+                        venue=Venue.OKX,
+                        symbol=request.symbol,
+                        side=request.side,
+                        quantity=0.004,
+                        price=49_900.0,
+                        order_id="okx-compensation-partial",
+                        fee_quote=0.04,
+                        filled_at_ms=1_001,
+                    )
+                self.position = PositionSnapshot(
+                    venue=Venue.OKX,
+                    symbol=request.symbol,
+                    side=Side.SELL,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1_002,
+                )
+                return OrderFill(
+                    venue=Venue.OKX,
+                    symbol=request.symbol,
+                    side=request.side,
+                    quantity=request.quantity,
+                    price=49_900.0,
+                    order_id="okx-compensation-retry",
+                    fee_quote=0.06,
+                    filled_at_ms=1_002,
+                )
+
+        short_adapter = _PartialThenFullCompensationAdapter()
+        long_adapter = FakeCompensationAdapter(Venue.BINANCE, position_qty=0.0)
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BINANCE: long_adapter, Venue.OKX: short_adapter},
+            journal=journal,
+        )
+        position = _make_position()
+        short_legs: list = []
+        long_legs: list = []
+
+        await executor.compensate_failed_full_close(
+            position,
+            "hard_stop",
+            "exit_short_chunk_0",
+            position.short_venue,
+            OrderSubmitError(SubmitFailureClass.UNCERTAIN, "timeout"),
+            short_legs,
+            long_legs,
+            EngineState(),
+        )
+
+        assert [leg.fill.order_id for leg in short_legs] == [
+            "okx-compensation-partial",
+            "okx-compensation-retry",
+        ]
+        assert sum(leg.fill.quantity for leg in short_legs) == pytest.approx(0.01)
+        assert long_legs == []
 
     @pytest.mark.asyncio
     async def test_compensate_bybit_duplicate_reconciles_full_live_flat(self):

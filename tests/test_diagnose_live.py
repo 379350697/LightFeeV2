@@ -14,10 +14,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
-from scripts.diagnose_live import run_diagnose
+from scripts.diagnose_live import _find_event_files, run_diagnose
 
 
 def test_deploy_status_treats_short_git_head_as_matching_full_deploy_version(monkeypatch):
@@ -6788,6 +6789,169 @@ def test_missing_exchange_body_in_events_reported():
         # evidence_quality should reflect body missing
         ec = result["evidence_quality"]
         assert ec["overall"] in ("missing", "partial")
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_rotated_live_events_are_discovered_and_merged_before_the_global_cap():
+    """A unique rotated reject survives and a duplicate rotation is de-duplicated."""
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": 1_700_000_003_000,
+        })
+        _write_jsonl(os.path.join(d, "live-events.jsonl.1"), [
+            {
+                "ts_ms": 1_700_000_001_000,
+                "run_id": "live-run-a",
+                "seq": 6,
+                "kind": "order.rejected",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "BTCUSDT",
+                    "reason": "rotated-only-reject",
+                },
+            },
+            {
+                "ts_ms": 1_700_000_001_500,
+                "run_id": "live-run-a",
+                "seq": 7,
+                "kind": "order.rejected",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "BTCUSDT",
+                    "reason": "rotated-history-reject",
+                },
+            },
+        ])
+        _write_jsonl(os.path.join(d, "live-events.jsonl"), [
+            {
+                "ts_ms": 1_700_000_002_000,
+                "run_id": "live-run-a",
+                "seq": 7,
+                "kind": "order.rejected",
+                "payload": {
+                    "venue": "okx",
+                    "symbol": "BTCUSDT",
+                    "reason": "rotated-history-reject",
+                },
+            },
+            {
+                "ts_ms": 1_700_000_003_000,
+                "run_id": "live-run-a",
+                "seq": 8,
+                "kind": "runtime.lifecycle_changed",
+                "payload": {"to": "running"},
+            },
+            {
+                "ts_ms": 1_700_000_004_000,
+                "run_id": "live-run-a",
+                "seq": 9,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {},
+            },
+        ])
+        (Path(d) / "live-events.jsonl.writer.lock").write_text("lock")
+        (Path(d) / "live-events.jsonl.checkpoint").write_text("checkpoint")
+
+        found = _find_event_files(d)
+        assert [path.name for path in found] == [
+            "live-events.jsonl",
+            "live-events.jsonl.1",
+        ]
+
+        result = run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=1_700_000_005_000,
+            max_events=5,
+        )
+
+        assert result["scope"]["event_files_read"] == [
+            str(Path(d) / "live-events.jsonl"),
+            str(Path(d) / "live-events.jsonl.1"),
+        ]
+        assert result["scope"]["events_parsed"] == 4
+        assert result["event_counts"]["order.rejected"] == 2
+        assert {error["error"] for error in result["order_error_evidence"]} == {
+            "rotated-history-reject",
+            "rotated-only-reject",
+        }
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_run_diagnose_since_deploy_keeps_latest_large_rotated_record(monkeypatch):
+    """A bounded rotated tail must not fall back to the oldest matching rows."""
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+        })
+        padding = "x" * 25_000
+        records = [
+            {
+                "ts_ms": seq,
+                "run_id": "large-rotation-run",
+                "seq": seq,
+                "kind": "scan.no_entry_diagnostics",
+                "payload": {"padding": padding},
+            }
+            for seq in range(1, 13)
+        ]
+        records.append({
+            "ts_ms": 13,
+            "run_id": "large-rotation-run",
+            "seq": 13,
+            "kind": "order.rejected",
+            "payload": {
+                "venue": "okx",
+                "symbol": "BTCUSDT",
+                "reason": "latest-rotated-record",
+                "padding": padding,
+            },
+        })
+        _write_jsonl(os.path.join(d, "live-events.jsonl.1"), records)
+        monkeypatch.setattr(dl, "_build_service_status", lambda _unit_dir: {
+            "lightfee-live": {
+                "active": "active", "unit_exists": True,
+                "n_restarts": 0, "started_at_ms": 1,
+            },
+            "lightfee-sidecar": {
+                "active": "active", "unit_exists": True,
+                "n_restarts": 0, "started_at_ms": 1,
+            },
+        })
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir="/nonexistent",
+            now_ms=20,
+            since_deploy=True,
+            max_events=10,
+        )
+
+        assert result["scope"]["events_parsed"] == 10
+        assert result["event_counts"]["order.rejected"] == 1
+        assert result["order_error_evidence"][0]["error"] == "latest-rotated-record"
     finally:
         import shutil
         shutil.rmtree(d, ignore_errors=True)

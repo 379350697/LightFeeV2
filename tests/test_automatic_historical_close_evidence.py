@@ -532,7 +532,7 @@ async def test_ong_bybit_takeover_is_reconciled_without_claiming_v2_submission()
         ("unique_candidate_exact_recheck", 1, None),
     ],
 )
-async def test_automatic_history_discovery_failures_retain_debt_with_backoff(
+async def test_completed_automatic_history_failures_terminalize_audit_debt_once(
     classification: str,
     candidate_count: int,
     fee_quote: float | None,
@@ -572,9 +572,197 @@ async def test_automatic_history_discovery_failures_retain_debt_with_backoff(
 
     await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
 
+    terminal_classification = (
+        "unique_candidate_exact_recheck_incomplete"
+        if candidate_count == 1
+        else classification
+    )
     assert ctx.state.pending_close_reconciliations == [task]
-    assert task["next_attempt_ms"] > NOW_MS
+    assert task["automatic_history_terminal_status"] == "irrecoverable_audit_debt"
+    assert task["automatic_history_terminal_reason"] == terminal_classification
+    assert task["next_attempt_ms"] == 0
+    terminal_payload = _critical_payload(
+        ctx, "exit.billing_evidence_debt_irrecoverable"
+    )
+    assert terminal_payload is not None
+    assert terminal_payload["classification"] == terminal_classification
+    assert terminal_payload["reconciliation"] == task
     assert _critical_payload(ctx, "exit.reconciled") is None
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS + 600_000)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    assert _critical_payload(ctx, "exit.reconciled") is None
+    assert (
+        ctx.venue_adapters[Venue.BINANCE]
+        .discover_historical_close_fill_reconciliation.await_count
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_history_query_failure_retains_retryable_debt():
+    snapshot = _snapshot(
+        position_id="entry-history-query-transient",
+        symbol="COTIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BINANCE,
+        long_quantity=0.0,
+        short_quantity=2400.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    binance = _Adapter(Venue.BINANCE)
+    binance.discover_historical_close_fill_reconciliation = AsyncMock(
+        side_effect=RuntimeError("temporary exchange history outage")
+    )
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.BINANCE: binance})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    assert "automatic_history_terminal_status" not in task
+    assert task["automatic_history_last_classification"] == "history_query_error"
+    assert task["next_attempt_ms"] > NOW_MS
+    assert _critical_payload(ctx, "exit.billing_evidence_debt_irrecoverable") is None
+
+
+@pytest.mark.asyncio
+async def test_known_exact_debt_settles_when_exact_records_arrive_without_history():
+    """Known IDs stay on the exact path when delayed exchange data arrives."""
+    snapshot = _snapshot(
+        position_id="entry-known-exact-arrives",
+        symbol="COTIUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=20.0,
+        short_quantity=20.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        reason="known_close_fill_temporarily_unavailable",
+        long_legs=[{
+            "venue": Venue.BINANCE.value,
+            "order_id": "known-long",
+            "client_order_id": "known-long-cid",
+        }],
+        short_legs=[{
+            "venue": Venue.BYBIT.value,
+            "order_id": "known-short",
+            "client_order_id": "known-short-cid",
+        }],
+    )
+    binance = _Adapter(
+        Venue.BINANCE,
+        exact={
+            "known-long": _fill(
+                venue=Venue.BINANCE,
+                symbol="COTIUSDT",
+                side=Side.SELL,
+                quantity=20.0,
+                price=0.0101,
+                order_id="known-long",
+                client_order_id="known-long-cid",
+            )
+        },
+    )
+    bybit = _Adapter(
+        Venue.BYBIT,
+        exact={
+            "known-short": _fill(
+                venue=Venue.BYBIT,
+                symbol="COTIUSDT",
+                side=Side.BUY,
+                quantity=20.0,
+                price=0.0100,
+                order_id="known-short",
+                client_order_id="known-short-cid",
+            )
+        },
+    )
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: bybit})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    assert _critical_payload(ctx, "exit.reconciled") is not None
+    binance.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    bybit.discover_historical_close_fill_reconciliation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_known_exact_debt_uses_unique_history_only_after_exact_recheck_is_incomplete():
+    """A stale known ID may resolve only through the existing strict fallback."""
+    snapshot = _snapshot(
+        position_id="entry-known-exact-history-fallback",
+        symbol="COTIUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=20.0,
+        short_quantity=20.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        reason="known_close_fill_temporarily_unavailable",
+        long_legs=[{
+            "venue": Venue.BINANCE.value,
+            "order_id": "known-long",
+            "client_order_id": "known-long-cid",
+        }],
+        short_legs=[{
+            "venue": Venue.BYBIT.value,
+            "order_id": "stale-short",
+            "client_order_id": "stale-short-cid",
+        }],
+    )
+    binance = _Adapter(
+        Venue.BINANCE,
+        exact={
+            "known-long": _fill(
+                venue=Venue.BINANCE,
+                symbol="COTIUSDT",
+                side=Side.SELL,
+                quantity=20.0,
+                price=0.0101,
+                order_id="known-long",
+                client_order_id="known-long-cid",
+            )
+        },
+    )
+    bybit = _Adapter(
+        Venue.BYBIT,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=_fill(
+                venue=Venue.BYBIT,
+                symbol="COTIUSDT",
+                side=Side.BUY,
+                quantity=20.0,
+                price=0.0100,
+                order_id="recovered-short",
+                client_order_id="recovered-short-cid",
+            ),
+        ),
+    )
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: bybit})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    payload = _critical_payload(ctx, "exit.reconciled")
+    assert ctx.state.pending_close_reconciliations == []
+    assert payload is not None
+    assert payload["historical_evidence_resolution"] == {
+        "short": {
+            "classification": "unique_candidate_exact_recheck",
+            "candidate_count": 1,
+            "provenance": "exact_exchange_execution",
+            "order_id": "recovered-short",
+            "client_order_id": "recovered-short-cid",
+            "replaced_incomplete_known_identity": True,
+        }
+    }
+    binance.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    bybit.discover_historical_close_fill_reconciliation.assert_awaited_once()
 
 
 @pytest.mark.asyncio

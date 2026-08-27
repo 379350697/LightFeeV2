@@ -20,10 +20,12 @@ import hashlib
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -56,7 +58,7 @@ from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
 
 # Schema version — bump when output shape changes
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # ---------------------------------------------------------------------------
 # Default paths (production-correct)
@@ -78,6 +80,7 @@ DEFAULT_EXCHANGE_TRUTH_VENUES = [
     "hyperliquid",
 ]
 UNFILTERED_PROBE_KEY = "*"
+_EVENT_LOG_NAME_RE = re.compile(r"^(?P<base>.+\.jsonl)(?:\.(?P<rotation>[1-9]\d*))?$")
 
 ORDER_ERROR_KINDS = frozenset({
     "order.rejected",
@@ -121,72 +124,170 @@ def _read_json(path: str | Path) -> dict[str, Any]:
         return json.load(f)
 
 
-def _read_jsonl_tail(
+def _iter_jsonl_records_from_tail(
     path: str | Path,
-    max_records: int = DEFAULT_MAX_EVENTS,
-    since_ms: int = 0,
-) -> list[dict[str, Any]]:
-    """Read JSONL from tail (most recent events first), respecting since_ms filter."""
+    *,
+    chunk_bytes: int = 64 * 1024,
+) -> Iterator[dict[str, Any]]:
+    """Yield complete JSONL records newest-first without loading a whole log."""
     p = Path(path)
-    if not p.exists():
-        return []
-    file_size = p.stat().st_size
-    if file_size == 0:
-        return []
+    try:
+        file_size = p.stat().st_size
+    except OSError:
+        return
+    if file_size <= 0:
+        return
 
-    records: list[dict[str, Any]] = []
-    chunk_size = min(file_size, max(200_000, max_records * 1000))
-    with open(p, "rb") as f:
-        if file_size > chunk_size:
-            f.seek(file_size - chunk_size)
-            f.readline()  # skip partial first line
-        for line_bytes in f:
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                ts = int(rec.get("ts_ms", 0) or 0)
-                if since_ms and ts < since_ms:
-                    continue
-                records.append(rec)
-            except json.JSONDecodeError:
-                pass
-
-    if len(records) < max_records and since_ms > 0:
-        # Fallback to full scan for time-filtered window
-        records = []
-        with open(p) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    ts = int(rec.get("ts_ms", 0) or 0)
-                    if since_ms and ts < since_ms:
+    try:
+        with p.open("rb") as f:
+            offset = file_size
+            trailing = b""
+            while offset > 0:
+                size = min(chunk_bytes, offset)
+                offset -= size
+                f.seek(offset)
+                block = f.read(size)
+                lines = (block + trailing).split(b"\n")
+                trailing = lines.pop(0) if offset > 0 else b""
+                for line_bytes in reversed(lines):
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+                    if not line:
                         continue
-                    records.append(rec)
-                    if len(records) >= max_records:
-                        break
-                except json.JSONDecodeError:
-                    pass
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        yield record
+    except OSError:
+        return
 
-    if len(records) > max_records:
-        records = records[-max_records:]
-    return records
+
+def _collect_recent_journal_events(
+    event_files: list[Path],
+    *,
+    max_records: int,
+    since_ms: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Merge journal rotations within one global, newest-first record budget.
+
+    Journal rotation preserves append order: the active journal is newer than
+    ``.1``, which is newer than ``.2``. Reading each file from its tail in that
+    order therefore obtains the actual latest records without the old
+    per-file ``max_records`` fanout. A file provably last modified before a
+    high-confidence window is skipped rather than scanned in full.
+    """
+    limit = max(int(max_records or 0), 0)
+    records: list[dict[str, Any]] = []
+    seen_identities: set[tuple[str, int]] = set()
+    event_files_read: list[str] = []
+    event_files_skipped_before_window: list[str] = []
+    source_files_at_record_limit: list[str] = []
+
+    if limit == 0:
+        return records, {
+            "event_files_read": event_files_read,
+            "event_files_skipped_before_window": event_files_skipped_before_window,
+            "event_files_skipped_after_global_cap": [str(path) for path in event_files],
+            "source_files_at_record_limit": source_files_at_record_limit,
+            "global_event_cap_reached": bool(event_files),
+            "records_before_global_cap": None,
+        }
+
+    for index, path in enumerate(event_files):
+        try:
+            modified_at_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            continue
+        if since_ms and modified_at_ms < since_ms:
+            event_files_skipped_before_window.append(str(path))
+            continue
+
+        event_files_read.append(str(path))
+        for record in _iter_jsonl_records_from_tail(path):
+            try:
+                timestamp_ms = int(record.get("ts_ms", 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if since_ms and timestamp_ms < since_ms:
+                continue
+            identity = _event_identity(record)
+            if identity is not None:
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+            if len(records) >= limit:
+                source_files_at_record_limit.append(str(path))
+                return _deduplicate_and_sort_events(records), {
+                    "event_files_read": event_files_read,
+                    "event_files_skipped_before_window": event_files_skipped_before_window,
+                    "event_files_skipped_after_global_cap": [
+                        str(remaining) for remaining in event_files[index + 1 :]
+                    ],
+                    "source_files_at_record_limit": source_files_at_record_limit,
+                    "global_event_cap_reached": True,
+                    "records_before_global_cap": None,
+                }
+            records.append(record)
+
+    return _deduplicate_and_sort_events(records), {
+        "event_files_read": event_files_read,
+        "event_files_skipped_before_window": event_files_skipped_before_window,
+        "event_files_skipped_after_global_cap": [],
+        "source_files_at_record_limit": source_files_at_record_limit,
+        "global_event_cap_reached": False,
+        "records_before_global_cap": len(records),
+    }
 
 
 def _find_event_files(runtime_dir: str) -> list[Path]:
     base = Path(runtime_dir)
     if not base.exists():
         return []
-    candidates: list[Path] = []
-    for pattern in ["live-events*.jsonl", "events*.jsonl", "*.jsonl"]:
-        for p in sorted(base.glob(pattern)):
-            if p not in candidates:
-                candidates.append(p)
-    return candidates
+    candidates: list[tuple[int, str, int, Path]] = []
+    for path in base.iterdir():
+        if not path.is_file():
+            continue
+        match = _EVENT_LOG_NAME_RE.match(path.name)
+        if match is None:
+            continue
+        log_base = match.group("base")
+        rotation = int(match.group("rotation") or 0)
+        # The active live journal is authoritative; its numeric rotations are
+        # then read newest-to-oldest. Other legacy journals retain a stable
+        # deterministic order and are globally time-sorted before diagnosis.
+        priority = 0 if log_base == "live-events.jsonl" else 1
+        candidates.append((priority, log_base, rotation, path))
+    candidates.sort(key=lambda item: item[:3])
+    return [path for _, _, _, path in candidates]
+
+
+def _event_identity(record: dict[str, Any]) -> tuple[str, int] | None:
+    run_id = str(record.get("run_id") or "").strip()
+    sequence = record.get("seq")
+    if not run_id or isinstance(sequence, bool):
+        return None
+    try:
+        return run_id, int(sequence)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _deduplicate_and_sort_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge journal rotations without collapsing legitimate repeated events."""
+    deduplicated: list[dict[str, Any]] = []
+    seen_identities: set[tuple[str, int]] = set()
+    for record in events:
+        identity = _event_identity(record)
+        if identity is not None:
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+        deduplicated.append(record)
+    return sorted(
+        deduplicated,
+        key=lambda record: int(record.get("ts_ms", 0) or 0),
+    )
 
 
 def _resolve_state_path(runtime_dir: str, explicit_path: str = "") -> tuple[Path, str]:
@@ -4979,11 +5080,21 @@ def run_diagnose(
     else:
         event_files = _find_event_files(runtime_dir)
 
-    all_events: list[dict[str, Any]] = []
-    for ef in event_files:
-        all_events.extend(_read_jsonl_tail(ef, max_events))
-        if len(all_events) >= max_events:
-            break
+    # Service/deploy time is available before journal ingestion. Applying it
+    # here bounds each rotated tail without relying on the current file alone.
+    preliminary_window = _compute_window(
+        since_deploy, generated_at_ms, deploy_status, service_status, [],
+    )
+    preliminary_since_ms = (
+        int(preliminary_window.get("since_ms", 0) or 0)
+        if preliminary_window.get("confidence") == "high"
+        else 0
+    )
+    all_events, event_read_scope = _collect_recent_journal_events(
+        event_files,
+        max_records=max_events,
+        since_ms=preliminary_since_ms,
+    )
 
     window = _compute_window(
         since_deploy, generated_at_ms, deploy_status, service_status, all_events,
@@ -4992,6 +5103,8 @@ def run_diagnose(
     since_ms = window.get("since_ms", 0)
     if since_ms > 0:
         all_events = [e for e in all_events if int(e.get("ts_ms", 0) or 0) >= since_ms]
+
+    all_events = _deduplicate_and_sort_events(all_events)
 
     if symbol or venues:
         all_events = [e for e in all_events if _event_matches_scope(e, symbol, venues)]
@@ -5117,6 +5230,18 @@ def run_diagnose(
             "since_deploy": since_deploy,
             "max_events": max_events,
             "event_files": [str(ef) for ef in event_files],
+            "event_files_read": event_read_scope["event_files_read"],
+            "event_files_skipped_before_window": event_read_scope[
+                "event_files_skipped_before_window"
+            ],
+            "event_files_skipped_after_global_cap": event_read_scope[
+                "event_files_skipped_after_global_cap"
+            ],
+            "source_files_at_record_limit": event_read_scope[
+                "source_files_at_record_limit"
+            ],
+            "global_event_cap_reached": event_read_scope["global_event_cap_reached"],
+            "records_before_global_cap": event_read_scope["records_before_global_cap"],
             "events_parsed": len(all_events),
             "state_path": str(resolved_state_path),
             "state_path_source": state_source,

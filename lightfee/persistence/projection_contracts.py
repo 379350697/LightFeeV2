@@ -30,6 +30,7 @@ PROJECTED_ENTRY_EXIT_KINDS: frozenset[str] = frozenset({
     "entry.residual_detected",
     "exit.closed",
     "exit.close_chunk_submitted",
+    "exit.close_order_identity_acknowledged",
     "exit.close_order_intent_claimed",
     "exit.passive_close_registered",
     "exit.close_residual_detected",

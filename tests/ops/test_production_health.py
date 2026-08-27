@@ -18,6 +18,35 @@ from scripts.diagnose_live import _build_state_consistency
 from scripts import verify_production_services as vps
 
 
+def _fresh_lifecycle(venues: list[str], observed_at_ms: int) -> dict:
+    return {
+        "funding_lifecycle": [
+            {
+                "venue": venue,
+                "observed_at_ms": observed_at_ms,
+                "coverage_usable": 1,
+            }
+            for venue in venues
+        ],
+        "market_lifecycle": [
+            {
+                "venue": venue,
+                "observed_at_ms": observed_at_ms,
+                "coverage_usable": 1,
+            }
+            for venue in venues
+        ],
+        "liquidity_lifecycle": [
+            {
+                "venue": venue,
+                "published_at_ms": observed_at_ms,
+                "coverage_usable": 1,
+            }
+            for venue in venues
+        ],
+    }
+
+
 def test_sidecar_unit_rejects_missing_config():
     text = """
 [Service]
@@ -74,13 +103,87 @@ def test_snapshot_accepts_fresh_seven_venue_shape():
     snapshot = {
         "market_observed_at_ms": 1778786998000,
         "quotes": {
-            f"{venue}:BTCUSDT": {"venue": venue, "symbol": "BTCUSDT", "bid": 65000.0, "ask": 65001.0}
+            f"{venue}:BTCUSDT": {
+                "venue": venue,
+                "symbol": "BTCUSDT",
+                "bid": 65000.0,
+                "ask": 65001.0,
+                "observed_at_ms": 1778786998000,
+            }
             for venue in venues
         },
         "degraded_venues": [],
+        **_fresh_lifecycle(venues, 1778786998000),
     }
     report = analyze_sidecar_snapshot(snapshot, now_ms=1778787000000, max_age_ms=10_000)
     assert report.ok
+
+
+def test_snapshot_rejects_degraded_venue_even_when_publish_timestamp_is_fresh():
+    """A fresh writer heartbeat must not hide a failed venue fetch."""
+    venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
+    now_ms = 1_778_787_000_000
+    snapshot = {
+        "market_observed_at_ms": now_ms - 1_000,
+        "published_at_ms": now_ms - 500,
+        "quotes": {
+            f"{venue}:BTCUSDT": {
+                "venue": venue,
+                "symbol": "BTCUSDT",
+                "bid": 65000.0,
+                "ask": 65001.0,
+                "observed_at_ms": now_ms - 1_000,
+            }
+            for venue in venues
+        },
+        "degraded_venues": ["okx"],
+        "degraded_domains": [],
+        "degraded_symbols": {},
+    }
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=now_ms,
+        max_age_ms=10_000,
+        max_quote_age_ms=15_000,
+    )
+
+    assert report.ok is False
+    assert "snapshot_source_degraded:okx" in report.fingerprints
+
+
+def test_snapshot_rejects_old_quote_source_even_when_publish_timestamp_is_fresh():
+    """Last-good quote timestamps are the source truth, not publish time."""
+    venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
+    now_ms = 1_778_787_000_000
+    snapshot = {
+        "market_observed_at_ms": now_ms - 1_000,
+        "published_at_ms": now_ms - 500,
+        "quotes": {
+            f"{venue}:BTCUSDT": {
+                "venue": venue,
+                "symbol": "BTCUSDT",
+                "bid": 65000.0,
+                "ask": 65001.0,
+                "observed_at_ms": now_ms - (20_000 if venue == "okx" else 1_000),
+            }
+            for venue in venues
+        },
+        "degraded_venues": [],
+        "degraded_domains": [],
+        "degraded_symbols": {},
+    }
+
+    report = analyze_sidecar_snapshot(
+        snapshot,
+        now_ms=now_ms,
+        max_age_ms=10_000,
+        max_quote_age_ms=15_000,
+    )
+
+    assert report.ok is False
+    assert "quote_source_stale:okx" in report.fingerprints
+    assert report.details["quote_source_max_age_ms_by_venue"]["okx"] == 20_000
 
 
 def test_current_state_flags_stale_fail_closed_clean_state():
@@ -941,8 +1044,9 @@ def test_verify_production_services_cli_json_success(tmp_path):
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
     snapshot.write_text(json.dumps({
         "market_observed_at_ms": 1778786998000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
+        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001, "observed_at_ms": 1778786998000} for v in venues},
         "degraded_venues": [],
+        **_fresh_lifecycle(venues, 1778786998000),
     }))
     current = tmp_path / "current.json"
     current.write_text(json.dumps({
@@ -970,6 +1074,7 @@ def test_verify_production_services_cli_json_success(tmp_path):
             sys.executable,
             "scripts/verify_production_services.py",
             "--unit-dir", str(unit_dir),
+            "--config", "config/live.example.toml",
             "--snapshot", str(snapshot),
             "--current-state", str(current),
             "--resolv-conf", str(resolv),
@@ -982,6 +1087,82 @@ def test_verify_production_services_cli_json_success(tmp_path):
     assert result.returncode == 0, result.stderr + result.stdout
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
+
+
+def test_verify_cli_rejects_stale_quote_source_under_the_live_config_policy(tmp_path):
+    """The deploy entrypoint must use the entry path's 15s quote budget."""
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    (unit_dir / "lightfee-sidecar.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/lightfee-sidecar --config config/live.example.toml\n"
+    )
+    (unit_dir / "lightfee-live.service").write_text(
+        "[Service]\n"
+        "EnvironmentFile=/etc/lightfee/lightfee.env\n"
+        "ExecStart=/opt/lightfee-v2/.venv/bin/python3 -m lightfee.apps.live --config config/live.example.toml\n"
+    )
+    now_ms = 1_778_787_000_000
+    venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps({
+        "market_observed_at_ms": now_ms - 1_000,
+        "quotes": {
+            f"{venue}:BTCUSDT": {
+                "venue": venue,
+                "symbol": "BTCUSDT",
+                "bid": 65000,
+                "ask": 65001,
+                "observed_at_ms": now_ms - (16_000 if venue == "okx" else 1_000),
+            }
+            for venue in venues
+        },
+        "degraded_venues": [],
+        **_fresh_lifecycle(venues, now_ms - 1_000),
+    }))
+    current = tmp_path / "current.json"
+    current.write_text(json.dumps({
+        "lifecycle": "running",
+        "risk_mode": "running",
+        "last_tick_ms": now_ms - 1_000,
+        "open_position_count": 0,
+        "pending_entry_count": 0,
+        "pending_close_count": 0,
+        "exchange_truth": {
+            "available": True,
+            "confidence": "high",
+            "has_nonzero_position": False,
+            "has_open_order": False,
+            "positions": {},
+            "open_orders": {},
+        },
+    }))
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 1.1.1.1\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/verify_production_services.py",
+            "--unit-dir", str(unit_dir),
+            "--snapshot", str(snapshot),
+            "--current-state", str(current),
+            "--resolv-conf", str(resolv),
+            "--now-ms", str(now_ms),
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 1, result.stderr + result.stdout
+    sidecar_report = next(
+        report for report in json.loads(result.stdout)["reports"]
+        if report["name"] == "sidecar_snapshot"
+    )
+    assert sidecar_report["details"]["source_age_limits_ms"]["quote"] == 15_000
+    assert "quote_source_stale:okx" in sidecar_report["fingerprints"]
 
 
 def test_verify_production_services_cli_requires_explicit_deploy_acceptance_for_flat_background_reconciliation(tmp_path):
@@ -1001,8 +1182,9 @@ def test_verify_production_services_cli_requires_explicit_deploy_acceptance_for_
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
     snapshot.write_text(json.dumps({
         "market_observed_at_ms": 1778786998000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
+        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001, "observed_at_ms": 1778786998000} for v in venues},
         "degraded_venues": [],
+        **_fresh_lifecycle(venues, 1778786998000),
     }))
     current = tmp_path / "current.json"
     current.write_text(json.dumps({
@@ -1038,6 +1220,7 @@ def test_verify_production_services_cli_requires_explicit_deploy_acceptance_for_
             sys.executable,
             "scripts/verify_production_services.py",
             "--unit-dir", str(unit_dir),
+            "--config", "config/live.example.toml",
             "--snapshot", str(snapshot),
             "--current-state", str(current),
             "--resolv-conf", str(resolv),
@@ -1064,6 +1247,7 @@ def test_verify_production_services_cli_requires_explicit_deploy_acceptance_for_
             sys.executable,
             "scripts/verify_production_services.py",
             "--unit-dir", str(unit_dir),
+            "--config", "config/live.example.toml",
             "--snapshot", str(snapshot),
             "--current-state", str(current),
             "--resolv-conf", str(resolv),
@@ -1096,9 +1280,10 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
     snapshot = tmp_path / "snapshot.json"
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
     snapshot.write_text(json.dumps({
-        "market_observed_at_ms": 1778786955000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
+        "market_observed_at_ms": 1778786998000,
+        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001, "observed_at_ms": 1778786998000} for v in venues},
         "degraded_venues": [],
+        **_fresh_lifecycle(venues, 1778786998000),
     }))
     current = tmp_path / "current.json"
     current.write_text(json.dumps({
@@ -1126,6 +1311,7 @@ def test_verify_production_services_cli_default_allows_production_scan_gap(tmp_p
             sys.executable,
             "scripts/verify_production_services.py",
             "--unit-dir", str(unit_dir),
+            "--config", "config/live.example.toml",
             "--snapshot", str(snapshot),
             "--current-state", str(current),
             "--resolv-conf", str(resolv),
@@ -1157,8 +1343,9 @@ def test_verify_production_services_cli_requires_exchange_truth_evidence(tmp_pat
     venues = ["aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"]
     snapshot.write_text(json.dumps({
         "market_observed_at_ms": 1778786998000,
-        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001} for v in venues},
+        "quotes": {f"{v}:BTCUSDT": {"venue": v, "symbol": "BTCUSDT", "bid": 65000, "ask": 65001, "observed_at_ms": 1778786998000} for v in venues},
         "degraded_venues": [],
+        **_fresh_lifecycle(venues, 1778786998000),
     }))
     current = tmp_path / "current.json"
     current.write_text(json.dumps({

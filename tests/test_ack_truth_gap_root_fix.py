@@ -436,7 +436,7 @@ class TestBillingEvidenceIdentityGap:
         ]
         assert len(debt_events) == 1
         assert debt_events[0].args[2]["operator_action"] == (
-            "supply_typed_snapshot_and_close_leg_identity"
+            "none_automatic_exact_then_unique_history_recheck"
         )
         assert debt_events[0].args[2]["identity_evidence"] == {
             "missing_identity_legs": ["long", "short"],
@@ -699,6 +699,55 @@ class TestBillingEvidenceIdentityGap:
         assert restored.pending_close_reconciliations[0].get(
             "reconciliation_status"
         ) is None
+
+    def test_irrecoverable_history_debt_replays_without_reenabling_retry(self):
+        """The one-shot history conclusion must survive a crash before snapshot."""
+        from lightfee.engine.recovery import _apply_journal_replay_to_state
+        from lightfee.engine.state import EngineState
+
+        debt = {
+            "position_id": "entry-history-terminal-replay",
+            "symbol": "COTIUSDT",
+            "kind": "final",
+            "closed_at_ms": 1_780_000_000_000,
+            "position_snapshot": {
+                "position_id": "entry-history-terminal-replay",
+                "symbol": "COTIUSDT",
+                "long_venue": "bybit",
+                "short_venue": "binance",
+                "matched_quantity": 2400.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+            "reconciliation_status": "evidence_debt",
+            "evidence_debt_reason": "missing_close_order_identity",
+        }
+        terminalized = {
+            **debt,
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "ambiguous_candidates",
+            "automatic_history_terminalized_at_ms": 1_780_000_060_000,
+            "next_attempt_ms": 0,
+        }
+
+        restored = EngineState()
+        _apply_journal_replay_to_state(
+            restored,
+            [
+                {
+                    "kind": "exit.billing_evidence_debt_registered",
+                    "ts_ms": 1_780_000_000_000,
+                    "payload": {"reconciliation": debt},
+                },
+                {
+                    "kind": "exit.billing_evidence_debt_irrecoverable",
+                    "ts_ms": 1_780_000_060_000,
+                    "payload": {"reconciliation": terminalized},
+                },
+            ],
+        )
+
+        assert restored.pending_close_reconciliations == [terminalized]
 
     def test_external_recovery_reclassification_replays_as_debt_removal(self):
         """A crash after reclassification cannot resurrect external debt."""

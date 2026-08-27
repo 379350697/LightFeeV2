@@ -1009,6 +1009,33 @@ class TestEngineStateFieldCompleteness:
 
         assert state.pending_close_reconciliations == [enriched]
 
+    def test_pending_close_reconciliation_enqueue_preserves_terminal_audit_debt(
+        self,
+    ):
+        state = EngineState()
+        debt = {
+            "position_id": "entry-history-terminal",
+            "symbol": "COTIUSDT",
+            "kind": "final",
+            "closed_at_ms": 1_780_000_000_000,
+            "reconciliation_status": "evidence_debt",
+            "evidence_debt_reason": "missing_close_order_identity",
+            "long_legs": [],
+            "short_legs": [],
+        }
+        terminalized = {
+            **debt,
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "ambiguous_candidates",
+            "automatic_history_terminalized_at_ms": 1_780_000_060_000,
+            "next_attempt_ms": 0,
+        }
+
+        state.enqueue_pending_close_reconciliation(debt)
+        state.enqueue_pending_close_reconciliation(terminalized)
+
+        assert state.pending_close_reconciliations == [terminalized]
+
     def test_pending_close_reconciliation_order_id_ignores_missing_client_id(self):
         state = EngineState()
         first = {

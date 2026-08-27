@@ -98,14 +98,13 @@ BINANCE_STYLE_OPEN_INTEREST_REFRESH_CAP = 128
 _BINANCE_STYLE_TRANSIENT_OPEN_INTEREST_STATUSES = frozenset(
     {"timeout", "rate_limited", "http_error"}
 )
-# V1 parity: per-symbol OKX funding-rate concurrency limit
-_OKX_FUNDING_RATE_SEMAPHORE = 40
+# V1 multi-symbol contract: bulk snapshots may use only a small, bounded
+# funding REST fallback when the cache is cold.  Do not fan out one request per
+# requested symbol and then cancel the batch to protect quote publication.
+OKX_BULK_FUNDING_REST_FALLBACK_LIMIT = 4
 _OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S = 6.0
-OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S = 0.2
 
-# The largest known per-client fan-out is OKX funding (40).  Leave headroom for
-# the accompanying public requests while preventing cancelled/slow requests
-# from creating an unbounded socket population.
+# Binance-style OI is the largest remaining bounded public fan-out (16).
 MARKET_DATA_MAX_CONNECTIONS = 48
 
 # V1 parity: OKX funding cache TTL (10 min) — src/live/okx.rs OKX_FUNDING_CACHE_MAX_OBSERVED_AGE_MS
@@ -161,6 +160,10 @@ class MarketDataClient:
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
         self._funding_cache: dict[str, tuple[float, int, int]] = {}  # (rate_bps, timestamp_ms, observed_at_ms)
         self._funding_cache_observed_at_ms: int = 0
+        # V2 has no V1-equivalent persistent public funding stream.  Advance
+        # the bounded REST fallback across cache misses so cold symbols are not
+        # permanently starved while retaining V1's four-request ceiling.
+        self._okx_funding_refresh_after_symbol: str | None = None
         # V1-style evidence cache for Binance-compatible per-symbol OI.
         # key -> (open_interest_quote, mark_price, observed_at_ms, status, reason)
         self._binance_style_open_interest_cache: dict[
@@ -963,41 +966,60 @@ class MarketDataClient:
 
             # Fetch only stale or missing symbols
             if symbols_to_fetch:
-                sem = asyncio.Semaphore(_OKX_FUNDING_RATE_SEMAPHORE)
+                symbols_to_fetch.sort()
+                refresh_count = min(
+                    len(symbols_to_fetch),
+                    OKX_BULK_FUNDING_REST_FALLBACK_LIMIT,
+                )
+                refresh_start = 0
+                if self._okx_funding_refresh_after_symbol is not None:
+                    refresh_start = next(
+                        (
+                            index
+                            for index, symbol in enumerate(symbols_to_fetch)
+                            if symbol > self._okx_funding_refresh_after_symbol
+                        ),
+                        0,
+                    )
+                refresh_symbols = [
+                    symbols_to_fetch[(refresh_start + index) % len(symbols_to_fetch)]
+                    for index in range(refresh_count)
+                ]
+                self._okx_funding_refresh_after_symbol = refresh_symbols[-1]
 
                 async def _fetch_funding(venue_sym: str) -> None:
-                    async with sem:
-                        try:
-                            fr = await asyncio.wait_for(
-                                self._public_get(
-                                    spec.funding_rate_path,
-                                    params={"instId": venue_sym},
-                                ),
-                                timeout=_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S,
-                            )
-                        except (PublicTransportError, asyncio.TimeoutError):
-                            return
-                        fr_data = fr.get("data", [])
-                        if isinstance(fr_data, list) and fr_data:
-                            item = fr_data[0]
-                            funding_map[venue_sym] = item
-                            # V1 parity: update cache
-                            cache_key = f"{venue_str}:{venue_sym_to_canon.get(venue_sym, venue_sym)}"
-                            rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
-                            ts_ms = _funding_timestamp_ms(item)
-                            if ts_ms > 0:
-                                self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
+                    try:
+                        fr = await asyncio.wait_for(
+                            self._public_get(
+                                spec.funding_rate_path,
+                                params={"instId": venue_sym},
+                            ),
+                            timeout=_OKX_FUNDING_RATE_PER_SYMBOL_TIMEOUT_S,
+                        )
+                    except (PublicTransportError, asyncio.TimeoutError):
+                        return
+                    fr_data = fr.get("data", [])
+                    if isinstance(fr_data, list) and fr_data:
+                        item = fr_data[0]
+                        funding_map[venue_sym] = item
+                        # V1 parity: update cache
+                        cache_key = f"{venue_str}:{venue_sym_to_canon.get(venue_sym, venue_sym)}"
+                        rate_bps = _safe_float(item.get("fundingRate", 0)) * 10000.0
+                        ts_ms = _funding_timestamp_ms(item)
+                        if ts_ms > 0:
+                            self._funding_cache[cache_key] = (rate_bps, ts_ms, now_ms)
 
-                tasks = [asyncio.create_task(_fetch_funding(sym)) for sym in symbols_to_fetch]
+                tasks = [asyncio.create_task(_fetch_funding(sym)) for sym in refresh_symbols]
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*tasks),
-                        timeout=OKX_FUNDING_RATE_ENRICHMENT_BUDGET_S,
-                    )
-                except asyncio.TimeoutError:
-                    for task in tasks:
-                        if not task.done():
-                            task.cancel()
+                    await asyncio.gather(*tasks)
+                finally:
+                    # The service may still cancel the whole refresh during
+                    # shutdown or its outer deadline.  That lifecycle path
+                    # must await every child; ordinary quote publication never
+                    # cancels an already-open funding request for speed.
+                    remaining = [task for task in tasks if not task.done()]
+                    for task in remaining:
+                        task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
 
         # 3. open-interest?instType=SWAP

@@ -40,6 +40,7 @@ class CloseRuntime:
         _AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
         | {_EXACT_ID_RETRY_EVIDENCE_DEBT_REASON}
     )
+    _AUTOMATIC_HISTORY_TERMINAL_STATUS = "irrecoverable_audit_debt"
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -273,11 +274,12 @@ class CloseRuntime:
 
         A task without its typed position routing or close-order identity cannot
         use the ordinary exact-ID lookup.  Keep it as a visible close-work owner.
-        Missing-identity and unattributed-execution debts may later enter the
-        bounded unique-history + exact-execution path. A complete task whose
-        exact fill is temporarily unavailable retries that exact ID. Every
-        other debt stays operator-owned. The journal includes the full task so
-        a crash before the next snapshot preserves the state transition during
+        Missing-identity, unattributed-execution, and temporarily unavailable
+        exact-fill debts may later enter the bounded unique-history + exact-
+        execution path.  The exact order ID is always tried first; history is
+        only a strict fallback when it remains incomplete. Every other debt
+        stays operator-owned. The journal includes the full task so a crash
+        before the next snapshot preserves the state transition during
         recovery.
         """
         if reconciliation.get("reconciliation_status") == "evidence_debt":
@@ -329,16 +331,12 @@ class CloseRuntime:
                 "reconciliation_status": "evidence_debt",
                 "resolution_policy": (
                     "automatic_unique_history_exact_recheck_or_operator_import"
-                    if reason in self._AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
-                    else (
-                        "automatic_exact_order_recheck"
-                        if reason == self._EXACT_ID_RETRY_EVIDENCE_DEBT_REASON
-                        else "operator_import_required"
-                    )
+                    if reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
+                    else "operator_import_required"
                 ),
                 "operator_action": (
-                    "none_automatic_exact_order_recheck"
-                    if reason == self._EXACT_ID_RETRY_EVIDENCE_DEBT_REASON
+                    "none_automatic_exact_then_unique_history_recheck"
+                    if reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
                     else "supply_typed_snapshot_and_close_leg_identity"
                 ),
                 "billing_reconciliation_required": True,
@@ -434,6 +432,7 @@ class CloseRuntime:
         candidate_count: int | None = None,
         leg: str = "",
         error: str = "",
+        retryable: bool = True,
     ) -> None:
         reconciliation["automatic_history_last_classification"] = classification
         reconciliation["automatic_history_last_attempt_ms"] = now_ms
@@ -443,7 +442,7 @@ class CloseRuntime:
             "kind": str(reconciliation.get("kind") or "final"),
             "classification": classification,
             "leg": leg,
-            "retryable": True,
+            "retryable": retryable,
         }
         if candidate_count is not None:
             payload["candidate_count"] = candidate_count
@@ -451,6 +450,54 @@ class CloseRuntime:
             payload["error"] = error
         self.ctx.journal.append(
             "reconciliation.automatic_historical_evidence_blocked",
+            payload,
+        )
+
+    def _mark_automatic_history_evidence_irrecoverable(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+        *,
+        classification: str,
+        candidate_count: int | None = None,
+        leg: str = "",
+    ) -> None:
+        """Durably stop automatic history retries after a strict terminal result.
+
+        This covers both a completed strict miss and immutable missing routing
+        evidence that makes a strict query impossible.  In either case,
+        repeating the automatic path cannot safely create a missing execution.
+        The debt remains visible and importable, but no longer consumes runtime
+        retries or pretends that a later fuzzy match is acceptable.
+        """
+        if (
+            reconciliation.get("automatic_history_terminal_status")
+            == self._AUTOMATIC_HISTORY_TERMINAL_STATUS
+        ):
+            return
+        reconciliation["automatic_history_terminal_status"] = (
+            self._AUTOMATIC_HISTORY_TERMINAL_STATUS
+        )
+        reconciliation["automatic_history_terminal_reason"] = classification
+        reconciliation["automatic_history_terminalized_at_ms"] = now_ms
+        reconciliation["next_attempt_ms"] = 0
+        payload: dict[str, Any] = {
+            "position_id": str(reconciliation.get("position_id") or ""),
+            "symbol": str(reconciliation.get("symbol") or ""),
+            "kind": str(reconciliation.get("kind") or "final"),
+            "classification": classification,
+            "terminal_accounting_status": self._AUTOMATIC_HISTORY_TERMINAL_STATUS,
+            "terminal_reason": f"automatic_history_{classification}",
+            "resolution_policy": "operator_import_required",
+            "reconciliation": dict(reconciliation),
+        }
+        if candidate_count is not None:
+            payload["candidate_count"] = candidate_count
+        if leg:
+            payload["leg"] = leg
+        self.ctx.journal.append_critical(
+            now_ms,
+            "exit.billing_evidence_debt_irrecoverable",
             payload,
         )
 
@@ -518,12 +565,19 @@ class CloseRuntime:
     ) -> tuple[list[Any], list[Any], dict[str, Any]] | None:
         """Resolve a final debt without promoting a fuzzy match to evidence.
 
-        Exchange position/open-order truth gates discovery.  Each missing leg
-        must have one history candidate and the venue adapter must then return
-        its normal exact order/execution reconciliation with complete fees.
+        Exchange position/open-order truth gates discovery.  Every incomplete
+        leg must have one history candidate and the venue adapter must then
+        return its normal exact order/execution reconciliation with complete
+        fees.
         """
         if str(reconciliation.get("kind") or "final") != "final":
             self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="unsupported_partial_evidence_debt",
+                retryable=False,
+            )
+            self._mark_automatic_history_evidence_irrecoverable(
                 reconciliation,
                 now_ms,
                 classification="unsupported_partial_evidence_debt",
@@ -534,11 +588,14 @@ class CloseRuntime:
             or pending_close_reconciliation_evidence_debt_reason(reconciliation)
             or ""
         )
-        if debt_reason not in {
-            "missing_close_order_identity",
-            "unattributed_exchange_execution",
-        }:
+        if debt_reason not in self._AUTOMATIC_EVIDENCE_DEBT_REASONS:
             self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="unsupported_evidence_debt_reason",
+                retryable=False,
+            )
+            self._mark_automatic_history_evidence_irrecoverable(
                 reconciliation,
                 now_ms,
                 classification="unsupported_evidence_debt_reason",
@@ -582,21 +639,69 @@ class CloseRuntime:
                 reconciliation,
                 now_ms,
                 classification="missing_position_snapshot",
+                retryable=False,
+            )
+            self._mark_automatic_history_evidence_irrecoverable(
+                reconciliation,
+                now_ms,
+                classification="missing_position_snapshot",
             )
             return None
         expected_quantities = self._close_reconciliation_expected_quantities(
             reconciliation,
             snapshot,
         )
-        if expected_quantities is None:
-            self._record_automatic_history_evidence_block(
-                reconciliation,
-                now_ms,
-                classification="missing_expected_close_quantities",
-            )
-            return None
-
         missing_legs = set(pending_close_reconciliation_missing_legs(reconciliation))
+        if expected_quantities is None:
+            # Legacy debt snapshots can lack target quantities while retaining
+            # both exact close identities. V1 permits those exact queries to
+            # finish; quantity is required only for history discovery, where
+            # it is part of the uniqueness contract.
+            if missing_legs:
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification="missing_expected_close_quantities",
+                    retryable=False,
+                )
+                self._mark_automatic_history_evidence_irrecoverable(
+                    reconciliation,
+                    now_ms,
+                    classification="missing_expected_close_quantities",
+                )
+                return None
+            resolved_fills: dict[str, list[Any]] = {}
+            for leg, venue in (("long", long_venue), ("short", short_venue)):
+                try:
+                    fills = await self._call_fetch_close_leg_reconciliations(
+                        symbol=symbol,
+                        venue=venue,
+                        legs=reconciliation.get(f"{leg}_legs"),
+                    )
+                except Exception as exc:
+                    self._record_automatic_history_evidence_block(
+                        reconciliation,
+                        now_ms,
+                        classification="known_leg_exact_query_error",
+                        leg=leg,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    return None
+                if fills is None:
+                    self._record_automatic_history_evidence_block(
+                        reconciliation,
+                        now_ms,
+                        classification="known_leg_exact_query_unavailable",
+                        leg=leg,
+                    )
+                    return None
+                resolved_fills[leg] = fills
+            return (
+                resolved_fills.get("long", []),
+                resolved_fills.get("short", []),
+                {},
+            )
+
         historical_resolution: dict[str, Any] = {}
         resolved_fills: dict[str, list[Any]] = {}
         closed_at_ms = self._safe_reconciliation_int(
@@ -604,6 +709,12 @@ class CloseRuntime:
         )
         if closed_at_ms <= 0:
             self._record_automatic_history_evidence_block(
+                reconciliation,
+                now_ms,
+                classification="missing_closed_at_ms",
+                retryable=False,
+            )
+            self._mark_automatic_history_evidence_irrecoverable(
                 reconciliation,
                 now_ms,
                 classification="missing_closed_at_ms",
@@ -661,6 +772,13 @@ class CloseRuntime:
                     now_ms,
                     classification="history_discovery_unsupported",
                     leg=leg,
+                    retryable=False,
+                )
+                self._mark_automatic_history_evidence_irrecoverable(
+                    reconciliation,
+                    now_ms,
+                    classification="history_discovery_unsupported",
+                    leg=leg,
                 )
                 return None
             try:
@@ -695,6 +813,14 @@ class CloseRuntime:
                     classification=classification,
                     candidate_count=candidate_count,
                     leg=leg,
+                    retryable=False,
+                )
+                self._mark_automatic_history_evidence_irrecoverable(
+                    reconciliation,
+                    now_ms,
+                    classification=classification,
+                    candidate_count=candidate_count,
+                    leg=leg,
                 )
                 return None
 
@@ -720,6 +846,14 @@ class CloseRuntime:
                     classification="unique_candidate_exact_recheck_incomplete",
                     candidate_count=1,
                     leg=leg,
+                    retryable=False,
+                )
+                self._mark_automatic_history_evidence_irrecoverable(
+                    reconciliation,
+                    now_ms,
+                    classification="unique_candidate_exact_recheck_incomplete",
+                    candidate_count=1,
+                    leg=leg,
                 )
                 return None
             resolved_fills[leg] = [fill]
@@ -734,13 +868,6 @@ class CloseRuntime:
                 ),
             }
 
-        if not historical_resolution:
-            self._record_automatic_history_evidence_block(
-                reconciliation,
-                now_ms,
-                classification="no_missing_leg_to_discover",
-            )
-            return None
         return (
             resolved_fills.get("long", []),
             resolved_fills.get("short", []),
@@ -1738,6 +1865,12 @@ class CloseRuntime:
                 changed = True
                 continue
             if reconciliation.get("reconciliation_status") == "evidence_debt":
+                if (
+                    reconciliation.get("automatic_history_terminal_status")
+                    == self._AUTOMATIC_HISTORY_TERMINAL_STATUS
+                ):
+                    retained.append(reconciliation)
+                    continue
                 auto_reason = str(
                     reconciliation.get("evidence_debt_reason")
                     or pending_close_reconciliation_evidence_debt_reason(reconciliation)
@@ -1852,7 +1985,7 @@ class CloseRuntime:
             automatic_history_evidence_debt = (
                 reconciliation.get("reconciliation_status") == "evidence_debt"
                 and str(reconciliation.get("evidence_debt_reason") or "")
-                in self._AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
+                in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
             )
             if automatic_history_evidence_debt:
                 automatic_evidence = (
@@ -1865,6 +1998,13 @@ class CloseRuntime:
                     )
                 )
                 if automatic_evidence is None:
+                    if (
+                        reconciliation.get("automatic_history_terminal_status")
+                        == self._AUTOMATIC_HISTORY_TERMINAL_STATUS
+                    ):
+                        retained.append(reconciliation)
+                        changed = True
+                        continue
                     self._call_apply_pending_close_reconciliation_backoff(
                         reconciliation,
                         now_ms,

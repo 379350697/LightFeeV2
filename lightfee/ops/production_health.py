@@ -244,18 +244,132 @@ def _fixture_quote_count(snapshot: dict[str, Any]) -> int:
     return count
 
 
+def _normalized_string_values(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return sorted({str(item).strip().lower() for item in value if str(item).strip()})
+
+
+def _lifecycle_rows_by_venue(
+    snapshot: dict[str, Any],
+    name: str,
+) -> dict[str, list[dict[str, Any]]]:
+    rows = snapshot.get(name)
+    by_venue: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(rows, list):
+        return by_venue
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        venue = str(raw.get("venue") or "").strip().lower()
+        if venue:
+            by_venue.setdefault(venue, []).append(raw)
+    return by_venue
+
+
+def _source_age_ms(raw_timestamp: Any, now_ms: int) -> int | None:
+    timestamp = _nonnegative_int_or_none(raw_timestamp)
+    if timestamp is None:
+        return None
+    age_ms = now_ms - timestamp
+    return age_ms if age_ms >= 0 else None
+
+
 def analyze_sidecar_snapshot(
     snapshot: dict[str, Any],
     *,
     now_ms: int,
     max_age_ms: int,
+    max_quote_age_ms: int | None = None,
+    max_funding_age_ms: int | None = None,
+    max_liquidity_age_ms: int | None = None,
 ) -> HealthReport:
+    """Validate writer freshness and the market evidence carried by a snapshot.
+
+    ``published_at_ms`` only proves the sidecar wrote a new file.  The entry
+    path relies on the per-quote timestamp and domain lifecycle state, so the
+    deployment gate must fail when either is stale or degraded.
+    """
     fingerprints: list[str] = []
     observed = int(snapshot.get("market_observed_at_ms") or snapshot.get("published_at_ms") or 0)
     age_ms = now_ms - observed if observed else None
     venues = _quote_venues(snapshot)
     missing = sorted(EXPECTED_VENUES - venues)
     fixture_quotes = _fixture_quote_count(snapshot)
+    quote_limit_ms = max_quote_age_ms if max_quote_age_ms is not None else max_age_ms
+    funding_limit_ms = max_funding_age_ms if max_funding_age_ms is not None else max_age_ms
+    liquidity_limit_ms = (
+        max_liquidity_age_ms if max_liquidity_age_ms is not None else max_age_ms
+    )
+    quotes = snapshot.get("quotes", {})
+    quote_source_max_age_ms_by_venue: dict[str, int | None] = {}
+    if isinstance(quotes, dict):
+        for venue in sorted(venues & EXPECTED_VENUES):
+            source_ages = [
+                _source_age_ms(raw.get("observed_at_ms"), now_ms)
+                for key, raw in quotes.items()
+                if isinstance(raw, dict)
+                and (
+                    str(raw.get("venue") or "").strip().lower() == venue
+                    or (
+                        not raw.get("venue")
+                        and isinstance(key, str)
+                        and key.split(":", 1)[0].lower() == venue
+                    )
+                )
+            ]
+            if not source_ages or any(age is None for age in source_ages):
+                quote_source_max_age_ms_by_venue[venue] = None
+                fingerprints.append(f"quote_source_timestamp_missing:{venue}")
+                continue
+            source_age_ms = max(age for age in source_ages if age is not None)
+            quote_source_max_age_ms_by_venue[venue] = source_age_ms
+            if source_age_ms > quote_limit_ms:
+                fingerprints.append(f"quote_source_stale:{venue}")
+
+    degraded_venues = _normalized_string_values(snapshot.get("degraded_venues"))
+    degraded_domains = _normalized_string_values(snapshot.get("degraded_domains"))
+    degraded_symbols = snapshot.get("degraded_symbols")
+    for venue in degraded_venues:
+        fingerprints.append(f"snapshot_source_degraded:{venue}")
+    for domain in degraded_domains:
+        fingerprints.append(f"snapshot_domain_degraded:{domain}")
+    if isinstance(degraded_symbols, dict) and degraded_symbols:
+        fingerprints.append("snapshot_symbols_degraded")
+
+    lifecycle_details: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for lifecycle_name, domain, limit_ms, timestamp_key in (
+        ("funding_lifecycle", "funding", funding_limit_ms, "observed_at_ms"),
+        ("market_lifecycle", "market", max_age_ms, "observed_at_ms"),
+        ("liquidity_lifecycle", "liquidity", liquidity_limit_ms, "published_at_ms"),
+    ):
+        rows_by_venue = _lifecycle_rows_by_venue(snapshot, lifecycle_name)
+        domain_details: dict[str, list[dict[str, Any]]] = {}
+        for venue in sorted(EXPECTED_VENUES):
+            rows = rows_by_venue.get(venue, [])
+            if not rows:
+                fingerprints.append(f"{domain}_lifecycle_missing:{venue}")
+                domain_details[venue] = []
+                continue
+            domain_details[venue] = []
+            for row in rows:
+                age = _source_age_ms(row.get(timestamp_key), now_ms)
+                reason = str(row.get("degraded_reason") or "").strip()
+                coverage = _nonnegative_int_or_none(row.get("coverage_usable"))
+                domain_details[venue].append({
+                    "source_age_ms": age,
+                    "coverage_usable": coverage,
+                    "degraded_reason": reason,
+                })
+                if age is None:
+                    fingerprints.append(f"{domain}_source_timestamp_missing:{venue}")
+                elif age > limit_ms:
+                    fingerprints.append(f"{domain}_source_stale:{venue}")
+                if coverage is None or coverage <= 0:
+                    fingerprints.append(f"{domain}_source_unavailable:{venue}")
+                if reason:
+                    fingerprints.append(f"snapshot_source_degraded:{venue}")
+        lifecycle_details[domain] = domain_details
 
     if observed == FIXTURE_MARKET_OBSERVED_AT_MS:
         fingerprints.append("fixture_timestamp")
@@ -270,14 +384,24 @@ def analyze_sidecar_snapshot(
         name="sidecar_snapshot",
         ok=not fingerprints,
         severity="critical" if fingerprints else "info",
-        fingerprints=fingerprints,
+        fingerprints=list(dict.fromkeys(fingerprints)),
         details={
             "observed_at_ms": observed,
             "age_ms": age_ms,
             "quote_venues": sorted(venues),
             "missing_venues": missing,
             "fixture_quote_count": fixture_quotes,
-            "degraded_venues": list(snapshot.get("degraded_venues", [])),
+            "source_age_limits_ms": {
+                "quote": quote_limit_ms,
+                "funding": funding_limit_ms,
+                "market": max_age_ms,
+                "liquidity": liquidity_limit_ms,
+            },
+            "quote_source_max_age_ms_by_venue": quote_source_max_age_ms_by_venue,
+            "lifecycle_source_evidence": lifecycle_details,
+            "degraded_venues": degraded_venues,
+            "degraded_domains": degraded_domains,
+            "degraded_symbols": degraded_symbols if isinstance(degraded_symbols, dict) else {},
         },
     )
 

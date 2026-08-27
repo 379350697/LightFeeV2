@@ -13,6 +13,7 @@ from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.runtime_context import MarketDataRuntimeContext
+from lightfee.engine.snapshot_freshness_policy import snapshot_domain_budget_ms
 from lightfee.marketdata.l2 import L2BookStatus, L2PoolAssignment, LocalL2BookKey
 from lightfee.venues.market_data import open_interest_evidence_status_from_error
 
@@ -838,58 +839,7 @@ class MarketDataRuntime:
         ]
 
     def _snapshot_domain_budget_ms(self, domain: str, row=None) -> int:
-        domain_s = str(domain or "").lower()
-        if domain_s == "liquidity":
-            configured_ms = int(
-                getattr(
-                    self.ctx.config.runtime,
-                    "sidecar_perp_liquidity_budget_ms",
-                    self.ctx.config.strategy.max_liquidity_snapshot_age_ms,
-                )
-                or 0
-            )
-            refresh_ms = int(
-                getattr(self.ctx.config.runtime, "sidecar_refresh_ms", 0) or 0
-            )
-            timeout_ms = int(
-                float(
-                    getattr(
-                        self.ctx.config.runtime,
-                        "sidecar_liquidity_timeout_s",
-                        10.0,
-                    )
-                    or 0.0
-                )
-                * 1000.0
-            )
-            publish_interval_ms = (
-                int(getattr(row, "publish_interval_ms", 0) or 0)
-                if row is not None else 0
-            )
-            return int(
-                max(
-                    configured_ms,
-                    int(self.ctx.config.strategy.max_liquidity_snapshot_age_ms or 0),
-                    refresh_ms * 3 if refresh_ms > 0 else 0,
-                    refresh_ms + timeout_ms * 2 if timeout_ms > 0 else 0,
-                    publish_interval_ms * 2 if publish_interval_ms > 0 else 0,
-                    30_000,
-                )
-            )
-        if domain_s == "quote":
-            return int(
-                getattr(self.ctx.config.runtime, "max_order_quote_age_ms", 0)
-                or self.ctx.config.runtime.max_market_age_ms
-                or self.ctx.config.runtime.sidecar_snapshot_max_age_ms
-            )
-        if domain_s == "market":
-            # This is the sidecar's global market-view timestamp.  V1 gives
-            # that snapshot-level evidence the sidecar horizon; max_market_age
-            # remains for per-venue entry/L2 evidence.
-            return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
-        if domain_s == "funding":
-            return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
-        return int(self.ctx.config.runtime.sidecar_snapshot_max_age_ms)
+        return snapshot_domain_budget_ms(self.ctx.config, domain, row)
 
     @staticmethod
     def _snapshot_metric_key(venue: str, symbol: str, domain: str) -> str:

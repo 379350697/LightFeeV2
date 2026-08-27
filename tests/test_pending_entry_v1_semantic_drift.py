@@ -1026,7 +1026,9 @@ async def test_pending_close_reconciliation_keeps_flat_final_fill_evidence_debt_
         if record["kind"] == "exit.billing_evidence_debt_registered"
     ][0]
     assert debt["terminal_reason"] == "known_close_fill_temporarily_unavailable"
-    assert debt["resolution_policy"] == "automatic_exact_order_recheck"
+    assert debt["resolution_policy"] == (
+        "automatic_unique_history_exact_recheck_or_operator_import"
+    )
     assert not [
         record for record in records
         if record["kind"] == "exit.reconciliation_abandoned"

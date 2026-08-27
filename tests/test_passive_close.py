@@ -8695,7 +8695,7 @@ class TestCloseOrderIntentDurability:
         assert recovered_pending.position_snapshot is recovered.open_positions[position.position_id]
 
     def test_maker_intent_is_persisted_before_submit_and_survives_restart(self):
-        """A crash after exchange acceptance must retain a client-ID lookup key."""
+        """A crash after exchange acceptance retains the exact per-leg lookup."""
         from lightfee.engine.recovery import (
             _restore_state_from_snapshot_dict,
             build_persistent_state_view,
@@ -8766,6 +8766,7 @@ class TestCloseOrderIntentDurability:
         restored = _restore_state_from_snapshot_dict(build_persistent_state_view(state))
         restored_pending = restored.pending_passive_closes[position.position_id]
         assert restored_pending.long_legs[0].fill is None
+        assert restored_pending.long_legs[0].order_id == "maker-order-1"
         assert restored_pending.long_legs[0].client_order_id == client_order_id
 
         long_records, short_records = executor._pending_close_reconciliation_records(
@@ -8776,12 +8777,110 @@ class TestCloseOrderIntentDurability:
         assert short_records == []
         assert long_records == [{
             "venue": Venue.BINANCE.value,
-            "order_id": "",
+            "order_id": "maker-order-1",
             "client_order_id": client_order_id,
             "quantity": 0.0,
             "average_price": 0.0,
             "fee_quote": None,
         }]
+
+    def test_maker_ack_identity_replays_after_pre_ack_snapshot(self, tmp_path):
+        """ACK identity survives the precise crash window that lost COTI/BTR."""
+        from lightfee.engine.recovery import recover_from_snapshot
+        from lightfee.persistence.snapshot_store import SnapshotStore
+
+        journal = Journal(tmp_path / "close-ack-identity.log")
+        journal.open()
+        adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        state = EngineState()
+        position = _make_position(position_id="entry-close-ack-identity")
+        state.open_positions[position.position_id] = position
+        snapshot = SnapshotStore(tmp_path / "before-close-ack.json")
+        snapshot.write(state.to_dict())
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=position.matched_quantity,
+            chunk_quantities=[position.matched_quantity],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.HIGH_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.pending_passive_closes[position.position_id] = pending
+        adapter.submit_passive_order = AsyncMock(
+            return_value=_make_passive_ack(
+                venue=Venue.BINANCE,
+                side=Side.SELL,
+                order_id="ack-before-snapshot-order",
+                client_order_id="",
+                quantity=position.matched_quantity,
+            )
+        )
+        executor = PassiveCloseExecutor({Venue.BINANCE: adapter}, journal)
+        executor._get_passive_tick_size = AsyncMock(return_value=0.01)
+
+        assert asyncio.run(
+            executor._submit_maker_order(
+                state,
+                pending,
+                position,
+                Venue.BINANCE,
+                Side.SELL,
+                "long",
+                50_000.0,
+                position.matched_quantity,
+            )
+        )
+
+        recovered = recover_from_snapshot(snapshot, journal)
+        recovered_leg = recovered.pending_passive_closes[position.position_id].long_legs[0]
+        assert recovered_leg.fill is None
+        assert recovered_leg.order_id == "ack-before-snapshot-order"
+        assert recovered_leg.client_order_id
+
+    def test_replaced_order_fill_keeps_every_acknowledged_order_identity(self):
+        """A cancel/replace fill cannot erase the prior acknowledged order."""
+        position = _make_position(position_id="entry-close-replaced-ack")
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            long_legs=[
+                PersistedCloseExecutionLeg(
+                    order_id="maker-order-original",
+                    client_order_id="maker-cid",
+                ),
+                PersistedCloseExecutionLeg(
+                    order_id="maker-order-replaced",
+                    client_order_id="maker-cid",
+                ),
+            ],
+        )
+        fill = OrderFill(
+            venue=Venue.BINANCE,
+            symbol=position.symbol,
+            side=Side.SELL,
+            quantity=position.matched_quantity,
+            price=50_000.0,
+            order_id="maker-order-replaced",
+            client_order_id="maker-cid",
+            fee_quote=0.01,
+            filled_at_ms=1_000,
+        )
+
+        PassiveCloseExecutor._record_close_execution_leg(
+            pending,
+            leg_label="long",
+            fill=fill,
+            client_order_id="maker-cid",
+            submitted_at_ms=900,
+        )
+
+        assert pending.long_legs[0].fill is None
+        assert pending.long_legs[0].order_id == "maker-order-original"
+        assert pending.long_legs[1].fill == fill
 
     def test_intent_replays_after_ack_loss_without_followup_snapshot(self, tmp_path):
         """Journal replay retains the CID and refuses a duplicate maker submit."""

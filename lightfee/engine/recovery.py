@@ -378,6 +378,7 @@ def _restore_persisted_close_execution_legs(
                     if "fee_evidence_complete" in item
                     else False
                 ),
+                order_id=str(item.get("order_id", "") or ""),
                 client_order_id=str(item.get("client_order_id", "") or ""),
                 submit_started_at_ms=int(item.get("submit_started_at_ms", 0) or 0),
                 latency_ms=int(item.get("latency_ms", 0) or 0),
@@ -399,6 +400,7 @@ def _serialize_persisted_close_execution_leg(
     return {
         "fill": _serialize_order_fill(leg.fill),
         "fee_evidence_complete": fee_evidence_complete,
+        "order_id": str(leg.order_id or ""),
         "client_order_id": str(leg.client_order_id or ""),
         "submit_started_at_ms": int(leg.submit_started_at_ms or 0),
         "latency_ms": int(leg.latency_ms or 0),
@@ -1152,6 +1154,53 @@ def _apply_journal_replay_to_state(
             if payload.get("operation") == "submit_passive_order":
                 pending.phase_state.maker_client_order_id = client_order_id
 
+        elif kind == "exit.close_order_identity_acknowledged":
+            order_id = str(payload.get("order_id") or "")
+            client_order_id = str(payload.get("client_order_id") or "")
+            leg_label = str(payload.get("leg") or "")
+            position_id = str(payload.get("position_id") or "")
+            if not order_id or leg_label not in {"long", "short"} or not position_id:
+                continue
+            existing = state.pending_passive_closes.get(position_id)
+            existing_legs = (
+                existing.long_legs if leg_label == "long" and existing is not None
+                else existing.short_legs if existing is not None
+                else []
+            )
+            pending = _restore_pending_passive_close_from_journal(
+                state,
+                payload,
+                replace_existing=(
+                    existing is None
+                    or not any(
+                        leg.client_order_id == client_order_id
+                        or leg.order_id == order_id
+                        for leg in existing_legs
+                    )
+                ),
+            )
+            if pending is None:
+                continue
+            legs = pending.long_legs if leg_label == "long" else pending.short_legs
+            if any(
+                leg.order_id == order_id
+                and leg.client_order_id == client_order_id
+                for leg in legs
+            ):
+                continue
+            for leg in legs:
+                if leg.client_order_id == client_order_id and not leg.order_id:
+                    leg.order_id = order_id
+                    break
+            else:
+                legs.append(
+                    PersistedCloseExecutionLeg(
+                        fill=None,
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                    )
+                )
+
         elif kind == "exit.billing_evidence_imported":
             # Operator evidence is durable only through the same strict
             # state-level replacement gate used by the control plane.  Replay
@@ -1231,6 +1280,7 @@ def _apply_journal_replay_to_state(
         elif kind in (
             "exit.pending_close_reconciliation_registered",
             "exit.billing_evidence_debt_registered",
+            "exit.billing_evidence_debt_irrecoverable",
         ):
             # The full reconciliation record is carried by the critical
             # registration event so a crash before the next snapshot cannot

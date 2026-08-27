@@ -245,6 +245,43 @@ class CloseExecutionLeg:
     latency_ms: int = 0
 
 
+@dataclass
+class CompensationCloseOutcome:
+    """All evidence produced while flattening one compensation leg.
+
+    A zero-fill ACK or an uncertain transport result is not evidence of a
+    zero execution.  Keep its exact exchange identity even when a subsequent
+    position probe proves the venue flat, so final-close reconciliation can
+    recover the execution and fee statement without changing exposure.
+    """
+
+    legs: list[CloseExecutionLeg] = field(default_factory=list)
+    unresolved_submission_identities: list[tuple[str, str]] = field(
+        default_factory=list
+    )
+    exchange_flat: bool = False
+
+
+def _record_compensation_submission_identity(
+    outcome: CompensationCloseOutcome,
+    order_id: str,
+    client_order_id: str,
+) -> None:
+    identity = (str(order_id or ""), str(client_order_id or ""))
+    if any(identity) and identity not in outcome.unresolved_submission_identities:
+        outcome.unresolved_submission_identities.append(identity)
+
+
+def _merge_compensation_outcome(
+    target: CompensationCloseOutcome,
+    additional: CompensationCloseOutcome,
+) -> None:
+    target.legs.extend(additional.legs)
+    for identity in additional.unresolved_submission_identities:
+        _record_compensation_submission_identity(target, *identity)
+    target.exchange_flat = target.exchange_flat or additional.exchange_flat
+
+
 # ---------------------------------------------------------------------------
 # Close balance (matched quantities after close)
 # ---------------------------------------------------------------------------
@@ -684,11 +721,12 @@ def _append_unresolved_close_submission_identities(
     *,
     venue: Venue,
     client_order_ids: tuple[str, ...],
+    submission_identities: tuple[tuple[str, str], ...] = (),
 ) -> bool:
-    """Persist only CIDs whose submitted close has no local fill record.
+    """Persist unconfirmed close submissions without erasing exchange order IDs.
 
     The zero quantity is deliberately a placeholder, never an asserted fill.
-    It gives the reconciliation runtime the exact exchange lookup key while
+    It gives the reconciliation runtime every exact exchange lookup key while
     keeping the local accounting segment fail-closed until that lookup returns
     a real fill.
     """
@@ -697,7 +735,38 @@ def _append_unresolved_close_submission_identities(
         for record in records
         if isinstance(record, dict)
     }
+    known_order_ids = {
+        str(record.get("order_id") or "")
+        for record in records
+        if isinstance(record, dict)
+    }
     appended = False
+    # A CID-only retry may be the same idempotent submission as a recorded
+    # fill. A distinct exchange order ID is stronger evidence and must be
+    # retained even when a venue reuses a CID across replacement attempts.
+    for order_id, client_order_id in submission_identities:
+        order_id = str(order_id or "")
+        client_order_id = str(client_order_id or "")
+        if not order_id and (
+            not client_order_id or client_order_id in known_client_order_ids
+        ):
+            continue
+        if order_id and order_id in known_order_ids:
+            continue
+        records.append(
+            {
+                "venue": venue.value,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": 0.0,
+                "filled_at_ms": 0,
+            }
+        )
+        known_client_order_ids.add(client_order_id)
+        known_order_ids.add(order_id)
+        appended = True
     for client_order_id in client_order_ids:
         client_order_id = str(client_order_id or "")
         if not client_order_id or client_order_id in known_client_order_ids:
@@ -731,6 +800,8 @@ def register_close_accounting_reconciliation(
     evidence_gaps: tuple[str, ...],
     long_unresolved_client_order_ids: tuple[str, ...] = (),
     short_unresolved_client_order_ids: tuple[str, ...] = (),
+    long_unresolved_submission_identities: tuple[tuple[str, str], ...] = (),
+    short_unresolved_submission_identities: tuple[tuple[str, str], ...] = (),
 ) -> None:
     """Persist exact close identities before discarding incomplete local billing."""
     long_records = _close_reconciliation_leg_records(long_legs)
@@ -740,12 +811,14 @@ def register_close_accounting_reconciliation(
         long_records,
         venue=position.long_venue,
         client_order_ids=long_unresolved_client_order_ids,
+        submission_identities=long_unresolved_submission_identities,
     ):
         unresolved_submission_legs.append("long")
     if _append_unresolved_close_submission_identities(
         short_records,
         venue=position.short_venue,
         client_order_ids=short_unresolved_client_order_ids,
+        submission_identities=short_unresolved_submission_identities,
     ):
         unresolved_submission_legs.append("short")
     remaining_long = max(
@@ -890,6 +963,39 @@ class CloseExecutor:
         any_long_uncertain = False
         unresolved_short_client_order_ids: list[str] = []
         unresolved_long_client_order_ids: list[str] = []
+        unresolved_short_submission_identities: list[tuple[str, str]] = []
+        unresolved_long_submission_identities: list[tuple[str, str]] = []
+
+        def retain_unresolved_submission_identities(
+            result: dict[str, Any],
+            identities: list[tuple[str, str]],
+        ) -> bool:
+            """Keep every uncertain submission, including attempts before a retry.
+
+            A later confirmed fill does not prove that an earlier timed-out ACK
+            did not execute. The close ledger therefore retains the exact ID
+            (or its CID fallback) until reconciliation establishes its fill.
+            """
+            retained = False
+            for raw_identity in result.get("unresolved_submission_identities", ()):
+                if not isinstance(raw_identity, (tuple, list)) or len(raw_identity) != 2:
+                    continue
+                identity = (str(raw_identity[0] or ""), str(raw_identity[1] or ""))
+                if not any(identity) or identity in identities:
+                    continue
+                identities.append(identity)
+                retained = True
+            return retained
+
+        def unresolved_submission_legs() -> tuple[str, ...]:
+            return tuple(
+                leg_label
+                for leg_label, uncertain, identities in (
+                    ("long", any_long_uncertain, unresolved_long_submission_identities),
+                    ("short", any_short_uncertain, unresolved_short_submission_identities),
+                )
+                if uncertain or identities
+            )
 
         def persist_compensation_truth_gap() -> None:
             """Keep exact submitted identities if V1 compensation cannot probe.
@@ -904,14 +1010,7 @@ class CloseExecutor:
                 position,
                 long_legs,
                 short_legs,
-                unresolved_submission_legs=tuple(
-                    leg_label
-                    for leg_label, uncertain in (
-                        ("long", any_long_uncertain),
-                        ("short", any_short_uncertain),
-                    )
-                    if uncertain
-                ),
+                unresolved_submission_legs=unresolved_submission_legs(),
             )
             register_close_accounting_reconciliation(
                 state,
@@ -928,6 +1027,12 @@ class CloseExecutor:
                 ),
                 short_unresolved_client_order_ids=tuple(
                     unresolved_short_client_order_ids
+                ),
+                long_unresolved_submission_identities=tuple(
+                    unresolved_long_submission_identities
+                ),
+                short_unresolved_submission_identities=tuple(
+                    unresolved_short_submission_identities
                 ),
             )
 
@@ -955,6 +1060,10 @@ class CloseExecutor:
             short_result = await self._submit_close_leg_with_retry(
                 short_req, position.position_id, "short", now_ms,
             )
+            if retain_unresolved_submission_identities(
+                short_result, unresolved_short_submission_identities
+            ):
+                any_short_uncertain = True
             if short_result["outcome"] == "filled":
                 short_legs.append(CloseExecutionLeg(
                     fill=short_result["fill"],
@@ -994,6 +1103,12 @@ class CloseExecutor:
                                 short_result.get("reason", "close leg uncertain"),
                             ),
                             short_legs, long_legs, state,
+                            short_unresolved_submission_identities=(
+                                unresolved_short_submission_identities
+                            ),
+                            long_unresolved_submission_identities=(
+                                unresolved_long_submission_identities
+                            ),
                         )
                         break  # compensation succeeded, exit chunk loop
                     except CompensationFailedError:
@@ -1040,6 +1155,10 @@ class CloseExecutor:
             long_result = await self._submit_close_leg_with_retry(
                 long_req, position.position_id, "long", now_ms,
             )
+            if retain_unresolved_submission_identities(
+                long_result, unresolved_long_submission_identities
+            ):
+                any_long_uncertain = True
             if long_result["outcome"] == "filled":
                 long_legs.append(CloseExecutionLeg(
                     fill=long_result["fill"],
@@ -1080,6 +1199,12 @@ class CloseExecutor:
                                 long_result.get("reason", "close leg uncertain"),
                             ),
                             short_legs, long_legs, state,
+                            short_unresolved_submission_identities=(
+                                unresolved_short_submission_identities
+                            ),
+                            long_unresolved_submission_identities=(
+                                unresolved_long_submission_identities
+                            ),
                         )
                         break
                     except CompensationFailedError:
@@ -1114,6 +1239,12 @@ class CloseExecutor:
                             long_result.get("reason", "close leg rejected"),
                         ),
                         short_legs, long_legs, state,
+                        short_unresolved_submission_identities=(
+                            unresolved_short_submission_identities
+                        ),
+                        long_unresolved_submission_identities=(
+                            unresolved_long_submission_identities
+                        ),
                     )
                     break
                 except CompensationFailedError:
@@ -1144,6 +1275,13 @@ class CloseExecutor:
                 delay_s = self.config.close_chunk_min_interval_ms / 1000.0
                 await asyncio.sleep(delay_s)
 
+        any_short_uncertain = any_short_uncertain or bool(
+            unresolved_short_submission_identities
+        )
+        any_long_uncertain = any_long_uncertain or bool(
+            unresolved_long_submission_identities
+        )
+
         if not short_legs and not long_legs and not (any_short_uncertain or any_long_uncertain):
             self.journal.append(
                 "execution.close_failed",
@@ -1170,14 +1308,7 @@ class CloseExecutor:
             position,
             long_legs,
             short_legs,
-            unresolved_submission_legs=tuple(
-                leg_label
-                for leg_label, uncertain in (
-                    ("long", any_long_uncertain),
-                    ("short", any_short_uncertain),
-                )
-                if uncertain
-            ),
+            unresolved_submission_legs=unresolved_submission_legs(),
         )
         accounting_evidence_complete = not accounting_evidence_gaps
         if state is not None and not accounting_evidence_complete:
@@ -1193,6 +1324,12 @@ class CloseExecutor:
                 evidence_gaps=accounting_evidence_gaps,
                 long_unresolved_client_order_ids=tuple(unresolved_long_client_order_ids),
                 short_unresolved_client_order_ids=tuple(unresolved_short_client_order_ids),
+                long_unresolved_submission_identities=tuple(
+                    unresolved_long_submission_identities
+                ),
+                short_unresolved_submission_identities=tuple(
+                    unresolved_short_submission_identities
+                ),
             )
         residual = split_close_fill_residual(
             position, long_closed, short_closed,
@@ -1527,7 +1664,12 @@ class CloseExecutor:
                         "filled_at_ms": fill.filled_at_ms,
                     },
                 )
-                return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
+                return {
+                    "outcome": "filled",
+                    "fill": fill,
+                    "order_id": fill.order_id,
+                    "client_order_id": fill.client_order_id or request.client_order_id,
+                }
             else:
                 self.journal.append(
                     "order.uncertain",
@@ -1535,10 +1677,19 @@ class CloseExecutor:
                         "position_id": position_id,
                         "leg": leg,
                         "reason": "zero fill",
+                        "order_id": fill.order_id,
                         "client_order_id": request.client_order_id,
                     },
                 )
-                return {"outcome": "uncertain", "fill": None, "order_id": ""}
+                return {
+                    "outcome": "uncertain",
+                    "fill": None,
+                    "order_id": str(fill.order_id or ""),
+                    "client_order_id": (
+                        str(fill.client_order_id or "")
+                        or request.client_order_id
+                    ),
+                }
 
         except OrderSubmitError as e:
             req_ctx = RequestContext.from_order_request(request)
@@ -1564,19 +1715,29 @@ class CloseExecutor:
                 )
                 return {"outcome": "rejected", "fill": None, "reason": str(e), "order_id": ""}
             else:
+                accepted_order_id = str(getattr(e, "accepted_order_id", "") or "")
+                accepted_client_order_id = str(
+                    getattr(e, "accepted_client_order_id", "") or ""
+                )
                 self.journal.append(
                     "order.uncertain",
                     {
                         "position_id": position_id,
                         "leg": leg,
                         "reason": str(e),
+                        "order_id": accepted_order_id,
                         "client_order_id": request.client_order_id,
                         "exchange_error": evidence.to_dict(),
                         "request_context": req_ctx.to_dict(),
                         "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
-                return {"outcome": "uncertain", "fill": None, "order_id": ""}
+                return {
+                    "outcome": "uncertain",
+                    "fill": None,
+                    "order_id": accepted_order_id,
+                    "client_order_id": accepted_client_order_id or request.client_order_id,
+                }
 
         except Exception as e:
             req_ctx = RequestContext.from_order_request(request)
@@ -1598,7 +1759,12 @@ class CloseExecutor:
                     "evidence_completeness": evidence.evidence_completeness,
                 },
             )
-            return {"outcome": "uncertain", "fill": None, "order_id": ""}
+            return {
+                "outcome": "uncertain",
+                "fill": None,
+                "order_id": "",
+                "client_order_id": request.client_order_id,
+            }
 
     async def _submit_close_leg_with_retry(
         self,
@@ -1615,12 +1781,30 @@ class CloseExecutor:
         """
         retry_base_ms = 1000
         retry_max_ms = 10_000
+        unresolved_submission_identities: list[tuple[str, str]] = []
+
+        def record_uncertain_submission(result: dict[str, Any]) -> None:
+            if result.get("outcome") != "uncertain":
+                return
+            identity = (
+                str(result.get("order_id") or ""),
+                str(result.get("client_order_id") or request.client_order_id or ""),
+            )
+            if any(identity) and identity not in unresolved_submission_identities:
+                unresolved_submission_identities.append(identity)
+
+        def with_submission_history(result: dict[str, Any]) -> dict[str, Any]:
+            result["unresolved_submission_identities"] = tuple(
+                unresolved_submission_identities
+            )
+            return result
 
         for attempt in range(1, self.config.max_close_retries + 1):
             result = await self._submit_close_leg(request, position_id, leg, now_ms)
+            record_uncertain_submission(result)
 
             if result["outcome"] == "filled":
-                return result
+                return with_submission_history(result)
 
             if result["outcome"] == "rejected":
                 # V1: check for terminal reduce-only success (venue already flat)
@@ -1689,12 +1873,12 @@ class CloseExecutor:
                                     "reason": "duplicate_client_order_live_flat",
                                 },
                             )
-                            return {
+                            return with_submission_history({
                                 "outcome": "terminal_flat",
                                 "fill": None,
                                 "order_id": duplicate_reconcile.order_id,
                                 "reason": "duplicate_client_order_live_flat",
-                            }
+                            })
                         fill = OrderFill(
                             venue=request.venue,
                             symbol=request.symbol,
@@ -1726,7 +1910,9 @@ class CloseExecutor:
                                 "classification": duplicate_reconcile.classification,
                             },
                         )
-                        return {"outcome": "filled", "fill": fill, "order_id": fill.order_id}
+                        return with_submission_history({
+                            "outcome": "filled", "fill": fill, "order_id": fill.order_id,
+                        })
 
                     if (
                         duplicate_reconcile is not None
@@ -1765,12 +1951,12 @@ class CloseExecutor:
                                 "classification": duplicate_reconcile.classification,
                             },
                         )
-                        return {
+                        return with_submission_history({
                             "outcome": "filled",
                             "fill": fill,
                             "order_id": fill.order_id,
                             "reason": "duplicate_client_order_reconciled_partial",
-                        }
+                        })
 
                     if (
                         duplicate_reconcile is not None
@@ -1804,12 +1990,13 @@ class CloseExecutor:
                             ),
                         },
                     )
-                    return {
+                    return with_submission_history({
                         "outcome": "uncertain",
                         "fill": None,
                         "reason": reason,
                         "order_id": "",
-                    }
+                        "client_order_id": request.client_order_id,
+                    })
 
                 # --- Structured classification (Gate first, then generic) ---
                 error_class = _classify_close_leg_error(reason)
@@ -1841,11 +2028,11 @@ class CloseExecutor:
                                 "attempt": attempt,
                             },
                         )
-                        return {"outcome": "filled", "fill": OrderFill(
-                        venue=request.venue, symbol=request.symbol,
-                        side=request.side, quantity=0.0, price=0.0,
-                        order_id="terminal-flat",
-                    ), "order_id": "terminal-flat"}
+                        return with_submission_history({"outcome": "filled", "fill": OrderFill(
+                            venue=request.venue, symbol=request.symbol,
+                            side=request.side, quantity=0.0, price=0.0,
+                            order_id="terminal-flat",
+                        ), "order_id": "terminal-flat"})
 
                 if is_pending_conflict:
                     # V1: pending reduce-only conflict — not terminal, retry in next iteration
@@ -1877,8 +2064,8 @@ class CloseExecutor:
                         await asyncio.sleep(backoff_ms / 1000.0)
                         continue
                     # Max retries exhausted — return as rejected
-                    return result
-                return result
+                    return with_submission_history(result)
+                return with_submission_history(result)
 
             # Uncertain — retry with backoff if attempts remain
             if attempt < self.config.max_close_retries:
@@ -1895,7 +2082,12 @@ class CloseExecutor:
                 )
                 await asyncio.sleep(backoff_ms / 1000.0)
 
-        return {"outcome": "uncertain", "fill": None, "order_id": ""}
+        return with_submission_history({
+            "outcome": "uncertain",
+            "fill": None,
+            "order_id": "",
+            "client_order_id": request.client_order_id,
+        })
 
     # ------------------------------------------------------------------
     # V1 compensate_failed_full_close (exit.rs:1482-1601)
@@ -1911,6 +2103,9 @@ class CloseExecutor:
         short_legs: list[CloseExecutionLeg],
         long_legs: list[CloseExecutionLeg],
         state: Any | None = None,
+        *,
+        short_unresolved_submission_identities: list[tuple[str, str]] | None = None,
+        long_unresolved_submission_identities: list[tuple[str, str]] | None = None,
     ) -> None:
         """V1 compensate_failed_full_close (exit.rs:1482-1601).
 
@@ -1920,6 +2115,49 @@ class CloseExecutor:
         """
         residual_positions: list[dict[str, Any]] = []
         compensated_venues: list[str] = []
+        short_unresolved_submission_identities = (
+            short_unresolved_submission_identities
+            if short_unresolved_submission_identities is not None
+            else []
+        )
+        long_unresolved_submission_identities = (
+            long_unresolved_submission_identities
+            if long_unresolved_submission_identities is not None
+            else []
+        )
+
+        def retain_compensation_outcome(
+            venue: Venue,
+            outcome: CompensationCloseOutcome,
+        ) -> None:
+            target_legs = short_legs if venue == position.short_venue else long_legs
+            target_identities = (
+                short_unresolved_submission_identities
+                if venue == position.short_venue
+                else long_unresolved_submission_identities
+            )
+            existing_leg_keys = {
+                (
+                    leg.fill.order_id,
+                    leg.fill.client_order_id or leg.client_order_id,
+                    leg.fill.quantity,
+                    leg.fill.filled_at_ms,
+                )
+                for leg in target_legs
+            }
+            for leg in outcome.legs:
+                key = (
+                    leg.fill.order_id,
+                    leg.fill.client_order_id or leg.client_order_id,
+                    leg.fill.quantity,
+                    leg.fill.filled_at_ms,
+                )
+                if key not in existing_leg_keys:
+                    target_legs.append(leg)
+                    existing_leg_keys.add(key)
+            for identity in outcome.unresolved_submission_identities:
+                if any(identity) and identity not in target_identities:
+                    target_identities.append(identity)
 
         for venue, compensate_stage in [
             (position.short_venue, "exit_compensate_short"),
@@ -1974,19 +2212,20 @@ class CloseExecutor:
             quantity = abs(pos.quantity)
 
             # Tier 1: flatten with retries
-            fill_result = await self._flatten_close_leg_with_retries(
+            outcome = await self._flatten_close_leg_with_retries(
                 venue, position.symbol, quantity, cleanup_side,
                 position.position_id, compensate_stage,
             )
 
-            if fill_result is None:
+            if not outcome.exchange_flat:
                 # Tier 2: compensation hard stop
-                fill_result = await self._compensation_hard_stop_close_leg(
+                hard_stop_outcome = await self._compensation_hard_stop_close_leg(
                     venue, position.symbol, position.position_id,
                     compensate_stage,
                 )
+                _merge_compensation_outcome(outcome, hard_stop_outcome)
 
-            if fill_result is None:
+            if not outcome.exchange_flat:
                 # Both tiers failed — re-verify exchange position before FAIL_CLOSED.
                 # V1: compensate_failed_full_close (exit.rs:1482-1601) only enters
                 # fail_closed when there is confirmed residual exposure. If the
@@ -2000,6 +2239,8 @@ class CloseExecutor:
                     pass
 
                 if exchange_flat:
+                    outcome.exchange_flat = True
+                    retain_compensation_outcome(venue, outcome)
                     self.journal.append(
                         "exit.compensation_already_flat",
                         {
@@ -2014,6 +2255,10 @@ class CloseExecutor:
                     continue
 
                 # Confirmed residual exposure → FAIL_CLOSED
+                # Preserve every accepted/uncertain compensation identity before
+                # propagating the failure so the fail-closed reconciliation path
+                # can account for any fill that reached the exchange.
+                retain_compensation_outcome(venue, outcome)
                 if state is not None:
                     enter_fail_closed(state)
                     state.last_error = (
@@ -2039,18 +2284,11 @@ class CloseExecutor:
                     f" on {venue.value}"
                 )
 
-            # Compensation succeeded — record the fill leg
-            fill, client_order_id, submit_ms = fill_result
+            # Compensation succeeded or the exchange independently proved flat.
+            # Record all partial/full fills and all unconfirmed submissions; a
+            # later retry or flat probe cannot make an earlier ACK disappear.
+            retain_compensation_outcome(venue, outcome)
             compensated_venues.append(venue.value)
-            leg = CloseExecutionLeg(
-                fill=fill,
-                client_order_id=client_order_id,
-                submit_started_at_ms=submit_ms,
-            )
-            if venue == position.short_venue:
-                short_legs.append(leg)
-            else:
-                long_legs.append(leg)
 
         self.journal.append(
             "exit.compensated",
@@ -2069,15 +2307,17 @@ class CloseExecutor:
     async def _compensate_close_leg_exposure(
         self, venue: Venue, symbol: str, quantity: float,
         side: Side, position_id: str, stage: str,
-    ) -> tuple[OrderFill, str, int] | None:
+    ) -> CompensationCloseOutcome:
         """Single-shot reduce-only close for compensation flatten.
 
-        Returns (fill, client_order_id, submit_started_at_ms) or None.
+        Preserves confirmed fills and unconfirmed exact identities separately.
+        The caller uses ``exchange_flat`` only for exposure safety; it must not
+        treat a flat probe as permission to discard an accepted order ACK.
         """
 
         adapter = self.adapters.get(venue)
         if adapter is None:
-            return None
+            return CompensationCloseOutcome()
 
         client_order_id = compact_client_order_id(
             position_id, f"{stage}:{symbol}",
@@ -2090,10 +2330,43 @@ class CloseExecutor:
             time_in_force=TimeInForce.IOC,
             client_order_id=client_order_id,
         )
+        outcome = CompensationCloseOutcome()
+
+        def add_fill(fill: OrderFill, fill_client_order_id: str) -> None:
+            if fill.quantity <= 1e-12:
+                _record_compensation_submission_identity(
+                    outcome,
+                    fill.order_id,
+                    fill.client_order_id or fill_client_order_id,
+                )
+                return
+            outcome.legs.append(CloseExecutionLeg(
+                fill=fill,
+                client_order_id=fill_client_order_id,
+                submit_started_at_ms=submit_ms,
+            ))
+
+        async def verify_exchange_flat() -> bool:
+            try:
+                verify_pos = await adapter.fetch_position(symbol)
+            except Exception:
+                return False
+            outcome.exchange_flat = (
+                verify_pos is None or abs(verify_pos.quantity) <= 1e-9
+            )
+            return outcome.exchange_flat
 
         try:
             fill = await adapter.place_order(req)
         except Exception as exc:
+            accepted_order_id = str(getattr(exc, "accepted_order_id", "") or "")
+            accepted_client_order_id = str(
+                getattr(exc, "accepted_client_order_id", "") or client_order_id
+            )
+            if accepted_order_id or order_error_may_have_created_exposure(exc):
+                _record_compensation_submission_identity(
+                    outcome, accepted_order_id, accepted_client_order_id,
+                )
             if venue == Venue.BYBIT and _is_bybit_duplicate_order_link_id(str(exc)):
                 duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
                     adapter=adapter,
@@ -2129,7 +2402,10 @@ class CloseExecutor:
                         "original_error": str(exc),
                     },
                 )
-                if duplicate_reconcile.clear_state and duplicate_reconcile.reconciled_qty > 1e-9:
+                duplicate_client_order_id = (
+                    duplicate_reconcile.client_order_id or client_order_id
+                )
+                if duplicate_reconcile.reconciled_qty > 1e-9:
                     fill = OrderFill(
                         venue=venue,
                         symbol=symbol,
@@ -2137,10 +2413,19 @@ class CloseExecutor:
                         quantity=duplicate_reconcile.reconciled_qty,
                         price=duplicate_reconcile.average_price or 0.0,
                         order_id=duplicate_reconcile.order_id,
-                        client_order_id=duplicate_reconcile.client_order_id,
+                        client_order_id=duplicate_client_order_id,
                         filled_at_ms=submit_ms,
                     )
-                    return (fill, client_order_id, submit_ms)
+                    add_fill(fill, duplicate_client_order_id)
+                elif duplicate_reconcile.order_id:
+                    _record_compensation_submission_identity(
+                        outcome,
+                        duplicate_reconcile.order_id,
+                        duplicate_client_order_id,
+                    )
+                if duplicate_reconcile.clear_state:
+                    outcome.exchange_flat = True
+                    return outcome
                 if duplicate_reconcile.should_retry_with_new_client_id:
                     retry_client_order_id = compact_client_order_id(
                         position_id, f"{stage}:duplicate_retry:{symbol}",
@@ -2152,38 +2437,49 @@ class CloseExecutor:
                     )
                     try:
                         retry_fill = await adapter.place_order(retry_req)
-                    except Exception:
-                        pass
+                    except Exception as retry_exc:
+                        retry_order_id = str(
+                            getattr(retry_exc, "accepted_order_id", "") or ""
+                        )
+                        retry_client_id = str(
+                            getattr(
+                                retry_exc, "accepted_client_order_id", ""
+                            ) or retry_client_order_id
+                        )
+                        if (
+                            retry_order_id
+                            or order_error_may_have_created_exposure(retry_exc)
+                        ):
+                            _record_compensation_submission_identity(
+                                outcome, retry_order_id, retry_client_id,
+                            )
                     else:
+                        add_fill(retry_fill, retry_client_order_id)
                         if retry_fill.quantity >= duplicate_reconcile.retry_qty - 1e-9:
-                            return (retry_fill, retry_client_order_id, submit_ms)
+                            outcome.exchange_flat = True
+                            return outcome
+                        if await verify_exchange_flat():
+                            return outcome
 
-            # Order may have created exposure — check if position is now flat
-            try:
-                verify_pos = await adapter.fetch_position(symbol)
-                if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
-                    return None  # Already flat, no fill to record
-            except Exception:
-                pass
-            return None
+            # Order may have created exposure — retain its identity and report
+            # the current position truth independently of accounting evidence.
+            await verify_exchange_flat()
+            return outcome
 
+        add_fill(fill, client_order_id)
         if fill.quantity >= quantity - 1e-9:
-            return (fill, client_order_id, submit_ms)
+            outcome.exchange_flat = True
+            return outcome
 
-        # Partial fill — re-verify flatness
-        try:
-            verify_pos = await adapter.fetch_position(symbol)
-            if verify_pos is None or abs(verify_pos.quantity) <= 1e-9:
-                return (fill, client_order_id, submit_ms)  # Flat despite partial fill
-        except Exception:
-            pass
-
-        return None  # Position not flat after partial fill
+        # Partial or zero-fill ACK — re-verify flatness while retaining what the
+        # adapter returned. A later retry must not overwrite this evidence.
+        await verify_exchange_flat()
+        return outcome
 
     async def _flatten_close_leg_with_retries(
         self, venue: Venue, symbol: str, quantity: float,
         side: Side, position_id: str, stage: str,
-    ) -> tuple[OrderFill, str, int] | None:
+    ) -> CompensationCloseOutcome:
         """V1 flatten_single_leg_with_retries_collect (entry.rs:2711-2801).
 
         Retries flatten up to _MAX_EMERGENCY_FLATTEN_ATTEMPTS, re-fetching
@@ -2191,18 +2487,20 @@ class CloseExecutor:
         """
         adapter = self.adapters.get(venue)
         if adapter is None:
-            return None
+            return CompensationCloseOutcome()
 
         retry_quantity = quantity
         retry_side = side
+        outcome = CompensationCloseOutcome()
 
         for attempt in range(1, _MAX_EMERGENCY_FLATTEN_ATTEMPTS + 1):
-            result = await self._compensate_close_leg_exposure(
+            attempt_outcome = await self._compensate_close_leg_exposure(
                 venue, symbol, retry_quantity, retry_side,
                 position_id, f"{stage}_attempt_{attempt}",
             )
-            if result is not None:
-                return result
+            _merge_compensation_outcome(outcome, attempt_outcome)
+            if outcome.exchange_flat:
+                return outcome
 
             if attempt < _MAX_EMERGENCY_FLATTEN_ATTEMPTS:
                 # Re-fetch position for next retry
@@ -2212,16 +2510,17 @@ class CloseExecutor:
                     continue
 
                 if pos is None or abs(pos.quantity) <= 1e-9:
-                    return None  # Already flat
+                    outcome.exchange_flat = True
+                    return outcome
 
                 retry_quantity = abs(pos.quantity)
                 retry_side = pos.side.opposite()
 
-        return None
+        return outcome
 
     async def _compensation_hard_stop_close_leg(
         self, venue: Venue, symbol: str, position_id: str, stage: str,
-    ) -> tuple[OrderFill, str, int] | None:
+    ) -> CompensationCloseOutcome:
         """V1 compensation_hard_stop_failed_leg_exposure_collect (entry.rs:2828-2909).
 
         Delay, re-fetch position, then single-shot flatten.
@@ -2230,15 +2529,15 @@ class CloseExecutor:
 
         adapter = self.adapters.get(venue)
         if adapter is None:
-            return None
+            return CompensationCloseOutcome()
 
         try:
             pos = await adapter.fetch_position(symbol)
         except Exception:
-            return None
+            return CompensationCloseOutcome()
 
         if pos is None or abs(pos.quantity) <= 1e-9:
-            return None  # Already flat
+            return CompensationCloseOutcome(exchange_flat=True)
 
         cleanup_side = pos.side.opposite()
         quantity = abs(pos.quantity)
