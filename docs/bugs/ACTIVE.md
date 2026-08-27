@@ -34,19 +34,17 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `67e5c66b4721bba21c6c05cd05e7e78ec0c6d4d8`
-- Checked on: `2026-08-22` after the CL-123/CL-124 closure deployments. Remote
-  compileall and the 427-file manifest passed all 14 critical hashes; singleton
-  reported exactly one live and one sidecar process, both active with zero
-  restarts. Deployment health was fully green (`ok=true`, zero warnings), and
-  high-confidence truth across all seven venues reported zero positions, zero
-  open orders, and no missing evidence or mismatch. COTI and ONG each emitted
-  exactly one `exit.reconciled` from `automatic_historical_close_evidence` with
-  complete exact order/fill/fee evidence; the persisted close-owner,
-  reconciliation, and evidence-debt counts are now zero. A subsequent restart
-  emitted no duplicate reconciliation. The final natural Local-L2/startup
-  sample reported `unmapped_event_kinds=[]`, no diagnostic blockers, and
-  `RUNNING_CLEAN`. CL-121 still needs a natural targeted-OI 429 sample.
+- Last production SHA checked: `f390fbdfda597d234d6012b94f2635aa8634d355`
+- Checked on: `2026-08-26`. The remote `.deploy_version` and Git HEAD matched
+  `f390fbdf`; the live and sidecar services had zero restarts. High-confidence
+  truth across all seven venues reported zero positions and zero open orders.
+  This was not a green deployment acceptance: the sidecar had 41 `CLOSE_WAIT`
+  sockets (36 mapped to OKX), and the current OKX quote/funding source was
+  stale, safely blocking affected candidates as `quote_stale`. This evidence
+  opened CL-125. Three physically-flat close-evidence debts remain accounting
+  work and do not authorize a position or order conclusion. The local fixes in
+  `ac9d536` for CL-125 through CL-128 are not deployed yet. CL-121 still needs
+  a natural targeted-OI 429 sample.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -90,6 +88,10 @@ do not rewrite the daily evidence just to change status.
 | CL-122 | closed | `2377193c` | all `_dispatch_entry` false-return boundaries feed one Counter; initial-ledger, downstream no-quote, selected-dispatch, and `scan.no_entry_diagnostics` regressions; full suite/profile green | Production run `lightfee-1787395032184-4057959` naturally selected ONG, dispatched zero, and emitted `entry_dispatch_blocked_counts={recovery_ledger_blocked:1}`, the same final-gate count, and `candidate_stage_blocked_counts.entry_dispatch=1`; later CL-119 closure removed the false blocker without changing diagnostics. | [2026-08-22](daily/2026-08-22.md#cluster-cl-122-final-entry-dispatch-blocker-observability) |
 | CL-123 | closed | `194861c` | real `CloseRuntime` → Binance/Bybit history → exact order/execution → billing regressions cover COTI/ONG, stale CID fallback, Hedge/One-way semantics, pagination, ambiguity, incomplete fees, mismatched/unrelated execution identity, and live-truth blockers (dedicated `11 passed`; related selection `191 passed, 338 deselected`); complete suite `4411 passed, 9 skipped`; full profile 10/10 with `1571` tests | Deployed in `62474b39` and retained in `67e5c66b`. COTI reconciled Binance order `7918051356`, fee `0.01213439`; ONG reconciled Binance `2926675711`, fee `0.00473472`, and Bybit `9cec8c96-dc21-4c31-baf9-ec43f6184195`, fee `0.0144743`. Both events have `venue_statement_reconciled=true`, `evidence_gap=false`; owners/debts are zero and all seven venues remain flat/no-order. | [2026-08-22](daily/2026-08-22.md#cluster-cl-123-automatic-historical-close-evidence-exact-recheck) |
 | CL-124 | closed | `67e5c66b` | production-shaped `diagnose_live` RED/GREEN covers account-fee success/unavailable, exact Local-L2 phase start/complete, and the shared `runtime.local_l2_*` / `runtime.entry_local_l2_*` diagnostic families; lifecycle/diagnose suite `135 passed`; complete suite `4412 passed, 9 skipped` | Initial exact-only attempt `ebecc081` left nine natural Local-L2 kinds unmapped and was not accepted as closed. `67e5c66b` is deployed: the same natural startup/Local-L2 family now yields `unmapped_event_kinds=[]`; health/gate are green, services have zero restarts, and seven-venue truth is flat/no-order. | [2026-08-22](daily/2026-08-22.md#cluster-cl-124-startup-local-l2-lifecycle-diagnostic-mapping) |
+| CL-125 | local-green | `ac9d536` | real `fetch_funding_tickers` slow-transport RED/GREEN: V1 four-request ceiling, miss rotation, normal completion/no aggregate cancellation, parent-cancellation child cleanup, partial-failure quote preservation; full profile 10/10 green | deployment required: OKX source fresh, `quote_stale` releases, sidecar `CLOSE_WAIT` stays below threshold without growth | [2026-08-26](daily/2026-08-26.md#cluster-cl-125-okx-funding-fanout-aggregate-cancellation) |
+| CL-126 | local-green | `ac9d536` | ACK/retry/compensation identity persistence, strict-history complete/temporary failure, and crash replay matrix (`349 passed` in close scope; full profile 10/10 green) | deploy without creating orders; existing COTI×2/BTR debts must retain visible `irrecoverable_audit_debt` or resolve only from exact evidence, and new natural closes must retain ACK IDs | [2026-08-27](daily/2026-08-27.md#cl-126-passive-close-ack-identity-loss-and-stranded-evidence-debt) |
+| CL-127 | local-green | `ac9d536` | fresh writer + stale/degraded quote/funding/liquidity source matrix; live-config budget wiring (`223 passed` health/sidecar/diagnose selection; full profile 10/10 green) | deployment acceptance must reject stale/degraded raw source evidence even when wrapper snapshot publication is fresh | [2026-08-27](daily/2026-08-27.md#cl-127-sidecar-health-false-green-on-stale-source-evidence) |
+| CL-128 | local-green | `ac9d536` | rotated-only event, duplicate rotation, global cap, high-confidence `since-deploy`, and large-tail counterexamples (`117 passed`; full profile 10/10 green) | deployed diagnosis must enumerate rotations, report scope/cap metadata, and retain current-window event truth | [2026-08-27](daily/2026-08-27.md#cl-128-diagnosis-omitted-rotated-journals-and-drifted-ledger) |
 
 ## Pre-CL-093 Historical Boundary
 

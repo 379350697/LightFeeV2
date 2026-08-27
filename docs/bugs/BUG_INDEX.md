@@ -22,6 +22,41 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Investigations
 
+CL-128 rotated-journal diagnosis and ledger drift, 2026-08-27: the diagnostic
+only read `*.jsonl`, silently omitting `live-events.jsonl.1` and other
+rotations; its old tail fallback could then read the beginning rather than the
+latest high-confidence deployment window. `ac9d536` puts discovery, reverse
+bounded reading, global cap, exact-record de-duplication, and scope reporting
+at the single journal-read boundary. It is **local-green, deployment pending**;
+see [CL-128](daily/2026-08-27.md#cl-128-diagnosis-omitted-rotated-journals-and-drifted-ledger).
+
+CL-127 source-freshness health false-green, 2026-08-27: the deployment gate
+treated a newly written wrapper snapshot as healthy without checking whether
+the quote/funding/liquidity evidence it carried was stale or degraded.
+`ac9d536` shares the existing entry policy's per-domain budgets with health
+and rejects missing, stale, unavailable, or explicitly degraded source rows.
+It is **local-green, deployment pending**; see
+[CL-127](daily/2026-08-27.md#cl-127-sidecar-health-false-green-on-stale-source-evidence).
+
+CL-126 close ACK identity and audit-debt terminality, 2026-08-27: accepted
+close IDs could be lost from the owning leg, and a completed strict history
+miss could retry forever. `ac9d536` persists every ACK identity at its leg,
+recovers it after a crash, uses a strict exact-history fallback only when
+allowed, and makes deterministic misses visible `irrecoverable_audit_debt`
+instead of retrying, guessing PnL, or changing exposure. It is **local-green,
+deployment pending**; see
+[CL-126](daily/2026-08-27.md#cl-126-passive-close-ack-identity-loss-and-stranded-evidence-debt).
+
+CL-125 OKX funding fanout aggregate cancellation, 2026-08-26: a previous V2
+"fast snapshot" repair had diverged from V1's four-request cold-cache fallback
+contract: it widened the fanout to 40 then canceled the entire batch after
+0.2 seconds. The production sidecar retained 36 OKX `CLOSE_WAIT` sockets and
+the resulting stale OKX quote/funding data safely blocked affected candidates.
+The repair retains the cache and symbol fixes, restores the four-request bound,
+rotates cache misses for V2, and forbids ordinary aggregate cancellation of
+in-flight HTTP enrichment. It is **local-green, deployment pending**; see
+[CL-125](daily/2026-08-26.md#cluster-cl-125-okx-funding-fanout-aggregate-cancellation).
+
 CL-123 automatic historical close evidence, 2026-08-22: COTI and ONG were
 physically flat/no-order but remained accounting debts even though read-only
 history could uniquely identify their closes. The earlier Binance discovery
