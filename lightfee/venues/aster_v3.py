@@ -50,6 +50,7 @@ ASTER_V3_DOC_URL = (
 )
 
 ASTER_V3_ORDER_PATH = "/fapi/v3/order"
+ASTER_V3_USER_TRADES_PATH = "/fapi/v3/userTrades"
 ASTER_V3_OPEN_ORDERS_PATH = "/fapi/v3/openOrders"
 ASTER_V3_POSITION_PATH = "/fapi/v3/positionRisk"
 ASTER_V3_POSITION_MODE_PATH = "/fapi/v3/positionSide/dual"

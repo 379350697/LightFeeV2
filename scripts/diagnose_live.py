@@ -54,6 +54,12 @@ from lightfee.engine.v1_lifecycle_closure import (
     map_lifecycle_event_kind,
 )
 from lightfee.offline.analysis.journal import summarize_quick_flat_events
+from lightfee.ops.production_health import (
+    HealthReport,
+    analyze_sidecar_snapshot,
+    config_path_from_systemd_unit,
+    sidecar_freshness_policy,
+)
 from lightfee.ops.position_side_semantics import side_matches_business_leg
 from lightfee.venues.specs import VenueOperation
 
@@ -69,6 +75,8 @@ FALLBACK_STATE_FILE = "state-current.json"
 DEFAULT_DEPLOY_FILE = ".deploy_version"
 DEFAULT_UNIT_DIR = "/etc/systemd/system"
 DEFAULT_MAX_EVENTS = 50_000
+DEFAULT_SNAPSHOT_MAX_AGE_MS = 60_000
+DEFAULT_SIDECAR_SNAPSHOT_FILE = "opportunity-input-snapshot.json"
 SERVICE_NAMES = ["lightfee-live.service", "lightfee-sidecar.service"]
 DEFAULT_EXCHANGE_TRUTH_VENUES = [
     "binance",
@@ -626,6 +634,93 @@ def _build_health(state: dict[str, Any], service_status: dict[str, Any]) -> dict
         "critical_count": critical,
         "warning_count": warning,
         "fingerprints": fingerprints,
+    }
+
+
+def _merge_health_report(health: dict[str, Any], report: HealthReport) -> None:
+    if report.ok:
+        return
+    fingerprints = health.setdefault("fingerprints", [])
+    for fingerprint in report.fingerprints:
+        if fingerprint not in fingerprints:
+            fingerprints.append(fingerprint)
+    if report.severity == "critical":
+        health["critical_count"] = int(health.get("critical_count", 0) or 0) + 1
+        health["ok"] = False
+    else:
+        health["warning_count"] = int(health.get("warning_count", 0) or 0) + 1
+
+
+def _build_sidecar_snapshot_health(
+    *,
+    runtime_dir: str,
+    unit_dir: str,
+    snapshot_path: str,
+    config_path: str,
+    now_ms: int,
+) -> tuple[HealthReport | None, dict[str, Any]]:
+    resolved_snapshot = Path(snapshot_path) if snapshot_path else (
+        Path(runtime_dir) / DEFAULT_SIDECAR_SNAPSHOT_FILE
+    )
+    required = bool(snapshot_path) or (
+        os.path.abspath(runtime_dir) == os.path.abspath(DEFAULT_RUNTIME_DIR)
+    )
+    if not resolved_snapshot.exists():
+        if required:
+            report = HealthReport(
+                name="sidecar_snapshot",
+                ok=False,
+                severity="critical",
+                fingerprints=["snapshot_file_missing"],
+                details={"path": str(resolved_snapshot)},
+            )
+            return report, {
+                "checked": True,
+                "path": str(resolved_snapshot),
+                "ok": False,
+                "fingerprints": report.fingerprints,
+                "details": report.details,
+            }
+        return None, {
+            "checked": False,
+            "path": str(resolved_snapshot),
+            "reason": "snapshot_not_present_in_nonproduction_runtime_dir",
+        }
+
+    configured_path = config_path or config_path_from_systemd_unit(
+        _try_read_unit(unit_dir, "lightfee-live.service")
+    )
+    policy_report, limits = sidecar_freshness_policy(configured_path)
+    if not configured_path and not required:
+        policy_report = HealthReport(
+            name="sidecar_freshness_policy",
+            ok=True,
+            details={"source": "diagnose_nonproduction_fallback"},
+        )
+        limits = {}
+    if not policy_report.ok:
+        return policy_report, {
+            "checked": True,
+            "path": str(resolved_snapshot),
+            "ok": False,
+            "fingerprints": policy_report.fingerprints,
+            "details": policy_report.details,
+        }
+    report = analyze_sidecar_snapshot(
+        _read_json(resolved_snapshot),
+        now_ms=now_ms,
+        max_age_ms=limits.get("market", DEFAULT_SNAPSHOT_MAX_AGE_MS),
+        max_quote_age_ms=limits.get("quote"),
+        max_funding_age_ms=limits.get("funding"),
+        max_liquidity_age_ms=limits.get("liquidity"),
+    )
+    return report, {
+        "checked": True,
+        "path": str(resolved_snapshot),
+        "ok": report.ok,
+        "fingerprints": report.fingerprints,
+        "details": report.details,
+        "freshness_policy": policy_report.details,
     }
 
 
@@ -5055,6 +5150,7 @@ def run_diagnose(
     current_state_path: str = "",
     event_paths: list[str] | None = None,
     snapshot_path: str = "",
+    config_path: str = "",
     symbol: str = "",
     max_events: int = DEFAULT_MAX_EVENTS,
     now_ms: int = 0,
@@ -5110,6 +5206,15 @@ def run_diagnose(
         all_events = [e for e in all_events if _event_matches_scope(e, symbol, venues)]
 
     health = _build_health(state, service_status)
+    sidecar_health_report, sidecar_snapshot_health = _build_sidecar_snapshot_health(
+        runtime_dir=runtime_dir,
+        unit_dir=unit_dir,
+        snapshot_path=snapshot_path,
+        config_path=config_path,
+        now_ms=generated_at_ms,
+    )
+    if sidecar_health_report is not None:
+        _merge_health_report(health, sidecar_health_report)
     local_state = _build_local_state(state, all_events)
 
     pos_symbols: list[str] = []
@@ -5250,6 +5355,7 @@ def run_diagnose(
         "service_status": service_status,
         "window": window,
         "health": health,
+        "sidecar_snapshot_health": sidecar_snapshot_health,
         "lifecycle": str(state.get("lifecycle", "unknown")),
         "risk_mode": str(state.get("risk_mode", "unknown")),
         "local_state": local_state,
@@ -5680,6 +5786,8 @@ def main() -> None:
                        help="Specific event file(s); auto-discovered if omitted")
     parser.add_argument("--snapshot", type=str, default="",
                        help="Path to opportunity-input-snapshot.json")
+    parser.add_argument("--config", type=str, default="",
+                       help="Live TOML config; defaults to --config from lightfee-live.service")
     parser.add_argument("--unit-dir", type=str, default=DEFAULT_UNIT_DIR,
                        help="Systemd unit directory (default: {})".format(DEFAULT_UNIT_DIR))
     parser.add_argument("--max-events", type=int, default=DEFAULT_MAX_EVENTS,
@@ -5705,6 +5813,7 @@ def main() -> None:
         current_state_path=args.current_state,
         event_paths=args.events,
         snapshot_path=args.snapshot,
+        config_path=args.config,
         symbol=args.symbol,
         max_events=args.max_events,
         now_ms=args.now_ms,

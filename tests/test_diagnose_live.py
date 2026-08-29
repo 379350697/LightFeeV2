@@ -274,6 +274,67 @@ def test_run_diagnose_active_balanced_position_is_not_high_risk(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_rejects_fresh_wrapper_with_degraded_source(monkeypatch):
+    """A newly written snapshot must not hide a degraded venue source."""
+    from scripts import diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        now_ms = 1_700_000_005_000
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_entry_count": 0,
+            "pending_close_count": 0,
+            "last_tick_ms": now_ms,
+        })
+        _write_json(os.path.join(d, "opportunity-input-snapshot.json"), {
+            "published_at_ms": now_ms,
+            "market_observed_at_ms": now_ms,
+            "quotes": {
+                "aster:COTIUSDT": {
+                    "venue": "aster",
+                    "observed_at_ms": now_ms,
+                    "bid": 0.01,
+                    "ask": 0.011,
+                }
+            },
+            "degraded_venues": ["aster"],
+        })
+        unit_dir = os.path.join(d, "units")
+        os.mkdir(unit_dir)
+        config_path = str(
+            Path(__file__).resolve().parents[1] / "config" / "example.toml"
+        )
+        Path(unit_dir, "lightfee-live.service").write_text(
+            "[Service]\n"
+            f"ExecStart=/opt/lightfee-v2/.venv/bin/python -m lightfee "
+            f"--config {config_path}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(dl, "_build_exchange_truth", _balanced_active_exchange_truth)
+
+        result = dl.run_diagnose(
+            runtime_dir=d,
+            unit_dir=unit_dir,
+            now_ms=now_ms,
+        )
+
+        assert result["health"]["ok"] is False
+        assert "snapshot_source_degraded:aster" in result["health"]["fingerprints"]
+        assert result["sidecar_snapshot_health"]["ok"] is False
+        assert (
+            result["sidecar_snapshot_health"]["freshness_policy"]["config_path"]
+            == config_path
+        )
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
     from scripts.diagnose_live import _build_production_acceptance_gate
 

@@ -52,6 +52,24 @@ SHA, or when a row marked deployed/closed names a fix that is absent from the
 recorded deployment. Update this file after a deployment or production check;
 do not rewrite the daily evidence just to change status.
 
+## Uncommitted Working-Tree Repairs
+
+The following repairs are deliberately not rows in the deployment table until
+they have a fixing commit. They are **local-green only**, not production facts:
+
+- Aster V3 strict historical close discovery and the one-time reactivation of
+  legacy `history_discovery_unsupported` debt;
+- exclusion of terminal automatic-history audit debt from recovery probe symbol
+  projections;
+- source-health inspection in `diagnose_live`, using the same config budgets as
+  the deployment verifier; and
+- exact Tailscale Quad100 resolver recognition.
+
+Their contract, rejected prior repair patterns, counterexamples, and local
+evidence are recorded in [2026-08-29](daily/2026-08-29.md). They must not be
+called deployed or closed until this table receives real fixing commits and a
+production observation.
+
 ## Current Batch
 
 | ID | Status | Fix commit | Regression evidence | Production evidence / next condition | History |

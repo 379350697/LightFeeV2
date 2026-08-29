@@ -12,6 +12,24 @@ from lightfee.core.domain import OrderFill, PassiveOrderState, Side, Venue
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
+AUTOMATIC_HISTORY_TERMINAL_STATUS = "irrecoverable_audit_debt"
+
+
+def is_terminal_automatic_history_evidence_debt(pending: Any) -> bool:
+    """Return whether a close debt is terminal accounting-only work.
+
+    This status records that position and order truth were already resolved,
+    while automatic historical evidence reached a strict terminal result.  It
+    must remain visible to accounting, but cannot justify recovery probes.
+    """
+    return (
+        isinstance(pending, dict)
+        and pending.get("reconciliation_status") == "evidence_debt"
+        and pending.get("automatic_history_terminal_status")
+        == AUTOMATIC_HISTORY_TERMINAL_STATUS
+    )
+
+
 @dataclass
 class OpenPosition:
     position_id: str

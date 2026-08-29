@@ -2944,6 +2944,40 @@ class TestRuntimePreflight:
                 "pending_close_reconciliation": ["COTIUSDT", "ONGUSDT"],
             }
 
+    def test_terminal_history_debt_is_excluded_from_all_recovery_position_probes(self):
+        """V1 treats terminal accounting debt as background-only work."""
+        with tempfile.TemporaryDirectory() as td:
+            runtime = LiveRuntime(make_test_config(td))
+            runtime.state.set_pending_close_reconciliations([
+                {
+                    "position_id": "terminal-audit-debt",
+                    "symbol": "ONGUSDT",
+                    "long_venue": "aster",
+                    "short_venue": "binance",
+                    "reconciliation_status": "evidence_debt",
+                    "automatic_history_terminal_status": "irrecoverable_audit_debt",
+                    "automatic_history_terminal_reason": "ambiguous_candidates",
+                }
+            ])
+
+            assert runtime._startup_position_probe_symbols({}) == []
+            assert runtime._startup_recovery_ledger_symbols({}) == []
+            assert runtime._truth_required_recovery_probe_symbol_sources([]) == {}
+
+            runtime._refresh_recovery_ledger_from_exchange_truth(
+                {
+                    "truth_scope": "account",
+                    "truth_supported": True,
+                    "truth_available": True,
+                    "positions": [],
+                    "open_orders": [],
+                },
+                now_ms=1_000,
+            )
+
+            assert runtime.recovery_ledger.work_items[0].blocking is False
+            assert runtime._truth_required_recovery_probe_symbol_sources([]) == {}
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("slow_probe", "expected_classification"),

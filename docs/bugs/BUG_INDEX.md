@@ -22,6 +22,24 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Investigations
 
+2026-08-29 uncommitted repair batch: Aster V3 historical close discovery was
+missing, so a uniquely reconstructable Aster debt was terminalized as
+unsupported; terminal accounting-only debt also continued to seed recovery
+position probes. `diagnose_live` separately failed to inspect the same
+source-health payload already used by deployment acceptance, and the resolver
+allowlist misclassified Tailscale Quad100 as untrusted. The working-tree repair
+uses strict V3 user-trades candidate grouping plus exact-order/complete-fee
+recheck, reactivates only the obsolete unsupported-capability terminal reason,
+removes only terminal audit debt from recovery symbols, shares the health
+policy/analyzer, and accepts only the two exact Quad100 addresses. It is
+**local-green, not committed or deployed**; see
+[2026-08-29](daily/2026-08-29.md).
+
+The initial local Aster implementation briefly reused a broad passive-order
+status compatibility mapping for strict billing evidence. That local-only
+review regression is corrected: only V3 `FILLED` can settle historical audit
+evidence; undocumented terminal-like values remain visible debt.
+
 CL-128 rotated-journal diagnosis and ledger drift, 2026-08-27: the diagnostic
 only read `*.jsonl`, silently omitting `live-events.jsonl.1` and other
 rotations; its old tail fallback could then read the beginning rather than the

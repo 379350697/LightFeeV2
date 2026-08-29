@@ -28,6 +28,7 @@ from lightfee.venues.bybit import (
     BybitAdapter,
     find_bybit_historical_close_order_candidates,
 )
+from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.transport import LiveCredential
 
 
@@ -296,6 +297,190 @@ async def test_coti_debt_unique_binance_history_exactly_rechecks_and_reconciles(
         "system_client_id_execution"
     )
     assert payload["venue_statement_reconciled"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("order_status", "expected_reconciled"),
+    [
+        ("FILLED", True),
+        ("CLOSED", False),
+        ("FINISHED", False),
+        ("COMPLETED", False),
+        ("DONE", False),
+    ],
+)
+async def test_aster_debt_requires_documented_filled_order_for_exact_recheck(
+    order_status: str,
+    expected_reconciled: bool,
+):
+    """Only Aster's documented final order status can settle live audit debt."""
+    snapshot = _snapshot(
+        position_id="entry-aster-history",
+        symbol="COTIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=2400.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    aster = AsterAdapter()
+    aster._private = MagicMock()
+    aster.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.ASTER,
+            symbol="COTIUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    aster.fetch_open_orders = AsyncMock(return_value=[])
+    seen: list[str] = []
+
+    async def request(_method: str, path: str, **kwargs):
+        seen.append(path)
+        if path == "/fapi/v3/userTrades":
+            assert kwargs["params"]["symbol"] == "COTIUSDT"
+            assert kwargs["params"]["limit"] == 1000
+            return [
+                {
+                    "symbol": "COTIUSDT",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "orderId": "aster-close-1",
+                    "clientOrderId": "lfxs-aster-close-1",
+                    "qty": "1200",
+                    "price": "0.010112",
+                    "commission": "-0.004",
+                    "commissionAsset": "USDT",
+                    "time": NOW_MS - 59_100,
+                },
+                {
+                    "symbol": "COTIUSDT",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "orderId": "aster-close-1",
+                    "clientOrderId": "lfxs-aster-close-1",
+                    "qty": "1200",
+                    "price": "0.010112",
+                    "commission": "-0.00813439",
+                    "commissionAsset": "USDT",
+                    "time": NOW_MS - 59_000,
+                },
+            ]
+        if path == "/fapi/v3/order":
+            assert kwargs["params"] == {
+                "symbol": "COTIUSDT",
+                "orderId": "aster-close-1",
+            }
+            return {
+                "symbol": "COTIUSDT",
+                "side": "BUY",
+                "positionSide": "SHORT",
+                "status": order_status,
+                "executedQty": "2400",
+                "avgPrice": "0.010112",
+                "orderId": "aster-close-1",
+                "clientOrderId": "lfxs-aster-close-1",
+                "updateTime": NOW_MS - 59_000,
+            }
+        raise AssertionError(path)
+
+    aster._private._request = AsyncMock(side_effect=request)
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert seen == ["/fapi/v3/userTrades", "/fapi/v3/order"]
+    payload = _critical_payload(ctx, "exit.reconciled")
+    if expected_reconciled:
+        assert ctx.state.pending_close_reconciliations == []
+        assert payload is not None
+        assert payload["short_order_id"] == "aster-close-1"
+        assert payload["segment_exit_fee_quote"] == pytest.approx(0.01213439)
+        assert payload["historical_evidence_resolution"]["short"]["provenance"] == (
+            "aster_v3_user_trades_exact_order"
+        )
+    else:
+        assert ctx.state.pending_close_reconciliations == [task]
+        assert payload is None
+        assert task["automatic_history_terminal_reason"] == (
+            "exact_recheck_identity_mismatch"
+        )
+
+
+@pytest.mark.asyncio
+async def test_history_discovery_unsupported_debt_reopens_once_when_adapter_capability_arrives():
+    """Only the old capability-missing terminal result may be retried."""
+    snapshot = _snapshot(
+        position_id="entry-history-capability-upgrade",
+        symbol="COTIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=2400.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "history_discovery_unsupported",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    aster = _Adapter(
+        Venue.ASTER,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=_fill(
+                venue=Venue.ASTER,
+                symbol="COTIUSDT",
+                side=Side.BUY,
+                quantity=2400.0,
+                price=0.010112,
+                order_id="aster-reopened-history",
+            ),
+        ),
+    )
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    aster.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert _critical_payload(ctx, "exit.reconciled") is not None
+
+
+@pytest.mark.asyncio
+async def test_strict_history_terminal_debt_never_reopens_for_new_adapter_capability():
+    """Capability upgrades cannot turn an ambiguous history into evidence."""
+    snapshot = _snapshot(
+        position_id="entry-history-ambiguous",
+        symbol="COTIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=2400.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "ambiguous_candidates",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    aster = _Adapter(Venue.ASTER)
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    aster.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    assert task["automatic_history_terminal_reason"] == "ambiguous_candidates"
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import shlex
+
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from lightfee.config.loader import load_config
 from lightfee.engine.recovery_decision_core import (
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
@@ -14,11 +17,16 @@ from lightfee.engine.recovery_decision_core import (
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+from lightfee.engine.snapshot_freshness_policy import snapshot_domain_budget_ms
 from lightfee.ops.position_side_semantics import side_matches_business_leg
 
 
 EXPECTED_VENUES = {"aster", "binance", "bitget", "bybit", "gate", "hyperliquid", "okx"}
-KNOWN_GOOD_RESOLVERS = {"1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9"}
+# Quad100 is Tailscale's local DNS stub, not an untrusted public resolver.
+KNOWN_GOOD_RESOLVERS = {
+    "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9",
+    "100.100.100.100", "fd7a:115c:a1e0::53",
+}
 FIXTURE_MARKET_OBSERVED_AT_MS = 1710000075000
 MAX_PROCESS_FD_COUNT = 512
 MAX_PROCESS_CLOSE_WAIT_COUNT = 10
@@ -43,6 +51,78 @@ class HealthSummary:
     critical_count: int
     warning_count: int
     reports: list[HealthReport]
+
+
+def config_path_from_systemd_unit(unit_text: str) -> str:
+    """Extract the explicit live config path from a systemd ExecStart line."""
+    for raw in unit_text.splitlines():
+        line = raw.strip()
+        if not line.startswith("ExecStart="):
+            continue
+        command = line.split("=", 1)[1].strip().lstrip("-@!+")
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            continue
+        for index, arg in enumerate(args):
+            if arg == "--config" and index + 1 < len(args):
+                return args[index + 1]
+            if arg.startswith("--config="):
+                return arg.split("=", 1)[1]
+    return ""
+
+
+def sidecar_freshness_policy(config_path: str) -> tuple[HealthReport, dict[str, int]]:
+    """Load the entry-path freshness policy for every health consumer."""
+    if not config_path:
+        return (
+            HealthReport(
+                name="sidecar_freshness_policy",
+                ok=False,
+                severity="critical",
+                fingerprints=["live_config_path_missing"],
+                details={},
+            ),
+            {},
+        )
+    try:
+        config = load_config(config_path)
+        limits = {
+            "market": snapshot_domain_budget_ms(config, "market"),
+            "quote": snapshot_domain_budget_ms(config, "quote"),
+            "funding": snapshot_domain_budget_ms(config, "funding"),
+            "liquidity": snapshot_domain_budget_ms(config, "liquidity"),
+        }
+    except Exception as exc:
+        return (
+            HealthReport(
+                name="sidecar_freshness_policy",
+                ok=False,
+                severity="critical",
+                fingerprints=["live_config_freshness_policy_unavailable"],
+                details={"config_path": config_path, "error": str(exc)[:300]},
+            ),
+            {},
+        )
+    if any(limit <= 0 for limit in limits.values()):
+        return (
+            HealthReport(
+                name="sidecar_freshness_policy",
+                ok=False,
+                severity="critical",
+                fingerprints=["live_config_freshness_policy_invalid"],
+                details={"config_path": config_path, "limits_ms": limits},
+            ),
+            {},
+        )
+    return (
+        HealthReport(
+            name="sidecar_freshness_policy",
+            ok=True,
+            details={"config_path": config_path, "limits_ms": limits},
+        ),
+        limits,
+    )
 
 
 def _nonnegative_int_or_none(value: Any) -> int | None:

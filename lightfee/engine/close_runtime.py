@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue, close_order_side_for_position
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.lifecycle import set_lifecycle
@@ -16,6 +17,7 @@ from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
 from lightfee.engine.state import (
+    AUTOMATIC_HISTORY_TERMINAL_STATUS,
     is_unattributed_recovered_live_flat_reconciliation,
     pending_close_reconciliation_evidence_debt_reason,
     pending_close_reconciliation_identity_evidence,
@@ -40,7 +42,8 @@ class CloseRuntime:
         _AUTOMATIC_HISTORY_EVIDENCE_DEBT_REASONS
         | {_EXACT_ID_RETRY_EVIDENCE_DEBT_REASON}
     )
-    _AUTOMATIC_HISTORY_TERMINAL_STATUS = "irrecoverable_audit_debt"
+    _AUTOMATIC_HISTORY_TERMINAL_STATUS = AUTOMATIC_HISTORY_TERMINAL_STATUS
+    _AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON = "history_discovery_unsupported"
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -500,6 +503,72 @@ class CloseRuntime:
             "exit.billing_evidence_debt_irrecoverable",
             payload,
         )
+
+    @staticmethod
+    def _adapter_supports_historical_close_discovery(adapter: Any) -> bool:
+        discover = getattr(adapter, "discover_historical_close_fill_reconciliation", None)
+        if not callable(discover):
+            return False
+        return getattr(discover, "__func__", discover) is not (
+            VenueAdapter.discover_historical_close_fill_reconciliation
+        )
+
+    def _reactivate_history_discovery_capability_upgrade(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+    ) -> bool:
+        """Retry only legacy debt terminalized for a missing adapter capability.
+
+        Strict no-candidate, ambiguous, and incomplete-evidence terminal states
+        remain terminal.  A newly implemented venue capability is the sole
+        condition that can make this legacy result actionable again.
+        """
+        if (
+            reconciliation.get("automatic_history_terminal_status")
+            != self._AUTOMATIC_HISTORY_TERMINAL_STATUS
+            or reconciliation.get("automatic_history_terminal_reason")
+            != self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
+        ):
+            return False
+        snapshot = reconciliation.get("position_snapshot")
+        if not isinstance(snapshot, dict):
+            return False
+        expected_quantities = self._close_reconciliation_expected_quantities(
+            reconciliation,
+            snapshot,
+        )
+        if expected_quantities is None:
+            return False
+        venues = (
+            self._venue_from_close_reconciliation(
+                reconciliation.get("long_venue") or snapshot.get("long_venue")
+            ),
+            self._venue_from_close_reconciliation(
+                reconciliation.get("short_venue") or snapshot.get("short_venue")
+            ),
+        )
+        for venue, quantity in zip(venues, expected_quantities):
+            if quantity <= 1e-12:
+                continue
+            if venue is None or not self._adapter_supports_historical_close_discovery(
+                self.ctx.venue_adapters.get(venue)
+            ):
+                return False
+        reconciliation.pop("automatic_history_terminal_status", None)
+        reconciliation.pop("automatic_history_terminal_reason", None)
+        reconciliation.pop("automatic_history_terminalized_at_ms", None)
+        reconciliation["automatic_history_reactivated_at_ms"] = now_ms
+        reconciliation["next_attempt_ms"] = 0
+        self.ctx.journal.append(
+            "reconciliation.automatic_historical_evidence_reactivated",
+            {
+                "position_id": str(reconciliation.get("position_id") or ""),
+                "symbol": str(reconciliation.get("symbol") or snapshot.get("symbol") or ""),
+                "reason": self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON,
+            },
+        )
+        return True
 
     @classmethod
     def _close_leg_evidence_complete(
@@ -1869,8 +1938,14 @@ class CloseRuntime:
                     reconciliation.get("automatic_history_terminal_status")
                     == self._AUTOMATIC_HISTORY_TERMINAL_STATUS
                 ):
-                    retained.append(reconciliation)
-                    continue
+                    if self._reactivate_history_discovery_capability_upgrade(
+                        reconciliation,
+                        now_ms,
+                    ):
+                        changed = True
+                    else:
+                        retained.append(reconciliation)
+                        continue
                 auto_reason = str(
                     reconciliation.get("evidence_debt_reason")
                     or pending_close_reconciliation_evidence_debt_reason(reconciliation)

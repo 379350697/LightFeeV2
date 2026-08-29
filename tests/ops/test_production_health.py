@@ -5,6 +5,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from lightfee.ops.production_health import (
     analyze_runtime_resources,
     analyze_current_state,
@@ -807,6 +809,13 @@ def test_resolver_requires_okx_capable_priority():
     report = analyze_resolver_config(text)
     assert not report.ok
     assert "unverified_resolver_first" in report.fingerprints
+
+
+@pytest.mark.parametrize("resolver", ["100.100.100.100", "fd7a:115c:a1e0::53"])
+def test_resolver_accepts_tailscale_quad100_local_stub(resolver: str):
+    report = analyze_resolver_config(f"nameserver {resolver}\n")
+
+    assert report.ok
 
 
 def test_summary_is_failed_when_any_report_critical():

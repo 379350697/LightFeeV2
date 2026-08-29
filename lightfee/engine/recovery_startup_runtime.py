@@ -23,6 +23,7 @@ from lightfee.engine.recovery_decision_core import (
 from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.runtime_context import RuntimeContext
+from lightfee.engine.state import is_terminal_automatic_history_evidence_debt
 from lightfee.engine.v1_lifecycle_closure import closure_event_fields
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.specs import VenueOperation
@@ -906,6 +907,8 @@ class RecoveryStartupRuntime:
             snapshot = getattr(pending, "position_snapshot", None)
             add_symbol(getattr(snapshot, "symbol", ""))
         for pending in self.ctx.state.pending_close_reconciliations:
+            if is_terminal_automatic_history_evidence_debt(pending):
+                continue
             add_symbol(self._pending_close_reconciliation_symbol(pending))
         for repair in getattr(self.ctx.state, "pending_residual_repairs", []) or []:
             if isinstance(repair, dict):
@@ -964,6 +967,8 @@ class RecoveryStartupRuntime:
             add_symbol("pending_passive_close", getattr(snapshot, "symbol", ""))
             add_symbol("pending_passive_close", getattr(pending, "symbol", ""))
         for pending in self.ctx.state.pending_close_reconciliations:
+            if is_terminal_automatic_history_evidence_debt(pending):
+                continue
             add_symbol(
                 "pending_close_reconciliation",
                 self._pending_close_reconciliation_symbol(pending),
@@ -975,6 +980,15 @@ class RecoveryStartupRuntime:
                 add_symbol("pending_residual_repair", getattr(repair, "symbol", ""))
         ledger = getattr(self.ctx, "recovery_ledger", None)
         for item in getattr(ledger, "work_items", []) or []:
+            # A ledger already classified this close work as flat, background
+            # accounting.  Its owner must keep doing history reconciliation,
+            # but it is not position truth required and must not recreate the
+            # all-venue probe fanout that the terminal debt exclusion avoids.
+            if (
+                getattr(item, "kind", "") == "pending_close_reconciliation"
+                and not getattr(item, "blocking", True)
+            ):
+                continue
             add_symbol("recovery_ledger_work", getattr(item, "symbol", ""))
         for item in getattr(self.ctx.state, "live_recovery_reduce_only_pairs", []) or []:
             if isinstance(item, dict):

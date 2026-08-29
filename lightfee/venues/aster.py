@@ -7,23 +7,33 @@ Aster Pro API V3 and do not share Binance HMAC signing.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountFeeSnapshot,
+    HistoricalCloseEvidenceDiscovery,
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PassiveOrderAck,
     PassiveOrderProgress,
     PositionSnapshot,
+    Side,
     Venue,
     VenueMarketSnapshot,
+    close_order_side_for_position,
 )
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.account_fees import fee_rate_from_mapping
-from lightfee.venues.aster_v3 import AsterV3Client
+from lightfee.venues.aster_v3 import (
+    ASTER_V3_ORDER_PATH,
+    ASTER_V3_USER_TRADES_PATH,
+    AsterV3Client,
+    _extract_rows,
+)
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
     entry_tradability_unavailable,
@@ -48,6 +58,99 @@ _ASTER_ENTRY_TRADABILITY_CATALOG_TTL_MS = 0
 # How long an invalid-symbol (-1121) negative-cache entry stays effective before
 # the symbol may be re-admitted on a future refresh.
 _ASTER_UNSUPPORTED_SYMBOL_TTL_MS = 3_600_000
+_ASTER_HISTORY_TIME_WINDOW_MS = 300_000
+_ASTER_QUOTE_FEE_ASSETS = frozenset({"USDT", "USDC"})
+
+
+def _aster_history_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+
+def _aster_history_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _aster_history_row_closes_position_side(
+    raw: dict[str, Any],
+    expected_position_side: str,
+) -> bool:
+    """Keep one-way-mode history out unless it proves reduce-only ownership."""
+    observed_position_side = str(raw.get("positionSide") or "").upper()
+    if observed_position_side == str(expected_position_side or "").upper():
+        return True
+    reduce_only = raw.get("reduceOnly")
+    return observed_position_side == "BOTH" and (
+        reduce_only is True
+        or (isinstance(reduce_only, str) and reduce_only.lower() == "true")
+    )
+
+
+def find_aster_v3_historical_close_order_candidates(
+    trades: Iterable[dict[str, Any]],
+    *,
+    symbol: str,
+    side: Side | str,
+    position_side: str,
+    quantity: float,
+    closed_at_ms: int,
+    time_window_ms: int = _ASTER_HISTORY_TIME_WINDOW_MS,
+    quantity_relative_tolerance: float = 1e-9,
+) -> list[dict[str, Any]]:
+    """Group V3 user trades into every strictly matching close-order candidate."""
+    expected_side = "BUY" if side == Side.BUY or str(side).upper() == "BUY" else "SELL"
+    quantity_tolerance = max(quantity * quantity_relative_tolerance, 1e-12)
+    grouped: dict[str, dict[str, Any]] = {}
+    for raw in trades:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("orderId") or raw.get("order_id") or "").strip()
+        trade_qty = _aster_history_float(raw.get("qty", raw.get("quantity")))
+        trade_time_ms = _aster_history_int(raw.get("time", raw.get("timestamp")))
+        if (
+            not order_id
+            or str(raw.get("symbol") or "").upper() != symbol.upper()
+            or str(raw.get("side") or "").upper() != expected_side
+            or not _aster_history_row_closes_position_side(raw, position_side)
+            or trade_qty is None
+            or trade_qty <= 1e-12
+            or trade_time_ms is None
+            or abs(trade_time_ms - closed_at_ms) > time_window_ms
+        ):
+            continue
+        candidate = grouped.setdefault(
+            order_id,
+            {
+                "order_id": order_id,
+                "client_order_id": str(raw.get("clientOrderId") or ""),
+                "quantity": 0.0,
+                "updated_at_ms": 0,
+                "trades": [],
+            },
+        )
+        candidate["quantity"] += trade_qty
+        candidate["updated_at_ms"] = max(candidate["updated_at_ms"], trade_time_ms)
+        candidate["trades"].append(raw)
+        client_order_id = str(raw.get("clientOrderId") or "")
+        if candidate["client_order_id"] and client_order_id != candidate["client_order_id"]:
+            candidate["client_order_id"] = ""
+    return [
+        candidate
+        for candidate in grouped.values()
+        if math.isclose(
+            candidate["quantity"],
+            quantity,
+            rel_tol=quantity_relative_tolerance,
+            abs_tol=quantity_tolerance,
+        )
+    ]
 
 
 def _is_invalid_symbol_transport_error(exc: Exception) -> bool:
@@ -669,6 +772,147 @@ class AsterAdapter(VenueAdapter):
             raise self._private_unavailable()
         return await self._transport.fetch_order_status(
             symbol, order_id, client_order_id,
+        )
+
+    async def discover_historical_close_fill_reconciliation(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        position_side: str,
+        quantity: float,
+        closed_at_ms: int,
+    ) -> HistoricalCloseEvidenceDiscovery:
+        """Find one V3 execution group, then exactly recheck its order state.
+
+        V3 userTrades supplies per-execution commissions but has no safe
+        client-order filter. A bounded time window is therefore only candidate
+        discovery; its grouped quantity must match the exact order response.
+        """
+        if side != close_order_side_for_position(position_side):
+            raise ValueError("Aster historical close side contradicts position side")
+        if not math.isfinite(quantity) or quantity <= 1e-12 or closed_at_ms <= 0:
+            raise ValueError("Aster historical close query requires quantity and closed_at_ms")
+        if self._private is None:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="history_discovery_unsupported",
+                candidate_count=0,
+            )
+        venue_symbol = self._transport._venue_symbol(symbol)
+        try:
+            raw_trades = await self._private._request(
+                "GET",
+                ASTER_V3_USER_TRADES_PATH,
+                params={
+                    "symbol": venue_symbol,
+                    "startTime": max(0, closed_at_ms - _ASTER_HISTORY_TIME_WINDOW_MS),
+                    "endTime": closed_at_ms + _ASTER_HISTORY_TIME_WINDOW_MS,
+                    "limit": 1000,
+                },
+            )
+        except Exception as exc:
+            self._handle_private_invalid_symbol(
+                exc, symbol, endpoint=ASTER_V3_USER_TRADES_PATH
+            )
+            raise
+        rows = _extract_rows(raw_trades)
+        if len(rows) >= 1000:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="history_incomplete",
+                candidate_count=0,
+            )
+        candidates = find_aster_v3_historical_close_order_candidates(
+            rows,
+            symbol=venue_symbol,
+            side=side,
+            position_side=position_side,
+            quantity=quantity,
+            closed_at_ms=closed_at_ms,
+        )
+        if len(candidates) != 1:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="ambiguous_candidates" if candidates else "no_candidate",
+                candidate_count=len(candidates),
+            )
+        candidate = candidates[0]
+        try:
+            raw_order = await self._private._request(
+                "GET",
+                ASTER_V3_ORDER_PATH,
+                params={"symbol": venue_symbol, "orderId": candidate["order_id"]},
+            )
+        except Exception as exc:
+            self._handle_private_invalid_symbol(exc, symbol, endpoint=ASTER_V3_ORDER_PATH)
+            raise
+        order_rows = _extract_rows(raw_order)
+        order = order_rows[0] if order_rows else raw_order if isinstance(raw_order, dict) else {}
+        if not isinstance(order, dict):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_unavailable",
+                candidate_count=1,
+            )
+        order_qty = _aster_history_float(order.get("executedQty"))
+        order_price = _aster_history_float(order.get("avgPrice", order.get("price")))
+        order_status = str(order.get("status") or "").upper()
+        order_identity_matches = str(order.get("orderId") or order.get("id") or "") == candidate["order_id"]
+        order_position_matches = _aster_history_row_closes_position_side(order, position_side)
+        if (
+            str(order.get("symbol") or "").upper() != venue_symbol.upper()
+            or str(order.get("side") or "").upper() != side.value.upper()
+            or not order_position_matches
+            or not order_identity_matches
+            # Historical billing evidence must follow the V3 contract exactly.
+            # The broader progress-state normalization is intentionally not
+            # evidence that an Aster order is terminal and fully filled.
+            or order_status != "FILLED"
+            or order_qty is None
+            or not math.isclose(order_qty, quantity, rel_tol=1e-9, abs_tol=1e-12)
+            or not math.isclose(order_qty, candidate["quantity"], rel_tol=1e-9, abs_tol=1e-12)
+            or order_price is None
+            or order_price <= 0.0
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_identity_mismatch",
+                candidate_count=1,
+            )
+        fee_quote = 0.0
+        for trade in candidate["trades"]:
+            try:
+                fee = float(trade.get("commission"))
+            except (TypeError, ValueError, OverflowError):
+                fee = math.nan
+            fee_asset = str(trade.get("commissionAsset") or "").upper()
+            if not math.isfinite(fee) or fee_asset not in _ASTER_QUOTE_FEE_ASSETS:
+                return HistoricalCloseEvidenceDiscovery(
+                    classification="exact_recheck_incomplete",
+                    candidate_count=1,
+                )
+            fee_quote += abs(fee)
+        return HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=OrderFillReconciliation(
+                venue=Venue.ASTER,
+                symbol=venue_symbol,
+                side=side,
+                quantity=order_qty,
+                average_price=order_price,
+                order_id=candidate["order_id"],
+                client_order_id=(
+                    str(order.get("clientOrderId") or "")
+                    or candidate["client_order_id"]
+                    or None
+                ),
+                fee_quote=fee_quote,
+                filled_at_ms=int(candidate["updated_at_ms"]),
+                metadata={
+                    "fee_evidence_complete": True,
+                    "fee_evidence_source": "aster_v3_user_trades",
+                    "historical_candidate_endpoint": ASTER_V3_USER_TRADES_PATH,
+                    "historical_candidate_updated_at_ms": candidate["updated_at_ms"],
+                    "historical_evidence_provenance": "aster_v3_user_trades_exact_order",
+                },
+            ),
         )
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:

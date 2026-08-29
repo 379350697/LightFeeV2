@@ -22,15 +22,15 @@ if str(_repo_root) not in sys.path:
 from lightfee.ops.production_health import (
     HealthReport,
     analyze_current_state,
+    config_path_from_systemd_unit,
     analyze_resolver_config,
     analyze_runtime_resources,
     analyze_sidecar_snapshot,
     analyze_systemd_unit,
     deployment_acceptance_ok,
+    sidecar_freshness_policy,
     summarize_reports,
 )
-from lightfee.config.loader import load_config
-from lightfee.engine.snapshot_freshness_policy import snapshot_domain_budget_ms
 from lightfee.engine.exchange_truth import normalize_exchange_truth_payload
 from scripts.diagnose_live import _environment_file_scope
 
@@ -237,76 +237,6 @@ def _environment_file_paths(unit_texts: dict[str, str]) -> list[Path]:
     return paths
 
 
-def _config_path_from_unit(unit_text: str) -> str:
-    for raw in unit_text.splitlines():
-        line = raw.strip()
-        if not line.startswith("ExecStart="):
-            continue
-        command = line.split("=", 1)[1].strip().lstrip("-@!+")
-        try:
-            args = shlex.split(command)
-        except ValueError:
-            continue
-        for index, arg in enumerate(args):
-            if arg == "--config" and index + 1 < len(args):
-                return args[index + 1]
-            if arg.startswith("--config="):
-                return arg.split("=", 1)[1]
-    return ""
-
-
-def _sidecar_freshness_policy(config_path: str) -> tuple[HealthReport, dict[str, int]]:
-    if not config_path:
-        return (
-            HealthReport(
-                name="sidecar_freshness_policy",
-                ok=False,
-                severity="critical",
-                fingerprints=["live_config_path_missing"],
-                details={},
-            ),
-            {},
-        )
-    try:
-        config = load_config(config_path)
-        limits = {
-            "market": snapshot_domain_budget_ms(config, "market"),
-            "quote": snapshot_domain_budget_ms(config, "quote"),
-            "funding": snapshot_domain_budget_ms(config, "funding"),
-            "liquidity": snapshot_domain_budget_ms(config, "liquidity"),
-        }
-    except Exception as exc:
-        return (
-            HealthReport(
-                name="sidecar_freshness_policy",
-                ok=False,
-                severity="critical",
-                fingerprints=["live_config_freshness_policy_unavailable"],
-                details={"config_path": config_path, "error": str(exc)[:300]},
-            ),
-            {},
-        )
-    if any(limit <= 0 for limit in limits.values()):
-        return (
-            HealthReport(
-                name="sidecar_freshness_policy",
-                ok=False,
-                severity="critical",
-                fingerprints=["live_config_freshness_policy_invalid"],
-                details={"config_path": config_path, "limits_ms": limits},
-            ),
-            {},
-        )
-    return (
-        HealthReport(
-            name="sidecar_freshness_policy",
-            ok=True,
-            details={"config_path": config_path, "limits_ms": limits},
-        ),
-        limits,
-    )
-
-
 def _exchange_truth_probe_timeout_s() -> float:
     raw = os.environ.get("LIGHTFEE_VERIFY_EXCHANGE_TRUTH_TIMEOUT_S")
     if raw is None:
@@ -464,10 +394,10 @@ def main() -> None:
             unit_texts[name] = ""
             reports.append(analyze_systemd_unit(name, ""))
 
-    configured_path = args.config or _config_path_from_unit(
+    configured_path = args.config or config_path_from_systemd_unit(
         unit_texts.get("lightfee-live.service", "")
     )
-    policy_report, freshness_limits = _sidecar_freshness_policy(configured_path)
+    policy_report, freshness_limits = sidecar_freshness_policy(configured_path)
     reports.append(policy_report)
 
     if Path(args.snapshot).exists():
