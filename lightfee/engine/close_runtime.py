@@ -44,6 +44,10 @@ class CloseRuntime:
     )
     _AUTOMATIC_HISTORY_TERMINAL_STATUS = AUTOMATIC_HISTORY_TERMINAL_STATUS
     _AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON = "history_discovery_unsupported"
+    _AUTOMATIC_HISTORY_ASTER_LEGACY_NO_CANDIDATE_REASON = "no_candidate"
+    _AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON = (
+        "aster_v3_user_trades_missing_reduce_only"
+    )
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -513,23 +517,40 @@ class CloseRuntime:
             VenueAdapter.discover_historical_close_fill_reconciliation
         )
 
-    def _reactivate_history_discovery_capability_upgrade(
+    def _reactivate_history_discovery_upgrade(
         self,
         reconciliation: dict[str, Any],
         now_ms: int,
     ) -> bool:
-        """Retry only legacy debt terminalized for a missing adapter capability.
+        """Retry only a missing capability or the Aster V3 row-shape repair.
 
-        Strict no-candidate, ambiguous, and incomplete-evidence terminal states
-        remain terminal.  A newly implemented venue capability is the sole
-        condition that can make this legacy result actionable again.
+        Strict ambiguous and incomplete-evidence terminal states remain
+        terminal.  A legacy Aster generic no-candidate result gets one new
+        scan because V3 userTrades omitted reduceOnly and the old parser
+        incorrectly discarded that row.  The repaired adapter records future
+        misses as a distinct terminal reason, so they never re-open.
         """
         if (
             reconciliation.get("automatic_history_terminal_status")
             != self._AUTOMATIC_HISTORY_TERMINAL_STATUS
-            or reconciliation.get("automatic_history_terminal_reason")
-            != self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
         ):
+            return False
+        terminal_reason = str(
+            reconciliation.get("automatic_history_terminal_reason") or ""
+        )
+        debt_reason = str(
+            reconciliation.get("evidence_debt_reason")
+            or pending_close_reconciliation_evidence_debt_reason(reconciliation)
+            or ""
+        )
+        capability_upgrade = (
+            terminal_reason == self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
+        )
+        aster_schema_upgrade = (
+            terminal_reason == self._AUTOMATIC_HISTORY_ASTER_LEGACY_NO_CANDIDATE_REASON
+            and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
+        )
+        if not capability_upgrade and not aster_schema_upgrade:
             return False
         snapshot = reconciliation.get("position_snapshot")
         if not isinstance(snapshot, dict):
@@ -548,13 +569,26 @@ class CloseRuntime:
                 reconciliation.get("short_venue") or snapshot.get("short_venue")
             ),
         )
+        has_aster_leg = False
         for venue, quantity in zip(venues, expected_quantities):
             if quantity <= 1e-12:
                 continue
+            has_aster_leg = has_aster_leg or venue == Venue.ASTER
             if venue is None or not self._adapter_supports_historical_close_discovery(
                 self.ctx.venue_adapters.get(venue)
             ):
                 return False
+        if aster_schema_upgrade and not has_aster_leg:
+            return False
+        # Legacy persisted debt may predate evidence_debt_reason.  The same
+        # canonical predicate admitted this record to the bounded automatic
+        # path, so persist its result before reactivation; otherwise the
+        # following billing pass would treat it as operator-only and retain it.
+        if (
+            not reconciliation.get("evidence_debt_reason")
+            and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
+        ):
+            reconciliation["evidence_debt_reason"] = debt_reason
         reconciliation.pop("automatic_history_terminal_status", None)
         reconciliation.pop("automatic_history_terminal_reason", None)
         reconciliation.pop("automatic_history_terminalized_at_ms", None)
@@ -565,7 +599,11 @@ class CloseRuntime:
             {
                 "position_id": str(reconciliation.get("position_id") or ""),
                 "symbol": str(reconciliation.get("symbol") or snapshot.get("symbol") or ""),
-                "reason": self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON,
+                "reason": (
+                    self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
+                    if capability_upgrade
+                    else self._AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON
+                ),
             },
         )
         return True
@@ -1938,7 +1976,7 @@ class CloseRuntime:
                     reconciliation.get("automatic_history_terminal_status")
                     == self._AUTOMATIC_HISTORY_TERMINAL_STATUS
                 ):
-                    if self._reactivate_history_discovery_capability_upgrade(
+                    if self._reactivate_history_discovery_upgrade(
                         reconciliation,
                         now_ms,
                     ):

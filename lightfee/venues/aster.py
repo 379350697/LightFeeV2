@@ -81,16 +81,24 @@ def _aster_history_int(value: Any) -> int | None:
 def _aster_history_row_closes_position_side(
     raw: dict[str, Any],
     expected_position_side: str,
+    *,
+    allow_omitted_reduce_only: bool = False,
 ) -> bool:
-    """Keep one-way-mode history out unless it proves reduce-only ownership."""
+    """Check close ownership, optionally admitting incomplete trade rows as candidates."""
     observed_position_side = str(raw.get("positionSide") or "").upper()
     if observed_position_side == str(expected_position_side or "").upper():
         return True
     reduce_only = raw.get("reduceOnly")
-    return observed_position_side == "BOTH" and (
-        reduce_only is True
-        or (isinstance(reduce_only, str) and reduce_only.lower() == "true")
-    )
+    if observed_position_side != "BOTH":
+        return False
+    if reduce_only is True or (
+        isinstance(reduce_only, str) and reduce_only.lower() == "true"
+    ):
+        return True
+    # Aster V3 userTrades can omit reduceOnly in one-way mode.  It may locate
+    # a candidate, but the subsequent exact /order recheck still must prove
+    # reduce-only ownership before any fill or fee is accepted.
+    return allow_omitted_reduce_only and reduce_only is None
 
 
 def find_aster_v3_historical_close_order_candidates(
@@ -118,7 +126,11 @@ def find_aster_v3_historical_close_order_candidates(
             not order_id
             or str(raw.get("symbol") or "").upper() != symbol.upper()
             or str(raw.get("side") or "").upper() != expected_side
-            or not _aster_history_row_closes_position_side(raw, position_side)
+            or not _aster_history_row_closes_position_side(
+                raw,
+                position_side,
+                allow_omitted_reduce_only=True,
+            )
             or trade_qty is None
             or trade_qty <= 1e-12
             or trade_time_ms is None
@@ -835,7 +847,12 @@ class AsterAdapter(VenueAdapter):
         )
         if len(candidates) != 1:
             return HistoricalCloseEvidenceDiscovery(
-                classification="ambiguous_candidates" if candidates else "no_candidate",
+                # Distinguish a V3 scan performed with the corrected row-shape
+                # contract from legacy generic no_candidate debt.  The runtime
+                # may re-run only that legacy outcome once after this repair.
+                classification=(
+                    "ambiguous_candidates" if candidates else "aster_v3_no_candidate"
+                ),
                 candidate_count=len(candidates),
             )
         candidate = candidates[0]

@@ -52,6 +52,19 @@ status compatibility mapping for strict billing evidence. That local-only
 review regression is corrected: only V3 `FILLED` can settle historical audit
 evidence; undocumented terminal-like values remain visible debt.
 
+2026-08-31 Aster V3 one-way history follow-up: the initial strict Aster repair
+correctly required `reduceOnly` from the exact `/fapi/v3/order` proof, but
+incorrectly required the same field in a weaker `userTrades` discovery row.
+Production V3 one-way rows can omit it, so the known ONG close's sole candidate
+was discarded as `no_candidate` even though its exact order proves
+`FILLED`/`reduceOnly=true` and its execution has the matching quantity, price,
+and quote fee. The local repair admits only an omitted value as a candidate,
+then retains the exact-order proof gate unchanged. It re-runs only legacy
+automatic Aster generic `no_candidate` debt once; a post-repair
+`aster_v3_no_candidate`, ambiguous, incomplete, or non-Aster outcome remains
+terminal. This is **local-green, not committed or deployed**; see
+[CL-136](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate).
+
 CL-128 rotated-journal diagnosis and ledger drift, 2026-08-27: the diagnostic
 only read `*.jsonl`, silently omitting `live-events.jsonl.1` and other
 rotations; its old tail fallback could then read the beginning rather than the

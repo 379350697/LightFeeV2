@@ -35,7 +35,10 @@ def py(*args: str) -> tuple[str, ...]:
 
 def pytest(*args: str, timeout_s: int = 300) -> Step:
     label = "pytest " + " ".join(args)
-    return Step(label, ("pytest", "-q", *args), timeout_s)
+    # Use the interpreter that launched this validator.  Invoking a bare
+    # pytest depends on an activated virtualenv and can validate a different
+    # environment (or fail before the selected tests run).
+    return Step(label, py("-m", "pytest", "-q", *args), timeout_s)
 
 
 BASE_STEPS = (
@@ -55,6 +58,7 @@ PROFILES: dict[str, tuple[Step, ...]] = {
             "tests/engine/test_close_semantic_parity.py",
             "tests/engine/test_passive_close_semantic_parity.py",
             "tests/test_close_execution.py",
+            "tests/test_automatic_historical_close_evidence.py",
             timeout_s=300,
         ),
     ),
@@ -96,6 +100,7 @@ PROFILES: dict[str, tuple[Step, ...]] = {
         pytest(
             "tests/test_passive_close.py::TestProcessPendingPassiveCloseLiveFlatReconcile",
             "tests/test_diagnose_live.py",
+            "tests/test_automatic_historical_close_evidence.py",
             "-k",
             "XCNUSDT or aster or Aster or position_id",
             timeout_s=240,

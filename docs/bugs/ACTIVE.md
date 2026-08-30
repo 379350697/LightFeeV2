@@ -58,8 +58,14 @@ do not rewrite the daily evidence just to change status.
 The following repairs are deliberately not rows in the deployment table until
 they have a fixing commit. They are **local-green only**, not production facts:
 
-- Aster V3 strict historical close discovery and the one-time reactivation of
-  legacy `history_discovery_unsupported` debt;
+- CL-136: Aster V3 strict historical close discovery, including a
+  candidate-only accommodation for one-way `userTrades` rows that omit
+  `reduceOnly`, and the one-time reactivation of only legacy Aster generic
+  `no_candidate` or `history_discovery_unsupported` debt. Exact `/order`
+  recheck remains the sole proof gate; a corrected-scan
+  `aster_v3_no_candidate` remains terminal; legacy missing debt-reason fields
+  are normalized only during that reactivation; see
+  [2026-08-31](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate);
 - exclusion of terminal automatic-history audit debt from recovery probe symbol
   projections;
 - source-health inspection in `diagnose_live`, using the same config budgets as

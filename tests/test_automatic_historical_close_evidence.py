@@ -412,6 +412,82 @@ async def test_aster_debt_requires_documented_filled_order_for_exact_recheck(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("order_reduce_only", [True, False])
+async def test_aster_user_trade_without_reduce_only_is_candidate_only(
+    order_reduce_only: bool,
+):
+    """Aster V3 omits this field on trades; only its exact order may prove it."""
+    snapshot = _snapshot(
+        position_id="entry-aster-one-way-history",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=149.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    aster = AsterAdapter()
+    aster._private = MagicMock()
+    aster.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.ASTER,
+            symbol="ONGUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    aster.fetch_open_orders = AsyncMock(return_value=[])
+
+    async def request(_method: str, path: str, **_kwargs):
+        if path == "/fapi/v3/userTrades":
+            # Captured production V3 shape: the execution is in one-way mode
+            # (BOTH) and does not include reduceOnly.
+            return [{
+                "symbol": "ONGUSDT",
+                "side": "BUY",
+                "positionSide": "BOTH",
+                "orderId": "19932399",
+                "clientOrderId": "lfex5432933e299cf15e",
+                "qty": "149",
+                "price": "0.1569400",
+                "commission": "0",
+                "commissionAsset": "USDT",
+                "time": NOW_MS - 59_000,
+            }]
+        if path == "/fapi/v3/order":
+            return {
+                "symbol": "ONGUSDT",
+                "side": "BUY",
+                "positionSide": "BOTH",
+                "reduceOnly": order_reduce_only,
+                "status": "FILLED",
+                "executedQty": "149",
+                "avgPrice": "0.1569400",
+                "orderId": "19932399",
+                "clientOrderId": "lfex5432933e299cf15e",
+                "updateTime": NOW_MS - 59_000,
+            }
+        raise AssertionError(path)
+
+    aster._private._request = AsyncMock(side_effect=request)
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    if order_reduce_only:
+        assert ctx.state.pending_close_reconciliations == []
+        assert _critical_payload(ctx, "exit.reconciled") is not None
+    else:
+        assert ctx.state.pending_close_reconciliations == [task]
+        assert _critical_payload(ctx, "exit.reconciled") is None
+        assert task["automatic_history_terminal_reason"] == (
+            "exact_recheck_identity_mismatch"
+        )
+
+
+@pytest.mark.asyncio
 async def test_history_discovery_unsupported_debt_reopens_once_when_adapter_capability_arrives():
     """Only the old capability-missing terminal result may be retried."""
     snapshot = _snapshot(
@@ -452,6 +528,122 @@ async def test_history_discovery_unsupported_debt_reopens_once_when_adapter_capa
     assert ctx.state.pending_close_reconciliations == []
     aster.discover_historical_close_fill_reconciliation.assert_awaited_once()
     assert _critical_payload(ctx, "exit.reconciled") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted_reason", [True, False])
+async def test_legacy_aster_no_candidate_debt_retries_the_fixed_parser_once(
+    persisted_reason: bool,
+):
+    """Only legacy Aster no-candidate debt may see the corrected parser."""
+    snapshot = _snapshot(
+        position_id="entry-aster-legacy-no-candidate",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=149.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    if not persisted_reason:
+        task.pop("evidence_debt_reason")
+    aster = _Adapter(
+        Venue.ASTER,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=_fill(
+                venue=Venue.ASTER,
+                symbol="ONGUSDT",
+                side=Side.BUY,
+                quantity=149.0,
+                price=0.15694,
+                order_id="19932399",
+                fee_quote=0.0,
+                provenance="aster_v3_user_trades_exact_order",
+            ),
+        ),
+    )
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    aster.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert _critical_payload(ctx, "exit.reconciled") is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_aster_no_candidate_debt_stays_terminal_after_one_fixed_miss():
+    """A legacy re-scan which still finds nothing must not become a loop."""
+    snapshot = _snapshot(
+        position_id="entry-aster-legacy-fixed-miss",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=149.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    aster = _Adapter(
+        Venue.ASTER,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="aster_v3_no_candidate",
+            candidate_count=0,
+        ),
+    )
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+    runtime = CloseRuntime(ctx)
+
+    await runtime._process_pending_close_reconciliations(NOW_MS)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    aster.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert task["automatic_history_terminal_reason"] == "aster_v3_no_candidate"
+
+
+@pytest.mark.asyncio
+async def test_fixed_aster_no_candidate_debt_never_reopens():
+    """A current strict Aster miss remains terminal after the parser repair."""
+    snapshot = _snapshot(
+        position_id="entry-aster-current-no-candidate",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.ASTER,
+        long_quantity=0.0,
+        short_quantity=149.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "aster_v3_no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    aster = _Adapter(Venue.ASTER)
+    ctx = _ctx(task, {Venue.BYBIT: _Adapter(Venue.BYBIT), Venue.ASTER: aster})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    aster.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    assert task["automatic_history_terminal_reason"] == "aster_v3_no_candidate"
 
 
 @pytest.mark.asyncio
