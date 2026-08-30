@@ -62,7 +62,7 @@ and quote fee. The local repair admits only an omitted value as a candidate,
 then retains the exact-order proof gate unchanged. It re-runs only legacy
 automatic Aster generic `no_candidate` debt once; a post-repair
 `aster_v3_no_candidate`, ambiguous, incomplete, or non-Aster outcome remains
-terminal. This is **local-green, not committed or deployed**; see
+terminal. This is **local-green at `079601f`, not deployed**; see
 [CL-136](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate).
 
 CL-128 rotated-journal diagnosis and ledger drift, 2026-08-27: the diagnostic

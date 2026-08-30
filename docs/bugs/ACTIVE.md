@@ -58,14 +58,6 @@ do not rewrite the daily evidence just to change status.
 The following repairs are deliberately not rows in the deployment table until
 they have a fixing commit. They are **local-green only**, not production facts:
 
-- CL-136: Aster V3 strict historical close discovery, including a
-  candidate-only accommodation for one-way `userTrades` rows that omit
-  `reduceOnly`, and the one-time reactivation of only legacy Aster generic
-  `no_candidate` or `history_discovery_unsupported` debt. Exact `/order`
-  recheck remains the sole proof gate; a corrected-scan
-  `aster_v3_no_candidate` remains terminal; legacy missing debt-reason fields
-  are normalized only during that reactivation; see
-  [2026-08-31](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate);
 - exclusion of terminal automatic-history audit debt from recovery probe symbol
   projections;
 - source-health inspection in `diagnose_live`, using the same config budgets as
@@ -132,6 +124,7 @@ until this table receives real fixing commits and a production observation.
 | CL-128 | deployed-awaiting-verification | `ac9d536` | rotated-only event, duplicate rotation, global cap, high-confidence `since-deploy`, and large-tail counterexamples (`117 passed`; full profile 10/10 green) | after SSH recovery, run deployed diagnosis and record discovered rotations/scope metadata | [2026-08-27](daily/2026-08-27.md#cl-128-diagnosis-omitted-rotated-journals-and-drifted-ledger) |
 | CL-134 | deployed-awaiting-verification | `2111e36` | production-path RED/GREEN for terminal normal pair plus unrelated final close debt; exact-pair/one-leg/wrong-side/wrong-quantity/open-order core matrix; focused `477 passed`; full `4491 passed, 9 skipped` | `fe821142` is live: services active/0 restarts, current state `running` with background debt and high-confidence flat/no-order truth. Observe a natural matched open hedge beside debt remain `running`; non-normal/incomplete truth must stay blocked. | [2026-08-30](daily/2026-08-30.md#cl-134--a-normal-matched-hedge-was-globally-blocked-by-unrelated-close-accounting-debt) |
 | CL-135 | deployed-awaiting-verification | `0428fd1` | COTI-shaped delayed-fill → normal-hedge production-path regression; seven-venue prepare/verify capability matrix, malformed/mismatch/dual-mode/non-ack blockers, and same-venue de-duplication; deployment acceptance high-confidence clean | Natural observation still required: a delayed owned maker fill must hedge normally rather than reduce-only flatten; every entry leg must log its exchange-specific leverage proof or block before order submission. | [2026-08-30](daily/2026-08-30.md#cl-135--delayed-owned-maker-fill-was-cleaned-before-hedge-and-entry-leverage-was-not-proved-for-every-live-leg) |
+| CL-136 | local-green | `079601f` | Aster one-way V3 `userTrades` missing-`reduceOnly` production-shape RED/GREEN; exact order `reduceOnly=false` rejects; legacy generic miss retries once then corrected miss remains terminal; close profile `481 passed`, Aster profile `19 passed` | Not deployed. After deployment, confirm the named ONG debt resolves only when its exact Aster order still proves `FILLED`, `reduceOnly=true`, identity/quantity/price, and quote fee; otherwise it must remain terminal debt. | [2026-08-31](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate) |
 
 ## Pre-CL-093 Historical Boundary
 
