@@ -1054,6 +1054,65 @@ class TestTransportErrors:
         assert isinstance(err, Exception)
         assert "bad key" in str(err)
 
+    @pytest.mark.asyncio
+    async def test_network_error_retires_shared_transport_client_with_context(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            try:
+                raise ConnectionResetError("peer reset private stream")
+            except ConnectionResetError as cause:
+                raise httpx.ReadError("", request=request) from cause
+
+        transport = VenueTransport(spec=binance_spec(), mode="paper")
+        failed_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        transport._client = failed_client
+        try:
+            with pytest.raises(TransportError) as exc_info:
+                await transport._request("GET", "/fapi/v1/openInterest")
+
+            error = exc_info.value
+            assert error.request_phase == "read"
+            assert error.transport_error_type == "ReadError"
+            assert error.transport_error_cause_type == "ConnectionResetError"
+            assert error.transport_error_cause == "peer reset private stream"
+            assert error.client_generation == 1
+            assert error.client_retired is True
+            assert failed_client.is_closed
+            assert transport._client is None
+        finally:
+            await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_network_error_retires_listen_key_client_with_context(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            try:
+                raise ConnectionResetError("peer reset listen key")
+            except ConnectionResetError as cause:
+                raise httpx.ReadError("", request=request) from cause
+
+        transport = VenueTransport(spec=binance_spec(), mode="paper")
+        failed_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        transport._client = failed_client
+        try:
+            with pytest.raises(TransportError) as exc_info:
+                await transport._request_listen_key(
+                    "PUT",
+                    "/fapi/v1/listenKey",
+                    api_key="stream-key",
+                    params={"listenKey": "lk-1"},
+                )
+
+            error = exc_info.value
+            assert error.request_phase == "read"
+            assert error.transport_error_type == "ReadError"
+            assert error.transport_error_cause_type == "ConnectionResetError"
+            assert error.transport_error_cause == "peer reset listen key"
+            assert error.client_generation == 1
+            assert error.client_retired is True
+            assert failed_client.is_closed
+            assert transport._client is None
+        finally:
+            await transport.close()
+
 
 # ---------------------------------------------------------------------------
 # Paper mode behavior

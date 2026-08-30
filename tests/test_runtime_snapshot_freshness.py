@@ -1544,10 +1544,31 @@ def test_entry_open_interest_refresher_uses_targeted_public_budget():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("failure_status", "failure_reason", "status_code", "retry_after_ms"),
+    (
+        "failure_status",
+        "failure_reason",
+        "status_code",
+        "retry_after_ms",
+        "transport_fields",
+    ),
     [
-        ("timeout", "timeout_waiting_for_oi", 0, 0),
-        ("rate_limited", "http_429", 429, 2_000),
+        ("timeout", "timeout_waiting_for_oi", 0, 0, {}),
+        ("rate_limited", "http_429", 429, 2_000, {}),
+        (
+            "http_error",
+            "network: GET /fapi/v1/openInterest; phase=read",
+            0,
+            0,
+            {
+                "open_interest_request_phase": "read",
+                "open_interest_transport_error_type": "ReadError",
+                "open_interest_transport_error_detail": "",
+                "open_interest_transport_error_cause_type": "ConnectionResetError",
+                "open_interest_transport_error_cause": "peer reset stream",
+                "open_interest_client_generation": 7,
+                "open_interest_client_retired": True,
+            },
+        ),
     ],
 )
 async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(
@@ -1556,6 +1577,7 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(
     failure_reason,
     status_code,
     retry_after_ms,
+    transport_fields,
 ):
     config = AppConfig(
         runtime=RuntimeConfig(
@@ -1589,6 +1611,7 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(
                 "open_interest_evidence_reason": failure_reason,
                 "open_interest_http_status_code": status_code,
                 "open_interest_retry_after_ms": retry_after_ms,
+                **transport_fields,
             }
 
     runtime.entry_open_interest_refresher = FailedOiRefresher()
@@ -1662,6 +1685,8 @@ async def test_runtime_targeted_oi_refresh_failure_keeps_fail_closed(
     assert failed["open_interest_evidence_status"] == failure_status
     assert failed["open_interest_http_status_code"] == status_code
     assert failed["open_interest_retry_after_ms"] == retry_after_ms
+    for field, value in transport_fields.items():
+        assert failed[field] == value
     decision = next(
         record["payload"]
         for record in records

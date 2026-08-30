@@ -45,6 +45,13 @@ class FundingTicker:
     open_interest_evidence_reason: str = ""
     open_interest_http_status_code: int = 0
     open_interest_retry_after_ms: int = 0
+    open_interest_request_phase: str = ""
+    open_interest_transport_error_type: str = ""
+    open_interest_transport_error_detail: str = ""
+    open_interest_transport_error_cause_type: str = ""
+    open_interest_transport_error_cause: str = ""
+    open_interest_client_generation: int = 0
+    open_interest_client_retired: bool = False
     oi_candidate_count: int = 0
     oi_cache_hit_count: int = 0
     oi_cache_miss_count: int = 0
@@ -156,6 +163,13 @@ class MarketDataClient:
         self._exchange_http_timeout_ms = exchange_http_timeout_ms
         self._rate_limiter = rate_limiter
         self._client: Optional[httpx.AsyncClient] = None
+        # Retire a failed shared client only after its in-flight borrowers
+        # release it, so one peer-side failure cannot interrupt a healthy peer.
+        self._client_lifecycle_lock = asyncio.Lock()
+        self._client_generation = 0
+        self._client_generations: dict[int, int] = {}
+        self._client_leases: dict[int, int] = {}
+        self._retired_clients: dict[int, httpx.AsyncClient] = {}
         # V1 parity: per-symbol funding rate cache (OKX, etc.)
         # {venue_key:symbol -> FundingTicker} with observed_at_ms
         self._funding_cache: dict[str, tuple[float, int, int]] = {}  # (rate_bps, timestamp_ms, observed_at_ms)
@@ -183,21 +197,149 @@ class MarketDataClient:
     # ------------------------------------------------------------------
 
     async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            timeout_s = self._exchange_http_timeout_ms / 1000.0
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout_s),
-                limits=httpx.Limits(
-                    max_connections=MARKET_DATA_MAX_CONNECTIONS,
-                    max_keepalive_connections=4,
-                ),
-            )
-        return self._client
+        async with self._client_lifecycle_lock:
+            if self._client is None:
+                timeout_s = self._exchange_http_timeout_ms / 1000.0
+                self._client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(timeout_s),
+                    limits=httpx.Limits(
+                        max_connections=MARKET_DATA_MAX_CONNECTIONS,
+                        max_keepalive_connections=4,
+                    ),
+                )
+            self._register_client_locked(self._client)
+            return self._client
+
+    def _register_client_locked(self, client: httpx.AsyncClient) -> int:
+        """Return the stable generation for ``client`` while holding the lock."""
+        key = id(client)
+        generation = self._client_generations.get(key)
+        if generation is None:
+            self._client_generation += 1
+            generation = self._client_generation
+            self._client_generations[key] = generation
+        return generation
+
+    async def _borrow_client(self) -> tuple[httpx.AsyncClient, int]:
+        """Lease a client so retirement cannot interrupt another request."""
+        client = await self._get_client()
+        async with self._client_lifecycle_lock:
+            generation = self._register_client_locked(client)
+            key = id(client)
+            self._client_leases[key] = self._client_leases.get(key, 0) + 1
+            return client, generation
+
+    async def _release_client(self, client: httpx.AsyncClient) -> None:
+        client_to_close: httpx.AsyncClient | None = None
+        async with self._client_lifecycle_lock:
+            key = id(client)
+            remaining = self._client_leases.get(key, 0) - 1
+            if remaining > 0:
+                self._client_leases[key] = remaining
+            else:
+                self._client_leases.pop(key, None)
+                client_to_close = self._retired_clients.pop(key, None)
+                if client_to_close is not None:
+                    self._client_generations.pop(key, None)
+        if client_to_close is not None:
+            await client_to_close.aclose()
+
+    async def _retire_failed_client(self, client: httpx.AsyncClient) -> bool:
+        """Remove a peer-failed client from reuse and close it after all leases end."""
+        client_to_close: httpx.AsyncClient | None = None
+        retired = False
+        async with self._client_lifecycle_lock:
+            if self._client is client:
+                self._client = None
+                retired = True
+            key = id(client)
+            already_retired = key in self._retired_clients
+            if retired or already_retired:
+                self._retired_clients[key] = client
+                if self._client_leases.get(key, 0) == 0:
+                    client_to_close = self._retired_clients.pop(key)
+                    self._client_generations.pop(key, None)
+        if client_to_close is not None:
+            await client_to_close.aclose()
+        return retired or already_retired
+
+    def _network_failure_diagnostics(
+        self,
+        exc: BaseException,
+        *,
+        client_generation: int,
+        client_retired: bool,
+    ) -> dict[str, Any]:
+        """Return safe, structured diagnostics for an httpx transport failure."""
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            phase = "connect"
+        elif isinstance(exc, (httpx.ReadError, httpx.ReadTimeout)):
+            phase = "read"
+        elif isinstance(exc, (httpx.WriteError, httpx.WriteTimeout)):
+            phase = "write"
+        elif isinstance(exc, httpx.PoolTimeout):
+            phase = "pool"
+        else:
+            phase = "network"
+
+        cause = exc.__cause__ or exc.__context__
+        seen = {id(exc)}
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            next_cause = cause.__cause__ or cause.__context__
+            if next_cause is None or id(next_cause) in seen:
+                break
+            cause = next_cause
+
+        return {
+            "request_phase": phase,
+            "transport_error_type": type(exc).__name__,
+            "transport_error_detail": str(exc)[:200],
+            "transport_error_cause_type": (
+                type(cause).__name__ if cause is not None else ""
+            ),
+            "transport_error_cause": str(cause)[:200] if cause is not None else "",
+            "client_generation": client_generation,
+            "client_retired": client_retired,
+        }
+
+    @staticmethod
+    def _network_failure_message(
+        prefix: str,
+        method: str,
+        path: str,
+        diagnostics: Mapping[str, Any],
+    ) -> str:
+        cause_type = str(diagnostics.get("transport_error_cause_type", "") or "")
+        cause = str(diagnostics.get("transport_error_cause", "") or "")
+        detail = str(diagnostics.get("transport_error_detail", "") or "")
+        cause_summary = cause_type or "none"
+        if cause:
+            cause_summary = f"{cause_summary}: {cause}"
+        elif detail:
+            cause_summary = f"{cause_summary}: {detail}"
+        return (
+            f"{prefix}: {method} {path}; "
+            f"phase={diagnostics.get('request_phase', 'network')}; "
+            f"error={diagnostics.get('transport_error_type', 'HTTPError')}; "
+            f"cause={cause_summary}; "
+            f"client_generation={diagnostics.get('client_generation', 0)}; "
+            f"client_retired={bool(diagnostics.get('client_retired', False))}"
+        )
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
+        async with self._client_lifecycle_lock:
+            clients = {
+                id(client): client
+                for client in [self._client, *self._retired_clients.values()]
+                if client is not None
+            }
             self._client = None
+            self._client_generations.clear()
+            self._client_leases.clear()
+            self._retired_clients.clear()
+        for client in clients.values():
+            await client.aclose()
 
     # ------------------------------------------------------------------
     # Symbol conversion
@@ -252,7 +394,6 @@ class MarketDataClient:
         body: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Send a public HTTP request with scoped rate limiting."""
-        client = await self._get_client()
         base_url = self._spec.public_base_url
         scopes = self._public_rate_limit_scopes(method, path)
 
@@ -266,6 +407,7 @@ class MarketDataClient:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
 
         url = base_url + path
+        client, client_generation = await self._borrow_client()
         try:
             if method.upper() == "GET":
                 resp = await client.get(url, params=params)
@@ -302,13 +444,34 @@ class MarketDataClient:
             if not resp.text:
                 return {}
             return resp.json()
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
+            diagnostics = self._network_failure_diagnostics(
+                exc,
+                client_generation=client_generation,
+                client_retired=False,
+            )
             raise PublicTransportError(
                 PublicTransportErrorCategory.TIMEOUT,
-                f"timeout: {method} {path}",
-            )
+                self._network_failure_message("timeout", method, path, diagnostics),
+                **diagnostics,
+            ) from exc
         except httpx.NetworkError as e:
-            raise PublicTransportError(PublicTransportErrorCategory.TRANSPORT_FAILURE, f"network: {method} {path}: {e}")
+            retired = await self._retire_failed_client(client)
+            diagnostics = self._network_failure_diagnostics(
+                e,
+                client_generation=client_generation,
+                client_retired=retired,
+            )
+            raise PublicTransportError(
+                PublicTransportErrorCategory.TRANSPORT_FAILURE,
+                self._network_failure_message("network", method, path, diagnostics),
+                **diagnostics,
+            ) from e
+        except asyncio.CancelledError:
+            await self._retire_failed_client(client)
+            raise
+        finally:
+            await self._release_client(client)
 
     # ------------------------------------------------------------------
     # Funding ticker fetch — main sidecar entry point
@@ -463,6 +626,27 @@ class MarketDataClient:
                     ),
                     open_interest_retry_after_ms=int(
                         getattr(exc, "retry_after_ms", 0) or 0
+                    ),
+                    open_interest_request_phase=str(
+                        getattr(exc, "request_phase", "") or ""
+                    ),
+                    open_interest_transport_error_type=str(
+                        getattr(exc, "transport_error_type", "") or ""
+                    ),
+                    open_interest_transport_error_detail=str(
+                        getattr(exc, "transport_error_detail", "") or ""
+                    ),
+                    open_interest_transport_error_cause_type=str(
+                        getattr(exc, "transport_error_cause_type", "") or ""
+                    ),
+                    open_interest_transport_error_cause=str(
+                        getattr(exc, "transport_error_cause", "") or ""
+                    ),
+                    open_interest_client_generation=int(
+                        getattr(exc, "client_generation", 0) or 0
+                    ),
+                    open_interest_client_retired=bool(
+                        getattr(exc, "client_retired", False)
                     ),
                     oi_cache_miss_count=1,
                     oi_refresh_attempt_count=1,
@@ -1298,11 +1482,25 @@ class PublicTransportError(Exception):
         message: str,
         status_code: int = 0,
         retry_after_ms: int = 0,
+        request_phase: str = "",
+        transport_error_type: str = "",
+        transport_error_detail: str = "",
+        transport_error_cause_type: str = "",
+        transport_error_cause: str = "",
+        client_generation: int = 0,
+        client_retired: bool = False,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.retry_after_ms = retry_after_ms
+        self.request_phase = request_phase
+        self.transport_error_type = transport_error_type
+        self.transport_error_detail = transport_error_detail
+        self.transport_error_cause_type = transport_error_cause_type
+        self.transport_error_cause = transport_error_cause
+        self.client_generation = client_generation
+        self.client_retired = client_retired
 
 
 def open_interest_evidence_status_from_error(exc: Exception) -> str:

@@ -11,6 +11,9 @@ and slow enrichment that must not block publication.
 - Long sidecar log sequences of per-symbol enrichment calls before snapshot
   publication
 - `okx_funding_fanout_cancelled` / increasing `CLOSE_WAIT` to `www.okx.com:443`
+- `runtime.entry_oi_targeted_refresh_failed` with an empty `network:` suffix
+- `open_interest_transport_error_type`, `open_interest_client_generation`, or
+  `open_interest_client_retired` after a public REST failure
 
 ## Current Effective Rule
 
@@ -29,6 +32,13 @@ seed shortlist and warm tracking, but execution still needs a fresh validated
 top-book quote lease. Slow OI/liquidity evidence can be cached, capped, deferred,
 or marked unavailable for sidecar publication, but entry gates remain fail-closed
 when required evidence is not available.
+
+The shared market-data HTTP client must preserve the failure phase, exception
+type, root cause, and client generation for every `httpx.NetworkError`. It
+must remove only that failed client from future reuse and wait for concurrent
+public/private borrowers before closing it. The failing request remains
+fail-closed; this layer does not add retries, reset one venue, or alter pool
+limits.
 
 An enrichment fast path must not create one HTTP request per requested symbol
 and then cancel an already-open batch merely to meet a snapshot budget. For a
@@ -50,6 +60,7 @@ four-request ceiling to compensate.
 | 2026-06-16 | WS-BBO cold-start and full-universe OI cap/timeout could still block finalist evidence | local fixed; real public smoke verified; deployment pending | CL-087 adds a sticky WS-BBO warm set for recent V1 primary/shadow/current finalist targets and candidate-scoped Binance/Aster public OI refresh before the entry liquidity gate. It does not relax quote TTL, OI floor, liquidity/admission/sizing/order guards, or raise the global OI cap. Targeted OI success must still pass the original OI floor; timeout/unsupported remains fail-closed with explicit diagnostics. A real public smoke showed Binance/Aster BTC/ETH candidate-scoped OI resolves in about 354-368ms under the separate bounded entry budget, while the sidecar 100ms fast-path budget remains unchanged. Targeted OI runtime events are mapped as diagnostic-only lifecycle evidence to avoid unmapped drift. |
 | 2026-08-26 | `336ad5f8` widened OKX cold-cache fanout to 40; `fd1579d6` added a 0.2s aggregate cancellation to keep snapshots fast | ineffective / regressed production | The two changes were called V1 parity/fast path, but V1 caps multi-symbol REST fallback at four and completes it. The aggregate cancellation left 36 OKX `CLOSE_WAIT` sockets, made OKX data stale, and fail-closed OKX candidates. Do not reuse this pattern. |
 | 2026-08-26 | Restore bounded four-request fallback with miss rotation and no ordinary batch cancellation | local green; deployment pending | Real `httpx` production-path regressions prove exactly four slow requests start and complete with zero ordinary cancellations, and outer cancellation awaits exactly those four children. Quote rows remain available and incomplete funding stays fail-closed for entry. |
+| 2026-08-30 | Shared public `ReadError` formatted as an empty error and client stayed reusable | local green; deployment pending | CL-133 records phase/type/root cause/client generation through the targeted-OI journal and retires only the failed shared client after active public/private leases complete. No Aster-only reset, blind retry, or pool change is permitted. |
 
 ## Regression Harness
 
@@ -69,3 +80,7 @@ four-request ceiling to compensate.
    assertion is insufficient.
 4. Keep incomplete/stale funding fail-closed at entry. Do not trade to hide a
    delayed enrichment result.
+5. For a blank or opaque HTTP network error, repair the shared client boundary
+   first. Do not infer venue ownership from CDN IPs or reset one venue client.
+6. Test a concurrent borrower before retiring a shared client, including
+   listenKey/private REST; never close it immediately from one failed request.

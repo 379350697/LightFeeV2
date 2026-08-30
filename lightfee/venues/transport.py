@@ -260,12 +260,26 @@ class TransportErrorCategory(Enum):
 class TransportError(Exception):
     def __init__(self, category: TransportErrorCategory, message: str,
                  status_code: int = 0, body: str = "",
-                 headers: dict[str, str] | None = None) -> None:
+                 headers: dict[str, str] | None = None,
+                 request_phase: str = "",
+                 transport_error_type: str = "",
+                 transport_error_detail: str = "",
+                 transport_error_cause_type: str = "",
+                 transport_error_cause: str = "",
+                 client_generation: int = 0,
+                 client_retired: bool = False) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.body = body
         self.headers: dict[str, str] = headers or {}
+        self.request_phase = request_phase
+        self.transport_error_type = transport_error_type
+        self.transport_error_detail = transport_error_detail
+        self.transport_error_cause_type = transport_error_cause_type
+        self.transport_error_cause = transport_error_cause
+        self.client_generation = client_generation
+        self.client_retired = client_retired
 
 
 async def _resolve_bitget_contract_family_for_truth(transport: Any) -> BitgetContractFamily:
@@ -2635,7 +2649,6 @@ class VenueTransport(MarketDataClient):
         _retry_ts_error: bool = True,
     ) -> dict[str, Any]:
         """Send an HTTP request with V1 parity: server time, scoped rate limiting, time error retry."""
-        client = await self._get_client()
         base_url = (
             self._spec.private_base_url if private
             else self._spec.public_base_url
@@ -2656,6 +2669,7 @@ class VenueTransport(MarketDataClient):
         if global_rt is not None:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
 
+        client, client_generation = await self._borrow_client()
         try:
             if method.upper() == "GET":
                 resp = await client.get(url, headers=headers)
@@ -2737,16 +2751,32 @@ class VenueTransport(MarketDataClient):
             if self._rate_limiter is not None:
                 self._rate_limiter.record_success_for_scopes(scopes)
             return raw
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
+            diagnostics = self._network_failure_diagnostics(
+                exc,
+                client_generation=client_generation,
+                client_retired=False,
+            )
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
-                f"timeout: {method} {path}",
-            )
+                self._network_failure_message("timeout", method, path, diagnostics),
+                **diagnostics,
+            ) from exc
         except httpx.NetworkError as e:
+            retired = await self._retire_failed_client(client)
+            diagnostics = self._network_failure_diagnostics(
+                e,
+                client_generation=client_generation,
+                client_retired=retired,
+            )
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
-                f"network error: {method} {path}: {e}",
-            )
+                self._network_failure_message("network error", method, path, diagnostics),
+                **diagnostics,
+            ) from e
+        except asyncio.CancelledError:
+            await self._retire_failed_client(client)
+            raise
         except TransportError:
             raise
         except Exception as e:
@@ -2754,6 +2784,8 @@ class VenueTransport(MarketDataClient):
                 TransportErrorCategory.TRANSPORT_FAILURE,
                 f"unexpected error: {method} {path}: {e}",
             )
+        finally:
+            await self._release_client(client)
 
     async def _request_listen_key(
         self,
@@ -2768,7 +2800,6 @@ class VenueTransport(MarketDataClient):
         V1 parity: these endpoints use only the API-key header and optional
         listenKey query parameter. They are not trading signed requests.
         """
-        client = await self._get_client()
         base_url = self._spec.private_base_url
         qp_list: list[tuple[str, str]] = []
         if params:
@@ -2789,6 +2820,7 @@ class VenueTransport(MarketDataClient):
         if global_rt is not None:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
 
+        client, client_generation = await self._borrow_client()
         try:
             method_upper = method.upper()
             if method_upper == "POST":
@@ -2831,16 +2863,32 @@ class VenueTransport(MarketDataClient):
             if not resp.text:
                 return {}
             return resp.json()
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
+            diagnostics = self._network_failure_diagnostics(
+                exc,
+                client_generation=client_generation,
+                client_retired=False,
+            )
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
-                f"timeout: {method} {path}",
-            )
+                self._network_failure_message("timeout", method, path, diagnostics),
+                **diagnostics,
+            ) from exc
         except httpx.NetworkError as e:
+            retired = await self._retire_failed_client(client)
+            diagnostics = self._network_failure_diagnostics(
+                e,
+                client_generation=client_generation,
+                client_retired=retired,
+            )
             raise TransportError(
                 TransportErrorCategory.TRANSPORT_FAILURE,
-                f"network error: {method} {path}: {e}",
-            )
+                self._network_failure_message("network error", method, path, diagnostics),
+                **diagnostics,
+            ) from e
+        except asyncio.CancelledError:
+            await self._retire_failed_client(client)
+            raise
         except TransportError:
             raise
         except Exception as e:
@@ -2848,6 +2896,8 @@ class VenueTransport(MarketDataClient):
                 TransportErrorCategory.TRANSPORT_FAILURE,
                 f"unexpected error: {method} {path}: {e}",
             )
+        finally:
+            await self._release_client(client)
 
     def _time_offset_retry_exhausted_message(
         self,

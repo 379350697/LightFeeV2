@@ -88,6 +88,27 @@ class EntryOpenInterestRefresher:
                 "open_interest_retry_after_ms": int(
                     getattr(exc, "retry_after_ms", 0) or 0
                 ),
+                "open_interest_request_phase": str(
+                    getattr(exc, "request_phase", "") or ""
+                ),
+                "open_interest_transport_error_type": str(
+                    getattr(exc, "transport_error_type", "") or ""
+                ),
+                "open_interest_transport_error_detail": str(
+                    getattr(exc, "transport_error_detail", "") or ""
+                ),
+                "open_interest_transport_error_cause_type": str(
+                    getattr(exc, "transport_error_cause_type", "") or ""
+                ),
+                "open_interest_transport_error_cause": str(
+                    getattr(exc, "transport_error_cause", "") or ""
+                ),
+                "open_interest_client_generation": int(
+                    getattr(exc, "client_generation", 0) or 0
+                ),
+                "open_interest_client_retired": bool(
+                    getattr(exc, "client_retired", False)
+                ),
             }
         ticker = result.get(f"{venue_key}:{symbol_key}")
         if ticker is None:
@@ -112,6 +133,28 @@ class EntryOpenInterestRefresher:
             ),
             "open_interest_retry_after_ms": int(
                 getattr(ticker, "open_interest_retry_after_ms", 0) or 0
+            ),
+            "open_interest_request_phase": str(
+                getattr(ticker, "open_interest_request_phase", "") or ""
+            ),
+            "open_interest_transport_error_type": str(
+                getattr(ticker, "open_interest_transport_error_type", "") or ""
+            ),
+            "open_interest_transport_error_detail": str(
+                getattr(ticker, "open_interest_transport_error_detail", "") or ""
+            ),
+            "open_interest_transport_error_cause_type": str(
+                getattr(ticker, "open_interest_transport_error_cause_type", "")
+                or ""
+            ),
+            "open_interest_transport_error_cause": str(
+                getattr(ticker, "open_interest_transport_error_cause", "") or ""
+            ),
+            "open_interest_client_generation": int(
+                getattr(ticker, "open_interest_client_generation", 0) or 0
+            ),
+            "open_interest_client_retired": bool(
+                getattr(ticker, "open_interest_client_retired", False)
             ),
             "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
             "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
@@ -1334,6 +1377,27 @@ class MarketDataRuntime:
                     "open_interest_retry_after_ms": int(
                         getattr(exc, "retry_after_ms", 0) or 0
                     ),
+                    "open_interest_request_phase": str(
+                        getattr(exc, "request_phase", "") or ""
+                    ),
+                    "open_interest_transport_error_type": str(
+                        getattr(exc, "transport_error_type", "") or ""
+                    ),
+                    "open_interest_transport_error_detail": str(
+                        getattr(exc, "transport_error_detail", "") or ""
+                    ),
+                    "open_interest_transport_error_cause_type": str(
+                        getattr(exc, "transport_error_cause_type", "") or ""
+                    ),
+                    "open_interest_transport_error_cause": str(
+                        getattr(exc, "transport_error_cause", "") or ""
+                    ),
+                    "open_interest_client_generation": int(
+                        getattr(exc, "client_generation", 0) or 0
+                    ),
+                    "open_interest_client_retired": bool(
+                        getattr(exc, "client_retired", False)
+                    ),
                 }
             elapsed_ms = int(
                 (result or {}).get(
@@ -1365,6 +1429,33 @@ class MarketDataRuntime:
                 ),
                 "open_interest_retry_after_ms": int(
                     (result or {}).get("open_interest_retry_after_ms", 0) or 0
+                ),
+                "open_interest_request_phase": str(
+                    (result or {}).get("open_interest_request_phase", "") or ""
+                ),
+                "open_interest_transport_error_type": str(
+                    (result or {}).get("open_interest_transport_error_type", "")
+                    or ""
+                ),
+                "open_interest_transport_error_detail": str(
+                    (result or {}).get("open_interest_transport_error_detail", "")
+                    or ""
+                ),
+                "open_interest_transport_error_cause_type": str(
+                    (result or {}).get(
+                        "open_interest_transport_error_cause_type", ""
+                    )
+                    or ""
+                ),
+                "open_interest_transport_error_cause": str(
+                    (result or {}).get("open_interest_transport_error_cause", "")
+                    or ""
+                ),
+                "open_interest_client_generation": int(
+                    (result or {}).get("open_interest_client_generation", 0) or 0
+                ),
+                "open_interest_client_retired": bool(
+                    (result or {}).get("open_interest_client_retired", False)
                 ),
                 "elapsed_ms": elapsed_ms,
                 "ts_ms": now_ms,

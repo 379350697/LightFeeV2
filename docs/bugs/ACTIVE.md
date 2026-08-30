@@ -65,10 +65,16 @@ they have a fixing commit. They are **local-green only**, not production facts:
   the deployment verifier; and
 - exact Tailscale Quad100 resolver recognition.
 
+- shared HTTP transport typed failure evidence and delayed failed-client
+  retirement. This keeps the current request fail-closed, records phase/type/
+  root cause/client generation, and prevents a public failure from closing a
+  client still borrowed by private REST or listenKey work. It adds no retry or
+  venue-specific reset.
+
 Their contract, rejected prior repair patterns, counterexamples, and local
-evidence are recorded in [2026-08-29](daily/2026-08-29.md). They must not be
-called deployed or closed until this table receives real fixing commits and a
-production observation.
+evidence are recorded in [2026-08-29](daily/2026-08-29.md) and
+[2026-08-30](daily/2026-08-30.md). They must not be called deployed or closed
+until this table receives real fixing commits and a production observation.
 
 ## Current Batch
 

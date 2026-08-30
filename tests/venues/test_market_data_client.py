@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
 import pytest
 
 from lightfee.core.domain import Venue
@@ -276,6 +277,136 @@ class TestRateLimitScopesForNewEndpoints:
         assert snap["cooldown_until_ms"] > 0
         assert exc_info.value.status_code == 429
         assert exc_info.value.retry_after_ms == 1000
+
+
+class TestPublicTransportFailureRecovery:
+    """A failed public connection must not be reused or lose its evidence."""
+
+    @pytest.mark.asyncio
+    async def test_network_error_keeps_cause_and_retires_failed_client(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            try:
+                raise RuntimeError("peer closed idle connection")
+            except RuntimeError as cause:
+                raise httpx.ReadError("", request=request) from cause
+
+        client = MarketDataClient(binance_spec())
+        failed_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client._client = failed_client
+        try:
+            with pytest.raises(PublicTransportError) as exc_info:
+                await client._public_get(
+                    "/fapi/v1/openInterest",
+                    params={"symbol": "BTCUSDT"},
+                )
+
+            error = exc_info.value
+            assert error.request_phase == "read"
+            assert error.transport_error_type == "ReadError"
+            assert error.transport_error_cause_type == "RuntimeError"
+            assert error.transport_error_cause == "peer closed idle connection"
+            assert error.client_generation == 1
+            assert error.client_retired is True
+            assert "ReadError" in str(error)
+            assert "RuntimeError" in str(error)
+            assert client._client is None
+            assert failed_client.is_closed
+
+            replacement = await client._get_client()
+            assert replacement is not failed_client
+            assert client._client_generation == 2
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_network_error_reaches_targeted_oi_evidence(self):
+        from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            try:
+                raise ConnectionResetError("peer reset stream")
+            except ConnectionResetError as cause:
+                raise httpx.ReadError("", request=request) from cause
+
+        client = MarketDataClient(binance_spec())
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        refresher = EntryOpenInterestRefresher()
+        refresher._clients["binance"] = client
+        try:
+            result = await refresher.refresh_open_interest(
+                "binance",
+                "BTCUSDT",
+                mark_price=100.0,
+                now_ms=1,
+            )
+        finally:
+            await refresher.close()
+
+        assert result is not None
+        assert result["open_interest_evidence_status"] == "http_error"
+        assert result["open_interest_request_phase"] == "read"
+        assert result["open_interest_transport_error_type"] == "ReadError"
+        assert result["open_interest_transport_error_cause_type"] == "ConnectionResetError"
+        assert result["open_interest_transport_error_cause"] == "peer reset stream"
+        assert result["open_interest_client_generation"] == 1
+        assert result["open_interest_client_retired"] is True
+
+    @pytest.mark.asyncio
+    async def test_failed_client_waits_for_inflight_public_request_before_close(self):
+        slow_started = asyncio.Event()
+        allow_slow_response = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/slow":
+                slow_started.set()
+                await allow_slow_response.wait()
+                return httpx.Response(200, json={"ok": True})
+            raise httpx.ReadError("peer reset", request=request)
+
+        client = MarketDataClient(binance_spec())
+        failed_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client._client = failed_client
+        try:
+            slow_request = asyncio.create_task(client._public_get("/slow"))
+            await slow_started.wait()
+
+            with pytest.raises(PublicTransportError):
+                await client._public_get("/failed")
+
+            assert client._client is None
+            assert not failed_client.is_closed
+
+            allow_slow_response.set()
+            assert await slow_request == {"ok": True}
+            assert failed_client.is_closed
+        finally:
+            allow_slow_response.set()
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_public_request_retires_and_closes_its_client(self):
+        request_started = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            request_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        client = MarketDataClient(binance_spec())
+        failed_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client._client = failed_client
+        try:
+            request = asyncio.create_task(client._public_get("/blocked"))
+            await request_started.wait()
+            request.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+            assert client._client is None
+            assert failed_client.is_closed
+        finally:
+            await client.close()
 
 
 class TestParserFixtures:

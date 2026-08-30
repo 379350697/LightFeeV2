@@ -22,6 +22,18 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Investigations
 
+2026-08-30 shared HTTP opaque transport evidence and client retirement: a bare
+`httpx.ReadError` was formatted with `str(exc)`, leaving production
+`network: GET /fapi/v1/openInterest: ` events with no usable failure type or
+cause. The base `MarketDataClient` is also used by `VenueTransport`, so an
+Aster-only reset or blind retry was both unproven and unsafe. The local repair
+records safe phase/type/root-cause/client-generation fields, retires only the
+failed client, and delays its close until concurrent public/private borrowers
+release it. The current request remains fail-closed; no order retry, pool-size
+change, or venue-specific branch was added. It is **implemented and
+local-green, not committed or deployed**; see
+[2026-08-30](daily/2026-08-30.md#cl-133--shared-public-transport-erased-failure-evidence-and-reused-a-failed-client).
+
 2026-08-29 uncommitted repair batch: Aster V3 historical close discovery was
 missing, so a uniquely reconstructable Aster debt was terminalized as
 unsupported; terminal accounting-only debt also continued to seed recovery
