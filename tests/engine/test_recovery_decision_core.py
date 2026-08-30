@@ -145,11 +145,24 @@ def test_complete_account_truth_releases_live_artifact_latch_only_for_exact_norm
             "open_orders": open_orders,
         },
         prior_recovery_block_reason="unpaired_live_position",
+        recovery_work_items=(
+            {
+                "kind": "pending_close_reconciliation",
+                "blocking": True,
+                "position_id": "entry-coti-billing-debt",
+            },
+        ),
     )
 
     decision = V1RecoveryDecisionCore().decide(snapshot)
 
     assert decision.clear_previous_block is expected_clear
+    if expected_clear:
+        assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+        assert decision.entry_allowed is True
+        assert decision.clear_reason == "core_background_close_reconciliation"
+    else:
+        assert decision.entry_allowed is False
 
 
 def test_close_reconciliation_runs_in_background_without_prior_account_latch():

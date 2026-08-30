@@ -541,8 +541,17 @@ class V1RecoveryDecisionCore:
         snapshot: RecoveryEvidenceSnapshot,
     ) -> bool:
         work_items = _as_items(snapshot.recovery_work_items)
+        local_open_positions = _as_items(snapshot.local_open_positions)
         return bool(
-            not _has_items(snapshot.local_open_positions)
+            # V1 keeps terminal close accounting in the background after its
+            # active positions have been confirmed.  V2 uses the stronger,
+            # account-scoped REST proof here: every local pair must exactly
+            # match before an unrelated reconciliation debt can release a
+            # prior live-artifact latch.
+            (
+                not local_open_positions
+                or self._exchange_truth_matches_local_open_positions(snapshot)
+            )
             and not _has_items(snapshot.pending_entries)
             and not _has_items(snapshot.residual_repairs)
             and not _has_items(snapshot.passive_closes)

@@ -4274,6 +4274,19 @@ class TestRuntimePreflight:
                 short_entry_price=0.11,
                 opened_at_ms=1700000004000,
             )
+            runtime.state.set_pending_close_reconciliations([
+                {
+                    "position_id": "entry-coti-billing-debt",
+                    "kind": "final",
+                    "symbol": "COTIUSDT",
+                    "long_venue": Venue.OKX.value,
+                    "short_venue": Venue.BINANCE.value,
+                    "reconciliation_status": "evidence_debt",
+                    "evidence_debt_reason": (
+                        "known_close_fill_temporarily_unavailable"
+                    ),
+                }
+            ])
             runtime.state.pending_entries["entry-ong"] = PendingEntry(
                 pending_id="entry-ong",
                 symbol="ONGUSDT",
