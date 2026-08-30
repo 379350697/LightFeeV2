@@ -34,15 +34,18 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `8a2def63bdc86312527fe6fc1542ebb2609a8f65`
-- Checked on: `2026-08-30`. `8a2def63` was fast-forwarded to production; the
-  manifest, singleton check, services, seven source-freshness probes, FD /
-  `CLOSE_WAIT`, private-worker bounds, and Binance listenKey sample passed.
-  A natural `ZKPUSDT` matched hedge then exposed CL-134: its unrelated historic
-  final close debt held the lifecycle at `risk_only`. The position subsequently
-  closed normally and read-only diagnosis returned `running` with no positions
-  or orders, but the deployed release logic is incomplete. `2111e36` is local
-  green and awaits deployment; do not call CL-134 closed.
+- Last production SHA checked: `fe821142417a6091e165ea7264338c200ad6ede8`
+- Checked on: `2026-08-30`. `fe821142` (including `2111e36`) was
+  fast-forwarded to production, the manifest passed, and both services restarted
+  active with zero restarts. Source freshness is green; FD / `CLOSE_WAIT` is
+  `15/0` (sidecar) and `21/0` (live); direct post-start logs show one private
+  worker start per supported venue. Current high-confidence exchange truth is
+  flat/no-order and lifecycle is `running`, with the terminal close debt marked
+  background/entry-allowed. CL-134 still requires a natural matched **open**
+  pair beside that debt before closure. The generic verifier's private-worker
+  rate alert is a separate timestamp-collection false positive: this host does
+  not expose `ActiveEnterTimestampUSec`, so its one-hour fallback includes the
+  prior intentional restart as well as this one.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -114,7 +117,7 @@ until this table receives real fixing commits and a production observation.
 | CL-126 | deployed-awaiting-verification | `ac9d536` | ACK/retry/compensation identity persistence, strict-history complete/temporary failure, and crash replay matrix (`349 passed` in close scope; full profile 10/10 green) | existing BICO passive-close owner prevented full acceptance; after SSH recovery, re-read exchange truth and classify existing COTI×2/BTR evidence without order mutation | [2026-08-27](daily/2026-08-27.md#cl-126-passive-close-ack-identity-loss-and-stranded-evidence-debt) |
 | CL-127 | deployed-awaiting-verification | `ac9d536` | fresh writer + stale/degraded quote/funding/liquidity source matrix; live-config budget wiring (`223 passed` health/sidecar/diagnose selection; full profile 10/10 green) | first production sample is green; rerun complete acceptance after state recovery reaches `running` | [2026-08-27](daily/2026-08-27.md#cl-127-sidecar-health-false-green-on-stale-source-evidence) |
 | CL-128 | deployed-awaiting-verification | `ac9d536` | rotated-only event, duplicate rotation, global cap, high-confidence `since-deploy`, and large-tail counterexamples (`117 passed`; full profile 10/10 green) | after SSH recovery, run deployed diagnosis and record discovered rotations/scope metadata | [2026-08-27](daily/2026-08-27.md#cl-128-diagnosis-omitted-rotated-journals-and-drifted-ledger) |
-| CL-134 | local-green | `2111e36` | production-path RED/GREEN for terminal normal pair plus unrelated final close debt; exact-pair/one-leg/wrong-side/wrong-quantity/open-order core matrix; focused `477 passed`; full `4491 passed, 9 skipped` | `8a2def63` safely reproduced the missed path; deploy `2111e36` and observe a natural matched hedge with historical debt remain `running` while non-normal/incomplete truth stays blocked | [2026-08-30](daily/2026-08-30.md#cl-134--a-normal-matched-hedge-was-globally-blocked-by-unrelated-close-accounting-debt) |
+| CL-134 | deployed-awaiting-verification | `2111e36` | production-path RED/GREEN for terminal normal pair plus unrelated final close debt; exact-pair/one-leg/wrong-side/wrong-quantity/open-order core matrix; focused `477 passed`; full `4491 passed, 9 skipped` | `fe821142` is live: services active/0 restarts, current state `running` with background debt and high-confidence flat/no-order truth. Observe a natural matched open hedge beside debt remain `running`; non-normal/incomplete truth must stay blocked. | [2026-08-30](daily/2026-08-30.md#cl-134--a-normal-matched-hedge-was-globally-blocked-by-unrelated-close-accounting-debt) |
 
 ## Pre-CL-093 Historical Boundary
 
