@@ -34,17 +34,15 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `dc83dc75c7cc11dc5a5abf0f1a29b071e9f8eacb`
-- Checked on: `2026-08-27`. `ac9d536` and this ledger commit were fast-forwarded
-  to production, both services were restarted active, and `.deploy_version`
-  was set to `dc83dc7`. The first new acceptance sample was green for source
-  freshness (all seven venues), sidecar FD `14`/`CLOSE_WAIT=0`, live FD
-  `20`/`CLOSE_WAIT=0`, bounded private-WS starts, and fresh Binance listenKey.
-  It was not a full acceptance: recovered state still held an existing BICO
-  passive-close owner and was not `running`; its exchange-truth follow-up and
-  the required second resource-stability sample were blocked by repeated SSH
-  pre-authentication timeouts. CL-125 through CL-128 are deployed but not
-  closed. CL-121 still needs a natural targeted-OI 429 sample.
+- Last production SHA checked: `8a2def63bdc86312527fe6fc1542ebb2609a8f65`
+- Checked on: `2026-08-30`. `8a2def63` was fast-forwarded to production; the
+  manifest, singleton check, services, seven source-freshness probes, FD /
+  `CLOSE_WAIT`, private-worker bounds, and Binance listenKey sample passed.
+  A natural `ZKPUSDT` matched hedge then exposed CL-134: its unrelated historic
+  final close debt held the lifecycle at `risk_only`. The position subsequently
+  closed normally and read-only diagnosis returned `running` with no positions
+  or orders, but the deployed release logic is incomplete. `2111e36` is local
+  green and awaits deployment; do not call CL-134 closed.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -116,6 +114,7 @@ until this table receives real fixing commits and a production observation.
 | CL-126 | deployed-awaiting-verification | `ac9d536` | ACK/retry/compensation identity persistence, strict-history complete/temporary failure, and crash replay matrix (`349 passed` in close scope; full profile 10/10 green) | existing BICO passive-close owner prevented full acceptance; after SSH recovery, re-read exchange truth and classify existing COTI×2/BTR evidence without order mutation | [2026-08-27](daily/2026-08-27.md#cl-126-passive-close-ack-identity-loss-and-stranded-evidence-debt) |
 | CL-127 | deployed-awaiting-verification | `ac9d536` | fresh writer + stale/degraded quote/funding/liquidity source matrix; live-config budget wiring (`223 passed` health/sidecar/diagnose selection; full profile 10/10 green) | first production sample is green; rerun complete acceptance after state recovery reaches `running` | [2026-08-27](daily/2026-08-27.md#cl-127-sidecar-health-false-green-on-stale-source-evidence) |
 | CL-128 | deployed-awaiting-verification | `ac9d536` | rotated-only event, duplicate rotation, global cap, high-confidence `since-deploy`, and large-tail counterexamples (`117 passed`; full profile 10/10 green) | after SSH recovery, run deployed diagnosis and record discovered rotations/scope metadata | [2026-08-27](daily/2026-08-27.md#cl-128-diagnosis-omitted-rotated-journals-and-drifted-ledger) |
+| CL-134 | local-green | `2111e36` | production-path RED/GREEN for terminal normal pair plus unrelated final close debt; exact-pair/one-leg/wrong-side/wrong-quantity/open-order core matrix; focused `477 passed`; full `4491 passed, 9 skipped` | `8a2def63` safely reproduced the missed path; deploy `2111e36` and observe a natural matched hedge with historical debt remain `running` while non-normal/incomplete truth stays blocked | [2026-08-30](daily/2026-08-30.md#cl-134--a-normal-matched-hedge-was-globally-blocked-by-unrelated-close-accounting-debt) |
 
 ## Pre-CL-093 Historical Boundary
 

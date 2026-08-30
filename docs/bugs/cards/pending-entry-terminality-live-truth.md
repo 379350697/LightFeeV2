@@ -160,13 +160,15 @@ artifact: it becomes `owned_pending_entry_live_conflict`, blocks all new entry
 risk, and must be managed through cleanup/flatten-or-block until fresh account
 position and open-order truth prove flat.
 
-When only non-blocking close-accounting reconciliation remains, a historical
+When only close-accounting reconciliation remains, a historical
 `orphan_maker_order`, `unpaired_live_position`, or
 `owned_pending_entry_live_conflict` latch may release only from fresh,
-unfiltered **account-level** truth: every position and every open order
-(including reduce-only) must be zero/empty and no probe may be partial or
-missing. This preserves the V1 background-accounting rule without allowing a
-symbol-scoped or position-only flat probe to erase a live-artifact blocker.
+unfiltered **account-level** truth with no partial or missing probe. That truth
+must either prove the account flat with no open orders, or prove that every
+managed local position is an exact, opposite-side, equal-quantity hedge and
+that there are no open orders. The latter is V1's confirmed-managed-position
+background-accounting case. A symbol-scoped or position-only probe may not
+erase an account-level live-artifact blocker.
 
 Terminal close `evidence_debt` has a narrower pair-scoped release contract.  It
 remains visible for billing, but it may stop blocking only its exact symbol and
@@ -304,6 +306,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-08-09 | KAITO cleanup followed by stale `owned_pending_entry_live_conflict` with COTI background evidence debt | fixed locally, deploy pending | Complete all-account flat/no-open-order truth was already sufficient for the core to allow `RUNNING_WITH_EVIDENCE_GAP`, but the old live-artifact latch was excluded from evidence-gap release. Core now has one strict release predicate: complete non-partial account truth must show all positions and orders empty; non-blocking accounting debt remains a warning rather than global `risk_only`. |
 | 2026-08-20 | Post-terminal close owner remained in recovery ledger | local-green; `79db9b4` committed, deploy blocked | Direct reconciliation removal and passive close owner transitions can leave a pre-built recovery ledger stale. The shared owner-count refresh covers reconciliation removal, direct passive completion, and handoff to accounting; incomplete close evidence remains retained and does not become a safe release. A read-only pre-deploy gate found `entry-1787237547671-COTIUSDT` with a local open-position owner and a pending passive-close owner, so no pull/restart was permitted. |
 | 2026-08-22 | Terminal close evidence debt permanently blocked its matching pair while active/unknown reconciliation was nonblocking in the ledger | closed; `0474ca28` deployed and production verified | CL-119 makes RecoveryLedger the sole exact-pair gate. Active, unknown, or truth-gap close reconciliation blocks the unordered exact venue pair; the same symbol on another complete venue pair remains eligible. `evidence_debt` becomes nonblocking only with complete exact-pair flat/no-order truth. Three deployments successively exposed diagnostics/runtime truth-schema drift, startup omission of pending-close reconciliation symbols, and a fake-only symbol open-order method absent from production Binance/Bybit adapters. Symbol and account-wide truth now share the official venue-operation contract/parser owner; capability absence stays unsupported. Production showed all seven venues flat/no-order and both COTI/ONG rows visible with `blocking=false`, zero closure blocking rows, and no post-deploy RecoveryLedger/final-dispatch blocker. Historical billing evidence was not altered. |
+| 2026-08-30 | Matched ZKP hedge remained `risk_only` beside historical COTI close debt | local-green; `2111e36` deploy pending | The first account-truth release attempt (`8a2def63`) correctly matched the normal hedge, but the preceding "only close reconciliation" predicate rejected every nonempty `local_open_positions` list. V1 permits confirmed active positions to keep close accounting in the background. The existing core predicate now accepts local positions only when complete account truth exactly matches every local long/short pair and contains no open order; incomplete, one-leg, wrong-side, wrong-quantity, or order-bearing truth stays blocked. The production-shaped terminal pending removal regression carries an unrelated final `evidence_debt`; full pytest is green. |
 
 ## Recurrences
 
@@ -312,6 +315,7 @@ side is an evidence gap/fail-closed condition, not default buy.
 | 2026-08-04 | synthetic `HOMEUSDT` OKX/Bybit confirmed replay fill | `3c42aea` | deployed; cloud health green; behavior watch | [CL-093 confirmed replay fill ownership](../daily/2026-08-04.md#cluster-cl-093-confirmed-replay-fill-owner-terminalization) |
 | 2026-08-09 | KAITO cleanup + historical COTI background close reconciliation | working tree | local regression green; deploy pending | [CL-099 complete-flat live-artifact latch release](../daily/2026-08-09.md#cluster-cl-099-kaito-v3-capacity-admission-and-live-artifact-release) |
 | 2026-08-20 | historical COTI bills + current COTI close ownership | `79db9b4` | local-green; pre-deploy gate blocked; no production mutation | [CL-115 post-terminal recovery-ledger staleness](../daily/2026-08-20.md#cluster-cl-115-post-terminal-recovery-ledger-staleness) |
+| 2026-08-30 | `ZKPUSDT` OKX/Binance normal hedge + historical COTI close debt | `2111e36` | local-green; deployment pending | The live entry was quantity- and side-matched with no open orders, but the prior `unpaired_live_position` latch stayed `risk_only` solely because an unrelated terminal close debt existed. |
 | 2026-05-27 | `MUBARAKUSDT`, `EDENUSDT`, `INUSDT`, `BEATUSDT`, `PRLUSDT` | remote hot patch family | closed | [daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided](../daily/2026-05-27.md#cluster-cl-013-pending-entry-v1-terminality-drift-live-single-sided) |
 | 2026-05-30 | `ORCAUSDT`, `NOMUSDT`, `RAVEUSDT` | `0fd9a74`; no semantic code change selected for this family | final targeted probes flat/no-open-orders | [daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission](../daily/2026-05-30.md#cluster-cl-018-post-bbcd7b9-production-watch-residual-live-truth-and-exchange-admission) |
 | 2026-06-01 | `ARIAUSDT` Bybit/Binance | `f1727c1`; cloud verified | pending-entry live truth mismatch reproduced from production evidence; first deploy showed stale recovery block kept the fix unreachable; second deploy converted pending to open and flattened excess, then exposed drift-correction false-negative latching; final deploy reached running/flat/no-open-orders | [daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust](../daily/2026-06-01.md#cluster-cl-027-pending-entry-live-truth-under-min-hedge-dust) |
@@ -428,8 +432,10 @@ side is an evidence gap/fail-closed condition, not default buy.
     `uncertain_outcome=false` as a deletion authority.
 29. Before releasing an old live-artifact `risk_only` latch in the presence of
     background close debt, require complete all-account position **and**
-    open-order truth. Do not infer orders from a position-only or dirty-symbol
-    scan; any partial probe remains blocked.
+    open-order truth. It must prove either flat/no-order or an exact match for
+    every managed normal pair with no open order. Do not infer orders from a
+    position-only or dirty-symbol scan; any partial, one-leg, wrong-side, or
+    wrong-quantity truth remains blocked.
 30. Distinguish retryable/unknown pending-close work from terminal
     `evidence_debt`: the former blocks its matching pair; the latter may release
     the pair only when high-confidence exchange truth proves positions and open
