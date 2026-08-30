@@ -7,6 +7,7 @@ import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import (
     AccountFeeSnapshot,
     OrderFill,
@@ -51,6 +52,10 @@ class OkxAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
 
     async def fetch_account_fee_snapshot(
         self, reference_symbol: str = ""
@@ -195,6 +200,149 @@ class OkxAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    @staticmethod
+    def _okx_entry_position_sides(raw: Any) -> tuple[str, ...]:
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("code", "")) != "0"
+            or not isinstance(raw.get("data"), list)
+            or not raw["data"]
+            or not isinstance(raw["data"][0], dict)
+        ):
+            raise ValueError("OKX account config response is malformed")
+        mode = str(raw["data"][0].get("posMode", "") or "").lower()
+        if "long_short" in mode:
+            return ("long", "short")
+        if mode == "net_mode":
+            return ("net",)
+        raise ValueError(f"OKX account config position mode is unsupported: {mode or 'missing'}")
+
+    @staticmethod
+    def _okx_entry_leverages(
+        raw: Any, venue_symbol: str, expected_sides: tuple[str, ...]
+    ) -> dict[str, int]:
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("code", "")) != "0"
+            or not isinstance(raw.get("data"), list)
+        ):
+            raise ValueError("OKX leverage-info response is malformed")
+
+        leverages: dict[str, int] = {}
+        for row in raw["data"]:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("instId", "")).upper() != venue_symbol.upper():
+                continue
+            if str(row.get("mgnMode", "")).lower() != "cross":
+                continue
+            side = str(row.get("posSide", "") or "").lower()
+            if side not in expected_sides:
+                continue
+            try:
+                leverage = float(row.get("lever"))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("OKX leverage-info leverage is missing or invalid")
+            if not math.isfinite(leverage) or leverage <= 0 or not leverage.is_integer():
+                raise ValueError("OKX leverage-info leverage is missing or invalid")
+            leverages[side] = int(leverage)
+
+        if set(leverages) != set(expected_sides):
+            raise ValueError(
+                "OKX leverage-info is incomplete for position mode "
+                f"expected={list(expected_sides)} actual={sorted(leverages)}"
+            )
+        return leverages
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        """Set and read back cross leverage for the account's exact OKX position mode."""
+        target = int(leverage or 0)
+        if target <= 0 or self._transport.mode != "live":
+            return
+
+        venue_symbol = self._transport._venue_symbol(symbol)
+        payload: dict[str, Any] = {
+            "venue": Venue.OKX.value,
+            "symbol": venue_symbol,
+            "requested_leverage": target,
+            "requested_notional_quote": float(notional_quote or 0.0),
+            "account_config_endpoint": "/api/v5/account/config",
+            "leverage_info_endpoint": "/api/v5/account/leverage-info",
+            "set_leverage_endpoint": "/api/v5/account/set-leverage",
+        }
+        try:
+            config_raw = await self._transport._request(
+                "GET", "/api/v5/account/config", private=True
+            )
+            sides = self._okx_entry_position_sides(config_raw)
+            payload["position_sides"] = list(sides)
+
+            async def readback() -> dict[str, int]:
+                raw = await self._transport._request(
+                    "GET",
+                    "/api/v5/account/leverage-info",
+                    params={"instId": venue_symbol, "mgnMode": "cross"},
+                    private=True,
+                )
+                return self._okx_entry_leverages(raw, venue_symbol, sides)
+
+            before = await readback()
+            payload["before_leverages"] = dict(before)
+            if all(value == target for value in before.values()):
+                payload["outcome"] = "already_verified"
+                self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+                return
+
+            for side in sides:
+                if before[side] == target:
+                    continue
+                body: dict[str, str] = {
+                    "instId": venue_symbol,
+                    "lever": str(target),
+                    "mgnMode": "cross",
+                }
+                if side != "net":
+                    body["posSide"] = side
+                response = await self._transport._request(
+                    "POST", "/api/v5/account/set-leverage", body=body, private=True
+                )
+                response_code = str(response.get("code", "") if isinstance(response, dict) else "")
+                if response_code != "0":
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "OKX entry leverage set rejected "
+                        f"symbol={venue_symbol} posSide={side} code={response_code or 'missing'}",
+                    )
+
+            after = await readback()
+            payload["after_leverages"] = dict(after)
+            if any(value != target for value in after.values()):
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "OKX entry leverage readback mismatch "
+                    f"symbol={venue_symbol} expected={target} actual={after}",
+                )
+            payload["outcome"] = "set_and_verified"
+            self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+        except OrderSubmitError:
+            payload["outcome"] = "rejected"
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
+        except Exception as exc:
+            payload["outcome"] = "error"
+            payload["error"] = str(exc)[:300]
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"OKX entry leverage prepare failed: {exc}",
+            ) from exc
 
     async def fetch_order_fill_reconciliation(
         self,

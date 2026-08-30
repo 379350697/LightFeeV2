@@ -289,6 +289,10 @@ class BinanceAdapter(VenueAdapter):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
 
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
+
     async def ensure_entry_leverage(
         self,
         symbol: str,

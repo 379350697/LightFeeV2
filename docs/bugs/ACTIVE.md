@@ -72,6 +72,13 @@ they have a fixing commit. They are **local-green only**, not production facts:
   client still borrowed by private REST or listenKey work. It adds no retry or
   venue-specific reset.
 
+- pending-entry delayed maker-fill ownership and all-venue entry-leverage
+  verification. These retain a known maker owner until exact fill evidence can
+  drive the existing normal hedge, and require every live entry leg to prove
+  its exchange-specific leverage postcondition before a new order. They do not
+  change the existing terminalization-budget cleanup or submit an order during
+  verification.
+
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md) and
 [2026-08-30](daily/2026-08-30.md). They must not be called deployed or closed
@@ -118,6 +125,7 @@ until this table receives real fixing commits and a production observation.
 | CL-127 | deployed-awaiting-verification | `ac9d536` | fresh writer + stale/degraded quote/funding/liquidity source matrix; live-config budget wiring (`223 passed` health/sidecar/diagnose selection; full profile 10/10 green) | first production sample is green; rerun complete acceptance after state recovery reaches `running` | [2026-08-27](daily/2026-08-27.md#cl-127-sidecar-health-false-green-on-stale-source-evidence) |
 | CL-128 | deployed-awaiting-verification | `ac9d536` | rotated-only event, duplicate rotation, global cap, high-confidence `since-deploy`, and large-tail counterexamples (`117 passed`; full profile 10/10 green) | after SSH recovery, run deployed diagnosis and record discovered rotations/scope metadata | [2026-08-27](daily/2026-08-27.md#cl-128-diagnosis-omitted-rotated-journals-and-drifted-ledger) |
 | CL-134 | deployed-awaiting-verification | `2111e36` | production-path RED/GREEN for terminal normal pair plus unrelated final close debt; exact-pair/one-leg/wrong-side/wrong-quantity/open-order core matrix; focused `477 passed`; full `4491 passed, 9 skipped` | `fe821142` is live: services active/0 restarts, current state `running` with background debt and high-confidence flat/no-order truth. Observe a natural matched open hedge beside debt remain `running`; non-normal/incomplete truth must stay blocked. | [2026-08-30](daily/2026-08-30.md#cl-134--a-normal-matched-hedge-was-globally-blocked-by-unrelated-close-accounting-debt) |
+| CL-135 | local-green | uncommitted | COTI-shaped delayed-fill → normal-hedge production-path regression; seven-venue prepare/verify capability matrix, malformed/mismatch/dual-mode/non-ack blockers, and same-venue de-duplication | Needs a committed deployed SHA and natural observation: a delayed owned maker fill must hedge normally rather than reduce-only flatten; every entry leg must log its exchange-specific leverage proof or block before order submission. | [2026-08-30](daily/2026-08-30.md#cl-135--delayed-owned-maker-fill-was-cleaned-before-hedge-and-entry-leverage-was-not-proved-for-every-live-leg) |
 
 ## Pre-CL-093 Historical Boundary
 

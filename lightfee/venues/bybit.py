@@ -19,6 +19,7 @@ from lightfee.core.domain import (
     VenueMarketSnapshot,
     close_order_side_for_position,
 )
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.venues.entry_tradability import (
     entry_tradability_blocked,
@@ -144,6 +145,10 @@ class BybitAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
 
     async def fetch_account_fee_snapshot(
         self, reference_symbol: str = ""
@@ -293,6 +298,121 @@ class BybitAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    @staticmethod
+    def _extract_entry_leverages(raw: Any, venue_symbol: str) -> set[int]:
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("retCode", 0)) != "0"
+            or not isinstance(raw.get("result"), dict)
+            or not isinstance(raw["result"].get("list"), list)
+        ):
+            raise ValueError("Bybit position leverage response is malformed")
+
+        leverages: set[int] = set()
+        for row in raw["result"]["list"]:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("symbol", "")).upper() != venue_symbol.upper():
+                continue
+            try:
+                leverage = float(row.get("leverage"))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("Bybit position leverage is missing or invalid")
+            if not math.isfinite(leverage) or leverage <= 0 or not leverage.is_integer():
+                raise ValueError("Bybit position leverage is missing or invalid")
+            leverages.add(int(leverage))
+
+        if not leverages:
+            raise ValueError("Bybit position leverage is unavailable for symbol")
+        return leverages
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        """Set and read back Bybit's shared buy/sell leverage before entry."""
+        target = int(leverage or 0)
+        if target <= 0 or self._transport.mode != "live":
+            return
+
+        venue_symbol = self._transport._venue_symbol(symbol)
+        payload = {
+            "venue": Venue.BYBIT.value,
+            "symbol": venue_symbol,
+            "requested_leverage": target,
+            "requested_notional_quote": float(notional_quote or 0.0),
+            "position_endpoint": "/v5/position/list",
+            "set_leverage_endpoint": "/v5/position/set-leverage",
+        }
+        try:
+            before_raw = await self._transport._request(
+                "GET",
+                "/v5/position/list",
+                params={"category": "linear", "symbol": venue_symbol},
+                private=True,
+            )
+            before = self._extract_entry_leverages(before_raw, venue_symbol)
+            payload["before_leverages"] = sorted(before)
+            if before == {target}:
+                payload["outcome"] = "already_verified"
+                self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+                return
+
+            response = await self._transport._request(
+                "POST",
+                "/v5/position/set-leverage",
+                body={
+                    "category": "linear",
+                    "symbol": venue_symbol,
+                    "buyLeverage": str(target),
+                    "sellLeverage": str(target),
+                },
+                private=True,
+            )
+            response_code = str(response.get("retCode", "") if isinstance(response, dict) else "")
+            payload["set_leverage_ret_code"] = response_code
+            # 110043 means Bybit reports no setting change; it is acceptable
+            # only when the mandatory readback below proves the target.
+            if response_code not in {"0", "110043"}:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "Bybit entry leverage set rejected "
+                    f"symbol={venue_symbol} retCode={response_code or 'missing'}",
+                )
+
+            after_raw = await self._transport._request(
+                "GET",
+                "/v5/position/list",
+                params={"category": "linear", "symbol": venue_symbol},
+                private=True,
+            )
+            after = self._extract_entry_leverages(after_raw, venue_symbol)
+            payload["after_leverages"] = sorted(after)
+            if after != {target}:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "Bybit entry leverage readback mismatch "
+                    f"symbol={venue_symbol} expected={target} actual={sorted(after)}",
+                )
+
+            payload["outcome"] = "set_and_verified"
+            self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+        except OrderSubmitError:
+            payload["outcome"] = "rejected"
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
+        except Exception as exc:
+            payload["outcome"] = "error"
+            payload["error"] = str(exc)[:300]
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"Bybit entry leverage prepare failed: {exc}",
+            ) from exc
 
     async def fetch_order_fill_reconciliation(
         self,

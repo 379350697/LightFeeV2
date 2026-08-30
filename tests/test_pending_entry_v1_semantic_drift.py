@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, StrategyConfig
 from lightfee.core.domain import (
+    OrderFill,
     OrderFillReconciliation,
     PositionSnapshot,
     Side,
@@ -583,7 +584,7 @@ async def test_flat_reconcile_not_found_maker_with_zero_fill_and_live_flat_clear
 
     await runtime._reconcile_pending_state(now_ms=1780584326000)
 
-    assert pending.pending_id not in runtime.state.pending_entries
+    assert pending.pending_id not in runtime.state.pending_entries, tmp_journal.read_all()
     assert maker.open_order_calls == ["JTOUSDT"]
     assert maker.position_calls == ["JTOUSDT"]
     assert result.long_position.quantity == 0.0
@@ -3394,7 +3395,7 @@ async def test_zero_fill_finalize_retains_when_live_position_truth_is_nonzero(
 
 
 @pytest.mark.asyncio
-async def test_zero_fill_owned_live_single_leg_cleans_before_pending_release(
+async def test_zero_fill_owned_live_maker_position_waits_for_fill_reconciliation(
     config, tmp_journal,
 ):
     _mark_live(config)
@@ -3422,6 +3423,14 @@ async def test_zero_fill_owned_live_single_leg_cleans_before_pending_release(
         entry_price=0.0,
         observed_at_ms=1781456025992,
     )
+    live_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="HOMEUSDT",
+        side=Side.SELL,
+        quantity=1600.0,
+        entry_price=0.0289,
+        observed_at_ms=1781456026992,
+    )
     okx = _ZeroFillOwnedConflictCleanupAdapter(Venue.OKX)
     okx.position_snapshots = [live_long, live_long, live_long, flat_long]
     bybit = _OwnedConflictCleanupAdapter(Venue.BYBIT)
@@ -3439,7 +3448,8 @@ async def test_zero_fill_owned_live_single_leg_cleans_before_pending_release(
         symbol="HOMEUSDT",
         long_venue=Venue.OKX,
         short_venue=Venue.BYBIT,
-        target_quantity=1652.5511258004544,
+        target_quantity=1600.0,
+        created_at_ms=1781456020000,
         maker_leg="long",
         maker_order_id="3655876122055122944",
         maker_client_order_id="f435324a30e9a2b43818f9469e7d9317",
@@ -3458,29 +3468,59 @@ async def test_zero_fill_owned_live_single_leg_cleans_before_pending_release(
         1781456020992,
     )
 
-    assert finalized is True
-    assert pending.pending_id not in runtime.state.pending_entries
-    assert okx.place_order_call_count == 1
-    assert okx.last_request is not None
-    assert okx.last_request.reduce_only is True
-    assert okx.last_request.post_only is False
-    assert okx.last_request.time_in_force == TimeInForce.IOC
-    assert okx.last_request.side == Side.SELL
-    assert okx.last_request.quantity == pytest.approx(1600.0)
+    assert finalized is False
+    assert pending.pending_id in runtime.state.pending_entries
+    assert okx.place_order_call_count == 0
     events = tmp_journal.read_all()
     kinds = [event["kind"] for event in events]
     assert "entry.opened" not in kinds
     assert "entry.passive_unfilled" not in kinds
-    cleanup = [
+    deferred = [
         event["payload"]
         for event in events
-        if event["kind"] == "pending_entry.owned_live_conflict_cleanup_succeeded"
+        if event["kind"] == "pending_entry.finalize_deferred_unresolved_maker_zero_fill"
     ][-1]
-    assert cleanup["entry_id"] == pending.pending_id
-    assert cleanup["venue"] == "okx"
-    assert cleanup["live_position_side"] == "buy"
-    assert cleanup["live_position_quantity"] == pytest.approx(1600.0)
-    assert cleanup["reason"] == "owned_single_leg_flattened_and_fresh_truth_flat"
+    assert deferred["entry_id"] == pending.pending_id
+    assert deferred["reason"] == "maker_zero_fill_without_terminal_no_fill_evidence"
+
+    # The next exact reconciliation discovers the owned maker fill.  The
+    # normal V1 reconciliation path must then hedge it rather than flattening
+    # the maker exposure as an unexplained conflict.
+    bybit.position_snapshots = [live_short]
+    runtime.reconciler = _CapturingReconciler(
+        PositionReconciliationResult(
+            position_id=pending.pending_id,
+            symbol=pending.symbol,
+            long_status="filled",
+            short_status="not_found",
+            long_fill=OrderFill(
+                venue=Venue.OKX,
+                symbol=pending.symbol,
+                side=Side.BUY,
+                quantity=1600.0,
+                price=0.0288,
+                order_id=pending.maker_order_id,
+                filled_at_ms=1781456021944,
+            ),
+            long_position=live_long,
+            short_position=flat_short,
+            is_flat=False,
+        )
+    )
+
+    await runtime._reconcile_pending_state(now_ms=1781456021992)
+
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert bybit.place_order_call_count == 1
+    assert bybit.last_request is not None
+    assert bybit.last_request.side == Side.SELL
+    assert bybit.last_request.reduce_only is False
+    assert bybit.last_request.quantity == pytest.approx(1600.0)
+    assert runtime.state.open_positions[pending.pending_id].matched_quantity == pytest.approx(1600.0)
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "pending_entry.missing_hedge_detected" in kinds
+    assert "pending_entry.hedge_submit_result" in kinds
+    assert "entry.opened" in kinds
 
 
 @pytest.mark.asyncio

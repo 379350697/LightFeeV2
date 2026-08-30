@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import math
 import time
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -386,6 +387,10 @@ class BitgetAdapter(VenueAdapter):
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
 
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
+
     async def fetch_account_fee_snapshot(
         self, reference_symbol: str = ""
     ) -> Optional[AccountFeeSnapshot]:
@@ -582,6 +587,166 @@ class BitgetAdapter(VenueAdapter):
         family = await self.resolve_contract_family()
         self._profile = _profile_from_contract_family(family)
         return self._profile
+
+    @staticmethod
+    def _bitget_entry_leverage_value(value: Any, field: str) -> int:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"Bitget {field} is missing or invalid")
+        if not math.isfinite(parsed) or parsed <= 0 or not parsed.is_integer():
+            raise ValueError(f"Bitget {field} is missing or invalid")
+        return int(parsed)
+
+    @classmethod
+    def _bitget_uta_entry_leverage(cls, raw: Any, venue_symbol: str) -> int:
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("code", "")) != "00000"
+            or not isinstance(raw.get("data"), dict)
+            or not isinstance(raw["data"].get("symbolConfigList"), list)
+        ):
+            raise ValueError("Bitget UTA account settings response is malformed")
+        row = next(
+            (
+                item
+                for item in raw["data"]["symbolConfigList"]
+                if isinstance(item, dict)
+                and str(item.get("symbol", "")).upper() == venue_symbol.upper()
+                and str(item.get("category", "")).upper() == "USDT-FUTURES"
+            ),
+            None,
+        )
+        if row is None:
+            raise ValueError("Bitget UTA account settings are missing the entry symbol")
+        if str(row.get("marginMode", "")).lower() != "crossed":
+            raise ValueError("Bitget UTA entry margin mode is not crossed")
+        return cls._bitget_entry_leverage_value(row.get("leverage"), "UTA leverage")
+
+    @classmethod
+    def _bitget_classic_entry_leverage(cls, raw: Any) -> int:
+        if (
+            not isinstance(raw, dict)
+            or str(raw.get("code", "")) != "00000"
+            or not isinstance(raw.get("data"), dict)
+        ):
+            raise ValueError("Bitget classic set-leverage response is malformed")
+        data = raw["data"]
+        if str(data.get("marginMode", "")).lower() != "crossed":
+            raise ValueError("Bitget classic entry margin mode is not crossed")
+        return cls._bitget_entry_leverage_value(
+            data.get("crossMarginLeverage"), "classic crossMarginLeverage"
+        )
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        """Use the resolved Bitget account-family contract and prove its result."""
+        target = int(leverage or 0)
+        if target <= 0 or self._mode != "live":
+            return
+
+        from lightfee.venues.transport import _require_bitget_success
+
+        venue_symbol = self._transport._venue_symbol(symbol)
+        payload: dict[str, Any] = {
+            "venue": Venue.BITGET.value,
+            "symbol": venue_symbol,
+            "requested_leverage": target,
+            "requested_notional_quote": float(notional_quote or 0.0),
+        }
+        try:
+            family = await self.resolve_contract_family()
+            payload["account_family"] = family.value
+            if family == BitgetContractFamily.UTA_V3:
+                settings_params = {"category": "USDT-FUTURES"}
+                payload.update(
+                    {
+                        "settings_endpoint": "/api/v3/account/settings",
+                        "set_leverage_endpoint": "/api/v3/account/set-leverage",
+                    }
+                )
+                before_raw = await self._transport._request(
+                    "GET",
+                    "/api/v3/account/settings",
+                    params=settings_params,
+                    private=True,
+                )
+                before = self._bitget_uta_entry_leverage(before_raw, venue_symbol)
+                payload["before_leverage"] = before
+                if before == target:
+                    payload["outcome"] = "already_verified"
+                    self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+                    return
+
+                response = await self._transport._request(
+                    "POST",
+                    "/api/v3/account/set-leverage",
+                    body={
+                        "category": "USDT-FUTURES",
+                        "symbol": venue_symbol,
+                        "leverage": str(target),
+                    },
+                    private=True,
+                )
+                _require_bitget_success(response, "Bitget UTA entry leverage set failed")
+                after_raw = await self._transport._request(
+                    "GET",
+                    "/api/v3/account/settings",
+                    params=settings_params,
+                    private=True,
+                )
+                after = self._bitget_uta_entry_leverage(after_raw, venue_symbol)
+                payload["after_leverage"] = after
+                if after != target:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Bitget UTA entry leverage readback mismatch "
+                        f"symbol={venue_symbol} expected={target} actual={after}",
+                    )
+            elif family == BitgetContractFamily.CLASSIC_MIX_V2:
+                payload["set_leverage_endpoint"] = "/api/v2/mix/account/set-leverage"
+                response = await self._transport._request(
+                    "POST",
+                    "/api/v2/mix/account/set-leverage",
+                    body={
+                        "symbol": venue_symbol,
+                        "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT",
+                        "leverage": str(target),
+                    },
+                    private=True,
+                )
+                _require_bitget_success(response, "Bitget classic entry leverage set failed")
+                applied = self._bitget_classic_entry_leverage(response)
+                payload["response_leverage"] = applied
+                if applied != target:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Bitget classic entry leverage response mismatch "
+                        f"symbol={venue_symbol} expected={target} actual={applied}",
+                    )
+            else:
+                raise ValueError(f"Bitget entry leverage account family is unsupported: {family}")
+
+            payload["outcome"] = "set_and_verified"
+            self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+        except OrderSubmitError:
+            payload["outcome"] = "rejected"
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
+        except Exception as exc:
+            payload["outcome"] = "error"
+            payload["error"] = str(exc)[:300]
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"Bitget entry leverage prepare failed: {exc}",
+            ) from exc
 
     # ------------------------------------------------------------------
     # Adapter methods with profile-aware routing

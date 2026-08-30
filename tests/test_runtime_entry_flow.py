@@ -69,6 +69,20 @@ class FakeVenueAdapter(VenueAdapter):
     def venue(self) -> Venue:
         return self._venue
 
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        del symbol, leverage, notional_quote
+        return None
+
     async def place_order(self, request):
         self.place_order_call_count += 1
         self.last_request = request

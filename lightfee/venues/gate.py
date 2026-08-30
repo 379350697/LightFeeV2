@@ -7,6 +7,7 @@ import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import (
     AccountFeeSnapshot,
     OrderFill,
@@ -21,7 +22,12 @@ from lightfee.venues.entry_tradability import (
     entry_tradability_unavailable,
 )
 from lightfee.venues.specs import gate_spec
-from lightfee.venues.transport import LiveCredential, VenueTransport
+from lightfee.venues.transport import (
+    LiveCredential,
+    TransportError,
+    TransportErrorCategory,
+    VenueTransport,
+)
 
 
 class GateAdapter(VenueAdapter):
@@ -53,6 +59,10 @@ class GateAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._mode == "live"
+
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
 
     async def fetch_account_fee_snapshot(
         self, reference_symbol: str = ""
@@ -227,6 +237,119 @@ class GateAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    def _gate_catalog_entry_leverage_limit(
+        self, symbol: str, venue_symbol: str
+    ) -> int | None:
+        metadata_by_symbol = getattr(self._transport, "_symbol_metadata", {}) or {}
+        for key in (venue_symbol, symbol):
+            metadata = metadata_by_symbol.get(key)
+            if not isinstance(metadata, dict):
+                continue
+            for field in ("leverage_max", "max_leverage", "cross_leverage_limit"):
+                try:
+                    value = float(metadata.get(field))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value) and value > 0 and value.is_integer():
+                    return int(value)
+        return None
+
+    @staticmethod
+    def _gate_set_leverage_response(raw: Any) -> int:
+        if not isinstance(raw, dict):
+            raise ValueError("Gate set-leverage response is malformed")
+        try:
+            leverage = float(raw.get("leverage"))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("Gate set-leverage response leverage is missing or invalid")
+        if not math.isfinite(leverage) or leverage <= 0 or not leverage.is_integer():
+            raise ValueError("Gate set-leverage response leverage is missing or invalid")
+        return int(leverage)
+
+    @staticmethod
+    def _gate_requires_dual_leverage_retry(error: Exception) -> bool:
+        if not isinstance(error, TransportError):
+            return False
+        if error.category != TransportErrorCategory.REQUEST_REJECTED:
+            return False
+        text = f"{error} {error.body}".lower()
+        return (
+            "position_mode" in text
+            or "position mode" in text
+            or "dual mode" in text
+            or "dual_comp" in text
+            or "hedge mode" in text
+            or "position_not_found" in text
+            or "position not found" in text
+        )
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        """Set Gate cross leverage, retrying only the V1 dual-mode mismatch path."""
+        target = int(leverage or 0)
+        if target <= 0 or self._mode != "live":
+            return
+
+        venue_symbol = self._transport._venue_symbol(symbol)
+        catalog_limit = self._gate_catalog_entry_leverage_limit(symbol, venue_symbol)
+        effective = min(target, catalog_limit) if catalog_limit else target
+        effective = max(int(effective), 1)
+        path = f"/api/v4/futures/usdt/positions/{venue_symbol}/set_leverage"
+        payload: dict[str, Any] = {
+            "venue": Venue.GATE.value,
+            "symbol": venue_symbol,
+            "requested_leverage": target,
+            "effective_leverage": effective,
+            "catalog_max_leverage": catalog_limit,
+            "requested_notional_quote": float(notional_quote or 0.0),
+            "set_leverage_endpoint": path,
+        }
+        try:
+            async def set_leverage(dual_side: str | None = None) -> None:
+                params = {"leverage": str(effective), "margin_mode": "cross"}
+                if dual_side:
+                    params["dual_side"] = dual_side
+                response = await self._transport._request(
+                    "POST", path, params=params, private=True
+                )
+                applied = self._gate_set_leverage_response(response)
+                if applied != effective:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Gate entry leverage response mismatch "
+                        f"symbol={venue_symbol} expected={effective} actual={applied}",
+                    )
+
+            try:
+                await set_leverage()
+                payload["position_mode"] = "single"
+            except Exception as exc:
+                if not self._gate_requires_dual_leverage_retry(exc):
+                    raise
+                await set_leverage("dual_long")
+                await set_leverage("dual_short")
+                payload["position_mode"] = "dual"
+
+            payload["outcome"] = "set_and_verified"
+            self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+        except OrderSubmitError:
+            payload["outcome"] = "rejected"
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
+        except Exception as exc:
+            payload["outcome"] = "error"
+            payload["error"] = str(exc)[:300]
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"Gate entry leverage prepare failed: {exc}",
+            ) from exc
 
     async def shutdown(self) -> None:
         await self._transport.close()

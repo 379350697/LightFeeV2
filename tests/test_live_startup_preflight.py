@@ -987,6 +987,10 @@ class TestRuntimePreflight:
             config = make_test_config(td)
 
             class LeverageAwareAdapter(FakeVenueAdapter):
+                @property
+                def supports_entry_leverage_preparation(self) -> bool:
+                    return True
+
                 def __init__(self, venue: Venue):
                     super().__init__(venue)
                     self.leverage_requests = []
@@ -1047,11 +1051,186 @@ class TestRuntimePreflight:
             runtime.journal.close()
 
     @pytest.mark.asyncio
+    async def test_live_entry_prepares_same_venue_leverage_once(self):
+        """V1 does not duplicate a mutation when both legs resolve to one venue."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class LeverageAwareAdapter(FakeVenueAdapter):
+                def __init__(self):
+                    super().__init__(Venue.BINANCE)
+                    self.leverage_requests = []
+
+                async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+                    self.leverage_requests.append((symbol, leverage))
+
+            class RecordingExecutor:
+                async def execute(self, ctx):
+                    return EntryExecutionResult(
+                        route=ExecutionRoute.REJECTED,
+                        state=EntryState.FAILED,
+                        reject_reason="planner test terminal",
+                    )
+
+            binance = LeverageAwareAdapter()
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance},
+            )
+            runtime.entry_executor = RecordingExecutor()
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="HUSDT",
+                long_venue="binance",
+                short_venue="binance",
+            )
+
+            assert await runtime._dispatch_entry(
+                candidate, 1778787000000, price_hint=0.57329
+            ) is True
+            assert binance.leverage_requests == [
+                ("HUSDT", config.strategy.live_target_leverage)
+            ]
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_live_entry_prepares_bybit_leverage_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class LeverageAwareBybit(FakeVenueAdapter):
+                @property
+                def supports_entry_leverage_preparation(self) -> bool:
+                    return True
+
+                def __init__(self):
+                    super().__init__(Venue.BYBIT)
+                    self.leverage_requests = []
+
+                async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+                    self.leverage_requests.append((symbol, leverage))
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    return EntryExecutionResult(
+                        route=ExecutionRoute.REJECTED,
+                        state=EntryState.FAILED,
+                        reject_reason="planner test terminal",
+                    )
+
+            bybit = LeverageAwareBybit()
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BYBIT: bybit},
+                ),
+            )
+            executor = RecordingExecutor()
+            runtime.entry_executor = executor
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="HUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=0.57329,
+            )
+
+            assert dispatched is True
+            assert executor.calls == 1
+            assert bybit.leverage_requests == [
+                ("HUSDT", config.strategy.live_target_leverage)
+            ]
+            assert any(
+                event["kind"] == "execution.entry_leverage_ready"
+                and event["payload"]["venue"] == "bybit"
+                for event in runtime.journal.read_all()
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_live_entry_blocks_when_a_venue_lacks_leverage_preparation_capability(self):
+        """A missing implementation is a gate failure, not a silent opt-out."""
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class ReadyAdapter(FakeVenueAdapter):
+                @property
+                def supports_entry_leverage_preparation(self) -> bool:
+                    return True
+
+                async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+                    return None
+
+            class UnsupportedAdapter(FakeVenueAdapter):
+                @property
+                def supports_entry_leverage_preparation(self) -> bool:
+                    return False
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError("entry must be blocked before order dispatch")
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "aster",
+                    overrides={
+                        Venue.BINANCE: UnsupportedAdapter(Venue.BINANCE),
+                        Venue.ASTER: ReadyAdapter(Venue.ASTER),
+                    },
+                ),
+            )
+            runtime.entry_executor = RecordingExecutor()
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="HUSDT",
+                long_venue="binance",
+                short_venue="aster",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=0.57329,
+            )
+
+            assert dispatched is False
+            assert runtime.entry_executor.calls == 0
+            assert runtime.state.venue_entry_cooldowns["binance:HUSDT"]["reason"] == (
+                "entry_leverage_prepare_unsupported"
+            )
+            assert any(
+                event["kind"] == "execution.entry_leverage_unavailable"
+                and event["payload"]["venue"] == "binance"
+                and event["payload"]["reason"] == "entry_leverage_prepare_unsupported"
+                for event in runtime.journal.read_all()
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
     async def test_live_entry_blocks_when_leverage_prepare_fails(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)
 
             class FailingLeverageAdapter(FakeVenueAdapter):
+                @property
+                def supports_entry_leverage_preparation(self) -> bool:
+                    return True
+
                 async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
                     raise OrderSubmitError(
                         SubmitFailureClass.REJECTED,
@@ -1102,6 +1281,63 @@ class TestRuntimePreflight:
                 event["kind"] == "runtime.entry_blocked_gate"
                 and event["payload"]["gate"] == "entry_leverage_prepare"
                 for event in events
+            )
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_live_entry_blocks_when_bybit_leverage_readback_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+
+            class FailingBybitLeverage(FakeVenueAdapter):
+                @property
+                def supports_entry_leverage_preparation(self) -> bool:
+                    return True
+
+                async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+                    raise OrderSubmitError(
+                        SubmitFailureClass.REJECTED,
+                        "Bybit entry leverage readback mismatch symbol=HUSDT expected=4 actual=[10]",
+                    )
+
+            class RecordingExecutor:
+                calls = 0
+
+                async def execute(self, ctx):
+                    self.calls += 1
+                    raise AssertionError("entry must be blocked before order dispatch")
+
+            runtime = LiveRuntime(
+                config,
+                venue_adapters=_fake_adapters_for_venues(
+                    "binance",
+                    "bybit",
+                    overrides={Venue.BYBIT: FailingBybitLeverage(Venue.BYBIT)},
+                ),
+            )
+            runtime.entry_executor = RecordingExecutor()
+            runtime.journal.open()
+            candidate = _admissible_dispatch_candidate(
+                symbol="HUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+            )
+
+            dispatched = await runtime._dispatch_entry(
+                candidate,
+                1778787000000,
+                price_hint=0.57329,
+            )
+
+            assert dispatched is False
+            assert runtime.entry_executor.calls == 0
+            assert runtime.state.venue_entry_cooldowns["bybit:HUSDT"]["reason"] == (
+                "entry_leverage_unavailable"
+            )
+            assert any(
+                event["kind"] == "execution.entry_leverage_unavailable"
+                and event["payload"]["venue"] == "bybit"
+                for event in runtime.journal.read_all()
             )
             runtime.journal.close()
 

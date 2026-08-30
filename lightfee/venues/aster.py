@@ -656,6 +656,10 @@ class AsterAdapter(VenueAdapter):
             raise self._private_unavailable()
         return await self._transport.fetch_account_risk_snapshot()
 
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
+
     async def ensure_entry_leverage(
         self,
         symbol: str,

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Optional
 
 from lightfee.core.contracts import VenueAdapter
+from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import (
     AccountBalanceSnapshot,
     AccountFeeSnapshot,
@@ -54,6 +56,10 @@ class HyperliquidAdapter(VenueAdapter):
     @property
     def supports_private_health(self) -> bool:
         return self._transport.mode == "live"
+
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        return True
 
     async def fetch_account_fee_snapshot(
         self, reference_symbol: str = ""
@@ -205,6 +211,105 @@ class HyperliquidAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    def _hyperliquid_entry_max_leverage(self, venue_symbol: str) -> int | None:
+        metadata = (getattr(self._transport, "_symbol_metadata", {}) or {}).get(
+            venue_symbol
+        )
+        if not isinstance(metadata, dict):
+            return None
+        try:
+            value = float(metadata.get("maxLeverage"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(value) or value <= 0 or not value.is_integer():
+            return None
+        return int(value)
+
+    async def ensure_entry_leverage(
+        self,
+        symbol: str,
+        leverage: int,
+        *,
+        notional_quote: float | None = None,
+    ) -> None:
+        """Submit Hyperliquid's signed updateLeverage action before entry.
+
+        Hyperliquid exposes the applied configuration through the accepted
+        signed action; an empty account need not expose a position row to read
+        back, so requiring ``userState`` here would incorrectly block first
+        entries.  The action acknowledgement is therefore the authoritative
+        postcondition for this venue.
+        """
+        target = int(leverage or 0)
+        if target <= 0 or self._transport.mode != "live":
+            return
+
+        from lightfee.venues.hyperliquid_signing import build_hyperliquid_exchange_payload
+
+        venue_symbol = self._transport._venue_symbol(symbol)
+        payload: dict[str, Any] = {
+            "venue": Venue.HYPERLIQUID.value,
+            "symbol": venue_symbol,
+            "requested_leverage": target,
+            "requested_notional_quote": float(notional_quote or 0.0),
+            "set_leverage_endpoint": "POST /exchange updateLeverage",
+        }
+        try:
+            credential = self._credential
+            if credential is None or not credential.wallet_private_key:
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "Hyperliquid entry leverage requires wallet_private_key",
+                )
+            asset_meta = await self._transport._hl_resolve_asset_meta(venue_symbol)
+            asset_index = int(asset_meta["asset_index"])
+            max_leverage = self._hyperliquid_entry_max_leverage(venue_symbol)
+            effective = min(target, max_leverage) if max_leverage else target
+            effective = max(int(effective), 1)
+            payload.update(
+                {
+                    "asset_index": asset_index,
+                    "catalog_max_leverage": max_leverage,
+                    "effective_leverage": effective,
+                }
+            )
+            body = build_hyperliquid_exchange_payload(
+                action={
+                    "type": "updateLeverage",
+                    "asset": asset_index,
+                    "isCross": True,
+                    "leverage": effective,
+                },
+                private_key_hex=credential.wallet_private_key,
+                vault_address=None,
+                is_mainnet=True,
+            )
+            response = await self._transport._request(
+                "POST", "/exchange", body=body, private=True
+            )
+            response_status = str(response.get("status", "") if isinstance(response, dict) else "")
+            payload["response_status"] = response_status
+            if response_status != "ok":
+                raise OrderSubmitError(
+                    SubmitFailureClass.REJECTED,
+                    "Hyperliquid entry leverage update rejected "
+                    f"symbol={venue_symbol} status={response_status or 'missing'}",
+                )
+            payload["outcome"] = "set_and_acknowledged"
+            self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)
+        except OrderSubmitError:
+            payload["outcome"] = "rejected"
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise
+        except Exception as exc:
+            payload["outcome"] = "error"
+            payload["error"] = str(exc)[:300]
+            self._transport._record_order_diagnostic("order.entry_leverage_unavailable", payload)
+            raise OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                f"Hyperliquid entry leverage prepare failed: {exc}",
+            ) from exc
 
     async def shutdown(self) -> None:
         await self._transport.close()

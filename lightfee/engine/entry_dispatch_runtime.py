@@ -161,15 +161,75 @@ class EntryDispatchRuntime:
         notional_quote = float(getattr(candidate, "entry_notional_quote", 0.0) or 0.0)
         pair_id = self._candidate_pair_id(candidate)
         tasks: list[tuple[Venue, Any]] = []
+        unavailable: list[tuple[Venue, str]] = []
+        seen_venues: set[Venue] = set()
         for venue in (long_venue, short_venue):
-            if venue not in (Venue.BINANCE, Venue.ASTER):
+            if venue in seen_venues:
                 continue
+            seen_venues.add(venue)
             adapter = self.ctx.venue_adapters.get(venue)
-            ensure = getattr(adapter, "ensure_entry_leverage", None) if adapter else None
-            if callable(ensure):
-                tasks.append((venue, ensure))
-        if not tasks:
-            return True
+            if adapter is None:
+                unavailable.append((venue, "adapter_missing"))
+                continue
+            if not bool(getattr(adapter, "supports_entry_leverage_preparation", False)):
+                unavailable.append((venue, "adapter_capability_missing"))
+                continue
+            ensure = getattr(adapter, "ensure_entry_leverage", None)
+            if not callable(ensure):
+                unavailable.append((venue, "adapter_method_missing"))
+                continue
+            tasks.append((venue, ensure))
+
+        # V1 invokes leverage preparation on every live entry leg.  A missing
+        # implementation must therefore be an admission failure, never a
+        # silent opt-out that permits an order with unknown leverage.
+        if unavailable:
+            for venue, unavailable_reason in unavailable:
+                reason = "entry_leverage_prepare_unsupported"
+                metadata = {
+                    "reason": reason,
+                    "official_doc_url": "",
+                    "evidence_gap": False,
+                }
+                error_text = f"{reason}:{unavailable_reason}"
+                self._record_symbol_admission_block(
+                    venue=venue,
+                    symbol=symbol,
+                    reason=reason,
+                    raw_error=error_text,
+                    now_ms=now_ms,
+                    evidence=metadata,
+                    source="entry_leverage_prepare",
+                    candidate_pair_id=pair_id,
+                )
+                self.ctx.journal.append(
+                    "execution.entry_leverage_unavailable",
+                    {
+                        "venue": venue.value,
+                        "symbol": symbol,
+                        "target_leverage": target_leverage,
+                        "entry_notional_quote": notional_quote,
+                        "candidate_pair_id": pair_id,
+                        "pair_id": pair_id,
+                        "reason": reason,
+                        "raw_error": error_text,
+                        "official_doc_url": "",
+                        "evidence_gap": False,
+                        "ts_ms": now_ms,
+                    },
+                )
+            self.ctx.journal.append(
+                "runtime.entry_blocked_gate",
+                {
+                    "symbol": symbol,
+                    "gate": "entry_leverage_prepare",
+                    "reason": "entry_leverage_prepare_unsupported",
+                    "candidate_pair_id": pair_id,
+                    "pair_id": pair_id,
+                    "ts_ms": now_ms,
+                },
+            )
+            return False
 
         async def _call(venue: Venue, ensure: Any) -> tuple[Venue, BaseException | None]:
             try:

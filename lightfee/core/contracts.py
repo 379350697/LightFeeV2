@@ -173,6 +173,11 @@ class VenueAdapter(ABC):
     ) -> None:
         pass
 
+    @property
+    def supports_entry_leverage_preparation(self) -> bool:
+        """Whether this adapter verifies leverage before a live entry order."""
+        return False
+
     async def precheck_entry_tradability(self, symbol: str) -> dict:
         """Prove this venue currently permits opening ``symbol``.
 

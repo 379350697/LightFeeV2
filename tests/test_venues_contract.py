@@ -30,6 +30,7 @@ from lightfee.venues.bitget import BitgetAdapter
 from lightfee.venues.gate import GateAdapter
 from lightfee.venues.aster import AsterAdapter
 from lightfee.venues.hyperliquid import HyperliquidAdapter
+from lightfee.venues.specs import BitgetContractFamily
 from lightfee.venues.symbol_rules import get_symbol_rules_cache
 from lightfee.venues.transport import LiveCredential, TransportError, TransportErrorCategory
 
@@ -61,6 +62,10 @@ def _fixture_account_address(venue_id: Venue) -> str:
     if venue_id == Venue.ASTER:
         return ASTER_FIXTURE_ACCOUNT_ADDRESS
     return "0xbeef"
+
+
+async def _async_value(value):
+    return value
 
 
 def _trust_hyperliquid_transport_for_test(transport) -> None:
@@ -1010,6 +1015,425 @@ class TestHyperliquidCapabilityConsistency:
 # ---------------------------------------------------------------------------
 
 
+class TestBybitEntryLeverage:
+    @pytest.mark.asyncio
+    async def test_skips_setter_when_bybit_readback_already_matches_target(self):
+        adapter = BybitAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        calls: list[tuple[str, str]] = []
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            calls.append((method, path))
+            assert method == "GET"
+            assert path == "/v5/position/list"
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"symbol": "HUSDT", "positionIdx": 1, "leverage": "4"},
+                        {"symbol": "HUSDT", "positionIdx": 2, "leverage": "4"},
+                    ]
+                },
+            }
+
+        adapter._transport._request = fake_request
+        try:
+            await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert calls == [("GET", "/v5/position/list")]
+
+    @pytest.mark.parametrize("set_ret_code", (0, 110043))
+    @pytest.mark.asyncio
+    async def test_sets_and_reads_back_both_bybit_position_leverages(
+        self, set_ret_code
+    ):
+        """A successful setter response is insufficient without readback."""
+        adapter = BybitAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        calls: list[tuple[str, str, dict | None, dict | None, bool]] = []
+        position_responses = iter(("10", "4"))
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            calls.append((method, path, params, body, private))
+            if path == "/v5/position/list":
+                leverage = next(position_responses)
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {"symbol": "HUSDT", "positionIdx": 1, "leverage": leverage},
+                            {"symbol": "HUSDT", "positionIdx": 2, "leverage": leverage},
+                        ]
+                    },
+                }
+            assert path == "/v5/position/set-leverage"
+            return {"retCode": set_ret_code, "result": {}}
+
+        adapter._transport._request = fake_request
+        try:
+            await adapter.ensure_entry_leverage("HUSDT", 4, notional_quote=50.0)
+        finally:
+            await adapter._transport.close()
+
+        assert calls == [
+            (
+                "GET",
+                "/v5/position/list",
+                {"category": "linear", "symbol": "HUSDT"},
+                None,
+                True,
+            ),
+            (
+                "POST",
+                "/v5/position/set-leverage",
+                None,
+                {
+                    "category": "linear",
+                    "symbol": "HUSDT",
+                    "buyLeverage": "4",
+                    "sellLeverage": "4",
+                },
+                True,
+            ),
+            (
+                "GET",
+                "/v5/position/list",
+                {"category": "linear", "symbol": "HUSDT"},
+                None,
+                True,
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rejects_when_bybit_readback_does_not_match_target(self):
+        adapter = BybitAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        position_responses = iter(("10", "10"))
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            if path == "/v5/position/list":
+                leverage = next(position_responses)
+                return {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {"symbol": "HUSDT", "positionIdx": 1, "leverage": leverage},
+                            {"symbol": "HUSDT", "positionIdx": 2, "leverage": leverage},
+                        ]
+                    },
+                }
+            assert path == "/v5/position/set-leverage"
+            return {"retCode": 0, "result": {}}
+
+        adapter._transport._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert "readback mismatch" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "malformed_response",
+        (
+            "not-a-response",
+            {"retCode": 0, "result": {}},
+            {"retCode": 0, "result": {"list": []}},
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_rejects_malformed_bybit_initial_leverage_evidence(
+        self, malformed_response
+    ):
+        adapter = BybitAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        calls: list[str] = []
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            calls.append(path)
+            return malformed_response
+
+        adapter._transport._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+        assert calls == ["/v5/position/list"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_malformed_bybit_post_set_readback(self):
+        adapter = BybitAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        responses = iter(
+            (
+                {
+                    "retCode": 0,
+                    "result": {
+                        "list": [
+                            {"symbol": "HUSDT", "positionIdx": 1, "leverage": "10"},
+                            {"symbol": "HUSDT", "positionIdx": 2, "leverage": "10"},
+                        ]
+                    },
+                },
+                {"retCode": 0, "result": {"list": []}},
+            )
+        )
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            if path == "/v5/position/list":
+                return next(responses)
+            assert path == "/v5/position/set-leverage"
+            return {"retCode": 0, "result": {}}
+
+        adapter._transport._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError) as exc_info:
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert exc_info.value.class_ == SubmitFailureClass.REJECTED
+
+
+class TestAdditionalVenueEntryLeverage:
+    @pytest.mark.asyncio
+    async def test_okx_sets_each_long_short_leverage_and_reads_back(self):
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        calls: list[tuple[str, str, dict | None, dict | None]] = []
+        leverage_reads = iter(
+            (
+                [
+                    {"instId": "H-USDT-SWAP", "mgnMode": "cross", "posSide": "long", "lever": "10"},
+                    {"instId": "H-USDT-SWAP", "mgnMode": "cross", "posSide": "short", "lever": "10"},
+                ],
+                [
+                    {"instId": "H-USDT-SWAP", "mgnMode": "cross", "posSide": "long", "lever": "4"},
+                    {"instId": "H-USDT-SWAP", "mgnMode": "cross", "posSide": "short", "lever": "4"},
+                ],
+            )
+        )
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            calls.append((method, path, params, body))
+            if path == "/api/v5/account/config":
+                return {"code": "0", "data": [{"posMode": "long_short_mode"}]}
+            if path == "/api/v5/account/leverage-info":
+                return {"code": "0", "data": next(leverage_reads)}
+            assert path == "/api/v5/account/set-leverage"
+            return {"code": "0", "data": []}
+
+        adapter._transport._request = fake_request
+        try:
+            await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        setter_bodies = [body for _, path, _, body in calls if path.endswith("set-leverage")]
+        assert setter_bodies == [
+            {"instId": "H-USDT-SWAP", "lever": "4", "mgnMode": "cross", "posSide": "long"},
+            {"instId": "H-USDT-SWAP", "lever": "4", "mgnMode": "cross", "posSide": "short"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_okx_rejects_leverage_readback_mismatch(self):
+        adapter = OkxAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        leverage_reads = iter(
+            (
+                [{"instId": "H-USDT-SWAP", "mgnMode": "cross", "posSide": "net", "lever": "10"}],
+                [{"instId": "H-USDT-SWAP", "mgnMode": "cross", "posSide": "net", "lever": "10"}],
+            )
+        )
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            if path == "/api/v5/account/config":
+                return {"code": "0", "data": [{"posMode": "net_mode"}]}
+            if path == "/api/v5/account/leverage-info":
+                return {"code": "0", "data": next(leverage_reads)}
+            assert path == "/api/v5/account/set-leverage"
+            return {"code": "0", "data": []}
+
+        adapter._transport._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError, match="readback mismatch"):
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_sets_then_reads_back_the_symbol_setting(self):
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter.resolve_contract_family = lambda: _async_value(BitgetContractFamily.UTA_V3)
+        calls: list[tuple[str, str, dict | None, dict | None]] = []
+        settings = iter(("10", "4"))
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            calls.append((method, path, params, body))
+            if path == "/api/v3/account/settings":
+                return {
+                    "code": "00000",
+                    "data": {
+                        "symbolConfigList": [
+                            {
+                                "category": "USDT-FUTURES",
+                                "symbol": "HUSDT",
+                                "marginMode": "crossed",
+                                "leverage": next(settings),
+                            }
+                        ]
+                    },
+                }
+            assert path == "/api/v3/account/set-leverage"
+            return {"code": "00000", "data": "success"}
+
+        adapter._transport._request = fake_request
+        try:
+            await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert calls[1] == (
+            "POST",
+            "/api/v3/account/set-leverage",
+            None,
+            {"category": "USDT-FUTURES", "symbol": "HUSDT", "leverage": "4"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_bitget_classic_requires_the_applied_cross_leverage(self):
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter.resolve_contract_family = lambda: _async_value(
+            BitgetContractFamily.CLASSIC_MIX_V2
+        )
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            assert path == "/api/v2/mix/account/set-leverage"
+            return {
+                "code": "00000",
+                "data": {"marginMode": "crossed", "crossMarginLeverage": "10"},
+            }
+
+        adapter._transport._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError, match="response mismatch"):
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+    @pytest.mark.asyncio
+    async def test_gate_retries_only_the_dual_mode_contract_and_verifies_response(self):
+        adapter = GateAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        calls: list[dict] = []
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            calls.append(dict(params or {}))
+            if len(calls) == 1:
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "position mode conflict",
+                    body='{"label":"POSITION_MODE_CONFLICT"}',
+                )
+            return {"leverage": "4"}
+
+        adapter._transport._request = fake_request
+        try:
+            await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert calls == [
+            {"leverage": "4", "margin_mode": "cross"},
+            {"leverage": "4", "margin_mode": "cross", "dual_side": "dual_long"},
+            {"leverage": "4", "margin_mode": "cross", "dual_side": "dual_short"},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_clamps_to_public_max_and_requires_ack(self):
+        adapter = HyperliquidAdapter(
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key=HL_FIXTURE_PRIVATE_KEY, account_address="0xbeef"
+            ),
+        )
+        adapter._transport._hl_asset_meta_cache["H"] = {
+            "asset_index": 7,
+            "sz_decimals": 2,
+            "price_decimals": 5,
+        }
+        adapter._transport._symbol_metadata["H"] = {"maxLeverage": 3}
+        captured: dict = {}
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            captured.update({"method": method, "path": path, "body": body, "private": private})
+            return {"status": "ok", "response": {"type": "default"}}
+
+        adapter._transport._request = fake_request
+        try:
+            await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+        assert captured["method"] == "POST"
+        assert captured["path"] == "/exchange"
+        assert captured["private"] is True
+        assert captured["body"]["action"] == {
+            "type": "updateLeverage",
+            "asset": 7,
+            "isCross": True,
+            "leverage": 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_hyperliquid_rejects_non_ok_leverage_acknowledgement(self):
+        adapter = HyperliquidAdapter(
+            mode="live",
+            credential=LiveCredential(
+                wallet_private_key=HL_FIXTURE_PRIVATE_KEY, account_address="0xbeef"
+            ),
+        )
+        adapter._transport._hl_asset_meta_cache["H"] = {
+            "asset_index": 7,
+            "sz_decimals": 2,
+            "price_decimals": 5,
+        }
+
+        async def fake_request(method, path, params=None, body=None, private=False):
+            assert path == "/exchange"
+            return {"status": "err", "response": "leverage rejected"}
+
+        adapter._transport._request = fake_request
+        try:
+            with pytest.raises(OrderSubmitError, match="update rejected"):
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        finally:
+            await adapter._transport.close()
+
+
 class TestAckOnlyOrderIntegration:
     """Integration test: ack-only order response through adapter must raise UNCERTAIN."""
 
@@ -1175,6 +1599,21 @@ class TestVenueCapabilityTruth:
             assert caps.execution_liquidity is not None, f"{venue}: execution_liquidity must be explicit"
             assert caps.reconcile_quality is not None, f"{venue}: reconcile_quality must be explicit"
             assert caps.testnet_support is not None, f"{venue}: testnet_support must be explicit"
+
+    def test_every_live_order_adapter_must_implement_entry_leverage_preparation(self):
+        """Prevents a new venue from silently opting out of V1's entry invariant."""
+        for adapter_type in (
+            BinanceAdapter,
+            OkxAdapter,
+            BybitAdapter,
+            BitgetAdapter,
+            GateAdapter,
+            AsterAdapter,
+            HyperliquidAdapter,
+        ):
+            adapter = adapter_type(mode="paper")
+            assert adapter.supports_entry_leverage_preparation is True
+            assert "ensure_entry_leverage" in adapter_type.__dict__
 
     def test_hyperliquid_unsupported_capabilities_are_explicit(self):
         from lightfee.venues.base import (
