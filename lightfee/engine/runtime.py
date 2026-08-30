@@ -67,6 +67,7 @@ from lightfee.engine.recovery import (
     build_persistent_state_view,
 )
 from lightfee.engine.recovery_decision_core import (
+    ACCOUNT_TRUTH_REQUIRED_BLOCK_REASONS,
     CORE_OWNED_BLOCK_REASONS,
     LIVE_ARTIFACT_BLOCK_REASONS,
     RecoveryEvidenceSnapshot,
@@ -10699,6 +10700,35 @@ class LiveRuntime:
             symbols.update(str(value or "").upper() for value in values if value)
         symbols.discard("")
 
+        # A live-artifact lock was set from account-wide exchange truth. A
+        # symbol sweep cannot safely release it after this pending entry has
+        # materialized as a normal two-leg OpenPosition.
+        if self.state.recovery_blocked_reason in ACCOUNT_TRUTH_REQUIRED_BLOCK_REASONS:
+            refreshed = await self._refresh_recovery_ledger_from_account_truth(now_ms)
+            if refreshed is not None:
+                self.journal.append(
+                    "recovery.pending_entry_terminal_core_refresh",
+                    {
+                        "symbol": symbol,
+                        "reason": reason,
+                        "symbols": sorted(symbols),
+                        "truth_required_symbol_sources": source_symbols,
+                        "truth_scope": "account",
+                        "decision": (
+                            self.recovery_decision.kind.value
+                            if self.recovery_decision is not None
+                            else ""
+                        ),
+                        "entry_allowed": (
+                            self.recovery_decision.entry_allowed
+                            if self.recovery_decision is not None
+                            else False
+                        ),
+                        "ts_ms": now_ms,
+                    },
+                )
+                return
+
         if symbols:
             refreshed = await self._refresh_recovery_ledger_for_symbols(
                 sorted(symbols),
@@ -10712,6 +10742,7 @@ class LiveRuntime:
                         "reason": reason,
                         "symbols": sorted(symbols),
                         "truth_required_symbol_sources": source_symbols,
+                        "truth_scope": "symbols",
                         "decision": (
                             self.recovery_decision.kind.value
                             if self.recovery_decision is not None

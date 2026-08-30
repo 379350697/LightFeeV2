@@ -4184,6 +4184,128 @@ class TestRuntimePreflight:
             assert runtime.state.lifecycle == EngineLifecycle.RUNNING
             runtime.journal.close()
 
+    @pytest.mark.asyncio
+    async def test_terminal_normal_pair_uses_account_truth_to_release_transient_one_leg_lock(
+        self,
+    ):
+        """A filled maker/hedge pair must not remain risk_only until it closes.
+
+        This is the production terminal path: the pending entry has been
+        materialized into an OpenPosition, then its stale one-leg recovery
+        latch must be judged from account-wide (not symbol-scoped) truth.
+        """
+
+        class AccountPairTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue, positions: list[PositionSnapshot]):
+                super().__init__(venue)
+                self.account_positions = positions
+                self.account_position_calls = 0
+                self.account_open_order_calls = 0
+                self.symbol_position_calls = 0
+                self.symbol_open_order_calls = 0
+
+            async def fetch_all_positions(self):
+                self.account_position_calls += 1
+                return list(self.account_positions)
+
+            async def fetch_position(self, symbol: str):
+                self.symbol_position_calls += 1
+                return PositionSnapshot(
+                    venue=self.venue,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=0.0,
+                    entry_price=0.0,
+                    observed_at_ms=1700000005000,
+                )
+
+            async def fetch_open_orders(self, symbol: str | None):
+                if symbol is None:
+                    self.account_open_order_calls += 1
+                else:
+                    self.symbol_open_order_calls += 1
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = AccountPairTruthAdapter(
+                Venue.BINANCE,
+                [
+                    PositionSnapshot(
+                        venue=Venue.BINANCE,
+                        symbol="ONGUSDT",
+                        side=Side.BUY,
+                        quantity=207.0,
+                        entry_price=0.11,
+                        observed_at_ms=1700000005000,
+                    )
+                ],
+            )
+            bybit = AccountPairTruthAdapter(
+                Venue.BYBIT,
+                [
+                    PositionSnapshot(
+                        venue=Venue.BYBIT,
+                        symbol="ONGUSDT",
+                        side=Side.SELL,
+                        quantity=207.0,
+                        entry_price=0.11,
+                        observed_at_ms=1700000005000,
+                    )
+                ],
+            )
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            )
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "unpaired_live_position"
+            runtime.state.recovery_blocked_at_ms = 123
+            runtime.state.open_positions["entry-ong"] = OpenPosition(
+                position_id="entry-ong",
+                symbol="ONGUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.BYBIT,
+                long_quantity=207.0,
+                short_quantity=207.0,
+                long_entry_price=0.11,
+                short_entry_price=0.11,
+                opened_at_ms=1700000004000,
+            )
+            runtime.state.pending_entries["entry-ong"] = PendingEntry(
+                pending_id="entry-ong",
+                symbol="ONGUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.BYBIT,
+                target_quantity=207.0,
+                long_side=Side.BUY,
+                short_side=Side.SELL,
+                created_at_ms=1700000000000,
+            )
+
+            await runtime._complete_pending_entry_terminal_removal(
+                "entry-ong",
+                reason="pending_entry_finalized",
+                symbol="ONGUSDT",
+                now_ms=1700000006000,
+            )
+
+            assert "entry-ong" not in runtime.state.pending_entries
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert binance.account_position_calls == 1
+            assert bybit.account_position_calls == 1
+            assert binance.account_open_order_calls == 1
+            assert bybit.account_open_order_calls == 1
+            assert binance.symbol_position_calls == 0
+            assert bybit.symbol_position_calls == 0
+            assert binance.symbol_open_order_calls == 0
+            assert bybit.symbol_open_order_calls == 0
+            runtime.journal.close()
+
     def test_unsupported_account_truth_keeps_previous_live_artifact_blocker(self):
         """No supported account probe must not clear an orphan-order risk lock."""
         with tempfile.TemporaryDirectory() as td:

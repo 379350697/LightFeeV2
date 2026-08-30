@@ -7,8 +7,11 @@ from enum import StrEnum
 from math import isfinite
 from typing import Any, Mapping
 
+from lightfee.venues.specs import canonical_symbol_from_venue
+
 
 EPSILON = 1e-9
+V1_PAIR_QUANTITY_EPSILON = 1e-6
 STALE_RISK_ONLY_ACCOUNT_TRUTH_BLOCK_REASON = (
     "stale_risk_only_requires_account_truth"
 )
@@ -626,7 +629,10 @@ class V1RecoveryDecisionCore:
     def _should_clear_core_block(self, snapshot: RecoveryEvidenceSnapshot) -> bool:
         reason = snapshot.prior_recovery_block_reason
         if reason in ACCOUNT_TRUTH_REQUIRED_BLOCK_REASONS:
-            return self._exchange_truth_is_complete_flat(snapshot.exchange_truth)
+            return (
+                self._exchange_truth_is_complete_flat(snapshot.exchange_truth)
+                or self._exchange_truth_matches_local_open_positions(snapshot)
+            )
         return reason is None or reason in CORE_CLEARABLE_BLOCK_REASONS
 
     @classmethod
@@ -686,6 +692,90 @@ class V1RecoveryDecisionCore:
 
     def _exchange_truth_is_complete_flat(self, exchange_truth: Any | None) -> bool:
         return self.is_complete_account_flat_truth(exchange_truth)
+
+    @classmethod
+    def _exchange_truth_matches_local_open_positions(
+        cls,
+        snapshot: RecoveryEvidenceSnapshot,
+    ) -> bool:
+        """Whether complete account truth proves every local live pair is normal.
+
+        A one-leg recovery latch is intentionally account-scoped: a symbol
+        subset cannot release it. V1 does not keep that latch once both legs
+        are present, opposite, and equal; require that same complete proof
+        before V2 resumes normal operation.
+        """
+        exchange_truth = snapshot.exchange_truth
+        scope = str(_get(exchange_truth, "truth_scope", "") or "").strip().lower()
+        if scope != RecoveryTruthScope.ACCOUNT.value:
+            return False
+        if not cls._truth_explicitly_supported(exchange_truth):
+            return False
+        if not cls._truth_available(exchange_truth) or cls._has_partial_evidence_gap(
+            exchange_truth
+        ):
+            return False
+        if (
+            _get(exchange_truth, "positions", None) is None
+            or _get(exchange_truth, "open_orders", None) is None
+            or _exchange_open_orders(exchange_truth)
+        ):
+            return False
+
+        expected: dict[tuple[str, str, str], float] = {}
+        for local_position in _as_items(snapshot.local_open_positions):
+            symbol = _symbol(local_position)
+            if not symbol:
+                return False
+            quantities: list[float] = []
+            for venue_field, quantity_field, side in (
+                ("long_venue", "long_quantity", "long"),
+                ("short_venue", "short_quantity", "short"),
+            ):
+                venue_value = _get(local_position, venue_field, "")
+                if hasattr(venue_value, "value"):
+                    venue_value = venue_value.value
+                venue = str(venue_value or "").lower()
+                try:
+                    quantity = float(_get(local_position, quantity_field, None))
+                except (TypeError, ValueError):
+                    return False
+                if not venue or not isfinite(quantity) or quantity <= EPSILON:
+                    return False
+                quantities.append(quantity)
+                key = (
+                    venue,
+                    canonical_symbol_from_venue(venue, symbol),
+                    side,
+                )
+                expected[key] = expected.get(key, 0.0) + quantity
+            if abs(quantities[0] - quantities[1]) > V1_PAIR_QUANTITY_EPSILON:
+                return False
+
+        if not expected:
+            return False
+
+        observed: dict[tuple[str, str, str], float] = {}
+        for position in _exchange_positions(exchange_truth):
+            quantity = cls._finite_position_quantity(position)
+            if quantity is None:
+                return False
+            if abs(quantity) <= EPSILON:
+                continue
+            venue = _venue(position)
+            symbol = _symbol(position)
+            side = _normalized_position_side(_get(position, "side", ""))
+            if not venue or not symbol or side not in {"long", "short"}:
+                return False
+            key = (venue, canonical_symbol_from_venue(venue, symbol), side)
+            observed[key] = observed.get(key, 0.0) + abs(quantity)
+
+        if observed.keys() != expected.keys():
+            return False
+        return all(
+            abs(observed[key] - quantity) <= V1_PAIR_QUANTITY_EPSILON
+            for key, quantity in expected.items()
+        )
 
 
 def complete_flat_truth_for_pair(
@@ -944,6 +1034,17 @@ def _venue(obj: Any) -> str:
     if hasattr(value, "value"):
         value = value.value
     return str(value or "").lower()
+
+
+def _normalized_position_side(value: Any) -> str:
+    if hasattr(value, "value"):
+        value = value.value
+    side = str(value or "").strip().lower()
+    if side in {"buy", "long", "side.buy"} or side.endswith(".buy"):
+        return "long"
+    if side in {"sell", "short", "side.sell"} or side.endswith(".sell"):
+        return "short"
+    return side
 
 
 def _venues(obj: Any) -> set[str]:

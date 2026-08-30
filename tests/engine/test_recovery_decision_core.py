@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from lightfee.engine.exchange_truth import (
     ExchangeTruthOpenOrder,
     ExchangeTruthPosition,
@@ -69,6 +71,85 @@ def test_full_flat_truth_releases_prior_live_conflict_with_background_close_debt
     assert decision.entry_allowed is True
     assert decision.clear_previous_block is True
     assert decision.clear_reason == "core_background_close_reconciliation"
+
+
+@pytest.mark.parametrize(
+    ("positions", "open_orders", "expected_clear"),
+    (
+        (
+            (
+                {"venue": "binance", "symbol": "ONGUSDT", "side": "buy", "quantity": 207.0},
+                {"venue": "bybit", "symbol": "ONGUSDT", "side": "sell", "quantity": 207.0000005},
+            ),
+            (),
+            True,
+        ),
+        # A one-leg, wrong-direction, wrong-size, or order-bearing account is
+        # not the normal paired position that may release an old live-artifact
+        # latch.
+        (
+            (
+                {"venue": "binance", "symbol": "ONGUSDT", "side": "buy", "quantity": 207.0},
+            ),
+            (),
+            False,
+        ),
+        (
+            (
+                {"venue": "binance", "symbol": "ONGUSDT", "side": "sell", "quantity": 207.0},
+                {"venue": "bybit", "symbol": "ONGUSDT", "side": "sell", "quantity": 207.0},
+            ),
+            (),
+            False,
+        ),
+        (
+            (
+                {"venue": "binance", "symbol": "ONGUSDT", "side": "buy", "quantity": 206.0},
+                {"venue": "bybit", "symbol": "ONGUSDT", "side": "sell", "quantity": 207.0},
+            ),
+            (),
+            False,
+        ),
+        (
+            (
+                {"venue": "binance", "symbol": "ONGUSDT", "side": "buy", "quantity": 207.0},
+                {"venue": "bybit", "symbol": "ONGUSDT", "side": "sell", "quantity": 207.0},
+            ),
+            ({"venue": "binance", "symbol": "ONGUSDT", "order_id": "still-live"},),
+            False,
+        ),
+    ),
+)
+def test_complete_account_truth_releases_live_artifact_latch_only_for_exact_normal_pair(
+    positions,
+    open_orders,
+    expected_clear,
+):
+    """V1 permits a normal live hedge to continue after the transient one-leg lock."""
+    snapshot = RecoveryEvidenceSnapshot(
+        local_open_positions=(
+            SimpleNamespace(
+                position_id="entry-ong",
+                symbol="ONGUSDT",
+                long_venue="binance",
+                short_venue="bybit",
+                long_quantity=207.0,
+                short_quantity=207.0,
+            ),
+        ),
+        exchange_truth={
+            "truth_scope": "account",
+            "truth_supported": True,
+            "truth_available": True,
+            "positions": positions,
+            "open_orders": open_orders,
+        },
+        prior_recovery_block_reason="unpaired_live_position",
+    )
+
+    decision = V1RecoveryDecisionCore().decide(snapshot)
+
+    assert decision.clear_previous_block is expected_clear
 
 
 def test_close_reconciliation_runs_in_background_without_prior_account_latch():
