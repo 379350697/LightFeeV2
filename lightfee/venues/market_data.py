@@ -141,6 +141,14 @@ def _funding_timestamp_ms(item: dict[str, Any], *, fallback_ms: int = 0) -> int:
     return fallback_ms
 
 
+def _funding_timestamp_ms_or_seconds(value: Any) -> int:
+    """Normalize an explicit exchange funding time without inventing one."""
+    ts = int(_safe_float(value, default=0.0))
+    if ts <= 0:
+        return 0
+    return ts * 1000 if ts < 10_000_000_000 else ts
+
+
 # ---------------------------------------------------------------------------
 # MarketDataClient
 # ---------------------------------------------------------------------------
@@ -1296,25 +1304,56 @@ class MarketDataClient:
         data = raw.get("data", [])
         items = data if isinstance(data, list) else [data]
 
+        now_ms = _now_ms()
+        funding_map: dict[str, dict[str, Any]] = {}
+        if spec.funding_rate_path:
+            try:
+                funding_raw = await self._public_get(
+                    spec.funding_rate_path,
+                    params={"productType": "USDT-FUTURES"},
+                )
+            except PublicTransportError:
+                funding_raw = {}
+            funding_data = funding_raw.get("data", []) if isinstance(funding_raw, dict) else []
+            funding_items = funding_data if isinstance(funding_data, list) else [funding_data]
+            for funding_item in funding_items:
+                if not isinstance(funding_item, dict):
+                    continue
+                symbol = str(funding_item.get("symbol", ""))
+                if symbol in venue_sym_to_canon:
+                    funding_map[symbol] = funding_item
+
         result: dict[str, FundingTicker] = {}
         for item in items:
             sym = str(item.get("symbol", ""))
             canon = venue_sym_to_canon.get(sym)
             if canon is None:
                 continue
+            mark = _safe_float(item.get("markPrice", item.get("lastPr", item.get("last", 0))))
+            holding_amount = _safe_float(item.get("holdingAmount", item.get("openInterest", 0)))
+            funding_item = funding_map.get(sym, {})
+            funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
+                funding_item.get("nextUpdate", 0)
+            )
+            if funding_timestamp_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
+                funding_timestamp_ms = 0
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
-                bid=_safe_float(item.get("bestBid", 0)),
-                ask=_safe_float(item.get("bestAsk", 0)),
+                bid=_safe_float(item.get("bidPr", item.get("bestBid", 0))),
+                ask=_safe_float(item.get("askPr", item.get("bestAsk", 0))),
                 bid_size=_safe_float(item.get("bidSz", 0)),
                 ask_size=_safe_float(item.get("askSz", 0)),
-                mark_price=_safe_float(item.get("markPrice", 0)),
+                mark_price=mark,
                 index_price=_safe_float(item.get("indexPrice", 0)),
-                funding_rate_bps=_safe_float(item.get("fundingRate", 0)) * 10000.0,
-                funding_timestamp_ms=_now_ms(),  # Bitget REST ticker does not include funding time
-                volume_24h_quote=_safe_float(item.get("usdtVolume", 0)),
-                open_interest_quote=_safe_float(item.get("openInterest", 0)),
+                funding_rate_bps=_safe_float(
+                    funding_item.get("fundingRate", item.get("fundingRate", 0))
+                ) * 10000.0,
+                funding_timestamp_ms=funding_timestamp_ms,
+                volume_24h_quote=_safe_float(item.get("usdtVolume", item.get("quoteVolume", 0))),
+                open_interest_quote=holding_amount * mark
+                if holding_amount > 0 and mark > 0
+                else 0.0,
             )
         return result
 
@@ -1330,6 +1369,49 @@ class MarketDataClient:
         raw = await self._public_get(spec.funding_ticker_path)
         items = raw if isinstance(raw, list) else [raw]
 
+        now_ms = _now_ms()
+        contract_map: dict[str, dict[str, Any]] = {}
+        missing_contract_symbols: set[str] = set()
+        for venue_sym, canon in venue_sym_to_canon.items():
+            cache_key = f"{venue_str}:{canon}"
+            if self._funding_rate_is_fresh(cache_key, now_ms):
+                rate_bps, timestamp_ms, _observed_at_ms = self._funding_cache[cache_key]
+                contract_map[venue_sym] = {
+                    "funding_rate": str(rate_bps / 10000.0),
+                    "funding_next_apply": timestamp_ms,
+                }
+            else:
+                missing_contract_symbols.add(venue_sym)
+
+        if spec.funding_contracts_path and missing_contract_symbols:
+            try:
+                contracts_raw = await self._public_get(spec.funding_contracts_path)
+            except PublicTransportError:
+                contracts_raw = []
+            contract_items = contracts_raw if isinstance(contracts_raw, list) else [contracts_raw]
+            for contract_item in contract_items:
+                if not isinstance(contract_item, dict):
+                    continue
+                symbol = str(contract_item.get("name", contract_item.get("contract", "")))
+                if not symbol:
+                    continue
+                funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
+                    contract_item.get("funding_next_apply", 0)
+                )
+                funding_is_fresh = funding_timestamp_ms > now_ms + _FUNDING_CACHE_MIN_FUTURE_MS
+                funding_rate = contract_item.get("funding_rate")
+                if funding_is_fresh and funding_rate not in (None, ""):
+                    canon = venue_sym_to_canon.get(symbol, self._from_venue_symbol(symbol).upper())
+                    self._funding_cache[f"{venue_str}:{canon}"] = (
+                        _safe_float(funding_rate) * 10000.0,
+                        funding_timestamp_ms,
+                        now_ms,
+                    )
+                if symbol in venue_sym_to_canon and (
+                    funding_is_fresh or symbol not in contract_map
+                ):
+                    contract_map[symbol] = contract_item
+
         result: dict[str, FundingTicker] = {}
         for item in items:
             sym = str(item.get("contract", ""))
@@ -1339,17 +1421,25 @@ class MarketDataClient:
             mark = _safe_float(item.get("mark_price", 0))
             quanto = _safe_float(item.get("quanto_multiplier", 1.0))
             oi_contracts = _safe_float(item.get("total_size", 0))
+            contract_item = contract_map.get(sym, {})
+            funding_timestamp_ms = _funding_timestamp_ms_or_seconds(
+                contract_item.get("funding_next_apply", 0)
+            )
+            if funding_timestamp_ms <= now_ms + _FUNDING_CACHE_MIN_FUTURE_MS:
+                funding_timestamp_ms = 0
             result[f"{venue_str}:{canon}"] = FundingTicker(
                 venue=venue_str,
                 symbol=canon,
                 bid=_safe_float(item.get("highest_bid", 0)),
                 ask=_safe_float(item.get("lowest_ask", 0)),
-                bid_size=_safe_float(item.get("bid_size", 0)),
-                ask_size=_safe_float(item.get("ask_size", 0)),
+                bid_size=_safe_float(item.get("highest_size", item.get("bid_size", 0))) * quanto,
+                ask_size=_safe_float(item.get("lowest_size", item.get("ask_size", 0))) * quanto,
                 mark_price=mark,
                 index_price=_safe_float(item.get("index_price", 0)),
-                funding_rate_bps=_safe_float(item.get("funding_rate", 0)) * 10000.0,
-                funding_timestamp_ms=_now_ms(),  # Gate REST ticker does not include funding next apply time
+                funding_rate_bps=_safe_float(
+                    contract_item.get("funding_rate", item.get("funding_rate", 0))
+                ) * 10000.0,
+                funding_timestamp_ms=funding_timestamp_ms,
                 volume_24h_quote=_safe_float(item.get("volume_24h_quote", item.get("volume_24h", 0))),
                 open_interest_quote=oi_contracts * quanto * mark if quanto > 0 and mark > 0 else oi_contracts,
             )

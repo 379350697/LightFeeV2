@@ -334,6 +334,13 @@ class TestV1RateLimitDefaults:
                 assert endpoint in v.endpoint_min_interval_ms
                 assert v.endpoint_min_interval_ms[endpoint] == min_interval
 
+    def test_bitget_current_funding_endpoint_is_market_scoped(self):
+        endpoint = "GET /api/v2/mix/market/current-fund-rate"
+        bitget = built_in_defaults().venues["bitget"]
+
+        assert bitget.endpoint_weights[endpoint] == 1
+        assert bitget.scopes[endpoint] == "market"
+
     def test_aster_v3_private_endpoint_weights_match_official_contract(self):
         cfg = built_in_defaults()
         v = cfg.venues["aster"]

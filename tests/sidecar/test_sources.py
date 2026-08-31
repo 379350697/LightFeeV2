@@ -7,12 +7,16 @@ import time
 
 import pytest
 
+from lightfee.config.schema import StrategyConfig
 from lightfee.core.domain import Venue
+from lightfee.sidecar.pairing import build_same_symbol_pairs
 from lightfee.sidecar.snapshot import QuoteSnapshot
 from lightfee.sidecar.sources.exchange import ExchangeSource
 from lightfee.sidecar.sources.liquidity import LiquiditySource
 from lightfee.sidecar.sources.transfer import TransferSource
-from lightfee.venues.specs import binance_spec, okx_spec, get_spec
+from lightfee.strategy.discovery import discover_tradeable_candidates
+from lightfee.venues.market_data import MarketDataClient
+from lightfee.venues.specs import binance_spec, bitget_spec, gate_spec, okx_spec, get_spec
 
 
 class TestExchangeSource:
@@ -62,6 +66,95 @@ class TestExchangeSource:
         src = ExchangeSource(binance_spec(), rate_limiter=limiter)
 
         assert src._client._rate_limiter is limiter
+
+    @pytest.mark.asyncio
+    async def test_real_exchange_source_path_keeps_gate_bitget_candidate_inside_funding_window(
+        self,
+    ):
+        """Public payload → source → pairing → V1 discovery must not synthesize now."""
+
+        class FakeBitgetClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v2/mix/market/tickers":
+                    return {
+                        "data": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "bidPr": "100",
+                                "askPr": "101",
+                                "markPrice": "100.5",
+                                "fundingRate": "0.0003",
+                                "holdingAmount": "2500",
+                            }
+                        ]
+                    }
+                if path == "/api/v2/mix/market/current-fund-rate":
+                    return {
+                        "data": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "fundingRate": "0.0003",
+                                "nextUpdate": "4100007200000",
+                            }
+                        ]
+                    }
+                raise AssertionError(f"unexpected path: {path}")
+
+        class FakeGateClient(MarketDataClient):
+            async def _public_get(self, path, params=None):
+                if path == "/api/v4/futures/usdt/tickers":
+                    return [
+                        {
+                            "contract": "BTC_USDT",
+                            "highest_bid": "101",
+                            "highest_size": "2",
+                            "lowest_ask": "102",
+                            "lowest_size": "3",
+                            "mark_price": "101.5",
+                            "funding_rate": "0.0004",
+                            "quanto_multiplier": "0.01",
+                            "total_size": "2500",
+                        }
+                    ]
+                if path == "/api/v4/futures/usdt/contracts":
+                    return [
+                        {
+                            "name": "BTC_USDT",
+                            "funding_rate": "0.0004",
+                            "funding_next_apply": 4100007200,
+                        }
+                    ]
+                raise AssertionError(f"unexpected path: {path}")
+
+        bitget_source = ExchangeSource(bitget_spec())
+        gate_source = ExchangeSource(gate_spec())
+        bitget_source._client = FakeBitgetClient(bitget_spec())
+        gate_source._client = FakeGateClient(gate_spec())
+        try:
+            quotes = {
+                **await bitget_source.fetch_all(["BTCUSDT"]),
+                **await gate_source.fetch_all(["BTCUSDT"]),
+            }
+        finally:
+            await bitget_source.close()
+            await gate_source.close()
+
+        candidates = build_same_symbol_pairs(quotes, ["BTCUSDT"])
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate.first_funding_timestamp_ms == 4_100_007_200_000
+        assert candidate.first_funding_timestamp_ms > 4_100_006_600_000
+
+        tradeable = discover_tradeable_candidates(
+            candidates,
+            StrategyConfig(
+                min_funding_edge_bps=0.0,
+                min_expected_edge_bps=0.0,
+                min_worst_case_edge_bps=0.0,
+            ),
+            now_ms=4_100_006_600_000,
+        )
+        assert tradeable == [candidate]
 
 
 class TestLiquiditySource:

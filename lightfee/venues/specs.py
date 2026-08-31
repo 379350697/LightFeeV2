@@ -112,6 +112,7 @@ class VenueSpec:
     # V2 sidecar public endpoint paths
     funding_ticker_path: str = ""
     funding_rate_path: str = ""
+    funding_contracts_path: str = ""
     premium_index_path: str = ""
     volume_24h_path: str = ""
     open_interest_path: str = ""
@@ -391,6 +392,7 @@ def bitget_spec() -> VenueSpec:
         venue_scope="venue:bitget",
         # V2 sidecar public endpoints
         funding_ticker_path="/api/v2/mix/market/tickers",
+        funding_rate_path="/api/v2/mix/market/current-fund-rate",
         ticker_includes_volume_oi=True,
         operation_contracts=classic_mix_v2_contracts,
         family_operation_contracts={
@@ -426,6 +428,7 @@ def gate_spec() -> VenueSpec:
         venue_scope="venue:gate",
         # V2 sidecar public endpoints
         funding_ticker_path="/api/v4/futures/usdt/tickers",
+        funding_contracts_path="/api/v4/futures/usdt/contracts",
         ticker_includes_volume_oi=True,
         operation_contracts={
             VenueOperation.CREATE_ORDER: _contract("POST", "/api/v4/futures/usdt/orders"),
