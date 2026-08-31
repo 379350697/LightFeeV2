@@ -62,7 +62,7 @@ and quote fee. The local repair admits only an omitted value as a candidate,
 then retains the exact-order proof gate unchanged. It re-runs only legacy
 automatic Aster generic `no_candidate` debt once; a post-repair
 `aster_v3_no_candidate`, ambiguous, incomplete, or non-Aster outcome remains
-terminal. This is **local-green at `079601f`, not deployed**; see
+terminal. This is **deployed-awaiting-verification at `079601f`**; see
 [CL-136](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate).
 
 2026-08-31 recovery snapshot/journal boundary: V2 incorrectly replayed the
@@ -73,8 +73,8 @@ repair records an existing journal file-identity/offset marker at each snapshot
 boundary and replays only a provably contiguous retained tail. No-snapshot
 recovery retains the V1 emergency full-journal fallback; legacy or unprovable
 markers restore the snapshot without a historical fallback, with exchange
-account truth remaining the live-exposure authority. This is **local-green in
-the working tree, not deployed**; see
+account truth remaining the live-exposure authority. This is
+**deployed-awaiting-verification at `0e0cc7a`**; see
 [CL-137](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work).
 
 CL-128 rotated-journal diagnosis and ledger drift, 2026-08-27: the diagnostic

@@ -34,17 +34,17 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `f443c10eacdea644bbd879329533b8d03cf4d6cc`
-- Checked on: `2026-08-31`. `f443c10` (including `0428fd1`, `079601f`, and
-  `2111e36`) was fast-forwarded to production; the manifest passed and both
-  services were active with zero restarts. The latest read-only truth was
-  high-confidence flat/no-order across venues. CL-134 still requires a natural
-  matched **open** pair beside background accounting work before closure, and
-  CL-135/CL-136 require their scenario-specific natural observations. The
-  generic verifier's private-worker rate alert remains a timestamp-collection
-  false positive: this host does not expose `ActiveEnterTimestampUSec`, so its
-  one-hour fallback includes the prior intentional restart as well as the
-  checked window.
+- Last production SHA checked: `0e0cc7a2bb7c5d7d3c263b49037390f9800ff62c`
+- Checked on: `2026-08-31`. `0e0cc7a` (including `0428fd1`, `079601f`, and
+  `2111e36`) was fast-forwarded to production. All 16 critical manifest hashes
+  matched; both services restarted active with zero restarts. Deployment
+  acceptance was green: seven-venue source evidence was fresh, exchange truth
+  was high-confidence flat/no-order, lifecycle/risk mode were `running`, and
+  the first post-restart runtime snapshot carried a journal checkpoint with no
+  pending entry, close, passive-close, reconciliation, or open-position state.
+  CL-134 still requires a natural matched **open** pair beside background
+  accounting work before closure, and CL-135/CL-136 require their
+  scenario-specific natural observations.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -75,14 +75,6 @@ they have a fixing commit. They are **local-green only**, not production facts:
   its exchange-specific leverage postcondition before a new order. They do not
   change the existing terminalization-budget cleanup or submit an order during
   verification.
-
-- snapshot-boundary journal recovery. Every production state-snapshot writer,
-  including the runtime and operator-control CLI, records a durable journal
-  file-identity/offset marker and only its contiguous tail is replayed; legacy
-  or unprovable markers restore snapshot state without a full retained
-  audit-history fallback. No-snapshot recovery retains the V1 emergency full
-  replay path, and terminal owner events cannot repopulate startup symbol
-  probes. See [CL-137](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work).
 
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
@@ -133,6 +125,7 @@ until this table receives real fixing commits and a production observation.
 | CL-134 | deployed-awaiting-verification | `2111e36` | production-path RED/GREEN for terminal normal pair plus unrelated final close debt; exact-pair/one-leg/wrong-side/wrong-quantity/open-order core matrix; focused `477 passed`; full `4491 passed, 9 skipped` | `fe821142` is live: services active/0 restarts, current state `running` with background debt and high-confidence flat/no-order truth. Observe a natural matched open hedge beside debt remain `running`; non-normal/incomplete truth must stay blocked. | [2026-08-30](daily/2026-08-30.md#cl-134--a-normal-matched-hedge-was-globally-blocked-by-unrelated-close-accounting-debt) |
 | CL-135 | deployed-awaiting-verification | `0428fd1` | COTI-shaped delayed-fill → normal-hedge production-path regression; seven-venue prepare/verify capability matrix, malformed/mismatch/dual-mode/non-ack blockers, and same-venue de-duplication; deployment acceptance high-confidence clean | Natural observation still required: a delayed owned maker fill must hedge normally rather than reduce-only flatten; every entry leg must log its exchange-specific leverage proof or block before order submission. | [2026-08-30](daily/2026-08-30.md#cl-135--delayed-owned-maker-fill-was-cleaned-before-hedge-and-entry-leverage-was-not-proved-for-every-live-leg) |
 | CL-136 | deployed-awaiting-verification | `079601f` | Aster one-way V3 `userTrades` missing-`reduceOnly` production-shape RED/GREEN; exact order `reduceOnly=false` rejects; legacy generic miss retries once then corrected miss remains terminal; close profile `481 passed`, Aster profile `19 passed` | `f443c10` is live and exchange truth is flat/no-order. Confirm the named ONG debt resolves only when its exact Aster order still proves `FILLED`, `reduceOnly=true`, identity/quantity/price, and quote fee; otherwise it must remain terminal debt. | [2026-08-31](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate) |
+| CL-137 | deployed-awaiting-verification | `0e0cc7a` | snapshot/tail/rotation/no-snapshot/terminal-owner matrix, operator CLI crash-window path, and terminalizer guard (`778 passed`) | `0e0cc7a` is live: manifest, singleton, deployment acceptance, and post-restart checkpoint passed; exchange truth is high-confidence flat/no-order. Await one ordinary later restart or rotated-tail observation; do not force orders or mutate history. | [2026-08-31](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work) |
 
 ## Pre-CL-093 Historical Boundary
 
