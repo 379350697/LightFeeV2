@@ -17,10 +17,25 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 | [residual-repair-live-truth](cards/residual-repair-live-truth.md) | residual repair live truth, pair-gate release, open-order/dust terminality | `execution.residual_repair_paused`, `residual_repair_live_open_orders_present`, `residual_repair_live_position_nonzero`, or stale `pending_residual_repairs` appears. |
 | [pending-entry-hedge-admission](cards/pending-entry-hedge-admission.md) | pending hedge deterministic admission rejects | Bybit `110125`/`110126`, Aster `-5018`, Hyperliquid `Insufficient margin`, or repeated `pending_entry.hedge_submit_result:error` appears. |
 | [local-l2-sequence-continuity](cards/local-l2-sequence-continuity.md) | Local-L2 rebuilds and official sequence evidence | `runtime.local_l2_sequence_gap_rebuild`, `runtime.local_l2_snapshot_error`, or Local-L2 insufficient evidence recurs. |
+| [market-data-snapshot-freshness](cards/market-data-snapshot-freshness.md) | sidecar quote/funding freshness and bounded public enrichment | Quote rows are present but Gate/Bitget funding time is near snapshot publication, venue quotes are zeroed, or public enrichment degrades. |
 | [passive-close-terminal-flatness](cards/passive-close-terminal-flatness.md) | passive close terminal flatness / under-min / price unavailable | Pending passive close loops, terminal flat, under-min, or price-unavailable close branches recur. |
 | [pending-entry-terminality-live-truth](cards/pending-entry-terminality-live-truth.md) | pending entry false flat / live truth mismatch | Local state is flat but exchange truth has nonzero positions, or pending entries clear on stale/uncertain evidence. |
 
 ## Recent Investigations
+
+2026-09-01 Gate/Bitget sidecar admission starvation: this was not an absence of
+opportunities or an order-API rejection. Production snapshots showed Bitget
+`bid=ask=0` for all 75 rows because V2 looked for obsolete aliases instead of
+the current `bidPr`/`askPr` fields. Gate and Bitget candidates also carried a
+first funding time about one publication interval before the snapshot because
+V2 wrote local `now` when their ticker lacked schedule metadata; the unchanged
+V1 funding-window gate correctly rejected them before dispatch. The reviewed
+repair uses Bitget's bulk current-funding `nextUpdate`, Gate's bulk contracts
+`funding_next_apply` (seconds → milliseconds), Gate's existing bounded cache,
+and `0` for unavailable or stale metadata. It preserves quote publication but
+never manufactures an entry schedule, adds no retry/poller/order change, and
+does not cherry-pick the divergent `v3` branch wholesale. It is **local-green
+at `d18d016`, not yet deployed**; see [2026-09-01](daily/2026-09-01.md).
 
 2026-08-30 shared HTTP opaque transport evidence and client retirement: a bare
 `httpx.ReadError` was formatted with `str(exc)`, leaving production

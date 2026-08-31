@@ -14,6 +14,8 @@ and slow enrichment that must not block publication.
 - `runtime.entry_oi_targeted_refresh_failed` with an empty `network:` suffix
 - `open_interest_transport_error_type`, `open_interest_client_generation`, or
   `open_interest_client_retired` after a public REST failure
+- Gate or Bitget funding timestamps within a sidecar publication interval of
+  `snapshot_published_at_ms`, or Bitget quote rows with `bid=ask=0`
 
 ## Current Effective Rule
 
@@ -32,6 +34,15 @@ seed shortlist and warm tracking, but execution still needs a fresh validated
 top-book quote lease. Slow OI/liquidity evidence can be cached, capped, deferred,
 or marked unavailable for sidecar publication, but entry gates remain fail-closed
 when required evidence is not available.
+
+Funding time is execution evidence, not a snapshot timestamp. A venue whose
+ticker does not carry a documented future funding time must obtain it from the
+documented bulk metadata endpoint or emit `0`; it must never substitute
+`observed_at_ms`/`now`. Gate's `funding_next_apply` is seconds and must be
+normalized to milliseconds. Its bulk contracts response may use the existing
+bounded freshness cache; Bitget's `current-fund-rate.nextUpdate` is already a
+bulk market request. A metadata failure may preserve bid/ask publication but
+must keep entry fail-closed through the existing funding-window gate.
 
 The shared market-data HTTP client must preserve the failure phase, exception
 type, root cause, and client generation for every `httpx.NetworkError`. It
@@ -61,6 +72,7 @@ four-request ceiling to compensate.
 | 2026-08-26 | `336ad5f8` widened OKX cold-cache fanout to 40; `fd1579d6` added a 0.2s aggregate cancellation to keep snapshots fast | ineffective / regressed production | The two changes were called V1 parity/fast path, but V1 caps multi-symbol REST fallback at four and completes it. The aggregate cancellation left 36 OKX `CLOSE_WAIT` sockets, made OKX data stale, and fail-closed OKX candidates. Do not reuse this pattern. |
 | 2026-08-26 | Restore bounded four-request fallback with miss rotation and no ordinary batch cancellation | local green; deployment pending | Real `httpx` production-path regressions prove exactly four slow requests start and complete with zero ordinary cancellations, and outer cancellation awaits exactly those four children. Quote rows remain available and incomplete funding stays fail-closed for entry. |
 | 2026-08-30 | Shared public `ReadError` formatted as an empty error and client stayed reusable | local green; deployment pending | CL-133 records phase/type/root cause/client generation through the targeted-OI journal and retires only the failed shared client after active public/private leases complete. No Aster-only reset, blind retry, or pool change is permitted. |
+| 2026-09-01 | Gate/Bitget sidecar parsed stale aliases and used local `now` as the funding schedule | local green at `d18d016`; deployment pending | Production showed Bitget `bidPr`/`askPr` as zeroed quotes and both venues' first funding time within one snapshot interval of observation. Restore documented bulk metadata parsing, seconds-to-ms Gate conversion, existing bounded Gate cache, and fail-closed `0` on absent/stale metadata. Do not cherry-pick a divergent branch wholesale, add a polling loop, or relax the V1 funding window. |
 
 ## Regression Harness
 
@@ -84,3 +96,6 @@ four-request ceiling to compensate.
    first. Do not infer venue ownership from CDN IPs or reset one venue client.
 6. Test a concurrent borrower before retiring a shared client, including
    listenKey/private REST; never close it immediately from one failed request.
+7. Before treating a timestamp as a funding schedule, verify its endpoint and
+   unit against the exchange document and current payload. A generated
+   observation timestamp is not a safe fallback for an absent future schedule.
