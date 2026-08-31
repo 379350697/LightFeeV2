@@ -191,6 +191,57 @@ class TestJournalStreaming:
 
 
 # ---------------------------------------------------------------------------
+# Snapshot checkpoints
+# ---------------------------------------------------------------------------
+
+class TestJournalSnapshotCheckpoints:
+    """A snapshot replays only the exact journal tail it did not include."""
+
+    def test_checkpoint_reads_only_later_records_with_utf8_payloads(self, tmp_path):
+        journal = Journal(tmp_path / "test.jsonl")
+        journal.open()
+        try:
+            journal.append("historical.event", {"symbol": "币本位"})
+            checkpoint = journal.snapshot_checkpoint()
+            journal.append("tail.event", {"symbol": "BTCUSDT"})
+
+            records = journal.read_after_snapshot_checkpoint(checkpoint)
+        finally:
+            journal.close()
+
+        assert records is not None
+        assert [record["kind"] for record in records] == ["tail.event"]
+
+    def test_checkpoint_follows_a_retained_rotation_chain(self, tmp_path):
+        journal = Journal(tmp_path / "test.jsonl", max_bytes=1, archive_count=2)
+        journal.open()
+        try:
+            journal.append("historical.event", {"n": 1})
+            checkpoint = journal.snapshot_checkpoint()
+            journal.append("tail.event", {"n": 2})
+
+            records = journal.read_after_snapshot_checkpoint(checkpoint)
+        finally:
+            journal.close()
+
+        assert records is not None
+        assert [record["kind"] for record in records] == ["tail.event"]
+
+    def test_invalid_checkpoint_never_falls_back_to_full_history(self, tmp_path):
+        journal = Journal(tmp_path / "test.jsonl")
+        journal.open()
+        try:
+            journal.append("historical.event", {"n": 1})
+            records = journal.read_after_snapshot_checkpoint(
+                {"version": 1, "device": 1, "inode": 1, "offset": 0}
+            )
+        finally:
+            journal.close()
+
+        assert records is None
+
+
+# ---------------------------------------------------------------------------
 # max_seq property
 # ---------------------------------------------------------------------------
 

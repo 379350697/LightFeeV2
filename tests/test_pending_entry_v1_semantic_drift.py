@@ -2314,6 +2314,7 @@ async def test_billing_evidence_gap_restart_clears_stale_reconciliation_snapshot
         symbol="BEATUSDT",
     )
     runtime.state.pending_close_reconciliations.append(reconciliation)
+    journal_checkpoint = tmp_journal.snapshot_checkpoint()
 
     await runtime._reconcile_pending_state(now_ms=3000)
     kinds = [record["kind"] for record in tmp_journal.read_all()]
@@ -2333,6 +2334,7 @@ async def test_billing_evidence_gap_restart_clears_stale_reconciliation_snapshot
         "pending_passive_closes": {},
         "pending_residual_repairs": [],
         "pending_closes": {},
+        "journal_checkpoint": journal_checkpoint,
     }
     snapshot_store.write(stale_snapshot)
 

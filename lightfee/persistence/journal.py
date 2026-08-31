@@ -176,6 +176,97 @@ class Journal:
                         pass
         return records
 
+    def snapshot_checkpoint(self) -> dict[str, int] | None:
+        """Return the durable byte boundary represented by a state snapshot.
+
+        Journal ``seq`` values restart with every process, so they cannot be a
+        durable cross-restart recovery cursor.  A snapshot instead records the
+        identity and byte offset of the JSONL file it includes.  Recovery can
+        then replay only records appended after this exact boundary.
+        """
+        if self._file is not None:
+            self._file.flush()
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return {
+            "version": 1,
+            "device": int(stat.st_dev),
+            "inode": int(stat.st_ino),
+            "offset": int(stat.st_size),
+        }
+
+    def read_after_snapshot_checkpoint(
+        self,
+        checkpoint: dict[str, Any],
+    ) -> list[dict[str, Any]] | None:
+        """Read the durable journal tail after ``snapshot_checkpoint``.
+
+        ``None`` means the checkpoint cannot be proven to be an ancestor of
+        the retained journal (for example after retention removed a rotated
+        file).  Callers must keep the snapshot authoritative in that case;
+        silently falling back to ``read_all`` would replay audit history as
+        live recovery work.
+        """
+        try:
+            if int(checkpoint.get("version")) != 1:
+                return None
+            device = int(checkpoint["device"])
+            inode = int(checkpoint["inode"])
+            offset = int(checkpoint["offset"])
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if offset < 0:
+            return None
+
+        paths = self._retained_paths_oldest_first()
+        checkpoint_index: int | None = None
+        for index, path in enumerate(paths):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if int(stat.st_dev) == device and int(stat.st_ino) == inode:
+                if offset > int(stat.st_size):
+                    return None
+                checkpoint_index = index
+                break
+        if checkpoint_index is None:
+            return None
+
+        records: list[dict[str, Any]] = []
+        try:
+            with open(paths[checkpoint_index], encoding="utf-8") as source:
+                source.seek(offset)
+                records.extend(self._parse_lines(source))
+            for path in paths[checkpoint_index + 1 :]:
+                with open(path, encoding="utf-8") as source:
+                    records.extend(self._parse_lines(source))
+        except OSError:
+            return None
+        return records
+
+    def _retained_paths_oldest_first(self) -> list[Path]:
+        """Return a contiguous retained rotation chain followed by live JSONL."""
+        archives: list[tuple[int, Path]] = []
+        prefix = f"{self.path.name}."
+        try:
+            candidates = self.path.parent.iterdir()
+        except OSError:
+            return [self.path] if self.path.exists() else []
+        for candidate in candidates:
+            suffix = candidate.name.removeprefix(prefix)
+            if candidate.name.startswith(prefix) and suffix.isdigit():
+                archives.append((int(suffix), candidate))
+        archives.sort(reverse=True)
+        if archives:
+            highest = archives[0][0]
+            expected = list(range(highest, 0, -1))
+            if [number for number, _ in archives] != expected:
+                return []
+        return [path for _, path in archives] + [self.path]
+
     # ------------------------------------------------------------------
     # Streaming read primitives (V2 projection/backfill)
     # ------------------------------------------------------------------

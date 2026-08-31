@@ -2072,7 +2072,12 @@ class LiveRuntime:
         if updated <= 0:
             return
         try:
-            self.snapshot_store.write(build_persistent_state_view(self.state))
+            self.snapshot_store.write(
+                build_persistent_state_view(
+                    self.state,
+                    journal_checkpoint=self.journal.snapshot_checkpoint(),
+                )
+            )
         except Exception as exc:
             self.journal.append(
                 "runtime.account_fee_snapshot_persist_failed",
@@ -3385,7 +3390,12 @@ class LiveRuntime:
                     },
                 )
             self._sync_passive_order_manager_states()
-            self.snapshot_store.write(build_persistent_state_view(self.state))
+            self.snapshot_store.write(
+                build_persistent_state_view(
+                    self.state,
+                    journal_checkpoint=self.journal.snapshot_checkpoint(),
+                )
+            )
 
     async def _flatten_live_position_leg_quantity(
         self,
@@ -3872,7 +3882,12 @@ class LiveRuntime:
         # Final state snapshot
         if self.state:
             self._sync_passive_order_manager_states()
-            self.snapshot_store.write(build_persistent_state_view(self.state))
+            self.snapshot_store.write(
+                build_persistent_state_view(
+                    self.state,
+                    journal_checkpoint=self.journal.snapshot_checkpoint(),
+                )
+            )
 
         # Final current-state export
         now_ms = wall_clock_now_ms()
@@ -4948,7 +4963,12 @@ class LiveRuntime:
 
                     # --- Persist state snapshot ---
                     self._sync_passive_order_manager_states()
-                    self.snapshot_store.write(build_persistent_state_view(self.state))
+                    self.snapshot_store.write(
+                        build_persistent_state_view(
+                            self.state,
+                            journal_checkpoint=self.journal.snapshot_checkpoint(),
+                        )
+                    )
 
                 finally:
                     self._complete_runtime_loop_iteration(wall_clock_now_ms())

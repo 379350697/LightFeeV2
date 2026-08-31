@@ -222,7 +222,10 @@ def main() -> None:
 
         # 4. Persist updated state to snapshot
         from lightfee.engine.recovery import build_persistent_state_view
-        view = build_persistent_state_view(state)
+        view = build_persistent_state_view(
+            state,
+            journal_checkpoint=journal.snapshot_checkpoint(),
+        )
         store.write(view)
 
         print(msg)

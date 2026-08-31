@@ -15,6 +15,7 @@ from lightfee.engine.recovery import (
     _apply_journal_replay_to_state,
     _restore_state_from_snapshot_dict,
     build_persistent_state_view,
+    recover_from_snapshot,
 )
 from lightfee.engine.state import (
     BillingEvidenceImportError,
@@ -479,6 +480,49 @@ def test_ops_cli_requires_apply_and_persists_audited_import(tmp_path, monkeypatc
     persisted = _restore_state_from_snapshot_dict(store.read() or {})
     assert persisted.pending_close_reconciliations[0]["reconciliation_status"] == "operator_evidence_imported"
     assert Journal(event_log_path).read_all()[-1]["kind"] == "exit.billing_evidence_imported"
+
+
+def test_ops_snapshot_replays_journal_tail_after_operator_command(tmp_path, monkeypatch):
+    """The shared operator writer must mark its snapshot's journal boundary."""
+    from lightfee.apps import ops
+
+    event_log_path = tmp_path / "journal.jsonl"
+    snapshot_path = tmp_path / "snapshot.json"
+    store = SnapshotStore(snapshot_path)
+    store.write(build_persistent_state_view(EngineState()))
+    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "pause-entry"])
+
+    with pytest.raises(SystemExit) as applied:
+        ops.main()
+    assert applied.value.code == 0
+
+    persisted = store.read()
+    assert isinstance(persisted, dict)
+    assert isinstance(persisted.get("journal_checkpoint"), dict)
+
+    journal = Journal(event_log_path)
+    journal.open()
+    try:
+        journal.append(
+            "entry.pending_registered",
+            {
+                "position_id": "entry-after-ops-snapshot",
+                "symbol": "COTIUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "target_quantity": 1.0,
+                "long_side": "buy",
+                "short_side": "sell",
+            },
+            flush=True,
+        )
+    finally:
+        journal.close()
+
+    recovered = recover_from_snapshot(store, Journal(event_log_path))
+
+    assert "entry-after-ops-snapshot" in recovered.pending_entries
 
 
 def test_ops_paths_require_one_explicit_persistence_pair(tmp_path):

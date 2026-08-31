@@ -44,6 +44,7 @@ from lightfee.core.domain import (
 )
 from lightfee.engine.close_executor import CloseExecutionLeg
 from lightfee.engine.exit import CloseExecution
+from lightfee.engine.recovery import build_persistent_state_view
 import lightfee.engine.passive_close as passive_close_module
 from lightfee.engine.passive_close import (
     PASSIVE_CLOSE_MAX_MISSING_L2_TICK_FAILURES,
@@ -8672,7 +8673,12 @@ class TestCloseOrderIntentDurability:
         position = _make_position(position_id="entry-close-registration")
         state.open_positions[position.position_id] = position
         snapshot = SnapshotStore(tmp_path / "before-close-registration.json")
-        snapshot.write(state.to_dict())
+        snapshot.write(
+            build_persistent_state_view(
+                state,
+                journal_checkpoint=journal.snapshot_checkpoint(),
+            )
+        )
 
         executor = PassiveCloseExecutor(
             {Venue.BINANCE: _mock_adapter_with_tick(Venue.BINANCE)},
@@ -8796,7 +8802,12 @@ class TestCloseOrderIntentDurability:
         position = _make_position(position_id="entry-close-ack-identity")
         state.open_positions[position.position_id] = position
         snapshot = SnapshotStore(tmp_path / "before-close-ack.json")
-        snapshot.write(state.to_dict())
+        snapshot.write(
+            build_persistent_state_view(
+                state,
+                journal_checkpoint=journal.snapshot_checkpoint(),
+            )
+        )
         pending = PendingPassiveClose(
             position_id=position.position_id,
             reason="funding_capture",
@@ -8894,7 +8905,12 @@ class TestCloseOrderIntentDurability:
         position = _make_position(position_id="entry-close-intent-ack-loss")
         state.open_positions[position.position_id] = position
         snapshot = SnapshotStore(tmp_path / "before-close-intent.json")
-        snapshot.write(state.to_dict())
+        snapshot.write(
+            build_persistent_state_view(
+                state,
+                journal_checkpoint=journal.snapshot_checkpoint(),
+            )
+        )
         pending = PendingPassiveClose(
             position_id=position.position_id,
             reason="funding_capture",
@@ -8980,11 +8996,15 @@ class TestCloseOrderIntentDurability:
                 )
             ],
         )
-        snapshot = SnapshotStore(tmp_path / "stale-pending-close.json")
-        snapshot.write(build_persistent_state_view(stale_state))
-
         journal = Journal(tmp_path / "later-intent.log")
         journal.open()
+        snapshot = SnapshotStore(tmp_path / "stale-pending-close.json")
+        snapshot.write(
+            build_persistent_state_view(
+                stale_state,
+                journal_checkpoint=journal.snapshot_checkpoint(),
+            )
+        )
         latest = PendingPassiveClose(
             position_id=position.position_id,
             reason="funding_capture",

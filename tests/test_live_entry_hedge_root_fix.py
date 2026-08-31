@@ -2518,7 +2518,12 @@ class TestV1PendingEntryHedgeDeltaRuntimeClosure:
         )
         runtime.state.pending_entries[pending.pending_id] = pending
         snapshot = SnapshotStore(tmp_path / "before-zero-fill.json")
-        snapshot.write(runtime.state.to_dict())
+        snapshot.write(
+            {
+                **runtime.state.to_dict(),
+                "journal_checkpoint": runtime.journal.snapshot_checkpoint(),
+            }
+        )
 
         assert await runtime._drive_missing_hedge_live(
             pending, pending.pending_id, 2_000

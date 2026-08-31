@@ -475,6 +475,8 @@ class TestRecovery:
             journal_path = Path(td) / "events.jsonl"
             snap_path = Path(td) / "state.json"
 
+            journal = Journal(journal_path)
+            journal.open()
             snap = SnapshotStore(snap_path)
             snap.write({
                 "lifecycle": "running",
@@ -502,10 +504,9 @@ class TestRecovery:
                         "matched_quantity": 1.0,
                     },
                 },
+                "journal_checkpoint": journal.snapshot_checkpoint(),
             })
 
-            journal = Journal(journal_path)
-            journal.open()
             journal.append("exit.closed", {
                 "position_id": "pos-close-me",
                 "reason": "profit_take",

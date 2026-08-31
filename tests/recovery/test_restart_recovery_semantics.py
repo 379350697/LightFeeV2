@@ -87,6 +87,15 @@ def _add_pending_close(state: EngineState, cid: str = "c1", position_id: str = "
     )
 
 
+def _write_snapshot_at_journal_boundary(
+    snapshot: SnapshotStore,
+    journal: Journal,
+    data: dict,
+) -> None:
+    """Persist the state and the exact journal boundary it represents."""
+    snapshot.write({**data, "journal_checkpoint": journal.snapshot_checkpoint()})
+
+
 # ---------------------------------------------------------------------------
 # REC-001: Recovery block/resume semantics
 # ---------------------------------------------------------------------------
@@ -418,8 +427,9 @@ class TestSnapshotRecovery:
     def test_recover_with_journal_replay_closes_position(self, tmp_path):
         snap = SnapshotStore(tmp_path / "snapshot.json")
         journal_path = tmp_path / "journal.jsonl"
-
-        snap.write({
+        journal = Journal(journal_path)
+        journal.open()
+        _write_snapshot_at_journal_boundary(snap, journal, {
             "lifecycle": "running",
             "run_id": "test-run",
             "open_positions": {
@@ -434,13 +444,8 @@ class TestSnapshotRecovery:
                 }
             },
         })
-
-        # Journal closes p1 after the snapshot
-        journal_path.write_text(
-            '{"seq":1,"run_id":"test-run","ts_ms":2000,"kind":"exit.closed","payload":{"position_id":"p1"}}\n'
-        )
-
-        journal = Journal(journal_path)
+        journal.append_critical(2_000, "exit.closed", {"position_id": "p1"})
+        journal.close()
         state = recover_from_snapshot(snap, journal)
         assert "p1" not in state.open_positions
 
@@ -455,10 +460,10 @@ class TestSnapshotRecovery:
             [{"position_id": "p1", "kind": "final", "closed_at_ms": 1_000}]
         )
         snap = SnapshotStore(tmp_path / "snapshot.json")
-        snap.write(state.to_dict())
         journal = Journal(tmp_path / "journal.jsonl")
         journal.open()
         try:
+            _write_snapshot_at_journal_boundary(snap, journal, state.to_dict())
             journal.append_critical(
                 2_000,
                 "exit.billing_evidence_unavailable",
@@ -482,14 +487,13 @@ class TestSnapshotRecovery:
     def test_journal_replay_restores_pending_entry_registered_event(self, tmp_path):
         snap = SnapshotStore(tmp_path / "snapshot.json")
         journal_path = tmp_path / "journal.jsonl"
-
-        snap.write({
-            "lifecycle": "running",
-            "run_id": "test-run",
-        })
         journal = Journal(journal_path)
         journal.open()
         try:
+            _write_snapshot_at_journal_boundary(snap, journal, {
+                "lifecycle": "running",
+                "run_id": "test-run",
+            })
             journal.append(
                 "entry.pending_registered",
                 {
@@ -526,6 +530,72 @@ class TestSnapshotRecovery:
         assert pending.maker_leg_filled == 0.4
         assert pending.hedge_leg_filled == 0.1
 
+    def test_legacy_snapshot_does_not_replay_retained_audit_history(self, tmp_path):
+        """The migration path must not resurrect V1-cleared pending owners."""
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            journal.append(
+                "entry.pending_registered",
+                {
+                    "entry_id": "historical-entry",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "target_quantity": 1.0,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                },
+            )
+            snapshot = SnapshotStore(tmp_path / "legacy-snapshot.json")
+            snapshot.write({"lifecycle": "running", "open_positions": {}})
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snapshot, Journal(journal.path))
+
+        assert not recovered.pending_entries
+        assert recovered.lifecycle == EngineLifecycle.RUNNING
+
+    def test_journal_tail_terminal_removal_does_not_resurrect_pending_entry(
+        self,
+        tmp_path,
+    ):
+        """A registration and V1 terminal removal in one tail is idempotent."""
+        snapshot = SnapshotStore(tmp_path / "snapshot.json")
+        journal = Journal(tmp_path / "journal.jsonl")
+        journal.open()
+        try:
+            _write_snapshot_at_journal_boundary(
+                snapshot, journal, {"lifecycle": "running", "open_positions": {}}
+            )
+            journal.append(
+                "entry.pending_registered",
+                {
+                    "entry_id": "entry-cleared-in-tail",
+                    "symbol": "COTIUSDT",
+                    "long_venue": "binance",
+                    "short_venue": "bybit",
+                    "target_quantity": 1.0,
+                    "long_side": "buy",
+                    "short_side": "sell",
+                },
+            )
+            journal.append(
+                "pending_entry.removed_by_v1_lifecycle_closure",
+                {
+                    "entry_id": "entry-cleared-in-tail",
+                    "owner_id": "entry-cleared-in-tail",
+                },
+            )
+        finally:
+            journal.close()
+
+        recovered = recover_from_snapshot(snapshot, Journal(journal.path))
+
+        assert not recovered.pending_entries
+        assert recovered.lifecycle == EngineLifecycle.RUNNING
+
     def test_journal_replay_restores_full_pending_successor_snapshot(self, tmp_path):
         pending = PendingEntry(
             pending_id="entry-full-persisted",
@@ -547,10 +617,12 @@ class TestSnapshotRecovery:
         source_state.pending_entries[pending.pending_id] = pending
         serialized = source_state.to_dict()["pending_entries"][pending.pending_id]
         snap = SnapshotStore(tmp_path / "snapshot.json")
-        snap.write({"lifecycle": "running", "run_id": "test-run"})
         journal = Journal(tmp_path / "journal.jsonl")
         journal.open()
         try:
+            _write_snapshot_at_journal_boundary(
+                snap, journal, {"lifecycle": "running", "run_id": "test-run"}
+            )
             journal.append_critical(
                 1_300,
                 "entry.pending_registered",
@@ -601,10 +673,10 @@ class TestSnapshotRecovery:
         source_state = EngineState()
         source_state.pending_entries[pending.pending_id] = pending
         snap = SnapshotStore(tmp_path / "snapshot.json")
-        snap.write(source_state.to_dict())
         journal = Journal(tmp_path / "journal.jsonl")
         journal.open()
         try:
+            _write_snapshot_at_journal_boundary(snap, journal, source_state.to_dict())
             journal.append_critical(
                 1_100,
                 "pending_entry.hedge_submit_attempt",
@@ -665,10 +737,10 @@ class TestSnapshotRecovery:
         source_state = EngineState()
         source_state.pending_entries[pending.pending_id] = pending
         snap = SnapshotStore(tmp_path / "snapshot.json")
-        snap.write(source_state.to_dict())
         journal = Journal(tmp_path / "journal.jsonl")
         journal.open()
         try:
+            _write_snapshot_at_journal_boundary(snap, journal, source_state.to_dict())
             journal.append_critical(
                 1_100,
                 "pending_entry.hedge_submit_attempt",
@@ -739,10 +811,10 @@ class TestSnapshotRecovery:
         source_state = EngineState()
         source_state.pending_entries[pending.pending_id] = pending
         snap = SnapshotStore(tmp_path / "snapshot.json")
-        snap.write(source_state.to_dict())
         journal = Journal(tmp_path / "journal.jsonl")
         journal.open()
         try:
+            _write_snapshot_at_journal_boundary(snap, journal, source_state.to_dict())
             journal.append_critical(
                 1_100,
                 "pending_entry.hedge_submit_attempt",

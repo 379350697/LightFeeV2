@@ -485,7 +485,11 @@ class TestRuntimeLaneScheduling:
         monkeypatch.setattr(runtime, "_maintain_pending_entry_passive_orders", noop_lane)
         monkeypatch.setattr(runtime, "_post_tick_housekeeping", noop_lane)
         monkeypatch.setattr(runtime, "_snapshot_local_l2_state", lambda: None)
-        monkeypatch.setattr(runtime_module, "build_persistent_state_view", lambda state: {})
+        monkeypatch.setattr(
+            runtime_module,
+            "build_persistent_state_view",
+            lambda state, **kwargs: {},
+        )
         monkeypatch.setattr(runtime.snapshot_store, "write", lambda state: None)
 
         await runtime.run_loop()

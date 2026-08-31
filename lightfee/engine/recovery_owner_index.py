@@ -41,12 +41,16 @@ class RecoveryOwnerIndex:
     def active_journal_owner_events(cls, journal_events: Iterable[Any]) -> list[Any]:
         events = list(journal_events)
         completed_claims = cls._durably_handed_off_claims(events)
+        terminal_pending_owner_ids = cls._terminal_pending_owner_ids(events)
         active_events: list[Any] = []
         for event in events:
             payload = _get(event, "payload", {})
             if not isinstance(payload, Mapping):
                 continue
             kind = _text(_get(event, "kind", "")).lower()
+            owner_ids = _journal_owner_identifiers(payload)
+            if kind != "entry.opened" and owner_ids & terminal_pending_owner_ids:
+                continue
             # This event says that the original pre-submit claim remains live;
             # it is not a second owner record.  Its diagnostic CIDs must never
             # override the claim when rebuilding the index at startup.
@@ -67,6 +71,19 @@ class RecoveryOwnerIndex:
                 continue
             active_events.append(event)
         return active_events
+
+    @staticmethod
+    def _terminal_pending_owner_ids(events: Iterable[Any]) -> set[str]:
+        terminal_ids: set[str] = set()
+        for event in events:
+            if _text(_get(event, "kind", "")).lower() != (
+                "pending_entry.removed_by_v1_lifecycle_closure"
+            ):
+                continue
+            payload = _get(event, "payload", {})
+            if isinstance(payload, Mapping):
+                terminal_ids.update(_journal_owner_identifiers(payload))
+        return terminal_ids
 
     @staticmethod
     def _durably_handed_off_claims(events: list[Any]) -> set[str]:
@@ -460,6 +477,21 @@ def _journal_owner_key(payload: Mapping[str, Any]) -> str:
         or payload.get("source_entry_id")
         or payload.get("internal_entry_id")
     )
+
+
+def _journal_owner_identifiers(payload: Mapping[str, Any]) -> set[str]:
+    return {
+        value
+        for field in (
+            "entry_id",
+            "pending_id",
+            "position_id",
+            "owner_id",
+            "source_entry_id",
+            "internal_entry_id",
+        )
+        if (value := _text(payload.get(field)))
+    }
 
 
 def _journal_position_specs(

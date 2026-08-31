@@ -856,7 +856,13 @@ class RecoveryStartupRuntime:
 
     def _recovery_owner_journal_events(self) -> list[dict[str, Any]]:
         try:
-            return self.ctx.journal.read_all()
+            snapshot = self.ctx.snapshot_store.read()
+            if snapshot is None:
+                return self.ctx.journal.read_all()
+            checkpoint = snapshot.get("journal_checkpoint")
+            if not isinstance(checkpoint, dict):
+                return []
+            return self.ctx.journal.read_after_snapshot_checkpoint(checkpoint) or []
         except Exception:
             return []
 

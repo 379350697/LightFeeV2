@@ -212,6 +212,77 @@ def test_journal_event_reconstructs_missing_pending_owner():
     assert owner.confidence == "probable"
 
 
+def test_v1_terminal_pending_removal_retires_journal_order_owner():
+    events = [
+        {
+            "kind": "order.passive_submitted",
+            "payload": {
+                "entry_id": "entry-cleared",
+                "symbol": "SEIUSDT",
+                "venue": "bybit",
+                "order_id": "historical-order",
+                "client_order_id": "historical-client",
+            },
+        },
+        {
+            "kind": "pending_entry.removed_by_v1_lifecycle_closure",
+            "payload": {
+                "entry_id": "entry-cleared",
+                "owner_id": "entry-cleared",
+            },
+        },
+    ]
+
+    assert RecoveryOwnerIndex.active_journal_owner_events(events) == []
+    owner = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []}, events
+    ).owner_for_order(
+        ExchangeArtifact(
+            kind="open_order",
+            venue="bybit",
+            symbol="SEIUSDT",
+            order_id="historical-order",
+        )
+    )
+
+    assert owner.confidence == "orphan"
+
+
+def test_terminal_close_keeps_order_owner_for_accounting_reconciliation():
+    """A flat position can still need its exact order/fee evidence."""
+    events = [
+        {
+            "kind": "order.passive_submitted",
+            "payload": {
+                "entry_id": "position-accounting",
+                "position_id": "position-accounting",
+                "symbol": "SEIUSDT",
+                "venue": "bybit",
+                "order_id": "historical-close-order",
+            },
+        },
+        {
+            "kind": "exit.billing_evidence_unavailable",
+            "payload": {"position_id": "position-accounting"},
+        },
+    ]
+
+    owner = RecoveryOwnerIndex.from_state_and_journal(
+        {"pending_entries": [], "open_positions": []}, events
+    ).owner_for_order(
+        ExchangeArtifact(
+            kind="open_order",
+            venue="bybit",
+            symbol="SEIUSDT",
+            order_id="historical-close-order",
+        )
+    )
+
+    assert owner.owner_type == "journal_pending_entry"
+    assert owner.owner_id == "position-accounting"
+    assert owner.confidence == "probable"
+
+
 def test_terminal_journal_event_keeps_submitted_order_owner_fact():
     index = RecoveryOwnerIndex.from_state_and_journal(
         {"pending_entries": [], "open_positions": []},

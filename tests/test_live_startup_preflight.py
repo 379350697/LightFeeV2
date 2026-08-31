@@ -4211,6 +4211,45 @@ class TestRuntimePreflight:
             ) == ["TRXUSDT"]
             runtime.journal.close()
 
+    def test_startup_owner_probe_uses_only_journal_tail_after_snapshot(self):
+        """Retained audit owners must not expand restart probe symbols."""
+        from lightfee.engine.recovery import build_persistent_state_view
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            config.symbols = ["SEIUSDT", "WLDUSDT"]
+            runtime = LiveRuntime(config)
+            runtime.journal.open()
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-historical",
+                    "symbol": "SEIUSDT",
+                    "order_id": "historical-order",
+                    "client_order_id": "historical-client",
+                },
+            )
+            runtime.snapshot_store.write(
+                build_persistent_state_view(
+                    runtime.state,
+                    journal_checkpoint=runtime.journal.snapshot_checkpoint(),
+                )
+            )
+            runtime.journal.append(
+                "entry.maker_submitted",
+                {
+                    "entry_id": "entry-tail",
+                    "symbol": "WLDUSDT",
+                    "order_id": "tail-order",
+                    "client_order_id": "tail-client",
+                },
+            )
+
+            assert runtime._startup_recovery_ledger_symbols(
+                {"resolved_symbols": config.symbols}
+            ) == ["WLDUSDT"]
+            runtime.journal.close()
+
     def test_startup_recovery_ledger_symbols_include_terminal_order_owner_facts(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_test_config(td)

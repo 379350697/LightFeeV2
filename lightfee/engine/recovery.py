@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from math import isfinite
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 if TYPE_CHECKING:
     from lightfee.core.domain import OrderFill
@@ -982,6 +982,31 @@ def _apply_journal_replay_to_state(
                 if pe is not None:
                     state.pending_entries[pid] = pe
 
+        elif kind == "pending_entry.removed_by_v1_lifecycle_closure":
+            # This is the sole production event emitted after the V1 lifecycle
+            # terminalizer removes a pending entry.  Its replay counterpart is
+            # required so a pre-removal registration in the same journal tail
+            # cannot resurrect an already resolved owner on restart.
+            terminal_closure = PendingEntryTerminalDecision(
+                outcome="v1_lifecycle_closure",
+                reason="durable_v1_lifecycle_closure_journal_successor",
+                terminal=True,
+                allows_pending_removal=True,
+                healthy=True,
+            )
+            for pending_id in {
+                str(payload.get("entry_id") or ""),
+                str(payload.get("pending_id") or ""),
+                str(payload.get("position_id") or ""),
+                str(payload.get("owner_id") or ""),
+            }:
+                if pending_id:
+                    PendingEntryTerminalizer.remove_if_allowed(
+                        state.pending_entries,
+                        pending_id,
+                        terminal_closure,
+                    )
+
         elif kind in {
             "pending_entry.hedge_submit_attempt",
             "pending_entry.hedge_submit_result",
@@ -1781,8 +1806,18 @@ def recover_from_snapshot(
     # (V1: recovery.live_detected is recorded when live positions are detected at startup)
     snapshot_position_ids = set(state.open_positions.keys())
 
-    # Replay journal records to catch events after last snapshot
-    journal_records = journal.read_all()
+    # A snapshot is an authoritative state boundary.  New snapshots record a
+    # byte-precise journal checkpoint; legacy snapshots intentionally do not
+    # fall back to full journal replay because that turns retained audit history
+    # into current recovery work.  Exchange account truth remains the fail-safe
+    # for the one pre-migration crash window without a checkpoint.
+    journal_records: list[dict[str, Any]] = []
+    if not has_snapshot:
+        journal_records = journal.read_all()
+    elif isinstance(snap, Mapping):
+        checkpoint = snap.get("journal_checkpoint")
+        if isinstance(checkpoint, dict):
+            journal_records = journal.read_after_snapshot_checkpoint(checkpoint) or []
     if journal_records:
         _apply_journal_replay_to_state(state, journal_records)
 
@@ -1903,7 +1938,11 @@ def is_ambiguous_live_truth(state: EngineState) -> bool:
 # State snapshot serialization (Rust V1: persistent_state_view)
 # ---------------------------------------------------------------------------
 
-def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
+def build_persistent_state_view(
+    state: EngineState,
+    *,
+    journal_checkpoint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Build a snapshot-suitable dict of engine state.
 
     Rust V1: persistent_state_view() strips volatile scan fields and
@@ -1924,6 +1963,8 @@ def build_persistent_state_view(state: EngineState) -> dict[str, Any]:
     view["pending_close_reconciliations"] = normalize_pending_close_reconciliations(
         state.pending_close_reconciliations
     )
+    if journal_checkpoint is not None:
+        view["journal_checkpoint"] = dict(journal_checkpoint)
 
     # Add open position details
     view["open_positions"] = {

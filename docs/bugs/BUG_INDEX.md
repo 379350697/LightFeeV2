@@ -65,6 +65,18 @@ automatic Aster generic `no_candidate` debt once; a post-repair
 terminal. This is **local-green at `079601f`, not deployed**; see
 [CL-136](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate).
 
+2026-08-31 recovery snapshot/journal boundary: V2 incorrectly replayed the
+entire retained audit journal after restoring a current snapshot. That could
+resurrect terminal pending owners and historical startup symbol probes; journal
+sequence numbers are not durable because they restart across processes. The
+repair records an existing journal file-identity/offset marker at each snapshot
+boundary and replays only a provably contiguous retained tail. No-snapshot
+recovery retains the V1 emergency full-journal fallback; legacy or unprovable
+markers restore the snapshot without a historical fallback, with exchange
+account truth remaining the live-exposure authority. This is **local-green in
+the working tree, not deployed**; see
+[CL-137](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work).
+
 CL-128 rotated-journal diagnosis and ledger drift, 2026-08-27: the diagnostic
 only read `*.jsonl`, silently omitting `live-events.jsonl.1` and other
 rotations; its old tail fallback could then read the beginning rather than the
