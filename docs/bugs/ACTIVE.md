@@ -34,17 +34,16 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `0e0cc7a2bb7c5d7d3c263b49037390f9800ff62c`
-- Checked on: `2026-08-31`. `0e0cc7a` (including `0428fd1`, `079601f`, and
-  `2111e36`) was fast-forwarded to production. All 16 critical manifest hashes
-  matched; both services restarted active with zero restarts. Deployment
-  acceptance was green: seven-venue source evidence was fresh, exchange truth
-  was high-confidence flat/no-order, lifecycle/risk mode were `running`, and
-  the first post-restart runtime snapshot carried a journal checkpoint with no
-  pending entry, close, passive-close, reconciliation, or open-position state.
-  CL-134 still requires a natural matched **open** pair beside background
-  accounting work before closure, and CL-135/CL-136 require their
-  scenario-specific natural observations.
+- Last production SHA checked: `12d8e038ded93c46ded7771ef7b03d0266f3d0a6`
+- Checked on: `2026-09-01`. `d18d016` and its bug-ledger commit `12d8e038`
+  were fast-forwarded to production. All 16 critical manifest hashes matched;
+  both services restarted active with zero restarts. Deployment acceptance was
+  green: seven-venue source evidence was fresh, exchange truth was
+  high-confidence flat/no-order, lifecycle/risk mode were `running`, and both
+  processes had zero `CLOSE_WAIT`. The live sidecar had 93/93 usable Bitget and
+  90/90 usable Gate rows with nonzero quotes and exchange-future funding times.
+  This proves CL-138's data repair, but not a future natural entry: the normal
+  spread/liquidity/risk gates remain unchanged.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -126,7 +125,7 @@ until this table receives real fixing commits and a production observation.
 | CL-135 | deployed-awaiting-verification | `0428fd1` | COTI-shaped delayed-fill → normal-hedge production-path regression; seven-venue prepare/verify capability matrix, malformed/mismatch/dual-mode/non-ack blockers, and same-venue de-duplication; deployment acceptance high-confidence clean | Natural observation still required: a delayed owned maker fill must hedge normally rather than reduce-only flatten; every entry leg must log its exchange-specific leverage proof or block before order submission. | [2026-08-30](daily/2026-08-30.md#cl-135--delayed-owned-maker-fill-was-cleaned-before-hedge-and-entry-leverage-was-not-proved-for-every-live-leg) |
 | CL-136 | deployed-awaiting-verification | `079601f` | Aster one-way V3 `userTrades` missing-`reduceOnly` production-shape RED/GREEN; exact order `reduceOnly=false` rejects; legacy generic miss retries once then corrected miss remains terminal; close profile `481 passed`, Aster profile `19 passed` | `f443c10` is live and exchange truth is flat/no-order. Confirm the named ONG debt resolves only when its exact Aster order still proves `FILLED`, `reduceOnly=true`, identity/quantity/price, and quote fee; otherwise it must remain terminal debt. | [2026-08-31](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate) |
 | CL-137 | deployed-awaiting-verification | `0e0cc7a` | snapshot/tail/rotation/no-snapshot/terminal-owner matrix, operator CLI crash-window path, and terminalizer guard (`778 passed`) | `0e0cc7a` is live: manifest, singleton, deployment acceptance, and post-restart checkpoint passed; exchange truth is high-confidence flat/no-order. Await one ordinary later restart or rotated-tail observation; do not force orders or mutate history. | [2026-08-31](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work) |
-| CL-138 | local-green | `d18d016` | Gate/Bitget documented-payload parser, metadata-error fail-closed, source→pairing→V1 discovery, cache, and rate-limit matrix; adjacent `638 passed` | Pre-deploy cloud probes proved the current public APIs return nonzero quotes and future schedules for all sampled contracts. Deploy, then prove sidecar output retains those fields without a synthetic funding time; no forced order is permitted. | [2026-09-01](daily/2026-09-01.md#cl-138--gatebitget-sidecar-market-data-contract-drift) |
+| CL-138 | deployed-awaiting-verification | `d18d016` | Gate/Bitget documented-payload parser, metadata-error fail-closed, source→pairing→V1 discovery, cache, and rate-limit matrix; adjacent `638 passed` | `12d8e038` is live: manifest/singleton/acceptance green; Bitget 93/93 and Gate 90/90 usable rows have nonzero quotes and exchange-future funding, with zero `CLOSE_WAIT`. Await only a natural eligible candidate; do not force an order. A separate post-restart Local-L2 diagnostic signal is tracked independently and is not evidence against this parser repair. | [2026-09-01](daily/2026-09-01.md#cl-138--gatebitget-sidecar-market-data-contract-drift) |
 
 ## Pre-CL-093 Historical Boundary
 

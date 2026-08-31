@@ -34,8 +34,10 @@ repair uses Bitget's bulk current-funding `nextUpdate`, Gate's bulk contracts
 `funding_next_apply` (seconds → milliseconds), Gate's existing bounded cache,
 and `0` for unavailable or stale metadata. It preserves quote publication but
 never manufactures an entry schedule, adds no retry/poller/order change, and
-does not cherry-pick the divergent `v3` branch wholesale. It is **local-green
-at `d18d016`, not yet deployed**; see [2026-09-01](daily/2026-09-01.md).
+does not cherry-pick the divergent `v3` branch wholesale. It is
+**deployed-awaiting-verification at `12d8e038`**: deployment acceptance passed
+and the sidecar has nonzero, future-scheduled Gate/Bitget rows. Only a natural
+eligible candidate remains to observe; see [2026-09-01](daily/2026-09-01.md).
 
 2026-08-30 shared HTTP opaque transport evidence and client retirement: a bare
 `httpx.ReadError` was formatted with `str(exc)`, leaving production
