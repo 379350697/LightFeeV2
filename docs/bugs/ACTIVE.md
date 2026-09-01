@@ -34,16 +34,16 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `b682891f154e7d0a660b58e44941661f166d76ac`
-- Checked on: `2026-09-02`. `b682891` was fast-forwarded and deployed; all 16
-  critical manifest hashes matched, both services restarted active, singleton
-  passed, all seven source domains were fresh, and both processes had zero
-  `CLOSE_WAIT`. The read-only probe found high-confidence flat/no-order truth.
-  Deployment acceptance remains red only for the pre-existing persisted
-  operator fail-closed latch; it was not cleared because its provenance is
-  lost. The same probe exposed that this host omits
-  `ActiveEnterTimestampUSec`, so CL-141's first deployed parser could not see
-  the activation time and a second, narrower source repair remains local-only.
+- Last production SHA checked: `216dc2580ba1b1522be4573cfd77cc29bf6371b2`
+- Checked on: `2026-09-02`. Both `b682891` and the follow-up `216dc258` were
+  fast-forwarded and deployed; all 16 critical manifest hashes matched, both
+  services restarted active, singleton passed, all seven source domains were
+  fresh, and both processes had zero `CLOSE_WAIT`. `216dc258` read this host's
+  display-only activation property and bounded the journal at the current
+  start: exactly six private-WS starts (one per venue) with `NRestarts=0`.
+  The only remaining deployment-acceptance red is the pre-existing persisted
+  operator fail-closed latch; exchange truth is high-confidence flat/no-order,
+  but the latch was not cleared because its provenance is lost.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -74,23 +74,6 @@ they have a fixing commit. They are **local-green only**, not production facts:
   its exchange-specific leverage postcondition before a new order. They do not
   change the existing terminalization-budget cleanup or submit an order during
   verification.
-
-- automatic hedge-deadline fail-closed no longer writes the durable
-  operator-requested fail-closed latch. It follows the existing V1 automatic
-  recovery path after complete flat account truth, while a real operator latch
-  and incomplete truth remain blocking. Source audit: the incorrect mainline
-  write dates to `e6c52598`; an earlier correction on a non-main branch was
-  never released. It remained dormant until ZORA's 2026-09-01 automatic
-  hedge-deadline path activated it.
-
-- private-WS churn collection now requests both systemd activation-property
-  shapes. `b682891` parsed a display string but requested only
-  `ActiveEnterTimestampUSec`; this cloud's systemd omits that field and exposes
-  `ActiveEnterTimestamp`. The local follow-up keeps the numeric path preferred,
-  parses the matching display fallback, and keeps malformed/missing data
-  conservative. The prior false alert only surfaced in the hour immediately
-  following a normal deployment restart; it did not show private-WS reconnect
-  behavior.
 
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
@@ -145,6 +128,8 @@ until this table receives real fixing commits and a production observation.
 | CL-137 | deployed-awaiting-verification | `0e0cc7a` | snapshot/tail/rotation/no-snapshot/terminal-owner matrix, operator CLI crash-window path, and terminalizer guard (`778 passed`) | `0e0cc7a` is live: manifest, singleton, deployment acceptance, and post-restart checkpoint passed; exchange truth is high-confidence flat/no-order. Await one ordinary later restart or rotated-tail observation; do not force orders or mutate history. | [2026-08-31](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work) |
 | CL-138 | deployed-awaiting-verification | `d18d016` | Gate/Bitget documented-payload parser, metadata-error fail-closed, source→pairing→V1 discovery, cache, and rate-limit matrix; adjacent `638 passed` | `12d8e038` is live: manifest/singleton/acceptance green; Bitget 93/93 and Gate 90/90 usable rows have nonzero quotes and exchange-future funding, with zero `CLOSE_WAIT`. Await only a natural eligible candidate; do not force an order. A separate post-restart Local-L2 diagnostic signal is tracked independently and is not evidence against this parser repair. | [2026-09-01](daily/2026-09-01.md#cl-138--gatebitget-sidecar-market-data-contract-drift) |
 | CL-139 | closed | `49de86a` | real HTTP-400 detail → bounded exact-history → zero-fill → lone-hedge cleanup matrix (`56` focused; `1,601` full) | Production observed exact Bitget `40109` → one Classic history row with zero fill → stale 2,496 maker high-water cleared → existing Bybit reduce-only cleanup verified 2,400 short flat; high-confidence exchange truth has no order/pending owner. | [2026-09-01](daily/2026-09-01.md#cl-139--bitget-canceled-maker-misread-as-fill-cancel-and-reconciliation-contract-gaps) |
+| CL-140 | deployed-awaiting-verification | `b682891` | direct deadline-abort → complete-flat recovery release, explicit-operator retain, and incomplete-truth retain matrix (`4` direct/adjacent checks; close profile `481 passed`) | `b682891`/`216dc258` are deployed. The account is high-confidence flat/no-order, but the old latch has lost provenance and remains deliberately preserved; after an explicit audited recovery action, observe one natural automatic hedge-deadline event returning to `running`. | [2026-09-02](daily/2026-09-02.md#cl-140--automatic-hedge-deadline-stop-was-persisted-as-an-operator-stop) |
+| CL-141 | closed | `216dc258` | numeric, display-only-property, malformed fallback, and resource-collector current-generation matrix (`55` health tests; close profile `481 passed`) | `216dc258` manifest/singleton probe passed with all sources fresh and zero `CLOSE_WAIT`; after its ordinary restart the verifier counted exactly six starts (one per enabled venue), used the current activation time as journal lower bound, and saw `NRestarts=0`. | [2026-09-02](daily/2026-09-02.md#cl-141--private-ws-churn-health-counted-a-prior-service-generation) |
 
 ## Pre-CL-093 Historical Boundary
 
