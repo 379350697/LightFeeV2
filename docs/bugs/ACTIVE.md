@@ -75,6 +75,14 @@ they have a fixing commit. They are **local-green only**, not production facts:
   change the existing terminalization-budget cleanup or submit an order during
   verification.
 
+- Bitget missing-order reconciliation at the real HTTP 400 boundary. The
+  previously deployed `66b4b76` checked `40109`/`43001` only after the shared
+  request layer had already raised `REQUEST_REJECTED`, so its exact bounded
+  history lookup was unreachable in production. The local correction routes
+  only those documented Bitget codes into the existing family-correct one-page
+  history lookup; unrelated 400 responses remain fail-closed. Its production
+  RED/GREEN evidence and non-goals are in [2026-09-01](daily/2026-09-01.md#cl-139--bitget-canceled-maker-misread-as-fill-cancel-and-reconciliation-contract-gaps).
+
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
 [2026-08-30](daily/2026-08-30.md), and

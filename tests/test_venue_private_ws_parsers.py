@@ -6,6 +6,7 @@ import asyncio
 import json
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from lightfee.core.domain import PassiveOrderState
@@ -924,6 +925,187 @@ class TestBitgetPassiveProgressEndpoint:
         diagnostics = transport.drain_order_diagnostics()
         query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
         assert query["response_classification"] == expected_classification
+
+    @pytest.mark.asyncio
+    async def test_bitget_http_400_missing_detail_uses_exact_history_fallback(self, monkeypatch):
+        """The real HTTP error boundary must reach the bounded history path."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        requests = []
+
+        def _handler(request):
+            requests.append(request)
+            if request.url.path == "/api/v2/mix/order/detail":
+                return httpx.Response(400, json={
+                    "code": "40109",
+                    "msg": "The data of the order cannot be found",
+                })
+            assert request.url.path == "/api/v2/mix/order/orders-history"
+            return httpx.Response(200, json={"code": "00000", "data": {
+                "entrustedList": [{
+                    "orderId": "1478408313786478593",
+                    "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                    "size": "2496",
+                    "baseVolume": "0",
+                    "state": "canceled",
+                }],
+            }})
+
+        async def _classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _classic_family,
+            raising=False,
+        )
+
+        try:
+            result = await transport.fetch_order_status(
+                "ZORAUSDT",
+                order_id="1478408313786478593",
+                client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+            )
+        finally:
+            await transport.close()
+
+        assert result is None
+        assert [request.url.path for request in requests] == [
+            "/api/v2/mix/order/detail",
+            "/api/v2/mix/order/orders-history",
+        ]
+        diagnostics = transport.drain_order_diagnostics()
+        query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
+        assert query["response_classification"] == "terminal_zero_fill"
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_http_400_missing_detail_uses_one_bounded_history_page(self, monkeypatch):
+        """The UTA HTTP error boundary keeps its documented bounded-list contract."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        requests = []
+
+        def _handler(request):
+            requests.append(request)
+            if request.url.path == "/api/v3/trade/order-info":
+                return httpx.Response(400, json={
+                    "code": "43001",
+                    "msg": "The order does not exist",
+                })
+            assert request.url.path == "/api/v3/trade/history-orders"
+            return httpx.Response(200, json={"code": "00000", "data": {
+                "list": [{
+                    "orderId": "1478408313786478593",
+                    "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                    "size": "2496",
+                    "baseVolume": "0",
+                    "state": "canceled",
+                }],
+            }})
+
+        async def _uta_family():
+            return BitgetContractFamily.UTA_V3
+
+        transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _uta_family,
+            raising=False,
+        )
+
+        try:
+            result = await transport.fetch_order_status(
+                "ZORAUSDT",
+                order_id="1478408313786478593",
+                client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+            )
+        finally:
+            await transport.close()
+
+        assert result is None
+        assert [request.url.path for request in requests] == [
+            "/api/v3/trade/order-info",
+            "/api/v3/trade/history-orders",
+        ]
+        assert dict(requests[-1].url.params) == {
+            "symbol": "ZORAUSDT",
+            "category": "USDT-FUTURES",
+            "limit": "100",
+        }
+        diagnostics = transport.drain_order_diagnostics()
+        query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
+        assert query["response_classification"] == "terminal_zero_fill"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "error_code"),
+        [(400, "400172"), (500, "40109")],
+    )
+    async def test_bitget_error_outside_missing_http_400_fails_closed_without_history(
+        self, monkeypatch, status_code, error_code,
+    ):
+        """Only documented missing-order HTTP 400 responses may enter history."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import TransportError, VenueTransport
+
+        requests = []
+
+        def _handler(request):
+            requests.append(request)
+            return httpx.Response(status_code, json={
+                "code": error_code,
+                "msg": "productType cannot be empty",
+            })
+
+        async def _classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        transport._client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _classic_family,
+            raising=False,
+        )
+
+        try:
+            if status_code == 400:
+                with pytest.raises(TransportError) as raised:
+                    await transport.fetch_order_status(
+                        "ZORAUSDT",
+                        order_id="1478408313786478593",
+                        client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+                    )
+            else:
+                result = await transport.fetch_order_status(
+                    "ZORAUSDT",
+                    order_id="1478408313786478593",
+                    client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+                )
+        finally:
+            await transport.close()
+
+        if status_code == 400:
+            assert raised.value.status_code == status_code
+        else:
+            assert result is None
+            diagnostics = transport.drain_order_diagnostics()
+            query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
+            assert query["response_classification"] == "transport_error:transport_failure"
+        assert [request.url.path for request in requests] == [
+            "/api/v2/mix/order/detail",
+        ]
 
     @pytest.mark.asyncio
     async def test_bitget_uta_history_fallback_uses_one_documented_bounded_page(

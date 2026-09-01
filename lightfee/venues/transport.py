@@ -1408,13 +1408,14 @@ def _cancel_response_indicates_absent_order(raw: dict[str, Any], venue_id: "Venu
     return False
 
 
-def _cancel_error_indicates_absent_order(
+def _error_indicates_absent_order(
     body: str, status_code: int, venue_id: "Venue",
 ) -> bool:
-    """Check if an HTTP error from cancel means the order was already absent.
+    """Check if an HTTP error means the order was already absent.
 
-    V1: bitget_error_indicates_absent_order catches codes 40109/43001 in error chain.
-    Other venues have equivalent "order not found" signatures.
+    V1 catches Bitget 40109/43001 in the HTTP error chain. Other venues have
+    equivalent "order not found" signatures. Callers must still decide whether
+    absence is terminal or requires a bounded history query.
     """
     msg = body.lower()
     if venue_id == Venue.BITGET:
@@ -4846,12 +4847,27 @@ class VenueTransport(MarketDataClient):
                     venue_sym=venue_sym,
                     extra=query_params,
                 )
-                raw = await self._request(
-                    contract.method,
-                    contract.path,
-                    params=params,
-                    private=contract.private,
-                )
+                try:
+                    raw = await self._request(
+                        contract.method,
+                        contract.path,
+                        params=params,
+                        private=contract.private,
+                    )
+                except TransportError as exc:
+                    # Bitget sends missing detail as HTTP 400, so _request()
+                    # cannot return its JSON body. Preserve the generic HTTP
+                    # contract and route only this known semantic error to the
+                    # existing bounded, exact-identity history branch.
+                    if not (
+                        exc.category == TransportErrorCategory.REQUEST_REJECTED
+                        and exc.status_code == 400
+                        and _error_indicates_absent_order(
+                            exc.body or str(exc), exc.status_code, spec.venue_id,
+                        )
+                    ):
+                        raise
+                    raw = {"code": "40109"}
                 code = str(raw.get("code", ""))
                 queried_endpoints = [contract.path]
                 if code in {"40109", "43001"}:
@@ -8128,7 +8144,7 @@ class VenueTransport(MarketDataClient):
 
         except TransportError as e:
             # V1: HTTP error from cancel may mean the order is already absent
-            if _cancel_error_indicates_absent_order(
+            if _error_indicates_absent_order(
                 getattr(e, 'body', '') or str(e),
                 getattr(e, 'status_code', 0),
                 spec.venue_id,

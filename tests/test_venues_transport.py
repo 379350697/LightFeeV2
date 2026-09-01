@@ -10782,26 +10782,26 @@ class TestCancelAbsentOrderDetection:
         )
 
     def test_bitget_error_absent_order_40109(self):
-        from lightfee.venues.transport import _cancel_error_indicates_absent_order
-        assert _cancel_error_indicates_absent_order(
+        from lightfee.venues.transport import _error_indicates_absent_order
+        assert _error_indicates_absent_order(
             '{"code":"40109","msg":"order does not exist"}', 400, Venue.BITGET
         )
 
     def test_bitget_error_absent_order_43001(self):
-        from lightfee.venues.transport import _cancel_error_indicates_absent_order
-        assert _cancel_error_indicates_absent_order(
+        from lightfee.venues.transport import _error_indicates_absent_order
+        assert _error_indicates_absent_order(
             "error code=43001 order not found", 400, Venue.BITGET
         )
 
     def test_binance_unknown_order_minus_2011(self):
-        from lightfee.venues.transport import _cancel_error_indicates_absent_order
-        assert _cancel_error_indicates_absent_order(
+        from lightfee.venues.transport import _error_indicates_absent_order
+        assert _error_indicates_absent_order(
             '{"code":-2011,"msg":"Unknown order sent."}', 400, Venue.BINANCE
         )
 
     def test_bybit_order_not_found(self):
-        from lightfee.venues.transport import _cancel_error_indicates_absent_order
-        assert _cancel_error_indicates_absent_order(
+        from lightfee.venues.transport import _error_indicates_absent_order
+        assert _error_indicates_absent_order(
             '{"retCode":170001,"retMsg":"order not found"}', 400, Venue.BYBIT
         )
 
@@ -10829,14 +10829,14 @@ class TestCancelAbsentOrderDetection:
         )
 
     def test_gate_order_not_found(self):
-        from lightfee.venues.transport import _cancel_error_indicates_absent_order
-        assert _cancel_error_indicates_absent_order(
+        from lightfee.venues.transport import _error_indicates_absent_order
+        assert _error_indicates_absent_order(
             '{"label":"ORDER_NOT_FOUND","message":"order not found"}', 400, Venue.GATE
         )
 
     def test_normal_error_not_absent(self):
-        from lightfee.venues.transport import _cancel_error_indicates_absent_order
-        assert not _cancel_error_indicates_absent_order(
+        from lightfee.venues.transport import _error_indicates_absent_order
+        assert not _error_indicates_absent_order(
             "rate limit exceeded", 429, Venue.BITGET
         )
 
