@@ -5103,11 +5103,19 @@ class TestRealPathAbortCleanupDeadline:
 
     @pytest.mark.asyncio
     async def test_reconcile_deadline_breach_cleanup_success_removes(self, tmp_path):
-        """Bug 3: Normal tick deadline breach + cleanup success → pending removed."""
+        """Deadline path stays automatic and releases only after full flat truth.
+
+        This exercises the actual pending-entry reconciliation caller, rather
+        than invoking the abort helper directly: expired inflight hedge →
+        fail-closed cleanup → complete account truth → normal recovery.
+        """
+        from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
         from lightfee.engine.runtime import LiveRuntime
         from lightfee.engine.state import HedgeInflight
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
         runtime = _make_open_runtime(tmp_path)
+        runtime.config.runtime.mode = "live"
         runtime.reconciler = _FakeReconciler()
         # Fake adapters with no position → flat → cleanup succeeds
         for ven in (Venue.BYBIT, Venue.HYPERLIQUID):
@@ -5143,6 +5151,26 @@ class TestRealPathAbortCleanupDeadline:
         await runtime._reconcile_pending_state(now_ms)
 
         assert "entry-bug3d" not in runtime.state.pending_entries
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.operator.requested_mode is None
+
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_supported": True,
+                "truth_scope": "account",
+                "truth_available": True,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [],
+                "errors": [],
+            },
+            now_ms=now_ms + 1,
+        )
+
+        assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+        assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+        assert runtime.state.lifecycle == EngineLifecycle.RUNNING
 
     # ── Bug 4: legacy string hedge_inflight exceeding hard ceiling ──
 
@@ -5332,6 +5360,123 @@ class TestRealPathAbortCleanupDeadline:
         assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
         assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
         assert "entry-fail-closed-order" not in runtime.state.pending_entries
+
+    @pytest.mark.asyncio
+    async def test_automatic_fail_closed_releases_only_after_complete_account_truth(self, tmp_path):
+        """A hedge-deadline abort is automatic, not an operator override.
+
+        V1 enters fail-closed before cleanup but does not persist the operator
+        latch.  Once both legs are flat and account-wide truth is complete,
+        the normal recovery core may release this automatic safety stop.
+        """
+        from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
+        from lightfee.engine.runtime import LiveRuntime
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        runtime.config.runtime.mode = "live"
+        for venue in (Venue.BINANCE, Venue.OKX):
+            adapter = _FakeVenueAdapter(venue)
+            adapter.position = None
+            runtime._venue_adapters[venue] = adapter
+
+        pending = PendingEntry(
+            pending_id="entry-automatic-fail-closed",
+            symbol="LINK-USDT",
+            long_venue=Venue.BINANCE,
+            short_venue=Venue.OKX,
+            target_quantity=10.0,
+            long_side=Side.BUY,
+            short_side=Side.SELL,
+            created_at_ms=1_000,
+            maker_leg="long",
+        )
+        runtime.state.pending_entries[pending.pending_id] = pending
+
+        removed = await runtime._abort_pending_entry_fail_closed(
+            pending, pending.pending_id, "hedge deadline breached"
+        )
+
+        assert removed is True
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+        assert runtime.state.operator.requested_mode is None
+
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_supported": True,
+                "truth_scope": "account",
+                "truth_available": True,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [],
+                "errors": [],
+            },
+            now_ms=2_000,
+        )
+
+        assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+        assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+        assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_operator_fail_closed_is_not_released_by_complete_account_truth(self, tmp_path):
+        """A deliberate operator latch remains stronger than flat truth."""
+        from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+        runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+        runtime.state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_supported": True,
+                "truth_scope": "account",
+                "truth_available": True,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [],
+                "errors": [],
+            },
+            now_ms=2_000,
+        )
+
+        assert runtime.recovery_decision.kind == (
+            RecoveryDecisionKind.OPERATOR_FAIL_CLOSED_PRESERVED
+        )
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+
+    @pytest.mark.asyncio
+    async def test_automatic_fail_closed_stays_locked_when_account_truth_is_partial(self, tmp_path):
+        """An incomplete account probe must not release an automatic stop."""
+        from lightfee.engine.recovery_decision_core import RecoveryDecisionKind
+        from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+        runtime = _make_open_runtime(tmp_path)
+        runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+        runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+
+        runtime._refresh_recovery_ledger_from_exchange_truth(
+            {
+                "truth_supported": True,
+                "truth_scope": "account",
+                "truth_available": True,
+                "positions": [],
+                "open_orders": [],
+                "probe_evidence": [{"classification": "timeout"}],
+                "errors": [],
+            },
+            now_ms=2_000,
+        )
+
+        assert runtime.recovery_decision.kind == (
+            RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+        )
+        assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+        assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
 
 
 # ═══════════════════════════════════════════════════════════════════════════

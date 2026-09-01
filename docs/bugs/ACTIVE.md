@@ -45,7 +45,9 @@ production-evidence cell.
   Overall deployment acceptance remains red for two separately tracked
   operational signals: lifecycle still reports `risk_only` despite a
   `RUNNING_CLEAN`/entry-allowed decision, and the one-hour private-WS counter
-  includes the deliberate deployment restart.
+  includes the deliberate deployment restart. They are now tracked as
+  CL-140/CL-141 with local-green source repairs; this deployed record remains
+  the production truth until a later deployment and observation prove them.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -77,10 +79,26 @@ they have a fixing commit. They are **local-green only**, not production facts:
   change the existing terminalization-budget cleanup or submit an order during
   verification.
 
+- automatic hedge-deadline fail-closed no longer writes the durable
+  operator-requested fail-closed latch. It follows the existing V1 automatic
+  recovery path after complete flat account truth, while a real operator latch
+  and incomplete truth remain blocking. Source audit: the incorrect mainline
+  write dates to `e6c52598`; an earlier correction on a non-main branch was
+  never released. It remained dormant until ZORA's 2026-09-01 automatic
+  hedge-deadline path activated it.
+
+- private-WS churn collection now parses systemd's production display form of
+  `ActiveEnterTimestampUSec`, so the one-hour count begins at the current
+  service generation rather than accidentally including the previous deploy.
+  An unparseable value deliberately widens the window instead of hiding churn.
+  The previous false alert only surfaced in the hour immediately following a
+  normal deployment restart; it did not show private-WS reconnect behavior.
+
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
 [2026-08-30](daily/2026-08-30.md), and
-[2026-08-31](daily/2026-08-31.md). They must not be called deployed or closed
+[2026-08-31](daily/2026-08-31.md), and
+[2026-09-02](daily/2026-09-02.md). They must not be called deployed or closed
 until this table receives real fixing commits and a production observation.
 
 ## Current Batch

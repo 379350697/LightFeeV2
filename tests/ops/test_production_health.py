@@ -944,7 +944,13 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
     def command_runner(command: list[str]) -> str:
         if command[:2] == ["systemctl", "show"]:
             if any("ActiveEnterTimestampUSec" in arg for arg in command):
-                return f"{active_entered_at_ms * 1_000}\n"
+                # systemctl renders this property as a local timestamp even
+                # when its name ends in ``USec``; production returned this
+                # exact shape, not an integer microsecond value.
+                return time.strftime(
+                    "%a %Y-%m-%d %H:%M:%S %Z\n",
+                    time.localtime(active_entered_at_ms / 1000.0),
+                )
             return "101\n" if command[2] == "lightfee-sidecar.service" else "202\n"
         if command[0] == "journalctl":
             assert f"--since=@{active_entered_at_ms / 1000.0:.3f}" in command
@@ -968,6 +974,45 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
     assert evidence["private_ws_worker_starts"] == {"binance": 1, "bybit": 1}
     assert evidence["private_ws_journal_since_ms"] == active_entered_at_ms
     assert report.ok
+
+
+@pytest.mark.parametrize(
+    ("systemd_value", "expected_ms"),
+    [
+        ("1778786990000000\n", 1_778_786_990_000),
+        ("unparseable timestamp\n", 0),
+    ],
+)
+def test_systemd_active_timestamp_preserves_numeric_and_conservative_fallback(
+    systemd_value,
+    expected_ms,
+):
+    def command_runner(command: list[str]) -> str:
+        assert command == [
+            "systemctl",
+            "show",
+            "lightfee-live.service",
+            "--property=ActiveEnterTimestampUSec",
+            "--value",
+        ]
+        return systemd_value
+
+    assert vps._systemd_active_enter_timestamp_ms(
+        "lightfee-live.service",
+        command_runner,
+    ) == expected_ms
+
+
+def test_systemd_active_timestamp_parses_host_local_fractional_display():
+    active_entered_at_ms = 1_778_786_990_123
+    local_time = time.localtime(active_entered_at_ms / 1000.0)
+    display = time.strftime("%a %Y-%m-%d %H:%M:%S", local_time)
+    display += f".123000 {time.strftime('%Z', local_time)}\n"
+
+    assert vps._systemd_active_enter_timestamp_ms(
+        "lightfee-live.service",
+        lambda _command: display,
+    ) == active_entered_at_ms
 
 
 def test_runtime_resource_collector_excludes_private_ws_starts_before_current_service_activation(tmp_path, monkeypatch):

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 # Ensure repo root is on sys.path when invoked as a script (subprocess, cron, etc.)
@@ -99,8 +100,29 @@ def _systemd_active_enter_timestamp_ms(unit: str, command_runner) -> int:
         "--value",
     ])
     try:
-        return max(int(output.strip().splitlines()[0]) // 1_000, 0)
-    except (IndexError, ValueError):
+        value = output.strip().splitlines()[0]
+    except IndexError:
+        return 0
+
+    try:
+        return max(int(value) // 1_000, 0)
+    except ValueError:
+        # systemctl renders ActiveEnterTimestampUSec as a local display string
+        # (for example, ``Tue 2026-09-01 23:53:54 CST``) on production. Its
+        # zone abbreviation is ambiguous to portable parsers, so interpret the
+        # rendered wall clock in the same host-local timezone that systemd used.
+        timestamp = value.rsplit(" ", 1)[0]
+        for timestamp_format in (
+            "%a %Y-%m-%d %H:%M:%S.%f",
+            "%a %Y-%m-%d %H:%M:%S",
+        ):
+            try:
+                return max(
+                    int(datetime.strptime(timestamp, timestamp_format).timestamp() * 1_000),
+                    0,
+                )
+            except ValueError:
+                continue
         return 0
 
 

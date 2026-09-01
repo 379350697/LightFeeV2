@@ -7450,7 +7450,6 @@ class LiveRuntime:
         Returns True if pending was removed, False if retained (cleanup failed).
         """
         enter_fail_closed(self.state)
-        self.state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
         return await self._abort_pending_entry(pending, entry_id, reason)
 
     async def _abort_pending_entry(
