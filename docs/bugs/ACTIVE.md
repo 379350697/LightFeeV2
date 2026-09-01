@@ -34,15 +34,18 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `9d7ffd3152266be3d0e00637bfec0c330e739f4a`
-- Checked on: `2026-09-02`. `9d7ffd3` (including `82e859c`) was fast-forwarded
-  and deployed; all 16 critical manifest hashes matched, both services
-  restarted active, singleton passed, all seven source domains were fresh, and
-  both processes had zero `CLOSE_WAIT`. The account remains high-confidence
-  flat/no-order. The only deployment-acceptance red is the pre-existing
-  persisted operator fail-closed latch. The first explicit recovery attempt
-  wrote only the non-authoritative generic pair now tracked by CL-143, so it
-  did not alter this real latch or constitute an accepted recovery audit.
+- Last production SHA checked: `dbb591b3e484da6f3738187973bfaf1da444cd41`
+- Checked on: `2026-09-02`. `dbb591b` was fast-forwarded and deployed; all 16
+  critical manifest hashes matched, both services restarted active, singleton
+  passed, all seven source domains were fresh, and both processes had zero
+  `CLOSE_WAIT`. Fresh high-confidence exchange truth was complete-flat/no-order.
+  With the live writer stopped and the authoritative pair plus the earlier
+  non-authoritative pair backed up, one explicitly paired `resume-if-safe`
+  appended `ops.command_applied` to `runtime/live-events.jsonl` and changed
+  `runtime/live-state.json` from `risk_only/fail_closed` to `running/running`.
+  The post-start verifier is fully green: no open local work or exchange orders,
+  exactly one private stream per enabled venue, and no orders were submitted or
+  cancelled by recovery.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -127,10 +130,10 @@ until this table receives real fixing commits and a production observation.
 | CL-137 | deployed-awaiting-verification | `0e0cc7a` | snapshot/tail/rotation/no-snapshot/terminal-owner matrix, operator CLI crash-window path, and terminalizer guard (`778 passed`) | `0e0cc7a` is live: manifest, singleton, deployment acceptance, and post-restart checkpoint passed; exchange truth is high-confidence flat/no-order. Await one ordinary later restart or rotated-tail observation; do not force orders or mutate history. | [2026-08-31](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work) |
 | CL-138 | deployed-awaiting-verification | `d18d016` | Gate/Bitget documented-payload parser, metadata-error fail-closed, source→pairing→V1 discovery, cache, and rate-limit matrix; adjacent `638 passed` | `12d8e038` is live: manifest/singleton/acceptance green; Bitget 93/93 and Gate 90/90 usable rows have nonzero quotes and exchange-future funding, with zero `CLOSE_WAIT`. Await only a natural eligible candidate; do not force an order. A separate post-restart Local-L2 diagnostic signal is tracked independently and is not evidence against this parser repair. | [2026-09-01](daily/2026-09-01.md#cl-138--gatebitget-sidecar-market-data-contract-drift) |
 | CL-139 | closed | `49de86a` | real HTTP-400 detail → bounded exact-history → zero-fill → lone-hedge cleanup matrix (`56` focused; `1,601` full) | Production observed exact Bitget `40109` → one Classic history row with zero fill → stale 2,496 maker high-water cleared → existing Bybit reduce-only cleanup verified 2,400 short flat; high-confidence exchange truth has no order/pending owner. | [2026-09-01](daily/2026-09-01.md#cl-139--bitget-canceled-maker-misread-as-fill-cancel-and-reconciliation-contract-gaps) |
-| CL-140 | deployed-awaiting-verification | `b682891` | direct deadline-abort → complete-flat recovery release, explicit-operator retain, and incomplete-truth retain matrix (`4` direct/adjacent checks; close profile `481 passed`) | `b682891`/`216dc258` are deployed. The account is high-confidence flat/no-order, but the old latch has lost provenance and remains deliberately preserved; after an explicit audited recovery action, observe one natural automatic hedge-deadline event returning to `running`. | [2026-09-02](daily/2026-09-02.md#cl-140--automatic-hedge-deadline-stop-was-persisted-as-an-operator-stop) |
+| CL-140 | deployed-awaiting-verification | `b682891` | direct deadline-abort → complete-flat recovery release, explicit-operator retain, and incomplete-truth retain matrix (`4` direct/adjacent checks; close profile `481 passed`) | The legacy latch was released by the CL-142/143 audited recovery after complete-flat truth. Still await one natural automatic hedge-deadline event returning to `running`; do not manufacture it. | [2026-09-02](daily/2026-09-02.md#cl-140--automatic-hedge-deadline-stop-was-persisted-as-an-operator-stop) |
 | CL-141 | closed | `216dc258` | numeric, display-only-property, malformed fallback, and resource-collector current-generation matrix (`55` health tests; close profile `481 passed`) | `216dc258` manifest/singleton probe passed with all sources fresh and zero `CLOSE_WAIT`; after its ordinary restart the verifier counted exactly six starts (one per enabled venue), used the current activation time as journal lower bound, and saw `NRestarts=0`. | [2026-09-02](daily/2026-09-02.md#cl-141--private-ws-churn-health-counted-a-prior-service-generation) |
-| CL-142 | local-green | `82e859c` | real maintenance CLI clean-release/real-position-retain matrix (`6 passed`); adjacent ops/risk/recovery (`222 passed`); pending-entry/recovery (`237 passed`); close profile (`481 passed`); full profile (`1,604 passed`) | V2's resume semantic repair is ready, but the first authorized attempt exposed CL-143: it wrote a generic side pair rather than the configured live pair. Deploy both fixes, then run the one explicitly paired recovery only after fresh complete-flat exchange truth. | [2026-09-02](daily/2026-09-02.md#cl-142--audited-resume-if-safe-could-not-release-a-clean-risk-only-latch) |
-| CL-143 | local-green | `5d64b5a` | production-shaped CLI RED/GREEN: five controls formerly accepted generic defaults; all six mutating forms now require an explicit pair, retain/clear and lease/discovery complements pass (`46` ops tests); close profile `481 passed`; full release profile `1,604 passed` before final test-only amend | First authorized resume printed success but wrote non-authoritative `runtime/journal.jsonl` / `runtime/snapshot.json`; true `live-state.json` remained fail-closed. Preserve that side pair as audit evidence, deploy `5d64b5a`, then run one explicitly paired recovery and verify the matching event plus post-start exchange truth. | [2026-09-02](daily/2026-09-02.md#cl-143--state-mutating-lightfee-ops-could-target-a-non-authoritative-default-pair) |
+| CL-142 | closed | `82e859c` | real maintenance CLI clean-release/real-position-retain matrix (`6 passed`); adjacent ops/risk/recovery (`222 passed`); pending-entry/recovery (`237 passed`); close profile (`481 passed`); full profile (`1,604 passed`) | `dbb591b` is deployed. After fresh complete-flat/no-order truth, the single authoritative resume event (`seq=1`, `run_id=lightfee-1788286119229-2211467`) changed the real state to `running/running`; post-start acceptance is fully green and recovery submitted/cancelled no orders. | [2026-09-02](daily/2026-09-02.md#cl-142--audited-resume-if-safe-could-not-release-a-clean-risk-only-latch) |
+| CL-143 | closed | `5d64b5a` | production-shaped CLI RED/GREEN: five controls formerly accepted generic defaults; all six mutating forms now require an explicit pair, retain/clear and lease/discovery complements pass (`46` ops tests); close profile `481 passed`; full release profile `1,604 passed` before final test-only amend | `dbb591b` is deployed. The remote command without a pair rejects with exit `2` before mutation; the one explicit pair wrote the matching authoritative event/state. The earlier generic pair was preserved in the recovery backup, and post-start acceptance is fully green. | [2026-09-02](daily/2026-09-02.md#cl-143--state-mutating-lightfee-ops-could-target-a-non-authoritative-default-pair) |
 
 ## Pre-CL-093 Historical Boundary
 
