@@ -168,3 +168,27 @@ result is true while ordinary `ok` remains false.  Never remove it manually to
 make a health check green. Prefer the code-level clean-start recovery. Manual
 state edits require a backup and must be followed by the ordinary verifier and,
 when deployment is intended, the explicit deployment-acceptance verifier.
+
+For an explicitly authorized, audited offline recovery, every state-mutating
+`lightfee-ops` command requires the exact deployed persistence pair. It never
+guesses `data/journal.jsonl` or `data/snapshot.json` from a working directory
+or environment variable. On this deployment that pair is
+`runtime/live-events.jsonl` and `runtime/live-state.json`:
+
+```bash
+cd /opt/lightfee-v2
+systemctl stop lightfee-live
+backup_dir=/root/lightfee-recovery-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$backup_dir"
+cp -a runtime/live-events.jsonl runtime/live-state.json "$backup_dir"
+find runtime -maxdepth 1 -type f -name 'live-events.jsonl.*' -exec cp -a {} "$backup_dir"/ \;
+PYTHONPATH=/opt/lightfee-v2 /opt/lightfee-v2/.venv/bin/lightfee-ops \
+  resume-if-safe \
+  --event-log-path runtime/live-events.jsonl \
+  --snapshot-path runtime/live-state.json
+systemctl start lightfee-live
+```
+
+Record the command output, the appended `ops.command_applied` journal event,
+and post-start verifier output. `discover-binance-close-evidence` is the only
+read-only `lightfee-ops` command and needs only its snapshot input.

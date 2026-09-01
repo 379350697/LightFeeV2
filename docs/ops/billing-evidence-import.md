@@ -157,9 +157,12 @@ that exact exchange verification.
 
 ## Production Procedure
 
-Use the `event_log_path` and `snapshot_path` from the deployed live config. Do
-not use the CLI defaults unless that config actually uses `data/journal.jsonl`
-and `data/snapshot.json`.
+Use the `event_log_path` and `snapshot_path` from the deployed live config.
+Every state-mutating `lightfee-ops` command requires that explicit pair; there
+is no default `data/journal.jsonl` / `data/snapshot.json` fallback. This keeps
+an offline action from writing a plausible-looking but non-authoritative state
+pair. The read-only `discover-binance-close-evidence` command is the sole
+exception and requires only its snapshot input.
 
 1. Capture the read-only health/diagnose output and retain the original
    exchange exports. Confirm the target is still `evidence_debt` and only one
