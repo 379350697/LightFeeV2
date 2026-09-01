@@ -97,20 +97,24 @@ def _systemd_active_enter_timestamp_ms(unit: str, command_runner) -> int:
         "show",
         unit,
         "--property=ActiveEnterTimestampUSec",
+        "--property=ActiveEnterTimestamp",
         "--value",
     ])
-    try:
-        value = output.strip().splitlines()[0]
-    except IndexError:
-        return 0
+    values = [value.strip() for value in output.splitlines() if value.strip()]
 
-    try:
-        return max(int(value) // 1_000, 0)
-    except ValueError:
-        # systemctl renders ActiveEnterTimestampUSec as a local display string
-        # (for example, ``Tue 2026-09-01 23:53:54 CST``) on production. Its
-        # zone abbreviation is ambiguous to portable parsers, so interpret the
-        # rendered wall clock in the same host-local timezone that systemd used.
+    for value in values:
+        try:
+            timestamp_ms = int(value) // 1_000
+        except ValueError:
+            continue
+        if timestamp_ms > 0:
+            return timestamp_ms
+
+    # Some systemd versions omit the *USec property altogether but expose the
+    # matching display property (for example, ``Tue 2026-09-01 23:53:54 CST``).
+    # Its zone abbreviation is ambiguous to portable parsers, so interpret the
+    # rendered wall clock in the same host-local timezone that systemd used.
+    for value in values:
         timestamp = value.rsplit(" ", 1)[0]
         for timestamp_format in (
             "%a %Y-%m-%d %H:%M:%S.%f",
@@ -123,7 +127,7 @@ def _systemd_active_enter_timestamp_ms(unit: str, command_runner) -> int:
                 )
             except ValueError:
                 continue
-        return 0
+    return 0
 
 
 def _process_socket_metrics(pid: int, *, proc_root: Path) -> dict[str, int]:

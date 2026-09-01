@@ -34,20 +34,16 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `49de86a800532ceda4433cbccb1816b7ef801a11`
-- Checked on: `2026-09-02`. `49de86a` was fast-forwarded to production; all 16
-  critical manifest hashes matched and both services restarted active. The
-  Bitget `40109` production path then made one exact Classic-history lookup,
-  proved zero maker fill, and the existing owned-single-leg reduce-only path
-  verified the Bybit 2,400 short flat. Exchange truth is now high-confidence
-  flat with no open order or pending owner, and both processes have zero
-  `CLOSE_WAIT`. This closes CL-139; it does not prove a future natural entry.
-  Overall deployment acceptance remains red for two separately tracked
-  operational signals: lifecycle still reports `risk_only` despite a
-  `RUNNING_CLEAN`/entry-allowed decision, and the one-hour private-WS counter
-  includes the deliberate deployment restart. They are now tracked as
-  CL-140/CL-141 with local-green source repairs; this deployed record remains
-  the production truth until a later deployment and observation prove them.
+- Last production SHA checked: `b682891f154e7d0a660b58e44941661f166d76ac`
+- Checked on: `2026-09-02`. `b682891` was fast-forwarded and deployed; all 16
+  critical manifest hashes matched, both services restarted active, singleton
+  passed, all seven source domains were fresh, and both processes had zero
+  `CLOSE_WAIT`. The read-only probe found high-confidence flat/no-order truth.
+  Deployment acceptance remains red only for the pre-existing persisted
+  operator fail-closed latch; it was not cleared because its provenance is
+  lost. The same probe exposed that this host omits
+  `ActiveEnterTimestampUSec`, so CL-141's first deployed parser could not see
+  the activation time and a second, narrower source repair remains local-only.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -87,12 +83,14 @@ they have a fixing commit. They are **local-green only**, not production facts:
   never released. It remained dormant until ZORA's 2026-09-01 automatic
   hedge-deadline path activated it.
 
-- private-WS churn collection now parses systemd's production display form of
-  `ActiveEnterTimestampUSec`, so the one-hour count begins at the current
-  service generation rather than accidentally including the previous deploy.
-  An unparseable value deliberately widens the window instead of hiding churn.
-  The previous false alert only surfaced in the hour immediately following a
-  normal deployment restart; it did not show private-WS reconnect behavior.
+- private-WS churn collection now requests both systemd activation-property
+  shapes. `b682891` parsed a display string but requested only
+  `ActiveEnterTimestampUSec`; this cloud's systemd omits that field and exposes
+  `ActiveEnterTimestamp`. The local follow-up keeps the numeric path preferred,
+  parses the matching display fallback, and keeps malformed/missing data
+  conservative. The prior false alert only surfaced in the hour immediately
+  following a normal deployment restart; it did not show private-WS reconnect
+  behavior.
 
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),

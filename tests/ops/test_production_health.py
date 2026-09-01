@@ -944,9 +944,9 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
     def command_runner(command: list[str]) -> str:
         if command[:2] == ["systemctl", "show"]:
             if any("ActiveEnterTimestampUSec" in arg for arg in command):
-                # systemctl renders this property as a local timestamp even
-                # when its name ends in ``USec``; production returned this
-                # exact shape, not an integer microsecond value.
+                # Production omits the *USec property and returns only the
+                # display property requested beside it.
+                assert "--property=ActiveEnterTimestamp" in command
                 return time.strftime(
                     "%a %Y-%m-%d %H:%M:%S %Z\n",
                     time.localtime(active_entered_at_ms / 1000.0),
@@ -993,6 +993,7 @@ def test_systemd_active_timestamp_preserves_numeric_and_conservative_fallback(
             "show",
             "lightfee-live.service",
             "--property=ActiveEnterTimestampUSec",
+            "--property=ActiveEnterTimestamp",
             "--value",
         ]
         return systemd_value
@@ -1003,15 +1004,22 @@ def test_systemd_active_timestamp_preserves_numeric_and_conservative_fallback(
     ) == expected_ms
 
 
-def test_systemd_active_timestamp_parses_host_local_fractional_display():
+def test_systemd_active_timestamp_reads_display_property_when_usec_is_absent():
     active_entered_at_ms = 1_778_786_990_123
     local_time = time.localtime(active_entered_at_ms / 1000.0)
     display = time.strftime("%a %Y-%m-%d %H:%M:%S", local_time)
     display += f".123000 {time.strftime('%Z', local_time)}\n"
 
+    def command_runner(command: list[str]) -> str:
+        # This is the production-shaped counterexample: systemd has no
+        # ActiveEnterTimestampUSec property, so only asking for it is empty.
+        if "--property=ActiveEnterTimestamp" not in command:
+            return ""
+        return display
+
     assert vps._systemd_active_enter_timestamp_ms(
         "lightfee-live.service",
-        lambda _command: display,
+        command_runner,
     ) == active_entered_at_ms
 
 
