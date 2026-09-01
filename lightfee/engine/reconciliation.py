@@ -47,6 +47,16 @@ class PositionReconciliationResult:
     short_fill: Optional[OrderFill] = None
     long_position: Optional[PositionSnapshot] = None
     short_position: Optional[PositionSnapshot] = None
+    # A terminal Bitget row with an explicit cumulative fill of zero.  This is
+    # narrower than a generic ``not_found``: runtime may lower stale local
+    # fill state only when the corresponding live venue position is also flat.
+    long_terminal_zero_fill: bool = False
+    short_terminal_zero_fill: bool = False
+    # A terminal Bitget row whose execution fields are absent or malformed.
+    # This is not zero-fill evidence; pending-entry recovery must retain and
+    # retry rather than acting on any stale local fill high-water mark.
+    long_terminal_fill_quantity_unavailable: bool = False
+    short_terminal_fill_quantity_unavailable: bool = False
     matched_quantity: float = 0.0
     residual_long: float = 0.0
     residual_short: float = 0.0
@@ -151,6 +161,26 @@ class OrderReconciler:
 
     def _adapter_for(self, venue: Venue) -> Optional[VenueAdapter]:
         return self._adapters.get(venue)
+
+    @staticmethod
+    def _query_proves_terminal_zero_fill(payload: Mapping[str, Any]) -> bool:
+        """Return whether a queried order exactly proved terminal zero fill."""
+        return (
+            str(payload.get("response_classification", "")) == "terminal_zero_fill"
+            and str(payload.get("uncertain_subtype", "")) == "execution_not_found"
+        )
+
+    @staticmethod
+    def _query_has_terminal_fill_quantity_unavailable(
+        payload: Mapping[str, Any],
+    ) -> bool:
+        """Return whether a terminal response lacked usable execution quantity."""
+        return (
+            str(payload.get("response_classification", ""))
+            == "terminal_fill_quantity_unavailable"
+            and str(payload.get("uncertain_subtype", ""))
+            == "execution_fields_unavailable"
+        )
 
     def drain_order_diagnostics(self) -> list[dict[str, Any]]:
         events = list(self._order_diagnostics)
@@ -458,6 +488,14 @@ class OrderReconciler:
             long_query_diagnostics = self._drain_adapter_order_diagnostics(long_adapter)
             self._order_diagnostics.extend(long_query_diagnostics)
             long_query_payload = self._latest_query_payload(long_query_diagnostics)
+            result.long_terminal_zero_fill = self._query_proves_terminal_zero_fill(
+                long_query_payload
+            )
+            result.long_terminal_fill_quantity_unavailable = (
+                self._query_has_terminal_fill_quantity_unavailable(
+                    long_query_payload
+                )
+            )
             (
                 result.long_status,
                 long_raw_status,
@@ -493,6 +531,14 @@ class OrderReconciler:
             short_query_diagnostics = self._drain_adapter_order_diagnostics(short_adapter)
             self._order_diagnostics.extend(short_query_diagnostics)
             short_query_payload = self._latest_query_payload(short_query_diagnostics)
+            result.short_terminal_zero_fill = self._query_proves_terminal_zero_fill(
+                short_query_payload
+            )
+            result.short_terminal_fill_quantity_unavailable = (
+                self._query_has_terminal_fill_quantity_unavailable(
+                    short_query_payload
+                )
+            )
             (
                 result.short_status,
                 short_raw_status,

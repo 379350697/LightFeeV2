@@ -330,6 +330,105 @@ def _safe_float(value: Any, *, default: float = 0.0) -> float:
         return default
 
 
+_BITGET_CUMULATIVE_QUANTITY_FIELDS = (
+    "cumExecQty",
+    "baseVolume",
+    "filledQty",
+    "fillQty",
+    "filled_amount",
+    "size",
+    "fillSz",
+)
+_BITGET_NO_FILL_TERMINAL_ORDER_STATES = frozenset({
+    "canceled", "cancelled", "expired", "rejected", "terminated",
+})
+_BITGET_TERMINAL_ORDER_STATES = _BITGET_NO_FILL_TERMINAL_ORDER_STATES | frozenset({
+    "filled", "closed", "completed", "done", "success",
+})
+
+
+def _bitget_cumulative_quantity(row: dict[str, Any]) -> Optional[float]:
+    """Return a valid cumulative-fill quantity, or ``None`` when unavailable.
+
+    Bitget Classic order rows expose ``size`` as submitted size and
+    ``baseVolume`` as executed base quantity.  A reported zero is therefore
+    authoritative: it must stop alias fallback instead of being replaced by
+    the positive submitted size.  Absence or malformed values are not zero
+    execution evidence; callers that release trading state must retain them as
+    uncertain.
+    """
+    for key in _BITGET_CUMULATIVE_QUANTITY_FIELDS:
+        value = row.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        quantity = _safe_float(value, default=float("nan"))
+        if math.isfinite(quantity) and quantity >= 0.0:
+            return quantity
+    return None
+
+
+def _bitget_order_status(row: Any) -> str:
+    if not isinstance(row, dict):
+        return ""
+    return str(
+        row.get("state", row.get("status", row.get("orderStatus", ""))) or ""
+    ).strip().lower()
+
+
+def _bitget_order_is_terminal(row: dict[str, Any]) -> bool:
+    return _bitget_order_status(row) in _BITGET_TERMINAL_ORDER_STATES
+
+
+def _bitget_order_is_terminal_zero_fill(row: dict[str, Any]) -> bool:
+    quantity = _bitget_cumulative_quantity(row)
+    return (
+        _bitget_order_status(row) in _BITGET_NO_FILL_TERMINAL_ORDER_STATES
+        and quantity is not None
+        and quantity <= 1e-12
+    )
+
+
+def _bitget_order_has_terminal_unavailable_fill_quantity(row: dict[str, Any]) -> bool:
+    """Terminal state alone cannot prove zero execution for reconciliation."""
+    return _bitget_order_is_terminal(row) and _bitget_cumulative_quantity(row) is None
+
+
+def _bitget_history_order_row(
+    raw: dict[str, Any], *, order_id: str, client_order_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return one exact Bitget history row; never infer identity from order.
+
+    UTA history is a bounded symbol-scoped list, while Classic can query by
+    identifier.  Both variants must still match an exchange or client ID
+    exactly before their row becomes reconciliation evidence.
+    """
+    data = raw.get("data", raw)
+    if isinstance(data, dict):
+        rows = data.get("entrustedList", data.get("list", data.get("rows", [])))
+    else:
+        rows = data
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return None
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_order_id = str(row.get("orderId", row.get("ordId", "")) or "")
+        row_client_order_id = str(row.get("clientOid", row.get("clientOrderId", "")) or "")
+        order_match = bool(order_id and row_order_id == order_id)
+        client_match = bool(client_order_id and row_client_order_id == client_order_id)
+        if not (order_match or client_match):
+            continue
+        if order_id and row_order_id and row_order_id != order_id:
+            continue
+        if client_order_id and row_client_order_id and row_client_order_id != client_order_id:
+            continue
+        return row
+    return None
+
+
 def _parse_optional_float(value: Any) -> Optional[float]:
     """V1 parse_optional_f64_field parity: returns None for missing/empty values.
 
@@ -4753,6 +4852,79 @@ class VenueTransport(MarketDataClient):
                     params=params,
                     private=contract.private,
                 )
+                code = str(raw.get("code", ""))
+                queried_endpoints = [contract.path]
+                if code in {"40109", "43001"}:
+                    history_contract, history_raw = await self._fetch_bitget_order_history(
+                        venue_sym,
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                        family=family,
+                    )
+                    queried_endpoints.append(history_contract.path)
+                    history_row = _bitget_history_order_row(
+                        history_raw,
+                        order_id=order_id,
+                        client_order_id=client_order_id,
+                    )
+                    if history_row is None:
+                        self._record_order_reconcile_query(
+                            symbol=venue_sym,
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            queried_endpoints=queried_endpoints,
+                            response_classification="bitget_history_exact_identity_unmatched",
+                            uncertain_subtype="history_identity_unmatched",
+                        )
+                        return None
+                    if _bitget_order_is_terminal_zero_fill(history_row):
+                        self._record_order_reconcile_query(
+                            symbol=venue_sym,
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            queried_endpoints=queried_endpoints,
+                            response_classification="terminal_zero_fill",
+                            uncertain_subtype="execution_not_found",
+                            next_action="clear_uncertain_state",
+                        )
+                        return None
+                    if _bitget_order_has_terminal_unavailable_fill_quantity(history_row):
+                        self._record_order_reconcile_query(
+                            symbol=venue_sym,
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            queried_endpoints=queried_endpoints,
+                            response_classification="terminal_fill_quantity_unavailable",
+                            uncertain_subtype="execution_fields_unavailable",
+                            next_action="reconcile_again_after_backoff",
+                        )
+                        return None
+                    raw = {"code": "00000", "data": history_row}
+                    contract = history_contract
+                elif isinstance(raw.get("data", raw), dict):
+                    detail_row = raw.get("data", raw)
+                    if _bitget_order_is_terminal_zero_fill(detail_row):
+                        self._record_order_reconcile_query(
+                            symbol=venue_sym,
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            queried_endpoints=queried_endpoints,
+                            response_classification="terminal_zero_fill",
+                            uncertain_subtype="execution_not_found",
+                            next_action="clear_uncertain_state",
+                        )
+                        return None
+                    if _bitget_order_has_terminal_unavailable_fill_quantity(detail_row):
+                        self._record_order_reconcile_query(
+                            symbol=venue_sym,
+                            order_id=order_id,
+                            client_order_id=client_order_id,
+                            queried_endpoints=queried_endpoints,
+                            response_classification="terminal_fill_quantity_unavailable",
+                            uncertain_subtype="execution_fields_unavailable",
+                            next_action="reconcile_again_after_backoff",
+                        )
+                        return None
                 return self._parse_order_status_bitget(
                     raw,
                     venue_sym,
@@ -4777,6 +4949,48 @@ class VenueTransport(MarketDataClient):
             return None
 
         return None
+
+    async def _fetch_bitget_order_history(
+        self,
+        venue_sym: str,
+        *,
+        order_id: str,
+        client_order_id: str,
+        family: BitgetContractFamily,
+    ) -> tuple["VenueOperationContract", dict[str, Any]]:
+        """Run one bounded, account-family-correct Bitget history lookup.
+
+        The fallback is intentionally available only after the exact order
+        endpoint says the order is gone.  Classic accepts identity filters;
+        UTA does not document them, so it fetches one symbol-scoped page and
+        lets ``_bitget_history_order_row`` require an exact returned identity.
+        """
+        contract = get_operation_contract(
+            self._spec,
+            VenueOperation.ORDER_HISTORY,
+            resolved_account_family=family,
+        )
+        if not contract.supported:
+            raise TransportError(
+                TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                "Bitget order history contract unsupported",
+            )
+        extra: dict[str, Any] = {}
+        if family == BitgetContractFamily.CLASSIC_MIX_V2:
+            if order_id:
+                extra["orderId"] = order_id
+            if client_order_id:
+                extra["clientOid"] = client_order_id
+        else:
+            extra["limit"] = "100"
+        raw = await self._request(
+            contract.method,
+            contract.path,
+            params=_bitget_contract_params(contract, venue_sym=venue_sym, extra=extra),
+            private=contract.private,
+        )
+        _require_bitget_success(raw, "bitget order history failed")
+        return contract, raw
 
     async def _fetch_order_status_binance(
         self,
@@ -5675,10 +5889,9 @@ class VenueTransport(MarketDataClient):
         # Note: caller provides fallback order_id
         order_id = str(data.get("orderId", data.get("ordId", "")))
         client_id = str(data.get("clientOid", ""))
-        # V1 multi-key fallback: cumExecQty, baseVolume, filledQty, fillQty, filled_amount, size
-        cum_qty = _safe_float(
-            data.get("cumExecQty", data.get("baseVolume", data.get("filledQty", data.get("fillQty", data.get("filled_amount", data.get("size", data.get("fillSz", "0")))))))
-        )
+        # A present zero is execution truth, not a missing alias.  Only an
+        # absent/malformed field may continue to the next V1-compatible alias.
+        cum_qty = _bitget_cumulative_quantity(data) or 0.0
         avg_price = _safe_float(
             data.get("priceAvg", data.get("avgPrice", data.get("fillPriceAvg", data.get("averagePrice", "0"))))
         )
@@ -7131,6 +7344,7 @@ class VenueTransport(MarketDataClient):
         # (bitget.rs:2576-2583). State is computed AFTER merge using merged cumulative_quantity.
         _btg_original_qty: float = 0.0
         _btg_status_str: str = ""
+        detail_cumulative_quantity: Optional[float] = None
 
         # 1. Fetch REST order detail (V1: fetch_bitget_order_detail → parse fields)
         try:
@@ -7170,6 +7384,15 @@ class VenueTransport(MarketDataClient):
                         except (TypeError, ValueError):
                             continue
                 return default
+
+            def _bf_cumulative_quantity(default=0.0):
+                nonlocal detail_cumulative_quantity
+                detail_cumulative_quantity = _bitget_cumulative_quantity(detail_data)
+                return (
+                    detail_cumulative_quantity
+                    if detail_cumulative_quantity is not None
+                    else default
+                )
 
             def _bf_i64(keys, default=0):
                 for k in keys:
@@ -7225,9 +7448,7 @@ class VenueTransport(MarketDataClient):
             detail_progress = CumulativeOrderProgress.from_position_snapshot(
                 order_id=_bf(["orderId", "ordId"]) or order_id,
                 client_order_id=_bf(["clientOid"]) or client_order_id,
-                cumulative_quantity=_bf_f64([
-                    "baseVolume", "filledQty", "fillQty", "filled_amount", "size",
-                ]),
+                cumulative_quantity=_bf_cumulative_quantity(),
                 average_price=_bf_f64([
                     "priceAvg", "fillPriceAvg", "averagePrice", "avgPrice",
                 ]) or None,
@@ -7283,7 +7504,13 @@ class VenueTransport(MarketDataClient):
                 _btg_original_qty > 0.0
                 and merged_qty + 1e-9 >= _btg_original_qty
             )
-            if _btg_status_str in ("filled", "closed", "completed", "done", "success") \
+            if (
+                _bitget_order_is_terminal(detail_data)
+                and merged_qty <= 0.0
+                and detail_cumulative_quantity is None
+            ):
+                state = PassiveOrderState.UNKNOWN
+            elif _btg_status_str in ("filled", "closed", "completed", "done", "success") \
                     or is_filled:
                 state = PassiveOrderState.FILLED
             elif _btg_status_str in (
@@ -7744,11 +7971,27 @@ class VenueTransport(MarketDataClient):
                 elif client_order_id:
                     params["orderLinkId"] = client_order_id
             elif spec.venue_id == Venue.BITGET:
-                params["symbol"] = venue_sym
+                family = await _resolve_bitget_contract_family_for_truth(self)
+                contract = get_operation_contract(
+                    spec,
+                    VenueOperation.CANCEL_ORDER,
+                    resolved_account_family=family,
+                )
+                if not contract.supported:
+                    raise TransportError(
+                        TransportErrorCategory.UNSUPPORTED_CAPABILITY,
+                        "Bitget passive cancel contract unsupported",
+                    )
+                identifiers: dict[str, Any] = {}
                 if order_id:
-                    params["orderId"] = order_id
+                    identifiers["orderId"] = order_id
                 elif client_order_id:
-                    params["clientOid"] = client_order_id
+                    identifiers["clientOid"] = client_order_id
+                params = _bitget_contract_params(
+                    contract,
+                    venue_sym=venue_sym,
+                    extra=identifiers,
+                )
             elif spec.venue_id == Venue.GATE:
                 if order_id:
                     params["order_id"] = order_id

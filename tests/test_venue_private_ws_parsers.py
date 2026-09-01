@@ -790,6 +790,289 @@ class TestBitgetPassiveProgressEndpoint:
         assert result.average_price == 48000.0
 
     @pytest.mark.asyncio
+    async def test_classic_explicit_zero_base_volume_never_falls_back_to_order_size(self, monkeypatch):
+        """A canceled Classic row's ``size`` is submitted quantity, not a fill."""
+        from lightfee.core.domain import Side
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        async def _fake_request(method, path, **kwargs):
+            assert path == "/api/v2/mix/order/detail"
+            return {
+                "code": "00000",
+                "data": {
+                    "orderId": "1478408313786478593",
+                    "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                    "size": "2496",
+                    "baseVolume": "0",
+                    "priceAvg": "",
+                    "fee": "0",
+                    "uTime": "1781456021000",
+                    "side": "buy",
+                    "state": "canceled",
+                },
+            }
+
+        async def _classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        with patch.object(VenueTransport, "_validate_live_credentials", return_value=None):
+            transport = VenueTransport(bitget_spec(), mode="mock")
+        monkeypatch.setattr(transport, "_request", _fake_request)
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _classic_family,
+            raising=False,
+        )
+        monkeypatch.setattr(transport, "private_order_progress", lambda **kwargs: None)
+
+        result = await transport.query_passive_order_progress(
+            "ZORAUSDT",
+            "1478408313786478593",
+            "5fc9a39af59f0bf2e029436c5e512146fac0",
+            side=Side.BUY,
+        )
+
+        assert result is not None
+        assert result.cumulative_quantity == 0.0
+        assert result.state == PassiveOrderState.CANCELED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("history_rows", "expected_classification"),
+        [
+            (
+                [{
+                    "orderId": "1478408313786478593",
+                    "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                    "size": "2496",
+                    "baseVolume": "0",
+                    "state": "canceled",
+                }],
+                "terminal_zero_fill",
+            ),
+            (
+                [{
+                    "orderId": "different-order",
+                    "clientOid": "different-client",
+                    "size": "2496",
+                    "baseVolume": "0",
+                    "state": "canceled",
+                }],
+                "bitget_history_exact_identity_unmatched",
+            ),
+            (
+                [{
+                    "orderId": "1478408313786478593",
+                    "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                    "baseVolume": "",
+                    "filledQty": "not-a-number",
+                    "state": "canceled",
+                }],
+                "terminal_fill_quantity_unavailable",
+            ),
+        ],
+    )
+    async def test_bitget_history_fallback_requires_exact_identity_before_zero_fill_evidence(
+        self, monkeypatch, history_rows, expected_classification,
+    ):
+        """A 40109 can prove zero fill only through an exact history row."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        calls = []
+
+        async def _fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("params")))
+            if path == "/api/v2/mix/order/detail":
+                return {"code": "40109", "msg": "data order cannot be found"}
+            assert path == "/api/v2/mix/order/orders-history"
+            return {"code": "00000", "data": {"entrustedList": history_rows}}
+
+        async def _classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        with patch.object(VenueTransport, "_validate_live_credentials", return_value=None):
+            transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        monkeypatch.setattr(transport, "_request", _fake_request)
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _classic_family,
+            raising=False,
+        )
+
+        result = await transport.fetch_order_status(
+            "ZORAUSDT",
+            order_id="1478408313786478593",
+            client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+        )
+
+        assert result is None
+        assert [path for _method, path, _params in calls] == [
+            "/api/v2/mix/order/detail",
+            "/api/v2/mix/order/orders-history",
+        ]
+        assert calls[-1][2] == {
+            "symbol": "ZORAUSDT",
+            "productType": "USDT-FUTURES",
+            "orderId": "1478408313786478593",
+            "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+        }
+        diagnostics = transport.drain_order_diagnostics()
+        query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
+        assert query["response_classification"] == expected_classification
+
+    @pytest.mark.asyncio
+    async def test_bitget_uta_history_fallback_uses_one_documented_bounded_page(
+        self, monkeypatch,
+    ):
+        """UTA history is symbol-scoped: match returned identity, never add unsupported filters."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        calls = []
+
+        async def _fake_request(method, path, **kwargs):
+            calls.append((method, path, kwargs.get("params")))
+            if path == "/api/v3/trade/order-info":
+                return {"code": "43001", "msg": "order not found"}
+            assert path == "/api/v3/trade/history-orders"
+            return {"code": "00000", "data": {"list": [{
+                "orderId": "1478408313786478593",
+                "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                "size": "2496",
+                "baseVolume": "0",
+                "state": "canceled",
+            }]}}
+
+        async def _uta_family():
+            return BitgetContractFamily.UTA_V3
+
+        with patch.object(VenueTransport, "_validate_live_credentials", return_value=None):
+            transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        monkeypatch.setattr(transport, "_request", _fake_request)
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _uta_family,
+            raising=False,
+        )
+
+        result = await transport.fetch_order_status(
+            "ZORAUSDT",
+            order_id="1478408313786478593",
+            client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+        )
+
+        assert result is None
+        assert [path for _method, path, _params in calls] == [
+            "/api/v3/trade/order-info",
+            "/api/v3/trade/history-orders",
+        ]
+        assert calls[-1][2] == {
+            "symbol": "ZORAUSDT",
+            "category": "USDT-FUTURES",
+            "limit": "100",
+        }
+        diagnostics = transport.drain_order_diagnostics()
+        query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
+        assert query["response_classification"] == "terminal_zero_fill"
+
+    @pytest.mark.asyncio
+    async def test_bitget_direct_terminal_missing_fill_fields_remains_uncertain(
+        self, monkeypatch,
+    ):
+        """A canceled detail row without a valid execution quantity cannot clear state."""
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        async def _fake_request(method, path, **kwargs):
+            assert path == "/api/v2/mix/order/detail"
+            return {"code": "00000", "data": {
+                "orderId": "1478408313786478593",
+                "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                "baseVolume": "",
+                "filledQty": "not-a-number",
+                "state": "canceled",
+            }}
+
+        async def _classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        with patch.object(VenueTransport, "_validate_live_credentials", return_value=None):
+            transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        monkeypatch.setattr(transport, "_request", _fake_request)
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _classic_family,
+            raising=False,
+        )
+
+        result = await transport.fetch_order_status(
+            "ZORAUSDT",
+            order_id="1478408313786478593",
+            client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+        )
+
+        assert result is None
+        diagnostics = transport.drain_order_diagnostics()
+        query = [event["payload"] for event in diagnostics if event["kind"] == "order.reconcile_query"][-1]
+        assert query["response_classification"] == "terminal_fill_quantity_unavailable"
+        assert query["uncertain_subtype"] == "execution_fields_unavailable"
+        assert query["next_action"] == "reconcile_again_after_backoff"
+
+    @pytest.mark.asyncio
+    async def test_bitget_passive_terminal_missing_fill_fields_is_not_terminal(
+        self, monkeypatch,
+    ):
+        """A canceled passive row needs an explicit fill quantity before terminalization."""
+        from lightfee.core.domain import PassiveOrderState, Side
+        from lightfee.venues.specs import BitgetContractFamily, bitget_spec
+        from lightfee.venues.transport import VenueTransport
+
+        async def _fake_request(method, path, **kwargs):
+            assert path == "/api/v2/mix/order/detail"
+            return {"code": "00000", "data": {
+                "orderId": "1478408313786478593",
+                "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+                "baseVolume": "",
+                "filledQty": "not-a-number",
+                "state": "canceled",
+            }}
+
+        async def _classic_family():
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        with patch.object(VenueTransport, "_validate_live_credentials", return_value=None):
+            transport = VenueTransport(bitget_spec(), mode="mock")
+        transport.mode = "live"
+        monkeypatch.setattr(transport, "_request", _fake_request)
+        monkeypatch.setattr(
+            transport,
+            "_bitget_resolve_contract_family",
+            _classic_family,
+            raising=False,
+        )
+        monkeypatch.setattr(transport, "private_order_progress", lambda **kwargs: None)
+
+        progress = await transport.query_passive_order_progress(
+            "ZORAUSDT",
+            "1478408313786478593",
+            "5fc9a39af59f0bf2e029436c5e512146fac0",
+            side=Side.BUY,
+        )
+
+        assert progress is not None
+        assert progress.cumulative_quantity == 0.0
+        assert progress.state == PassiveOrderState.UNKNOWN
+
+    @pytest.mark.asyncio
     async def test_reconciliation_participates_in_merge_with_highest_qty(self, monkeypatch):
         """Reconciliation call count, endpoint, and merge: when detail/private/
         recon have different quantities, the highest-quantity source wins merge."""

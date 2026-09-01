@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from lightfee.core.domain import OrderFill, PositionSnapshot, Side, Venue
+from lightfee.core.domain import OrderFill, PassiveOrderState, PositionSnapshot, Side, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryLiveTruth,
@@ -174,6 +174,71 @@ class PendingEntryRuntime:
             prev_hedge_filled = pending.hedge_leg_filled
             maker_filled_updated = False
             hedge_filled_updated = False
+
+            maker_position = (
+                result.long_position
+                if pending.maker_leg == "long"
+                else result.short_position
+            )
+            maker_terminal_zero_fill = bool(
+                result.long_terminal_zero_fill
+                if pending.maker_leg == "long"
+                else result.short_terminal_zero_fill
+            )
+            maker_terminal_fill_quantity_unavailable = bool(
+                result.long_terminal_fill_quantity_unavailable
+                if pending.maker_leg == "long"
+                else result.short_terminal_fill_quantity_unavailable
+            )
+            if maker_terminal_fill_quantity_unavailable:
+                pending.uncertain_outcome = True
+                self.ctx.journal.append(
+                    "pending_entry.maker_terminal_fill_quantity_unavailable",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_leg": pending.maker_leg,
+                        "maker_venue": pending.maker_venue().value,
+                        "maker_leg_filled": pending.maker_leg_filled,
+                        "hedge_leg_filled": pending.hedge_leg_filled,
+                        "reason": "terminal_order_execution_fields_unavailable",
+                    },
+                )
+                self.ctx._apply_reconcile_backoff(pending, now_ms)
+                continue
+            verified_maker_terminal_zero_fill = (
+                maker_terminal_zero_fill
+                and maker_position is not None
+                and abs(float(maker_position.quantity or 0.0)) <= 1e-9
+            )
+            if verified_maker_terminal_zero_fill and (
+                pending.maker_leg_filled > 1e-9
+                or bool(getattr(pending, "maker_remainder_slices", []))
+            ):
+                previous_slice_quantity = sum(
+                    max(float(getattr(slice_, "quantity", 0.0) or 0.0), 0.0)
+                    for slice_ in pending.maker_remainder_slices
+                )
+                pending.maker_leg_filled = 0.0
+                pending.maker_fill_price = 0.0
+                pending.maker_fee_quote = None
+                pending.maker_remainder_slices = []
+                passive = getattr(pending, "passive_order", None)
+                if passive is not None:
+                    passive.last_progress_state = PassiveOrderState.CANCELED
+                maker_filled_updated = True
+                self.ctx.journal.append(
+                    "pending_entry.maker_terminal_zero_fill_corrected",
+                    {
+                        "entry_id": entry_id,
+                        "symbol": pending.symbol,
+                        "maker_leg": pending.maker_leg,
+                        "maker_venue": maker_position.venue.value,
+                        "previous_maker_leg_filled": prev_maker_filled,
+                        "cleared_maker_remainder_quantity": previous_slice_quantity,
+                        "reason": "exact_terminal_zero_fill_and_flat_maker_position",
+                    },
+                )
 
             if result.long_fill is not None and result.long_fill.quantity > 0:
                 if pending.maker_leg == "long":
@@ -356,6 +421,32 @@ class PendingEntryRuntime:
                         "hedge_fill_price": pending.hedge_fill_price,
                     },
                 )
+
+            # A precise terminal-zero maker result can invalidate a previously
+            # persisted false fill.  If exactly one physical leg remains after
+            # that correction, use the normal owned-conflict reduce-only path;
+            # never drive a fresh hedge from the stale maker high-water mark.
+            if verified_maker_terminal_zero_fill:
+                live_long_quantity = abs(float(
+                    getattr(result.long_position, "quantity", 0.0) or 0.0
+                ))
+                live_short_quantity = abs(float(
+                    getattr(result.short_position, "quantity", 0.0) or 0.0
+                ))
+                if (live_long_quantity > 1e-9) != (live_short_quantity > 1e-9):
+                    if await self._cleanup_owned_single_leg_live_truth_conflict(
+                        pending=pending,
+                        entry_id=entry_id,
+                        live_long_quantity=live_long_quantity,
+                        live_short_quantity=live_short_quantity,
+                        matched_quantity=0.0,
+                        reason="maker_exact_terminal_zero_fill_with_owned_single_leg",
+                        now_ms=now_ms,
+                    ):
+                        resolved_entry_ids.append(entry_id)
+                    else:
+                        self.ctx._apply_reconcile_backoff(pending, now_ms)
+                    continue
 
             # --- V1: check if both legs are now filled → finalize ---
             if pending.missing_hedge_quantity() <= 1e-9 and pending.maker_completed():

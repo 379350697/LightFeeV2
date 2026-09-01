@@ -11,6 +11,7 @@ from lightfee.config.schema import AppConfig, PersistenceConfig, RuntimeConfig, 
 from lightfee.core.domain import (
     OrderFill,
     OrderFillReconciliation,
+    PassiveOrderState,
     PositionSnapshot,
     Side,
     TimeInForce,
@@ -24,7 +25,13 @@ from lightfee.engine.recovery_ledger import RecoveryLedger
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.reconciliation import OrderReconciler, PositionReconciliationResult
 from lightfee.engine.runtime import LiveRuntime
-from lightfee.engine.state import EngineState, OpenPosition, PendingEntry
+from lightfee.engine.state import (
+    EngineState,
+    OpenPosition,
+    PendingEntry,
+    PendingEntryRemainderSlice,
+    PendingPassiveOrder,
+)
 from lightfee.marketdata.resilience import ConnectionHealth
 from lightfee.persistence.journal import Journal
 from lightfee.persistence.snapshot_store import SnapshotStore
@@ -124,6 +131,27 @@ class _LivePositionOpenOrdersAdapter(_LivePositionAdapter):
 class _OwnedConflictCleanupAdapter(FakeVenueAdapter):
     async def fetch_open_orders(self, symbol):
         return []
+
+
+class _TerminalZeroFillDiagnosticAdapter(_OwnedConflictCleanupAdapter):
+    def __init__(self, venue: Venue):
+        super().__init__(venue)
+        self._diagnostics = [{
+            "kind": "order.reconcile_query",
+            "payload": {
+                "response_classification": "terminal_zero_fill",
+                "uncertain_subtype": "execution_not_found",
+                "queried_endpoints": [
+                    "/api/v2/mix/order/detail",
+                    "/api/v2/mix/order/orders-history",
+                ],
+            },
+        }]
+
+    def drain_order_diagnostics(self):
+        events = self._diagnostics
+        self._diagnostics = []
+        return events
 
 
 class _ZeroFillOwnedConflictCleanupAdapter(_OwnedConflictCleanupAdapter):
@@ -525,8 +553,8 @@ async def test_flat_reconcile_with_not_found_maker_retains_pending_entry_like_v1
 
     await runtime._reconcile_pending_state(now_ms=2000)
 
-    assert pending.pending_id in runtime.state.pending_entries
     kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert pending.pending_id in runtime.state.pending_entries, kinds
     assert "reconciliation.entry_flat_unresolved_maker_retained" in kinds
     assert "reconciliation.entry_cleared_flat" not in kinds
 
@@ -3523,6 +3551,265 @@ async def test_zero_fill_owned_live_maker_position_waits_for_fill_reconciliation
     assert "pending_entry.missing_hedge_detected" in kinds
     assert "pending_entry.hedge_submit_result" in kinds
     assert "entry.opened" in kinds
+
+
+@pytest.mark.asyncio
+async def test_exact_terminal_zero_maker_fill_clears_false_high_water_then_flattens_owned_hedge(
+    config, tmp_journal,
+):
+    """The ZORA shape must reduce-only close the lone hedge, never hedge again."""
+    _mark_live(config)
+    flat_bitget = PositionSnapshot(
+        venue=Venue.BITGET,
+        symbol="ZORAUSDT",
+        side=Side.BUY,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=1781456021000,
+    )
+    live_bybit_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="ZORAUSDT",
+        side=Side.SELL,
+        quantity=2400.0,
+        entry_price=0.009611875,
+        observed_at_ms=1781456021000,
+    )
+    maker = _TerminalZeroFillDiagnosticAdapter(Venue.BITGET)
+    maker.position_snapshots = [flat_bitget]
+    hedge = _OwnedConflictCleanupAdapter(Venue.BYBIT)
+    hedge.position_snapshots = [live_bybit_short, live_bybit_short]
+    hedge.default_position_side = Side.SELL
+    hedge.default_position_qty = 0.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BITGET: maker, Venue.BYBIT: hedge},
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = OrderReconciler({Venue.BITGET: maker, Venue.BYBIT: hedge})
+    pending = _pending_entry(
+        pending_id="entry-1781455987631-ZORAUSDT",
+        symbol="ZORAUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        target_quantity=2496.621,
+        maker_leg="long",
+        maker_order_id="1478408313786478593",
+        maker_client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+        hedge_order_id="006a382e-013c-4647-94ff-2cd945304cfe",
+        hedge_client_order_id="6da09016fd87048401663293935cfd84710e",
+        maker_leg_filled=2496.0,
+        hedge_leg_filled=2400.0,
+        maker_fill_price=0.0096,
+        hedge_fill_price=0.009611875,
+        passive_order=PendingPassiveOrder(
+            order_id="1478408313786478593",
+            client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+            target_quantity=2496.621,
+        ),
+        maker_remainder_slices=[PendingEntryRemainderSlice(
+            quantity=96.0,
+            notional_quote=0.9216,
+        )],
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=1781456022000)
+
+    assert pending.maker_leg_filled == 0.0
+    assert pending.maker_remainder_slices == []
+    assert pending.passive_order is not None
+    assert pending.passive_order.last_progress_state == PassiveOrderState.CANCELED
+    assert hedge.place_order_call_count == 1
+    assert hedge.last_request is not None
+    assert hedge.last_request.side == Side.BUY
+    assert hedge.last_request.reduce_only is True
+    assert hedge.last_request.quantity == pytest.approx(2400.0)
+    assert pending.pending_id not in runtime.state.pending_entries
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "pending_entry.maker_terminal_zero_fill_corrected" in kinds
+    assert "pending_entry.owned_live_conflict_cleanup_succeeded" in kinds
+    assert "pending_entry.missing_hedge_detected" not in kinds
+    assert "entry.opened" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_raw_bitget_terminal_without_execution_quantity_retains_pending_state(
+    config, tmp_journal,
+):
+    """Raw Bitget uncertainty must not reach the terminal-zero cleanup path."""
+    from lightfee.venues.bitget import BitgetAdapter
+    from lightfee.venues.specs import BitgetContractFamily
+
+    _mark_live(config)
+    maker = BitgetAdapter(
+        mode="paper",
+        account_family=BitgetContractFamily.CLASSIC_MIX_V2,
+    )
+    maker._mode = "live"
+    maker._transport.mode = "live"
+    maker._contract_family_resolver.lock(BitgetContractFamily.CLASSIC_MIX_V2)
+
+    async def _raw_terminal_without_execution_quantity(method, path, **kwargs):
+        assert path == "/api/v2/mix/order/detail"
+        return {"code": "00000", "data": {
+            "orderId": "1478408313786478593",
+            "clientOid": "5fc9a39af59f0bf2e029436c5e512146fac0",
+            "baseVolume": "",
+            "filledQty": "not-a-number",
+            "state": "canceled",
+        }}
+
+    maker._transport._request = _raw_terminal_without_execution_quantity
+    maker.fetch_position = AsyncMock(return_value=PositionSnapshot(
+        venue=Venue.BITGET,
+        symbol="ZORAUSDT",
+        side=Side.BUY,
+        quantity=0.0,
+        entry_price=0.0,
+        observed_at_ms=1781456021000,
+    ))
+    live_bybit_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="ZORAUSDT",
+        side=Side.SELL,
+        quantity=2400.0,
+        entry_price=0.009611875,
+        observed_at_ms=1781456021000,
+    )
+    hedge = _OwnedConflictCleanupAdapter(Venue.BYBIT)
+    hedge.position_snapshots = [live_bybit_short, live_bybit_short]
+    hedge.default_position_side = Side.SELL
+    hedge.default_position_qty = 0.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BITGET: maker, Venue.BYBIT: hedge},
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = OrderReconciler({Venue.BITGET: maker, Venue.BYBIT: hedge})
+    pending = _pending_entry(
+        pending_id="entry-1781455987631-ZORAUSDT-missing-execution-fields",
+        symbol="ZORAUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        target_quantity=2496.621,
+        created_at_ms=1781456020000,
+        maker_leg="long",
+        maker_order_id="1478408313786478593",
+        maker_client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+        hedge_order_id="006a382e-013c-4647-94ff-2cd945304cfe",
+        hedge_client_order_id="6da09016fd87048401663293935cfd84710e",
+        maker_leg_filled=2496.0,
+        hedge_leg_filled=2400.0,
+        maker_fill_price=0.0096,
+        hedge_fill_price=0.009611875,
+        passive_order=PendingPassiveOrder(
+            order_id="1478408313786478593",
+            client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+            target_quantity=2496.621,
+        ),
+        maker_remainder_slices=[PendingEntryRemainderSlice(
+            quantity=96.0,
+            notional_quote=0.9216,
+        )],
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    try:
+        await runtime._reconcile_pending_state(now_ms=1781456022000)
+    finally:
+        await maker.shutdown()
+
+    assert pending.maker_leg_filled == pytest.approx(2496.0)
+    assert pending.passive_order is not None
+    assert pending.passive_order.last_progress_state == PassiveOrderState.UNKNOWN
+    assert hedge.place_order_call_count == 0
+    assert pending.uncertain_outcome is True
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert pending.pending_id in runtime.state.pending_entries, kinds
+    assert "pending_entry.maker_terminal_fill_quantity_unavailable" in kinds
+    assert "pending_entry.maker_terminal_zero_fill_corrected" not in kinds
+    assert "pending_entry.owned_live_conflict_cleanup_succeeded" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_terminal_zero_diagnostic_never_clears_a_nonflat_live_maker(
+    config, tmp_journal,
+):
+    """Terminal order evidence cannot override a non-flat maker position."""
+    _mark_live(config)
+    live_bitget_long = PositionSnapshot(
+        venue=Venue.BITGET,
+        symbol="ZORAUSDT",
+        side=Side.BUY,
+        quantity=2496.0,
+        entry_price=0.0096,
+        observed_at_ms=1781456021000,
+    )
+    live_bybit_short = PositionSnapshot(
+        venue=Venue.BYBIT,
+        symbol="ZORAUSDT",
+        side=Side.SELL,
+        quantity=2496.0,
+        entry_price=0.009611875,
+        observed_at_ms=1781456021000,
+    )
+    maker = _TerminalZeroFillDiagnosticAdapter(Venue.BITGET)
+    maker.position_snapshots = [live_bitget_long]
+    maker.default_position_side = Side.BUY
+    maker.default_position_qty = 2496.0
+    hedge = _OwnedConflictCleanupAdapter(Venue.BYBIT)
+    hedge.position_snapshots = [live_bybit_short]
+    hedge.default_position_side = Side.SELL
+    hedge.default_position_qty = 2496.0
+    runtime = LiveRuntime(
+        config,
+        venue_adapters={Venue.BITGET: maker, Venue.BYBIT: hedge},
+    )
+    runtime.journal = tmp_journal
+    runtime.reconciler = OrderReconciler({Venue.BITGET: maker, Venue.BYBIT: hedge})
+    pending = _pending_entry(
+        pending_id="entry-1781455987631-ZORAUSDT-live-maker",
+        symbol="ZORAUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        target_quantity=2496.0,
+        created_at_ms=1781456020000,
+        maker_leg="long",
+        maker_order_id="1478408313786478593",
+        maker_client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+        hedge_order_id="006a382e-013c-4647-94ff-2cd945304cfe",
+        hedge_client_order_id="6da09016fd87048401663293935cfd84710e",
+        maker_leg_filled=2496.0,
+        hedge_leg_filled=2496.0,
+        maker_fill_price=0.0096,
+        hedge_fill_price=0.009611875,
+        passive_order=PendingPassiveOrder(
+            order_id="1478408313786478593",
+            client_order_id="5fc9a39af59f0bf2e029436c5e512146fac0",
+            target_quantity=2496.0,
+        ),
+        maker_remainder_slices=[PendingEntryRemainderSlice(
+            quantity=1.0,
+            notional_quote=0.0096,
+        )],
+    )
+    runtime.state.pending_entries[pending.pending_id] = pending
+
+    await runtime._reconcile_pending_state(now_ms=1781456022000)
+
+    assert pending.maker_leg_filled == pytest.approx(2496.0)
+    assert pending.maker_remainder_slices == [PendingEntryRemainderSlice(
+        quantity=1.0,
+        notional_quote=0.0096,
+    )]
+    assert pending.passive_order is not None
+    assert pending.passive_order.last_progress_state == PassiveOrderState.UNKNOWN
+    assert maker.place_order_call_count == 0
+    assert hedge.place_order_call_count == 0
+    kinds = [event["kind"] for event in tmp_journal.read_all()]
+    assert "pending_entry.maker_terminal_zero_fill_corrected" not in kinds
+    assert "pending_entry.owned_live_conflict_cleanup_succeeded" not in kinds
 
 
 @pytest.mark.asyncio
