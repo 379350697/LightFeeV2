@@ -451,7 +451,20 @@ def test_ops_cli_requires_apply_and_persists_audited_import(tmp_path, monkeypatc
     evidence_path.write_text(json.dumps(_evidence(snapshot=_snapshot())), encoding="utf-8")
     monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
 
-    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "import-billing-evidence", "--file", str(evidence_path)])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "import-billing-evidence",
+            "--file",
+            str(evidence_path),
+            "--event-log-path",
+            str(event_log_path),
+            "--snapshot-path",
+            str(snapshot_path),
+        ],
+    )
     with pytest.raises(SystemExit) as rejected:
         ops.main()
     assert rejected.value.code == 2
@@ -490,8 +503,18 @@ def test_ops_snapshot_replays_journal_tail_after_operator_command(tmp_path, monk
     snapshot_path = tmp_path / "snapshot.json"
     store = SnapshotStore(snapshot_path)
     store.write(build_persistent_state_view(EngineState()))
-    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "pause-entry"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "pause-entry",
+            "--event-log-path",
+            str(event_log_path),
+            "--snapshot-path",
+            str(snapshot_path),
+        ],
+    )
 
     with pytest.raises(SystemExit) as applied:
         ops.main()
@@ -532,8 +555,9 @@ def test_ops_cli_resume_if_safe_recovers_clean_fail_closed_with_audited_event(
     from lightfee.apps import ops
     from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
-    event_log_path = tmp_path / "journal.jsonl"
-    snapshot_path = tmp_path / "snapshot.json"
+    runtime_dir = tmp_path / "runtime"
+    event_log_path = runtime_dir / "live-events.jsonl"
+    snapshot_path = runtime_dir / "live-state.json"
     state = EngineState(
         lifecycle=EngineLifecycle.RISK_ONLY,
         risk_mode=GlobalRiskMode.FAIL_CLOSED,
@@ -543,8 +567,18 @@ def test_ops_cli_resume_if_safe_recovers_clean_fail_closed_with_audited_event(
     state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
     SnapshotStore(snapshot_path).write(build_persistent_state_view(state))
 
-    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "resume-if-safe"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "resume-if-safe",
+            "--event-log-path",
+            str(event_log_path),
+            "--snapshot-path",
+            str(snapshot_path),
+        ],
+    )
 
     with pytest.raises(SystemExit) as applied:
         ops.main()
@@ -573,8 +607,9 @@ def test_ops_cli_resume_if_safe_retains_a_live_position(tmp_path, monkeypatch):
     from lightfee.engine.state import OpenPosition
     from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
-    event_log_path = tmp_path / "journal.jsonl"
-    snapshot_path = tmp_path / "snapshot.json"
+    runtime_dir = tmp_path / "runtime"
+    event_log_path = runtime_dir / "live-events.jsonl"
+    snapshot_path = runtime_dir / "live-state.json"
     state = EngineState(
         lifecycle=EngineLifecycle.RISK_ONLY,
         risk_mode=GlobalRiskMode.FAIL_CLOSED,
@@ -593,8 +628,18 @@ def test_ops_cli_resume_if_safe_retains_a_live_position(tmp_path, monkeypatch):
     )
     SnapshotStore(snapshot_path).write(build_persistent_state_view(state))
 
-    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "resume-if-safe"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lightfee-ops",
+            "resume-if-safe",
+            "--event-log-path",
+            str(event_log_path),
+            "--snapshot-path",
+            str(snapshot_path),
+        ],
+    )
 
     with pytest.raises(SystemExit) as completed:
         ops.main()
@@ -614,6 +659,46 @@ def test_ops_paths_require_one_explicit_persistence_pair(tmp_path):
 
     with pytest.raises(ValueError, match="must be supplied together"):
         _resolve_paths(event_log_path=tmp_path / "events.jsonl")
+
+    with pytest.raises(ValueError, match="require --event-log-path and --snapshot-path"):
+        _resolve_paths()
+
+
+@pytest.mark.parametrize(
+    "argv_tail",
+    (
+        ("pause-entry",),
+        ("reduce-only",),
+        ("fail-closed",),
+        ("reconcile-now",),
+        ("resume-if-safe",),
+        ("import-billing-evidence", "--file", "evidence.json", "--apply"),
+    ),
+)
+def test_ops_cli_rejects_control_mutation_without_explicit_live_persistence_pair(
+    tmp_path,
+    monkeypatch,
+    argv_tail,
+):
+    """A control command must not create generic side-state beside live files."""
+    from lightfee.apps import ops
+
+    runtime_dir = tmp_path / "runtime"
+    event_log_path = runtime_dir / "live-events.jsonl"
+    snapshot_path = runtime_dir / "live-state.json"
+    SnapshotStore(snapshot_path).write(build_persistent_state_view(EngineState()))
+    snapshot_before = snapshot_path.read_bytes()
+    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(runtime_dir))
+    monkeypatch.setattr(sys, "argv", ["lightfee-ops", *argv_tail])
+
+    with pytest.raises(SystemExit) as rejected:
+        ops.main()
+
+    assert rejected.value.code == 2
+    assert snapshot_path.read_bytes() == snapshot_before
+    assert not (runtime_dir / "journal.jsonl").exists()
+    assert not (runtime_dir / "snapshot.json").exists()
+    assert not (runtime_dir / "journal.jsonl.writer.lock").exists()
 
 
 def test_ops_cli_discovers_binance_candidate_without_writer_or_persistence_mutation(
@@ -752,12 +837,21 @@ def test_ops_cli_refuses_every_control_mutation_while_live_writer_lease_is_held(
     snapshot_path = tmp_path / "snapshot.json"
     persisted_view = build_persistent_state_view(EngineState())
     SnapshotStore(snapshot_path).write(persisted_view)
-    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
-
     live_writer = PersistenceWriterLease(event_log_path)
     live_writer.acquire()
     try:
-        monkeypatch.setattr(sys, "argv", ["lightfee-ops", command])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "lightfee-ops",
+                command,
+                "--event-log-path",
+                str(event_log_path),
+                "--snapshot-path",
+                str(snapshot_path),
+            ],
+        )
         with pytest.raises(SystemExit) as rejected:
             ops.main()
     finally:

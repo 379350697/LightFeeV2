@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -23,27 +22,45 @@ def _resolve_paths(
     event_log_path: Path | None = None,
     snapshot_path: Path | None = None,
 ) -> tuple[Path, Path]:
-    """Resolve a matching event-log/snapshot pair from flags or defaults."""
+    """Require the exact event-log/snapshot pair for a durable mutation."""
     if (event_log_path is None) != (snapshot_path is None):
         raise ValueError("--event-log-path and --snapshot-path must be supplied together")
     if event_log_path is not None and snapshot_path is not None:
         return event_log_path, snapshot_path
-    data_dir = os.environ.get("LIGHTFEE_DATA_DIR", "data")
-    base = Path(data_dir)
-    journal_path = base / "journal.jsonl"
-    snapshot_path = base / "snapshot.json"
-    return journal_path, snapshot_path
+    raise ValueError(
+        "state-mutating commands require --event-log-path and --snapshot-path"
+    )
+
+
+def _add_persistence_path_args(parser: argparse.ArgumentParser) -> None:
+    """Require the deployed persistence pair instead of deriving unsafe defaults."""
+    parser.add_argument(
+        "--event-log-path",
+        required=True,
+        type=Path,
+        help="Configured live persistence event_log_path",
+    )
+    parser.add_argument(
+        "--snapshot-path",
+        required=True,
+        type=Path,
+        help="Configured live persistence snapshot_path",
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="lightfee-ops: Operator controls")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("pause-entry", help="Pause new entries")
-    sub.add_parser("reduce-only", help="Enter reduce-only mode")
-    sub.add_parser("fail-closed", help="Enter fail-closed mode")
-    sub.add_parser("reconcile-now", help="Trigger immediate reconciliation")
-    sub.add_parser("resume-if-safe", help="Resume if no blocking recovery work")
+    for command, help_text in (
+        ("pause-entry", "Pause new entries"),
+        ("reduce-only", "Enter reduce-only mode"),
+        ("fail-closed", "Enter fail-closed mode"),
+        ("reconcile-now", "Trigger immediate reconciliation"),
+        ("resume-if-safe", "Resume if no blocking recovery work"),
+    ):
+        command_parser = sub.add_parser(command, help=help_text)
+        _add_persistence_path_args(command_parser)
     billing_import = sub.add_parser(
         "import-billing-evidence",
         help="Import one typed close-accounting evidence pack for exchange reconciliation",
@@ -54,16 +71,7 @@ def main() -> None:
         action="store_true",
         help="Acknowledge the durable journal and snapshot mutation",
     )
-    billing_import.add_argument(
-        "--event-log-path",
-        type=Path,
-        help="Configured live persistence event_log_path (requires --snapshot-path)",
-    )
-    billing_import.add_argument(
-        "--snapshot-path",
-        type=Path,
-        help="Configured live persistence snapshot_path (requires --event-log-path)",
-    )
+    _add_persistence_path_args(billing_import)
     candidate_discovery = sub.add_parser(
         "discover-binance-close-evidence",
         help="Read-only candidate discovery for a Binance close-identity evidence debt",
@@ -148,14 +156,9 @@ def main() -> None:
     }
     if args.command == "import-billing-evidence" and not args.apply:
         parser.error("import-billing-evidence requires --apply")
-    if args.command == "import-billing-evidence" and (
-        getattr(args, "event_log_path", None) is None
-    ) != (getattr(args, "snapshot_path", None) is None):
-        parser.error("--event-log-path and --snapshot-path must be supplied together")
-
     journal_path, snapshot_path = _resolve_paths(
-        event_log_path=getattr(args, "event_log_path", None),
-        snapshot_path=getattr(args, "snapshot_path", None),
+        event_log_path=args.event_log_path,
+        snapshot_path=args.snapshot_path,
     )
     from lightfee.persistence.writer_lease import (
         PersistenceWriterLease,
