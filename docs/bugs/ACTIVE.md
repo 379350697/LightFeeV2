@@ -34,16 +34,18 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `12d8e038ded93c46ded7771ef7b03d0266f3d0a6`
-- Checked on: `2026-09-01`. `d18d016` and its bug-ledger commit `12d8e038`
-  were fast-forwarded to production. All 16 critical manifest hashes matched;
-  both services restarted active with zero restarts. Deployment acceptance was
-  green: seven-venue source evidence was fresh, exchange truth was
-  high-confidence flat/no-order, lifecycle/risk mode were `running`, and both
-  processes had zero `CLOSE_WAIT`. The live sidecar had 93/93 usable Bitget and
-  90/90 usable Gate rows with nonzero quotes and exchange-future funding times.
-  This proves CL-138's data repair, but not a future natural entry: the normal
-  spread/liquidity/risk gates remain unchanged.
+- Last production SHA checked: `49de86a800532ceda4433cbccb1816b7ef801a11`
+- Checked on: `2026-09-02`. `49de86a` was fast-forwarded to production; all 16
+  critical manifest hashes matched and both services restarted active. The
+  Bitget `40109` production path then made one exact Classic-history lookup,
+  proved zero maker fill, and the existing owned-single-leg reduce-only path
+  verified the Bybit 2,400 short flat. Exchange truth is now high-confidence
+  flat with no open order or pending owner, and both processes have zero
+  `CLOSE_WAIT`. This closes CL-139; it does not prove a future natural entry.
+  Overall deployment acceptance remains red for two separately tracked
+  operational signals: lifecycle still reports `risk_only` despite a
+  `RUNNING_CLEAN`/entry-allowed decision, and the one-hour private-WS counter
+  includes the deliberate deployment restart.
 - Check command: `python scripts/check_bug_ledger.py --deployed-sha <value-from-production-.deploy_version>`
 
 The command fails when the recorded SHA differs from the supplied production
@@ -74,14 +76,6 @@ they have a fixing commit. They are **local-green only**, not production facts:
   its exchange-specific leverage postcondition before a new order. They do not
   change the existing terminalization-budget cleanup or submit an order during
   verification.
-
-- Bitget missing-order reconciliation at the real HTTP 400 boundary. The
-  previously deployed `66b4b76` checked `40109`/`43001` only after the shared
-  request layer had already raised `REQUEST_REJECTED`, so its exact bounded
-  history lookup was unreachable in production. The local correction routes
-  only those documented Bitget codes into the existing family-correct one-page
-  history lookup; unrelated 400 responses remain fail-closed. Its production
-  RED/GREEN evidence and non-goals are in [2026-09-01](daily/2026-09-01.md#cl-139--bitget-canceled-maker-misread-as-fill-cancel-and-reconciliation-contract-gaps).
 
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
@@ -134,6 +128,7 @@ until this table receives real fixing commits and a production observation.
 | CL-136 | deployed-awaiting-verification | `079601f` | Aster one-way V3 `userTrades` missing-`reduceOnly` production-shape RED/GREEN; exact order `reduceOnly=false` rejects; legacy generic miss retries once then corrected miss remains terminal; close profile `481 passed`, Aster profile `19 passed` | `f443c10` is live and exchange truth is flat/no-order. Confirm the named ONG debt resolves only when its exact Aster order still proves `FILLED`, `reduceOnly=true`, identity/quantity/price, and quote fee; otherwise it must remain terminal debt. | [2026-08-31](daily/2026-08-31.md#cl-136--aster-v3-one-way-history-row-was-misclassified-as-no-candidate) |
 | CL-137 | deployed-awaiting-verification | `0e0cc7a` | snapshot/tail/rotation/no-snapshot/terminal-owner matrix, operator CLI crash-window path, and terminalizer guard (`778 passed`) | `0e0cc7a` is live: manifest, singleton, deployment acceptance, and post-restart checkpoint passed; exchange truth is high-confidence flat/no-order. Await one ordinary later restart or rotated-tail observation; do not force orders or mutate history. | [2026-08-31](daily/2026-08-31.md#cl-137--snapshot-recovery-replayed-retained-audit-history-as-live-work) |
 | CL-138 | deployed-awaiting-verification | `d18d016` | Gate/Bitget documented-payload parser, metadata-error fail-closed, source→pairing→V1 discovery, cache, and rate-limit matrix; adjacent `638 passed` | `12d8e038` is live: manifest/singleton/acceptance green; Bitget 93/93 and Gate 90/90 usable rows have nonzero quotes and exchange-future funding, with zero `CLOSE_WAIT`. Await only a natural eligible candidate; do not force an order. A separate post-restart Local-L2 diagnostic signal is tracked independently and is not evidence against this parser repair. | [2026-09-01](daily/2026-09-01.md#cl-138--gatebitget-sidecar-market-data-contract-drift) |
+| CL-139 | closed | `49de86a` | real HTTP-400 detail → bounded exact-history → zero-fill → lone-hedge cleanup matrix (`56` focused; `1,601` full) | Production observed exact Bitget `40109` → one Classic history row with zero fill → stale 2,496 maker high-water cleared → existing Bybit reduce-only cleanup verified 2,400 short flat; high-confidence exchange truth has no order/pending owner. | [2026-09-01](daily/2026-09-01.md#cl-139--bitget-canceled-maker-misread-as-fill-cancel-and-reconciliation-contract-gaps) |
 
 ## Pre-CL-093 Historical Boundary
 
