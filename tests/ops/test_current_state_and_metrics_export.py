@@ -734,9 +734,9 @@ class TestOperatorCommandsV1Semantics:
     def test_resume_if_safe_clears_operator_latch(self):
         """C-R3: Successful RESUME_IF_SAFE clears operator.requested_mode latch.
 
-        V1 RESUME_IF_SAFE only transitions to RUNNING when lifecycle is
-        already RUNNING (clears ENTRY_PAUSED/REDUCE_ONLY risk). When it
-        succeeds, the operator latch must also be cleared."""
+        V1 RESUME_IF_SAFE transitions to RUNNING whenever recovery work is
+        non-blocking. When it succeeds, the operator latch must also be
+        cleared."""
         from lightfee.engine.state import EngineState
         from lightfee.ops.commands import execute_operator_command
         from lightfee.persistence.journal import Journal
@@ -748,12 +748,11 @@ class TestOperatorCommandsV1Semantics:
         journal = Journal(journal_path)
         journal.open()
 
-        # Scenario: operator previously fail-closed, then manually returned
-        # lifecycle to RUNNING (e.g. via recovery). RESUME_IF_SAFE should
-        # clear the stale requested_mode latch.
+        # Scenario: an explicit operator resume releases a clean fail-closed
+        # latch; it must not require a prior unaudited lifecycle mutation.
         state = EngineState()
-        state.lifecycle = EngineLifecycle.RUNNING
-        state.risk_mode = GlobalRiskMode.ENTRY_PAUSED
+        state.lifecycle = EngineLifecycle.RISK_ONLY
+        state.risk_mode = GlobalRiskMode.FAIL_CLOSED
         state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
 
         new_risk, new_lifecycle, msg = execute_operator_command(

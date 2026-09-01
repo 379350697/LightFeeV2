@@ -525,6 +525,90 @@ def test_ops_snapshot_replays_journal_tail_after_operator_command(tmp_path, monk
     assert "entry-after-ops-snapshot" in recovered.pending_entries
 
 
+def test_ops_cli_resume_if_safe_recovers_clean_fail_closed_with_audited_event(
+    tmp_path, monkeypatch,
+):
+    """The real maintenance CLI releases only a clean, explicitly resumed latch."""
+    from lightfee.apps import ops
+    from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+    event_log_path = tmp_path / "journal.jsonl"
+    snapshot_path = tmp_path / "snapshot.json"
+    state = EngineState(
+        lifecycle=EngineLifecycle.RISK_ONLY,
+        risk_mode=GlobalRiskMode.FAIL_CLOSED,
+    )
+    state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+    # This is a retained diagnostic from a completed recovery, not live work.
+    state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
+    SnapshotStore(snapshot_path).write(build_persistent_state_view(state))
+
+    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "resume-if-safe"])
+
+    with pytest.raises(SystemExit) as applied:
+        ops.main()
+    assert applied.value.code == 0
+
+    restored = _restore_state_from_snapshot_dict(
+        SnapshotStore(snapshot_path).read() or {}
+    )
+    assert restored.lifecycle == EngineLifecycle.RUNNING
+    assert restored.risk_mode == GlobalRiskMode.RUNNING
+    assert restored.operator.requested_mode is None
+    applied_event = Journal(event_log_path).read_all()[-1]
+    assert applied_event["kind"] == "ops.command_applied"
+    assert applied_event["payload"] == {
+        "command": "resume_if_safe",
+        "previous_risk": "fail_closed",
+        "new_risk": "running",
+        "previous_lifecycle": "risk_only",
+        "new_lifecycle": "running",
+    }
+
+
+def test_ops_cli_resume_if_safe_retains_a_live_position(tmp_path, monkeypatch):
+    """A resume command cannot bypass real persisted recovery work."""
+    from lightfee.apps import ops
+    from lightfee.engine.state import OpenPosition
+    from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+    event_log_path = tmp_path / "journal.jsonl"
+    snapshot_path = tmp_path / "snapshot.json"
+    state = EngineState(
+        lifecycle=EngineLifecycle.RISK_ONLY,
+        risk_mode=GlobalRiskMode.FAIL_CLOSED,
+    )
+    state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+    state.open_positions["live-position"] = OpenPosition(
+        position_id="live-position",
+        symbol="COTIUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=1.0,
+        short_quantity=1.0,
+        long_entry_price=1.0,
+        short_entry_price=1.0,
+        opened_at_ms=1,
+    )
+    SnapshotStore(snapshot_path).write(build_persistent_state_view(state))
+
+    monkeypatch.setenv("LIGHTFEE_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["lightfee-ops", "resume-if-safe"])
+
+    with pytest.raises(SystemExit) as completed:
+        ops.main()
+    assert completed.value.code == 0
+
+    restored = _restore_state_from_snapshot_dict(
+        SnapshotStore(snapshot_path).read() or {}
+    )
+    assert restored.lifecycle == EngineLifecycle.RISK_ONLY
+    assert restored.risk_mode == GlobalRiskMode.FAIL_CLOSED
+    assert restored.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
+    assert set(restored.open_positions) == {"live-position"}
+
+
 def test_ops_paths_require_one_explicit_persistence_pair(tmp_path):
     from lightfee.apps.ops import _resolve_paths
 

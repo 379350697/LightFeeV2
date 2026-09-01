@@ -39,7 +39,5 @@ def apply_operator_command(
     elif command == OperatorCommand.RESUME_IF_SAFE:
         if has_blocking_recovery:
             return (current_risk, current_lifecycle)
-        if current_lifecycle == EngineLifecycle.RUNNING:
-            return (GlobalRiskMode.RUNNING, current_lifecycle)
-        return (current_risk, current_lifecycle)
+        return (GlobalRiskMode.RUNNING, EngineLifecycle.RUNNING)
     return (current_risk, current_lifecycle)

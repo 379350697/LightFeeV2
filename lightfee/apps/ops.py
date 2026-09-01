@@ -175,7 +175,10 @@ def main() -> None:
     journal = None
     try:
         # 1. Load persisted state from snapshot (lifecycle + risk_mode)
-        from lightfee.engine.recovery import _restore_state_from_snapshot_dict
+        from lightfee.engine.recovery import (
+            _restore_state_from_snapshot_dict,
+            has_lifecycle_blocking_work,
+        )
         from lightfee.persistence.snapshot_store import SnapshotStore
 
         store = SnapshotStore(snapshot_path)
@@ -210,7 +213,7 @@ def main() -> None:
         else:
             from lightfee.ops.commands import execute_operator_command
 
-            has_blocking = bool(state.recovery_blocked_reason)
+            has_blocking = has_lifecycle_blocking_work(state)
             _new_risk, _new_lifecycle, msg = execute_operator_command(
                 command=commands[args.command],
                 current_risk=state.risk_mode,
