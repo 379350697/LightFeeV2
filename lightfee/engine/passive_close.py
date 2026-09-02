@@ -72,6 +72,7 @@ from lightfee.engine.state import (
     is_unattributed_recovered_live_flat_reconciliation,
     pending_close_reconciliation_identity_evidence,
     pending_close_reconciliation_missing_legs,
+    pending_close_reconciliation_owned_quantities,
 )
 from lightfee.persistence.journal import Journal
 from lightfee.venues.common import (
@@ -5086,6 +5087,10 @@ class PassiveCloseExecutor:
             "created_cycle": int(getattr(state, "tick_count", 0) or 0),
             "position_snapshot": position_snapshot,
             "original_payload": dict(payload),
+            "owned_close_quantities": {
+                "long": max(float(position_snapshot.get("long_quantity") or 0.0), 0.0),
+                "short": max(float(position_snapshot.get("short_quantity") or 0.0), 0.0),
+            },
             "long_legs": long_legs,
             "short_legs": short_legs,
             "attempt_count": 0,
@@ -5183,6 +5188,18 @@ class PassiveCloseExecutor:
                 if existing_closed_at_ms > closed_at_ms:
                     continue
 
+                current_owned_quantities = pending_close_reconciliation_owned_quantities(
+                    reconciliation
+                )
+                prior_owned_quantities = pending_close_reconciliation_owned_quantities(
+                    existing
+                )
+                if (
+                    current_owned_quantities is None
+                    or prior_owned_quantities is None
+                ):
+                    continue
+
                 prior_records = {
                     "long": durable_records(
                         existing.get("long_legs"), venue=position.long_venue
@@ -5207,6 +5224,10 @@ class PassiveCloseExecutor:
                 reconciliation["short_legs"] = merge_records(
                     reconciliation["short_legs"], prior_records["short"]
                 )
+                reconciliation["owned_close_quantities"] = {
+                    "long": current_owned_quantities[0] + prior_owned_quantities[0],
+                    "short": current_owned_quantities[1] + prior_owned_quantities[1],
+                }
                 absorbed_partial_tasks.append(existing)
                 absorbed_partial_reconciliations.append(
                     {

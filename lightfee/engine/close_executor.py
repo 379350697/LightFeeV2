@@ -821,18 +821,19 @@ def register_close_accounting_reconciliation(
         submission_identities=short_unresolved_submission_identities,
     ):
         unresolved_submission_legs.append("short")
-    remaining_long = max(
-        position.long_quantity - sum(float(leg.fill.quantity) for leg in long_legs),
-        0.0,
-    )
-    remaining_short = max(
-        position.short_quantity - sum(float(leg.fill.quantity) for leg in short_legs),
-        0.0,
-    )
+    long_closed_qty = sum(float(leg.fill.quantity) for leg in long_legs)
+    short_closed_qty = sum(float(leg.fill.quantity) for leg in short_legs)
+    remaining_long = max(position.long_quantity - long_closed_qty, 0.0)
+    remaining_short = max(position.short_quantity - short_closed_qty, 0.0)
+    kind = "final" if remaining_long <= 1e-12 and remaining_short <= 1e-12 else "partial"
+    owned_close_quantities = {
+        "long": max(float(position.long_quantity), 0.0) if kind == "final" else long_closed_qty,
+        "short": max(float(position.short_quantity), 0.0) if kind == "final" else short_closed_qty,
+    }
     reconciliation = {
         "position_id": position.position_id,
         "symbol": position.symbol,
-        "kind": "final" if remaining_long <= 1e-12 and remaining_short <= 1e-12 else "partial",
+        "kind": kind,
         "reason": reason,
         "source": source,
         "closed_at_ms": now_ms,
@@ -840,9 +841,10 @@ def register_close_accounting_reconciliation(
         "position_snapshot": _close_reconciliation_position_snapshot(position),
         "original_payload": {
             "accounting_evidence_gaps": list(evidence_gaps),
-            "long_closed_qty": sum(float(leg.fill.quantity) for leg in long_legs),
-            "short_closed_qty": sum(float(leg.fill.quantity) for leg in short_legs),
+            "long_closed_qty": long_closed_qty,
+            "short_closed_qty": short_closed_qty,
         },
+        "owned_close_quantities": owned_close_quantities,
         "long_legs": long_records,
         "short_legs": short_records,
         "attempt_count": 0,

@@ -1077,16 +1077,13 @@ def pending_close_reconciliation_missing_legs(
     ``accepted_order_truth_gap`` callers intentionally do not use this helper
     because that task kind is allowed to contain one leg only.
     """
-    snapshot = reconciliation.get("position_snapshot") or {}
-    if not isinstance(snapshot, dict):
-        snapshot = {}
-    kind = str(reconciliation.get("kind") or "final")
-    original_payload = reconciliation.get("original_payload") or {}
-    if not isinstance(original_payload, dict):
-        original_payload = {}
+    owned_quantities = pending_close_reconciliation_owned_quantities(reconciliation)
+    if owned_quantities is None:
+        # A malformed immutable owner is not a safe reason to settle billing.
+        return ("long", "short")
 
     missing: list[str] = []
-    for leg_label in ("long", "short"):
+    for leg_label, expected in zip(("long", "short"), owned_quantities):
         legs = reconciliation.get(f"{leg_label}_legs")
         complete = isinstance(legs, list)
         if complete:
@@ -1097,8 +1094,49 @@ def pending_close_reconciliation_missing_legs(
             )
         if complete and legs:
             continue
+        if complete and not legs and expected <= 1e-12:
+            continue
+        missing.append(leg_label)
+    return tuple(missing)
 
-        expected: float | None = None
+
+def pending_close_reconciliation_owned_quantities(
+    reconciliation: dict[str, Any],
+) -> tuple[float, float] | None:
+    """Return this reconciliation's immutable close segment.
+
+    New records persist ``owned_close_quantities`` before their live position
+    can mutate.  Older journal records retain their V1-compatible derivation
+    from the original partial payload or the final position snapshot.
+    """
+    explicit = reconciliation.get("owned_close_quantities")
+    if explicit is not None:
+        if not isinstance(explicit, dict):
+            return None
+        values: list[float] = []
+        for label in ("long", "short"):
+            if label not in explicit:
+                return None
+            try:
+                value = float(explicit[label])
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value) or value < 0.0:
+                return None
+            values.append(value)
+        return values[0], values[1]
+
+    snapshot = reconciliation.get("position_snapshot") or {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    kind = str(reconciliation.get("kind") or "final")
+    original_payload = reconciliation.get("original_payload") or {}
+    if not isinstance(original_payload, dict):
+        original_payload = {}
+
+    expected: list[float] = []
+    for leg_label in ("long", "short"):
+        value: float | None = None
         expected_keys = (
             (f"{leg_label}_closed_qty",)
             if kind == "partial"
@@ -1109,19 +1147,17 @@ def pending_close_reconciliation_missing_legs(
             if key not in expected_source:
                 continue
             try:
-                value = float(expected_source.get(key))
+                candidate = float(expected_source.get(key))
             except (TypeError, ValueError):
-                expected = None
+                return None
+            if math.isfinite(candidate) and candidate >= 0.0:
+                value = candidate
                 break
-            if math.isfinite(value) and value >= 0.0:
-                expected = value
-                break
-            expected = None
-            break
-        if complete and not legs and expected is not None and expected <= 1e-12:
-            continue
-        missing.append(leg_label)
-    return tuple(missing)
+            return None
+        if value is None:
+            return None
+        expected.append(value)
+    return expected[0], expected[1]
 
 
 def pending_close_reconciliation_identity_evidence(

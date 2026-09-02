@@ -266,7 +266,7 @@ class LocalL2WsClient(ABC):
         """
         ...
 
-    def build_application_heartbeat(self) -> Optional[dict]:
+    def build_application_heartbeat(self) -> Optional[dict | str]:
         """Return an exchange-native heartbeat frame, if RFC control pings are insufficient."""
         return None
 
@@ -484,11 +484,11 @@ class LocalL2WsClient(ABC):
             return True
         return False
 
-    async def _send_application_heartbeats(self, ws: Any, message: dict) -> None:
+    async def _send_application_heartbeats(self, ws: Any, message: dict | str) -> None:
         try:
             while True:
                 await asyncio.sleep(self.ping_interval_s)
-                await ws.send(json.dumps(message))
+                await ws.send(message if isinstance(message, str) else json.dumps(message))
                 self._record_transport_event(
                     "application_ping_sent",
                     int(time.time() * 1000),
@@ -731,6 +731,11 @@ class BitgetL2WsClient(LocalL2WsClient):
                 "instId": self.symbol,
             }],
         }
+
+    def build_application_heartbeat(self) -> str:
+        # Bitget V2 requires the literal text frame "ping", not an RFC ping
+        # and not a JSON payload, or it closes an idle connection after 2 min.
+        return "ping"
 
     def parse_depth_message(self, raw: dict) -> Optional[LocalL2Update]:
         action = raw.get("action", "")

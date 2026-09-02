@@ -22,6 +22,7 @@ from lightfee.engine.state import (
     pending_close_reconciliation_evidence_debt_reason,
     pending_close_reconciliation_identity_evidence,
     pending_close_reconciliation_missing_legs,
+    pending_close_reconciliation_owned_quantities,
 )
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
@@ -1278,44 +1279,9 @@ class CloseRuntime:
         reconciliation: dict[str, Any],
         snapshot: dict[str, Any],
     ) -> tuple[float, float] | None:
-        """Return the exact close segment owned by this reconciliation.
-
-        V1 ``Partial`` reconciliation owns the quantities actually closed in
-        that stage, not the still-open opposite side.  ``Final`` owns the
-        quantities present in its own terminal snapshot.
-        """
-        kind = str(reconciliation.get("kind") or "final")
-        source = (
-            reconciliation.get("original_payload")
-            if kind == "partial"
-            else snapshot
-        )
-        if not isinstance(source, dict):
-            return None
-
-        expected: list[float] = []
-        for leg_label in ("long", "short"):
-            keys = (
-                (f"{leg_label}_closed_qty",)
-                if kind == "partial"
-                else (f"{leg_label}_quantity", "matched_quantity")
-            )
-            value: float | None = None
-            for key in keys:
-                if key not in source:
-                    continue
-                try:
-                    candidate = float(source.get(key))
-                except (TypeError, ValueError):
-                    return None
-                if not math.isfinite(candidate) or candidate < 0.0:
-                    return None
-                value = candidate
-                break
-            if value is None:
-                return None
-            expected.append(value)
-        return (expected[0], expected[1])
+        """Return the immutable close segment, with legacy replay fallback."""
+        del snapshot  # Compatibility signature for existing recovery callers.
+        return pending_close_reconciliation_owned_quantities(reconciliation)
 
     @staticmethod
     def _close_reconciliation_leg_quantity_complete(
@@ -1376,6 +1342,14 @@ class CloseRuntime:
 
         promoted = dict(reconciliation)
         promoted["kind"] = "final"
+        # This is a new final accounting owner, not a mutation of the durable
+        # partial segment.  The exact dual-leg proof above shows that the
+        # original partial classification only reflected a lost submit result;
+        # the final bill owns the complete snapshot quantities.
+        promoted["owned_close_quantities"] = {
+            "long": expected_long,
+            "short": expected_short,
+        }
         promoted["source"] = (
             f"{str(reconciliation.get('source') or 'pending_close_reconciliation')}"
             ":uncertain_submit_exact_fill"

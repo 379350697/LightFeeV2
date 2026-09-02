@@ -1031,6 +1031,32 @@ class TestBybitL2WsClientParsing:
 
 
 class TestBitgetL2WsClientParsing:
+    @pytest.mark.asyncio
+    async def test_uses_bitget_text_ping_not_json_or_rfc_ping(self):
+        """Bitget public WS requires the literal application frame ``ping``."""
+        data_plane, _, journal = _make_data_plane()
+        client = BitgetL2WsClient(
+            venue="bitget", symbol="BTCUSDT", data_plane=data_plane,
+        )
+
+        class OneSendThenStop:
+            def __init__(self):
+                self.sent: list[str] = []
+
+            async def send(self, payload):
+                self.sent.append(payload)
+                raise RuntimeError("stop after first heartbeat")
+
+        ws = OneSendThenStop()
+        client.ping_interval_s = 0.0
+        heartbeat = client.build_application_heartbeat()
+
+        try:
+            assert heartbeat == "ping"
+            await client._send_application_heartbeats(ws, heartbeat)
+            assert ws.sent == ["ping"]
+        finally:
+            journal.close()
     def test_parses_snapshot(self):
         dp, rt, _ = _make_data_plane()
         client = BitgetL2WsClient(

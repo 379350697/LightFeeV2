@@ -1424,6 +1424,35 @@ class TestCloseChunkExecutor:
 
         assert promoted is None
 
+    def test_full_uncertain_submission_promotes_a_new_final_owner(self):
+        """Exact dual-leg proof upgrades the owner without mutating the partial."""
+        reconciliation = {
+            "kind": "partial",
+            "owned_close_quantities": {"long": 0.0, "short": 0.01},
+            "unresolved_submission_legs": ["long"],
+            "position_snapshot": {
+                "long_quantity": 0.01,
+                "short_quantity": 0.01,
+            },
+        }
+
+        promoted = CloseRuntime(None)._reclassify_full_uncertain_submission(
+            reconciliation,
+            [SimpleNamespace(quantity=0.01)],
+            [SimpleNamespace(quantity=0.01)],
+        )
+
+        assert promoted is not None
+        assert promoted["kind"] == "final"
+        assert promoted["owned_close_quantities"] == {
+            "long": 0.01,
+            "short": 0.01,
+        }
+        assert reconciliation["owned_close_quantities"] == {
+            "long": 0.0,
+            "short": 0.01,
+        }
+
     @pytest.mark.asyncio
     async def test_uncertain_close_with_unavailable_compensation_truth_keeps_cid(self):
         """Fail-closed compensation still persists the original uncertain CID."""

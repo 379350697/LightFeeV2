@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from lightfee.core.domain import Venue
+from lightfee.core.domain import OrderFill, Side, Venue
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
@@ -124,6 +124,95 @@ def _no_billing(calls: list) -> None:
     for c in calls:
         k = str(c[0][0]) if c[0] else str(c[0][1]) if len(c[0]) > 1 else ""
         assert "billing" not in k and "exit.reconciled" not in k
+
+
+@pytest.mark.parametrize(
+    ("long_closed", "short_closed", "expected_kind", "expected_owner"),
+    (
+        (1.0, 0.0, "partial", {"long": 1.0, "short": 0.0}),
+        (1.0, 1.0, "final", {"long": 1.0, "short": 1.0}),
+    ),
+)
+def test_close_registration_persists_immutable_segment_owner(
+    tmp_path,
+    long_closed,
+    short_closed,
+    expected_kind,
+    expected_owner,
+):
+    """All active/risk close callers share this durable accounting boundary."""
+    from lightfee.engine.close_executor import (
+        CloseExecutionLeg,
+        register_close_accounting_reconciliation,
+    )
+    from lightfee.engine.close_runtime import CloseRuntime
+    from lightfee.engine.state import EngineState, OpenPosition
+    from lightfee.persistence.journal import Journal
+
+    state = EngineState()
+    position = OpenPosition(
+        position_id="entry-owner",
+        symbol="BTCUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=1.0,
+        short_quantity=1.0,
+        long_entry_price=100.0,
+        short_entry_price=100.0,
+        opened_at_ms=1_000,
+    )
+    journal = Journal(tmp_path / "owner.jsonl")
+    journal.open()
+    try:
+        register_close_accounting_reconciliation(
+            state,
+            journal,
+            position,
+            long_legs=[
+                CloseExecutionLeg(
+                    OrderFill(Venue.BINANCE, "BTCUSDT", Side.SELL, long_closed, 101.0, "long-1")
+                )
+            ] if long_closed else [],
+            short_legs=[
+                CloseExecutionLeg(
+                    OrderFill(Venue.BYBIT, "BTCUSDT", Side.BUY, short_closed, 99.0, "short-1")
+                )
+            ] if short_closed else [],
+            now_ms=2_000,
+            reason="funding_capture",
+            source="active_close",
+            evidence_gaps=(),
+        )
+    finally:
+        journal.close()
+
+    reconciliation = state.pending_close_reconciliations[0]
+    assert reconciliation["kind"] == expected_kind
+    assert reconciliation["owned_close_quantities"] == expected_owner
+    assert CloseRuntime._close_reconciliation_expected_quantities(
+        reconciliation, reconciliation["position_snapshot"]
+    ) == (expected_owner["long"], expected_owner["short"])
+
+
+def test_malformed_immutable_close_owner_stays_fail_closed():
+    """A bad new owner must not silently fall back to a mutable legacy shape."""
+    from lightfee.engine.state import pending_close_reconciliation_missing_legs
+
+    reconciliation = {
+        "kind": "final",
+        "position_snapshot": {
+            "long_quantity": 1.0,
+            "short_quantity": 1.0,
+        },
+        "owned_close_quantities": {"long": "not-a-quantity", "short": 1.0},
+        "long_legs": [{"order_id": "long-1"}],
+        "short_legs": [{"order_id": "short-1"}],
+    }
+
+    assert pending_close_reconciliation_missing_legs(reconciliation) == (
+        "long",
+        "short",
+    )
 
 
 # ---------------------------------------------------------------------------

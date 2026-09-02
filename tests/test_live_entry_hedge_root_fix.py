@@ -32,6 +32,7 @@ from lightfee.engine.state import (
     PendingEntryRemainderSlice,
     PendingPassiveOrder,
 )
+from lightfee.marketdata.l2 import L2BookStatus, PriceLevel
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.hyperliquid import HyperliquidAdapter
 from lightfee.venues.symbol_rules import SymbolRule
@@ -2286,6 +2287,67 @@ class TestPendingEntryHedgeTruthProgress:
 
 
 class TestV1PendingEntryHedgeDeltaRuntimeClosure:
+    def test_retry_keeps_the_first_hedge_deadline(self, tmp_path):
+        """A retry must spend the original V1 hedge budget, never mint a new one."""
+        runtime = _make_open_runtime(
+            tmp_path,
+            maker_hedge_deadline_ms=2_500,
+            maker_hedge_soft_deadline_ms=800,
+        )
+        pending = _make_pending_entry_for_hedge_delta()
+
+        runtime._pending_entry_hedge_deadline_started(
+            pending,
+            submitted_at_ms=2_000,
+            normalized_quantity=2.0,
+            hedge_price=20.0,
+            hedge_attempt=1,
+            hedge_venue=Venue.BYBIT,
+        )
+        assert pending.phase_state is not None
+        first_deadline = pending.phase_state.hedge_deadline_at_ms
+
+        runtime._pending_entry_hedge_deadline_started(
+            pending,
+            submitted_at_ms=2_600,
+            normalized_quantity=2.0,
+            hedge_price=20.0,
+            hedge_attempt=2,
+            hedge_venue=Venue.BYBIT,
+        )
+
+        assert pending.phase_state.hedge_deadline_at_ms == first_deadline
+
+    @pytest.mark.parametrize(
+        ("maker_leg", "expected_hedge_price"),
+        (("long", 19.7), ("short", 20.3)),
+    )
+    def test_hedge_price_uses_the_owned_hedge_venue_bbo(
+        self,
+        tmp_path,
+        maker_leg,
+        expected_hedge_price,
+    ):
+        """V1 prices a taker hedge from its own venue's executable BBO."""
+        runtime = _make_open_runtime(tmp_path)
+        pending = _make_pending_entry_for_hedge_delta(maker_leg=maker_leg)
+        now_ms = 2_000
+        for venue, bid, ask in (
+            (Venue.BINANCE, 20.1, 20.3),
+            (Venue.BYBIT, 19.7, 19.9),
+        ):
+            book = runtime.local_l2_runtime.ensure_book(venue.value, pending.symbol)
+            book.status = L2BookStatus.HOT
+            book.bids = [PriceLevel(price=bid, quantity=10.0)]
+            book.asks = [PriceLevel(price=ask, quantity=10.0)]
+            book.observed_at_ms = now_ms
+            book.last_snapshot_ms = now_ms
+
+        assert (
+            runtime._pending_entry_hedge_price_hint(pending, now_ms=now_ms)
+            == expected_hedge_price
+        )
+
     def test_adaptive_hedge_deadline_enforcement_uses_started_deadline(self, tmp_path):
         runtime = _make_open_runtime(
             tmp_path,

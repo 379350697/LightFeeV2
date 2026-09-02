@@ -752,6 +752,7 @@ class MarketDataClient:
                     elif spec.venue_id == Venue.GATE:
                         params["contract"] = venue_sym
                         params["limit"] = str(depth)
+                        params["with_id"] = "true"
                     raw = await self._public_get(spec.l2_snapshot_path, params=params)
 
                 result = parse_l2_update(spec.venue_id.value, payload=raw, symbol=venue_sym, now_ms=now_ms)

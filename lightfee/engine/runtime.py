@@ -1198,10 +1198,34 @@ class LiveRuntime:
             return float(getattr(spec, "min_notional", 0.0) or 0.0)
         return 0.0
 
-    def _pending_entry_hedge_price_hint(self, pending) -> float:
+    def _pending_entry_hedge_price_hint(self, pending, *, now_ms: int | None = None) -> float:
+        """Use the pending entry's own hedge-venue executable BBO before fallback."""
         price_hint = 0.0
+        if self._local_l2_effective_enabled():
+            books = self._pending_entry_l2_ready_books(
+                pending, now_ms if now_ms is not None else wall_clock_now_ms()
+            )
+            if books is not None:
+                long_book, short_book = books
+                hedge_book = (
+                    long_book
+                    if pending.hedge_venue() == pending.long_venue
+                    else short_book
+                )
+                levels = (
+                    hedge_book.asks
+                    if pending.hedge_side() == Side.BUY
+                    else hedge_book.bids
+                )
+                if levels:
+                    try:
+                        candidate = float(levels[0].price)
+                    except (AttributeError, TypeError, ValueError):
+                        candidate = 0.0
+                    if math.isfinite(candidate) and candidate > 0.0:
+                        price_hint = candidate
         weighted_average = getattr(pending, "unmatched_maker_weighted_average_price", None)
-        if callable(weighted_average):
+        if price_hint <= 0.0 and callable(weighted_average):
             try:
                 price_hint = float(weighted_average() or 0.0)
             except (TypeError, ValueError):
@@ -7206,7 +7230,7 @@ class LiveRuntime:
             )
             or 0
         )
-        hedge_price = self._pending_entry_hedge_price_hint(pending)
+        hedge_price = self._pending_entry_hedge_price_hint(pending, now_ms=now_ms)
         hedge_notional = abs(float(pending.hedge_inflight.quantity or 0.0) * hedge_price)
         deadline_decision = adaptive_entry_hedge_deadline_decision(
             hedge_elapsed_ms=hedge_elapsed_ms,
@@ -8909,7 +8933,7 @@ class LiveRuntime:
             from lightfee.core.domain import OrderRequest
 
             now_ms = wall_clock_now_ms()
-            hedge_price = self._pending_entry_hedge_price_hint(pending)
+            hedge_price = self._pending_entry_hedge_price_hint(pending, now_ms=now_ms)
             hedgeability_plan = self._pending_entry_hedgeability_plan(
                 pending,
                 hedge_venue,
@@ -9184,7 +9208,7 @@ class LiveRuntime:
         try:
             from lightfee.core.domain import OrderRequest
 
-            hedge_price = self._pending_entry_hedge_price_hint(pending)
+            hedge_price = self._pending_entry_hedge_price_hint(pending, now_ms=now_ms)
             hedgeability_plan = self._pending_entry_hedgeability_plan(
                 pending,
                 hedge_venue,

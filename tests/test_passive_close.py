@@ -5861,6 +5861,13 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             ),
             client_order_id="current-long-cid",
         )]
+        # The earlier long leg was already reduced locally.  The final live-flat
+        # observation owns only the remaining short leg, but it must absorb the
+        # partial's immutable long accounting quantity when it takes over that
+        # partial's durable lookup identity.
+        position.long_quantity = 0.0
+        position.short_quantity = 1.0
+        position.matched_quantity = 0.0
         state.pending_close_reconciliations = [{
             "position_id": position.position_id,
             "symbol": position.symbol,
@@ -5875,7 +5882,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
                 "short_quantity": 1.0,
             },
             "original_payload": {
-                "long_closed_qty": 0.0,
+                "long_closed_qty": 1.0,
                 "short_closed_qty": 0.0,
             },
             "long_legs": [{
@@ -5900,6 +5907,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             "final"
         ]
         final = state.pending_close_reconciliations[0]
+        assert final["owned_close_quantities"] == {"long": 1.0, "short": 1.0}
         assert final["missing_close_order_identity"] is False
         assert "unattributed_exchange_close_legs" not in final
         assert final["reconciliation_mode"] == "order_identity"

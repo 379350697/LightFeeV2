@@ -3322,6 +3322,9 @@ class VenueTransport(MarketDataClient):
                     elif spec.venue_id == Venue.GATE:
                         params["contract"] = venue_sym
                         params["limit"] = str(depth)
+                        # Gate returns the snapshot sequence only when asked;
+                        # that ID is required to bridge subsequent WS deltas.
+                        params["with_id"] = "true"
 
                     raw = await self._request("GET", spec.l2_snapshot_path, params=params)
 
@@ -4578,6 +4581,22 @@ class VenueTransport(MarketDataClient):
         except Exception as e:
             raise OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(e))
 
+    @staticmethod
+    def _normalized_order_identity(value: Any) -> str:
+        """Return a durable exchange identity, never a null string sentinel."""
+        if value is None:
+            return ""
+        normalized = str(value).strip()
+        return "" if normalized.lower() in {"", "none", "null"} else normalized
+
+    @classmethod
+    def _first_order_identity(cls, data: dict[str, Any], *keys: str) -> str:
+        for key in keys:
+            identity = cls._normalized_order_identity(data.get(key))
+            if identity:
+                return identity
+        return ""
+
     def _parse_order_fill(
         self,
         raw: dict[str, Any],
@@ -4652,7 +4671,15 @@ class VenueTransport(MarketDataClient):
 
         # Bybit V5 nests the order under "result"
         if isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
-            if data["result"].get("orderId") or data["result"].get("orderLinkId"):
+            if self._first_order_identity(
+                data["result"],
+                "orderId",
+                "ordId",
+                "orderLinkId",
+                "clientOrderId",
+                "clOrdId",
+                "clientOid",
+            ):
                 data = data["result"]
         elif isinstance(data, dict) and "result" in data and isinstance(data["result"], list) and data["result"]:
             data = data["result"][0]
@@ -4668,12 +4695,17 @@ class VenueTransport(MarketDataClient):
                 "unexpected order response shape — cannot parse fill",
             )
 
-        order_id = str(data.get(
-            "orderId",
-            data.get("ordId",
-            data.get("id",
-            data.get("order_id", "")))
-        ))
+        order_id = self._first_order_identity(
+            data, "orderId", "ordId", "id", "order_id"
+        )
+        accepted_client_order_id = self._first_order_identity(
+            data,
+            "orderLinkId",
+            "clientOrderId",
+            "clOrdId",
+            "clientOid",
+            "client_order_id",
+        ) or self._normalized_order_identity(request.client_order_id)
 
         # Explicit fill quantity fields — do NOT fall back to request.quantity
         exec_qty_raw = data.get(
@@ -4700,7 +4732,7 @@ class VenueTransport(MarketDataClient):
         elif has_fill_status:
             exec_qty = abs(float(data.get("size", data.get("quantity", 0))))
             exec_price = float(data.get("price", data.get("avgPrice", 0)))
-        elif order_id:
+        elif order_id or accepted_client_order_id:
             err = OrderSubmitError(
                 SubmitFailureClass.UNCERTAIN,
                 f"order accepted (id={order_id}) but fill not confirmed — "
@@ -4714,17 +4746,6 @@ class VenueTransport(MarketDataClient):
                 "filledQty",
                 "filled_size",
             ]
-            accepted_client_order_id = str(
-                data.get(
-                    "orderLinkId",
-                    data.get(
-                        "clientOrderId",
-                        data.get("clOrdId", request.client_order_id),
-                    ),
-                )
-                or request.client_order_id
-                or ""
-            )
             err.order_ack_only = True
             err.accepted_order_id = order_id
             err.accepted_client_order_id = accepted_client_order_id
@@ -4762,8 +4783,8 @@ class VenueTransport(MarketDataClient):
         quantity = abs(float(contract_quantity or 0.0))
         return quantity * ct_val if ct_val > 0.0 else quantity
 
-    @staticmethod
-    def _extract_order_identifiers(raw: dict[str, Any]) -> tuple[str, str]:
+    @classmethod
+    def _extract_order_identifiers(cls, raw: dict[str, Any]) -> tuple[str, str]:
         data: Any = raw.get("data", raw)
         if isinstance(data, dict) and isinstance(data.get("result"), dict):
             data = data["result"]
@@ -4773,13 +4794,11 @@ class VenueTransport(MarketDataClient):
             data = data[0]
         if not isinstance(data, dict):
             return "", ""
-        order_id = str(data.get("orderId", data.get("ordId", data.get("id", data.get("order_id", "")))) or "")
-        client_order_id = str(
-            data.get(
-                "orderLinkId",
-                data.get("clientOrderId", data.get("clOrdId", data.get("client_order_id", ""))),
-            )
-            or ""
+        order_id = cls._first_order_identity(
+            data, "orderId", "ordId", "id", "order_id"
+        )
+        client_order_id = cls._first_order_identity(
+            data, "orderLinkId", "clientOrderId", "clOrdId", "clientOid", "client_order_id"
         )
         return order_id, client_order_id
 
@@ -5903,8 +5922,10 @@ class VenueTransport(MarketDataClient):
 
         # V1: json_string(&row, &["orderId", "ordId"]).unwrap_or_else(|| order_id.to_string())
         # Note: caller provides fallback order_id
-        order_id = str(data.get("orderId", data.get("ordId", "")))
-        client_id = str(data.get("clientOid", ""))
+        order_id = self._first_order_identity(data, "orderId", "ordId")
+        client_id = self._first_order_identity(
+            data, "clientOid", "clientOrderId", "clOrdId", "orderLinkId"
+        )
         # A present zero is execution truth, not a missing alias.  Only an
         # absent/malformed field may continue to the next V1-compatible alias.
         cum_qty = _bitget_cumulative_quantity(data) or 0.0
@@ -7025,7 +7046,15 @@ class VenueTransport(MarketDataClient):
         data = raw.get("data", raw)
 
         if isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
-            if data["result"].get("orderId") or data["result"].get("orderLinkId"):
+            if self._first_order_identity(
+                data["result"],
+                "orderId",
+                "ordId",
+                "orderLinkId",
+                "clientOrderId",
+                "clOrdId",
+                "clientOid",
+            ):
                 data = data["result"]
         elif isinstance(data, dict) and "result" in data and isinstance(data["result"], list) and data["result"]:
             data = data["result"][0]
@@ -7035,14 +7064,10 @@ class VenueTransport(MarketDataClient):
         if not isinstance(data, dict):
             data = {}
 
-        order_id = str(data.get("orderId", data.get("ordId", data.get("id", ""))))
-        client_order_id = str(data.get(
-            "clientOrderId",
-            data.get("clOrdId",
-            data.get("orderLinkId",
-            data.get("clientOid",
-            request.client_order_id or ""))),
-        ))
+        order_id = self._first_order_identity(data, "orderId", "ordId", "id")
+        client_order_id = self._first_order_identity(
+            data, "clientOrderId", "clOrdId", "orderLinkId", "clientOid"
+        ) or self._normalized_order_identity(request.client_order_id)
         price = _safe_float(data.get("price", data.get("px", request.price or 0)))
         qty = _safe_float(data.get("origQty", data.get("sz", data.get("size", request.quantity))))
 
@@ -7578,6 +7603,8 @@ class VenueTransport(MarketDataClient):
         """Fetch Bitget order detail through the resolved account-family contract."""
         # Build query params: orderId or clientOid
         query_params: dict[str, Any] = {}
+        order_id = self._normalized_order_identity(order_id)
+        client_order_id = self._normalized_order_identity(client_order_id)
         if order_id and order_id != "bitget-unknown":
             query_params["orderId"] = order_id
         elif client_order_id:
@@ -7620,7 +7647,15 @@ class VenueTransport(MarketDataClient):
         data = raw.get("data", raw)
         if isinstance(data, dict) and "result" in data:
             r = data["result"]
-            if isinstance(r, dict) and (r.get("orderId") or r.get("orderLinkId")):
+            if isinstance(r, dict) and self._first_order_identity(
+                r,
+                "orderId",
+                "ordId",
+                "orderLinkId",
+                "clientOrderId",
+                "clOrdId",
+                "clientOid",
+            ):
                 data = r
             elif isinstance(r, list) and r:
                 data = r[0]
@@ -7630,13 +7665,10 @@ class VenueTransport(MarketDataClient):
         if not isinstance(data, dict):
             return None
 
-        order_id = str(data.get("orderId", data.get("ordId", data.get("id", ""))))
-        client_order_id = str(data.get(
-            "clientOrderId",
-            data.get("clOrdId",
-            data.get("orderLinkId",
-            data.get("clientOid", ""))),
-        ))
+        order_id = self._first_order_identity(data, "orderId", "ordId", "id")
+        client_order_id = self._first_order_identity(
+            data, "clientOrderId", "clOrdId", "orderLinkId", "clientOid"
+        )
         side_raw = str(data.get("side", "buy")).upper()
         side = Side.BUY if side_raw in ("BUY", "LONG") else Side.SELL
 

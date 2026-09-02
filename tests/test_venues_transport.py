@@ -8010,6 +8010,53 @@ class TestHyperliquidAdapterSymbolCatalog:
 
 
 # ---------------------------------------------------------------------------
+# Local-L2 REST bootstrap contracts
+# ---------------------------------------------------------------------------
+
+
+class TestGateL2SnapshotSequenceContract:
+    @pytest.mark.asyncio
+    async def test_gate_snapshot_requests_sequence_id_on_both_public_paths(self):
+        """Gate's REST snapshot must carry ``with_id=true`` to bridge WS deltas."""
+        credentials = LiveCredential(api_key="gate-key", api_secret="gate-secret")
+        trading_transport = VenueTransport(
+            spec=gate_spec(), mode="live", credential=credentials,
+        )
+        public_transport = MarketDataClient(spec=gate_spec())
+        trading_calls: list[dict[str, Any]] = []
+        public_calls: list[dict[str, Any]] = []
+        snapshot = {
+            "id": 321,
+            "t": 1_000,
+            "contract": "BTC_USDT",
+            "bids": [["100", "1"]],
+            "asks": [["101", "1"]],
+        }
+
+        async def private_request(method, path, *, params=None, **kwargs):
+            trading_calls.append(dict(params or {}))
+            return snapshot
+
+        async def public_get(path, *, params=None, **kwargs):
+            public_calls.append(dict(params or {}))
+            return snapshot
+
+        trading_transport._request = private_request
+        public_transport._public_get = public_get
+
+        await trading_transport.fetch_l2_snapshot(
+            "BTCUSDT", depth=50, max_retries=0
+        )
+        await public_transport.fetch_l2_snapshot(
+            "BTCUSDT", depth=50, max_retries=0
+        )
+
+        expected = {"contract": "BTC_USDT", "limit": "50", "with_id": "true"}
+        assert trading_calls == [expected]
+        assert public_calls == [expected]
+
+
+# ---------------------------------------------------------------------------
 # Task 3 regression: BitgetAdapter L2 metadata guard (no bare transport)
 # ---------------------------------------------------------------------------
 
@@ -8452,6 +8499,70 @@ class TestBitgetParseOrderStatusRedLight:
         }
         result = transport._parse_order_status_bitget(raw, "BTCUSDT", 1000000)
         assert result is None, f"zero baseVolume should return None, got {result}"
+
+    def test_bitget_null_order_id_keeps_client_oid_as_the_only_ack_identity(self):
+        """Bitget permits an accepted reduce-only ACK with ``orderId: null``.
+
+        The client id is then the only durable lookup key.  A literal ``"None"``
+        must never become an exchange order id because it wins over ``clientOid``
+        in the later detail query.
+        """
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        request = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="ONGUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            client_order_id="ong-passive-close-cid",
+        )
+
+        with pytest.raises(OrderSubmitError) as exc_info:
+            transport._parse_order_fill(
+                {
+                    "code": "00000",
+                    "data": {
+                        "orderId": None,
+                        "clientOid": "ong-passive-close-cid",
+                    },
+                },
+                request,
+                "ONGUSDT",
+                1_000,
+            )
+
+        error = exc_info.value
+        assert error.class_ is SubmitFailureClass.UNCERTAIN
+        assert error.order_ack_only is True
+        assert error.accepted_order_id == ""
+        assert error.accepted_client_order_id == "ong-passive-close-cid"
+
+    @pytest.mark.asyncio
+    async def test_bitget_null_order_id_queries_detail_by_client_oid(self, monkeypatch):
+        """A persisted historical null id must not mask the exact CID lookup."""
+        from lightfee.venues.specs import BitgetContractFamily
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        seen_params: list[dict[str, Any]] = []
+
+        async def fake_request(method, path, *, params=None, **kwargs):
+            seen_params.append(dict(params or {}))
+            return {"code": "00000", "data": {}}
+
+        async def resolved_family(_transport):
+            return BitgetContractFamily.CLASSIC_MIX_V2
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport._resolve_bitget_contract_family_for_truth",
+            resolved_family,
+        )
+        transport._request = fake_request
+
+        await transport._fetch_bitget_order_detail(
+            "ONGUSDT", "None", "ong-passive-close-cid"
+        )
+
+        assert seen_params[0]["clientOid"] == "ong-passive-close-cid"
+        assert "orderId" not in seen_params[0]
 
     def test_bitget_positive_fill_returns_correct_fields(self):
         """Non-red-light: verify parser returns correct fields for positive fill."""

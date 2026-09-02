@@ -461,9 +461,11 @@ def note_pending_entry_hedge_submitted(
         reconciled=False,
     )
     phase_state = ensure_pending_entry_phase_state(pending, int(submitted_at_ms or 0))
-    phase_state.hedge_deadline_at_ms = int(submitted_at_ms or 0) + (
-        decision.effective_hard_deadline_ms
-    )
+    existing_deadline_at_ms = getattr(phase_state, "hedge_deadline_at_ms", None)
+    if existing_deadline_at_ms is None or int(existing_deadline_at_ms or 0) <= 0:
+        phase_state.hedge_deadline_at_ms = int(submitted_at_ms or 0) + (
+            decision.effective_hard_deadline_ms
+        )
     return decision
 
 
