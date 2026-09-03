@@ -34,8 +34,15 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `dbb591b3e484da6f3738187973bfaf1da444cd41`
-- Checked on: `2026-09-02`. `dbb591b` was fast-forwarded and deployed; all 16
+- Last production SHA checked: `47c94b24`
+- Checked on: `2026-09-04`. `47c94b24` was fast-forwarded and deployed after
+  the remote working-tree changes were preserved in a recoverable stash. All 16
+  critical manifest hashes matched, both services restarted active with one
+  process each, all seven source domains were fresh, and both processes had
+  zero `CLOSE_WAIT`. Fresh high-confidence exchange truth was complete-flat/no-order;
+  `diagnose_live --since-deploy` returned `healthy`, `risk=low`, and
+  `gate_passed=true`. No order or cancel was submitted by deployment checks.
+- Prior checked deployment: `2026-09-02`. `dbb591b` was fast-forwarded and deployed; all 16
   critical manifest hashes matched, both services restarted active, singleton
   passed, all seven source domains were fresh, and both processes had zero
   `CLOSE_WAIT`. Fresh high-confidence exchange truth was complete-flat/no-order.
@@ -53,10 +60,11 @@ SHA, or when a row marked deployed/closed names a fix that is absent from the
 recorded deployment. Update this file after a deployment or production check;
 do not rewrite the daily evidence just to change status.
 
-## Uncommitted Working-Tree Repairs
+## Historical Working-Tree Repairs
 
-The following repairs are deliberately not rows in the deployment table until
-they have a fixing commit. They are **local-green only**, not production facts:
+The following bullets preserve investigation-time wording for older repairs;
+the current deployment state is maintained in the table above. Items without
+a corresponding deployed row remain local-green only, not production facts:
 
 - exclusion of terminal automatic-history audit debt from recovery probe symbol
   projections;
@@ -77,22 +85,18 @@ they have a fixing commit. They are **local-green only**, not production facts:
   change the existing terminalization-budget cleanup or submit an order during
   verification.
 
-- 2026-09-03 local-green repairs: CYS terminal-maker live-flatness before phase
-  advance; Gate `U..u` range continuity; Aster structured rejection evidence
-  through entry admission; immutable ownership of terminal automatic-history
-  debts; and post-probe snapshot-health clock selection. These are working-tree
-  changes only. Their contract, evidence, counterexamples, and validation are
-  recorded in [2026-09-03](daily/2026-09-03.md). They have no fixing commit or
-  production observation yet and must not be called deployed or closed.
+- 2026-09-03 repairs (CYS terminal-maker live-flatness, Gate `U..u` range
+  continuity, Aster structured rejection evidence, immutable terminal debt
+  ownership, and snapshot-health clock selection) are included in CL-145 at
+  `47c94b24` and are deployed-awaiting-verification. Their natural scenario
+  observations remain pending; details are in [2026-09-03](daily/2026-09-03.md).
 
-- 2026-09-04 local-green repairs: matched live-pair account-truth refresh for
-  stale `risk_only`; Bitget contracts-backed precision and shared decimal wire
-  formatting; and Bitget literal Local-L2 heartbeat parsing. The Aster/OI,
-  Local-L2 readiness, sidecar resource, and rotated-log observations only gain
-  typed evidence/regression coverage here; their independent production roots
-  remain unconfirmed. Full contract, counterexamples, rejected patterns, and
-  required production evidence are recorded in [2026-09-04](daily/2026-09-04.md).
-  Nothing in this batch is deployed or closed.
+- 2026-09-04 repairs (matched live-pair account-truth refresh, Bitget
+  contracts-backed precision/decimal wire formatting, and literal Local-L2
+  heartbeat parsing) are included in CL-145 at `47c94b24` and are
+  deployed-awaiting-verification. Aster/OI, Local-L2 readiness, sidecar
+  resource, and rotated-log roots remain unconfirmed; details and required
+  production evidence are in [2026-09-04](daily/2026-09-04.md).
 
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
@@ -152,6 +156,7 @@ until this table receives real fixing commits and a production observation.
 | CL-142 | closed | `82e859c` | real maintenance CLI clean-release/real-position-retain matrix (`6 passed`); adjacent ops/risk/recovery (`222 passed`); pending-entry/recovery (`237 passed`); close profile (`481 passed`); full profile (`1,604 passed`) | `dbb591b` is deployed. After fresh complete-flat/no-order truth, the single authoritative resume event (`seq=1`, `run_id=lightfee-1788286119229-2211467`) changed the real state to `running/running`; post-start acceptance is fully green and recovery submitted/cancelled no orders. | [2026-09-02](daily/2026-09-02.md#cl-142--audited-resume-if-safe-could-not-release-a-clean-risk-only-latch) |
 | CL-143 | closed | `5d64b5a` | production-shaped CLI RED/GREEN: five controls formerly accepted generic defaults; all six mutating forms now require an explicit pair, retain/clear and lease/discovery complements pass (`46` ops tests); close profile `481 passed`; full release profile `1,604 passed` before final test-only amend | `dbb591b` is deployed. The remote command without a pair rejects with exit `2` before mutation; the one explicit pair wrote the matching authoritative event/state. The earlier generic pair was preserved in the recovery backup, and post-start acceptance is fully green. | [2026-09-02](daily/2026-09-02.md#cl-143--state-mutating-lightfee-ops-could-target-a-non-authoritative-default-pair) |
 | CL-144 | deployed-awaiting-verification | `b33aa6c` | Bitget identity/HTTP detail, Local-L2 protocol, pending-entry hedge, immutable close owner including strict partial→final promotion, close/replay, and entry-runtime suites; full validation profile `1,612 passed` plus ACK-state `32 passed`; compile and whitespace checks passed | Deploy `b33aa6c`, then observe naturally: Bitget null-order-ID ACK, owned-hedge retry, Gate/Bitget Local-L2 bridge, and uncertain-submit full-fill close. No order is to be forced for verification. | [2026-09-02](daily/2026-09-02.md#cl-144--bitget-order-identity-owned-hedge-close-owner-and-local-l2-contract-drift) |
+| CL-145 | deployed-awaiting-verification | `47c94b24` | 2026-09-03/04 shared recovery/live-truth, Gate/Aster/Bitget contract, diagnosis, Local-L2, Bitget dynamic precision/heartbeat, and typed-transport production-path regressions; full validation profile 10/10; changed regression suite 364 passed | Deployment manifest, singleton, source freshness, FD/CLOSE_WAIT, private WS, listenKey, high-confidence flat/no-order truth, and `diagnose_live --since-deploy` passed. Await only natural matched-pair release, eligible Bitget order, and terminal evidence-debt observations; no order is to be forced. | [2026-09-04](daily/2026-09-04.md) |
 
 ## Pre-CL-093 Historical Boundary
 

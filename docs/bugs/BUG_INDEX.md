@@ -32,8 +32,10 @@ adapter profiles use the same decimal wire path. Literal Bitget Local-L2
 `ping`/`pong` is handled before JSON decoding. Aster transport/OI, Local-L2
 readiness, sidecar resources, and rotated-log observations received typed
 diagnostics and production-shaped regressions, but no speculative Aster reset,
-retry, concurrency, or health-threshold change was made. All are **local-green,
-not deployed or closed**; full evidence is in [2026-09-04](daily/2026-09-04.md).
+retry, concurrency, or health-threshold change was made. The batch is
+**deployed-awaiting-verification at `47c94b24`**: manifest/singleton/health/
+diagnosis passed with high-confidence flat/no-order truth; no natural scenario
+was forced. Full evidence is in [2026-09-04](daily/2026-09-04.md).
 
 2026-09-03 latest deployment audit follow-up: five separate contract breaks
 were reproduced locally from production evidence. A terminal CYS maker-close
@@ -44,10 +46,12 @@ a terminal automatic-history debt, and `diagnose_live` compared a concurrently
 published snapshot with an early clock. The working-tree repairs use the
 existing passive-close/live-truth, Local-L2 range, entry admission, state
 deduplication, and diagnosis owners respectively; they add no retry framework,
-venue reset, or alternate persistence path. Focused profiles and the repository
-full validation profile are green locally, but there is no fixing commit or
-production observation yet. Full evidence and the rejected repair patterns are
-in [2026-09-03](daily/2026-09-03.md).
+venue reset, or alternate persistence path. The repairs are included in
+deployed commit `47c94b24`; manifest/singleton/health/diagnosis passed with
+high-confidence flat/no-order truth. Natural scenario-level observations are
+still pending, so this family remains deployed-awaiting-verification. Full
+evidence and the rejected repair patterns are in
+[2026-09-03](daily/2026-09-03.md).
 
 2026-09-01 Gate/Bitget sidecar admission starvation: this was not an absence of
 opportunities or an order-API rejection. Production snapshots showed Bitget
