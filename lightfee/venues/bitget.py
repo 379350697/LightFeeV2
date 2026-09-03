@@ -798,6 +798,11 @@ class BitgetAdapter(VenueAdapter):
             family = await self.resolve_contract_family()
             profile = _profile_from_contract_family(family)
             venue_sym = self._transport._venue_symbol(request.symbol)
+            raw_request = request
+            request, preflight, _ = await self._transport.prepare_order_request(
+                request,
+                require_exchange_rules=True,
+            )
             now_ms = int(__import__("time").time() * 1000)
             hedge_mode = self._transport._hedge_mode
             if profile == BitgetAccountProfile.CLASSIC:
@@ -820,7 +825,11 @@ class BitgetAdapter(VenueAdapter):
                 "symbol": venue_sym,
                 "side": request.side.value,
                 "reduce_only": request.reduce_only,
-                "raw_qty": request.quantity,
+                "raw_qty": raw_request.quantity,
+                "raw_price": raw_request.price,
+                "quantized_qty": request.quantity,
+                "quantized_price": request.price,
+                "rule_source": preflight.get("rule_source", ""),
                 "client_order_id": request.client_order_id or "",
                 "endpoint": req_path,
                 "account_profile": profile.value,
@@ -892,6 +901,10 @@ class BitgetAdapter(VenueAdapter):
             family = await self.resolve_contract_family()
             profile = _profile_from_contract_family(family)
             venue_sym = self._transport._venue_symbol(request.symbol)
+            request, _preflight, _ = await self._transport.prepare_order_request(
+                request,
+                require_exchange_rules=True,
+            )
             now_ms = int(__import__("time").time() * 1000)
             hedge_mode = self._transport._hedge_mode
             if profile == BitgetAccountProfile.CLASSIC:

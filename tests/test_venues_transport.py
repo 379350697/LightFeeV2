@@ -7021,6 +7021,27 @@ class TestBybitOrderBody:
 class TestBitgetOrderBody:
     """Task 4 Steps 2-4: Bitget profile-aware order path and body."""
 
+    @pytest.fixture(autouse=True)
+    def bitget_exchange_rules(self, monkeypatch):
+        """Keep adapter body tests on the shared live-preflight contract."""
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BITGET
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="contracts",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
+
     @pytest.mark.asyncio
     async def test_bitget_classic_passive_order_body_uses_v2_mix_contract_fields(self):
         import json as _json
@@ -7185,6 +7206,70 @@ class TestBitgetOrderBody:
 
         assert body["side"] == "sell"
         assert body["posSide"] == "long"
+
+    @pytest.mark.parametrize("profile", ["classic", "uta"])
+    def test_bitget_low_price_preserves_contract_precision(self, profile):
+        from lightfee.venues.transport import _build_bitget_order_request
+
+        request = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="TUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            price=0.0044,
+            post_only=True,
+            client_order_id="bitget-low-price",
+        )
+
+        _path, body = _build_bitget_order_request(
+            request,
+            "TUSDT",
+            passive=True,
+            profile=profile,
+            hedge_mode=False,
+        )
+
+        assert body["price"] == "0.0044"
+
+    @pytest.mark.asyncio
+    async def test_bitget_classic_low_price_adapter_uses_dynamic_contract_precision(self):
+        """The live adapter path must retain a sub-cent Bitget contract price."""
+        import json as _json
+        from lightfee.venues.bitget import BitgetAdapter, BitgetAccountProfile
+
+        seen_body: dict[str, Any] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v2/mix/account/account":
+                return httpx.Response(
+                    200,
+                    json={"code": "00000", "data": {"posMode": "one_way_mode"}},
+                )
+            seen_body.update(_json.loads(request.content.decode()))
+            return httpx.Response(200, json=_fixture("bitget/classic_place_order_ack_only.json"))
+
+        adapter = BitgetAdapter(
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s", api_passphrase="p"),
+        )
+        adapter._profile = BitgetAccountProfile.CLASSIC
+        adapter._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await adapter.submit_passive_order(
+                OrderRequest(
+                    venue=Venue.BITGET,
+                    symbol="TUSDT",
+                    side=Side.BUY,
+                    quantity=2000.0,
+                    price=0.0044,
+                    post_only=True,
+                    client_order_id="bitget-low-price-adapter",
+                )
+            )
+        finally:
+            await adapter.shutdown()
+
+        assert seen_body["price"] == "0.0044"
 
     @pytest.mark.asyncio
     async def test_bitget_classic_one_way_reduce_only_buy_uses_reduce_only_not_trade_side(self):
@@ -12627,4 +12712,93 @@ class TestBinanceAsterPrecisionFix:
         rule = await SymbolRulesCache().get(transport, Venue.ASTER, "GUAUSDT")
 
         assert rule.rule_source == "spec_fallback"
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_bitget_symbol_rules_use_contract_precision_fields(self):
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        async def public_get(path, *, params=None):
+            calls.append((path, dict(params or {})))
+            assert path == "/api/v2/mix/market/contracts"
+            return {
+                "code": "00000",
+                "data": [{
+                    "symbol": "TUSDT",
+                    "priceEndStep": "1",
+                    "pricePlace": "6",
+                    "volumePlace": "3",
+                    "sizeMultiplier": "0.001",
+                    "minTradeNum": "0.001",
+                    "minTradeUSDT": "5",
+                }],
+            }
+
+        transport._public_get = public_get
+        rule = await SymbolRulesCache().get(transport, Venue.BITGET, "TUSDT")
+
+        assert rule.rule_source == "contracts"
+        assert rule.tick_size == pytest.approx(0.000001)
+        assert rule.qty_step == pytest.approx(0.001)
+        assert rule.min_qty == pytest.approx(0.001)
+        assert rule.min_notional == pytest.approx(5.0)
+        assert calls == [(
+            "/api/v2/mix/market/contracts",
+            {"productType": "USDT-FUTURES", "symbol": "TUSDT"},
+        )]
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_bitget_symbol_rules_reject_partial_contract_metadata(self):
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+
+        async def public_get(path, *, params=None):
+            return {
+                "code": "00000",
+                "data": [{
+                    "symbol": "TUSDT",
+                    "priceEndStep": "1",
+                    "pricePlace": "6",
+                    # Missing sizeMultiplier and minTradeNum is unsafe.
+                }],
+            }
+
+        transport._public_get = public_get
+        rule = await SymbolRulesCache().get(transport, Venue.BITGET, "TUSDT")
+
+        assert rule.rule_source == "spec_fallback"
+        await transport.close()
+
+    @pytest.mark.asyncio
+    async def test_bitget_symbol_rules_accept_zero_decimal_places(self):
+        """Integer-priced/integer-sized contracts may legitimately use zero places."""
+        from lightfee.venues.symbol_rules import SymbolRulesCache
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+
+        async def public_get(path, *, params=None):
+            return {
+                "code": "00000",
+                "data": [{
+                    "symbol": "TUSDT",
+                    "priceEndStep": "1",
+                    "pricePlace": "0",
+                    "volumePlace": "0",
+                    "minTradeNum": "1",
+                    "sizeMultiplier": "1",
+                }],
+            }
+
+        transport._public_get = public_get
+        rule = await SymbolRulesCache().get(transport, Venue.BITGET, "TUSDT")
+
+        assert rule.rule_source == "contracts"
+        assert rule.tick_size == pytest.approx(1.0)
+        assert rule.qty_step == pytest.approx(1.0)
+        assert rule.min_qty == pytest.approx(1.0)
         await transport.close()

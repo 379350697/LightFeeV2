@@ -8,11 +8,13 @@ Venue endpoints:
 - Binance/Aster: GET /fapi/v1/exchangeInfo → PRICE_FILTER, LOT_SIZE, MIN_NOTIONAL
 - Bybit: GET /v5/market/instruments-info?category=linear&symbol=X
 - OKX: GET /api/v5/public/instruments?instType=SWAP&instId=X
+- Bitget: GET /api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol=X
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import math
 from typing import Any, Optional
 
@@ -27,7 +29,7 @@ class SymbolRule:
     min_notional: float
     ct_val: float = 0.0  # OKX contract value (ctVal) for base→contract sizing
     max_market_qty: float = 0.0  # OKX maxMktSz, contract units for derivatives
-    rule_source: str = ""  # "exchangeInfo", "instruments-info", "instrument", "spec_fallback"
+    rule_source: str = ""  # "exchangeInfo", "instruments-info", "instrument", "contracts", "spec_fallback"
 
 
 class SymbolRulesCache:
@@ -72,6 +74,8 @@ class SymbolRulesCache:
             return await self._fetch_bybit(transport, venue_symbol)
         elif venue == Venue.OKX:
             return await self._fetch_okx(transport, venue_symbol)
+        elif venue == Venue.BITGET:
+            return await self._fetch_bitget(transport, venue_symbol)
         else:
             return self._spec_fallback(transport, venue_symbol)
 
@@ -206,6 +210,84 @@ class SymbolRulesCache:
             ct_val=ct_val,
             max_market_qty=max_mkt_sz,
             rule_source="instrument",
+        )
+
+    async def _fetch_bitget(self, transport: Any, venue_symbol: str) -> SymbolRule:
+        """Fetch the Bitget Mix contract precision contract.
+
+        Bitget publishes the price step as ``priceEndStep`` at the decimal
+        precision ``pricePlace`` and the quantity multiple as
+        ``sizeMultiplier``.  These values are the wire contract; static
+        VenueSpec defaults must never be mixed into a live rule.
+        """
+        try:
+            raw = await transport._public_get(
+                "/api/v2/mix/market/contracts",
+                params={"productType": "USDT-FUTURES", "symbol": venue_symbol},
+            )
+        except Exception:
+            return self._spec_fallback(transport, venue_symbol)
+
+        data = raw.get("data", []) if isinstance(raw, dict) else []
+        if not isinstance(data, list):
+            return self._spec_fallback(transport, venue_symbol)
+        item = next(
+            (
+                row for row in data
+                if isinstance(row, dict)
+                and str(row.get("symbol", "")).upper() == venue_symbol.upper()
+            ),
+            None,
+        )
+        if item is None:
+            return self._spec_fallback(transport, venue_symbol)
+
+        def decimal_field(name: str, *, allow_zero: bool = False) -> Decimal | None:
+            value = item.get(name)
+            if value in (None, ""):
+                return None
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError):
+                return None
+            if not parsed.is_finite() or (parsed < 0 if allow_zero else parsed <= 0):
+                return None
+            return parsed
+
+        price_end_step = decimal_field("priceEndStep")
+        price_place = decimal_field("pricePlace", allow_zero=True)
+        size_multiplier = decimal_field("sizeMultiplier")
+        volume_place = decimal_field("volumePlace", allow_zero=True)
+        min_trade_num = decimal_field("minTradeNum")
+        min_trade_usdt = decimal_field("minTradeUSDT")
+
+        # ``pricePlace``/``volumePlace`` are decimal counts, not arbitrary
+        # real-valued quantities.  Reject malformed catalog rows rather than
+        # manufacturing a precision rule from partial metadata.
+        if price_end_step is None or price_place is None:
+            return self._spec_fallback(transport, venue_symbol)
+        if price_place != price_place.to_integral_value():
+            return self._spec_fallback(transport, venue_symbol)
+        price_tick = price_end_step * (Decimal(10) ** -int(price_place))
+
+        qty_step = size_multiplier
+        if qty_step is None and volume_place is not None:
+            if volume_place != volume_place.to_integral_value():
+                return self._spec_fallback(transport, venue_symbol)
+            qty_step = Decimal(10) ** -int(volume_place)
+        if qty_step is None or min_trade_num is None:
+            return self._spec_fallback(transport, venue_symbol)
+
+        values = (price_tick, qty_step, min_trade_num)
+        if not all(value.is_finite() and value > 0 for value in values):
+            return self._spec_fallback(transport, venue_symbol)
+
+        return SymbolRule(
+            tick_size=float(price_tick),
+            qty_step=float(qty_step),
+            min_qty=float(min_trade_num),
+            min_notional=float(min_trade_usdt or Decimal("0")),
+            rule_source="contracts",
         )
 
     def _spec_fallback(self, transport: Any, venue_symbol: str) -> SymbolRule:

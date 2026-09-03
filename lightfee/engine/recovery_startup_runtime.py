@@ -248,7 +248,19 @@ class RecoveryStartupRuntime:
                 GlobalRiskMode.FAIL_CLOSED,
             }
             and self.ctx.state.operator.requested_mode != GlobalRiskMode.FAIL_CLOSED
-            and not self.ctx._has_local_recovery_work()
+            # A matched, live open pair is not itself recovery work.  The
+            # release decision must compare it with complete account truth;
+            # otherwise the local position short-circuits the very probe that
+            # can prove the earlier risk-only latch is stale.
+            and not any(
+                (
+                    self.ctx.state.pending_entries,
+                    self.ctx.state.pending_closes,
+                    self.ctx.state.pending_passive_closes,
+                    getattr(self.ctx.state, "pending_residual_repairs", []) or [],
+                    getattr(self.ctx, "_entry_capacity_reservations", ()) or (),
+                )
+            )
         )
 
     async def _refresh_risk_only_lifecycle_from_account_truth(
@@ -1284,9 +1296,31 @@ class RecoveryStartupRuntime:
         """Probe private positions when the runtime would otherwise look clean."""
         if str(getattr(self.ctx.config.runtime, "mode", "")).lower() != "live":
             return
+        # A persisted risk-only latch can coexist with a normal matched pair
+        # while the pair is active.  Do not route this case through startup
+        # recovery (which correctly treats local positions as work); refresh
+        # account-wide truth once so the shared recovery core can release only
+        # when both legs and open orders match exactly.
+        if self.ctx.state.open_positions:
+            if self._risk_only_lifecycle_needs_account_truth():
+                interval_ms = max(
+                    self.ctx.config.runtime.private_position_max_age_ms,
+                    1,
+                )
+                if (
+                    self.ctx._last_private_position_probe_ms > 0
+                    and now_ms
+                    < self.ctx._last_private_position_probe_ms + interval_ms
+                ):
+                    return
+                self.ctx._last_private_position_probe_ms = now_ms
+                await self._refresh_risk_only_lifecycle_from_account_truth(
+                    now_ms,
+                    lifecycle_clear_reason="runtime_active_pair_truth_clean",
+                )
+            return
         if (
-            self.ctx.state.open_positions
-            or self.ctx.state.pending_entries
+            self.ctx.state.pending_entries
             or self.ctx.state.pending_closes
             # A durable owner claim is locally in flight from reservation until
             # it gains an open/pending successor or is proven rejected.  Do

@@ -605,7 +605,11 @@ def _build_bitget_order_request(
         }
         if passive or request.price is not None:
             body["timeInForce"] = "post_only" if passive else "ioc"
-            body["price"] = _format_price(request.price or 0.0)
+            # Bitget contract precision is symbol-specific.  Fixed two-place
+            # formatting turns e.g. 0.0044 into wire ``0.00`` and causes a
+            # business rejection; the request has already been quantized by
+            # the shared symbol-rule preflight, so preserve its decimal value.
+            body["price"] = _format_decimal(request.price or 0.0)
         if hedge_mode:
             if request.reduce_only:
                 body["posSide"] = "short" if request.side == Side.BUY else "long"
@@ -632,7 +636,7 @@ def _build_bitget_order_request(
         "clientOid": request.client_order_id or "",
     }
     if passive or request.price is not None:
-        body["price"] = _format_price(request.price or 0.0)
+        body["price"] = _format_decimal(request.price or 0.0)
     if hedge_mode:
         body["tradeSide"] = "open" if not request.reduce_only else "close"
     else:
@@ -6847,7 +6851,7 @@ class VenueTransport(MarketDataClient):
             "clientOid": cid,
         }
         if quantized_price is not None and float(quantized_price) > 0:
-            body["price"] = _format_price(float(quantized_price))
+            body["price"] = _format_decimal(float(quantized_price))
         if self._hedge_mode:
             body["tradeSide"] = "open" if not request.reduce_only else "close"
         else:

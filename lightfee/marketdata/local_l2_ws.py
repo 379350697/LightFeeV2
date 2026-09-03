@@ -400,6 +400,24 @@ class LocalL2WsClient(ABC):
         try:
             if isinstance(raw_msg, bytes):
                 raw_msg = raw_msg.decode("utf-8")
+            # Bitget's public stream uses literal text control frames ("ping"
+            # / "pong"), not JSON objects.  Handle them before json.loads so
+            # a valid heartbeat cannot be misclassified as a decode failure.
+            raw_control = raw_msg.strip().lower()
+            if raw_control in {"ping", "pong"}:
+                now_ms = int(time.time() * 1000)
+                self.data_plane.note_ws_keepalive(
+                    self.venue,
+                    self.symbol,
+                    now_ms=now_ms,
+                    refresh_book=self.control_message_confirms_book(),
+                )
+                self._record_transport_event(
+                    "keepalive_received",
+                    now_ms,
+                    message=raw_control,
+                )
+                return
             payload = json.loads(raw_msg)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             error_text = self._record_error(error)

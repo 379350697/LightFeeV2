@@ -23,6 +23,18 @@ ledgers keep full incident evidence; cards keep reusable root-cause memory.
 
 ## Recent Investigations
 
+2026-09-04 evidence-split repair batch: a matched live pair could remain in
+`risk_only` because open positions were incorrectly counted as recovery work;
+the existing account-truth owner now refreshes that pair before release. A
+Bitget low-price order was also serialized with a static two-decimal formatter;
+the shared symbol-rule cache now uses the official contracts catalog and both
+adapter profiles use the same decimal wire path. Literal Bitget Local-L2
+`ping`/`pong` is handled before JSON decoding. Aster transport/OI, Local-L2
+readiness, sidecar resources, and rotated-log observations received typed
+diagnostics and production-shaped regressions, but no speculative Aster reset,
+retry, concurrency, or health-threshold change was made. All are **local-green,
+not deployed or closed**; full evidence is in [2026-09-04](daily/2026-09-04.md).
+
 2026-09-03 latest deployment audit follow-up: five separate contract breaks
 were reproduced locally from production evidence. A terminal CYS maker-close
 branch could advance before trusted live-flatness, Gate's `U..u` update range

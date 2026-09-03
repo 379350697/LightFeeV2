@@ -1032,6 +1032,28 @@ class TestBybitL2WsClientParsing:
 
 class TestBitgetL2WsClientParsing:
     @pytest.mark.asyncio
+    async def test_handles_literal_ping_and_pong_without_decode_error(self):
+        """Bitget control frames are raw text and must refresh stream evidence."""
+        data_plane, _, journal = _make_data_plane()
+        client = BitgetL2WsClient(
+            venue="bitget", symbol="BTCUSDT", data_plane=data_plane,
+        )
+
+        try:
+            await client._handle_message("ping")
+            await client._handle_message(b"pong")
+
+            transport_events = [
+                record["payload"]
+                for record in journal.read_all()
+                if record["kind"] == "runtime.local_l2_ws_transport"
+            ]
+            assert [event["message"] for event in transport_events] == ["ping", "pong"]
+            assert not any(event.get("event") == "decode_error" for event in transport_events)
+        finally:
+            journal.close()
+
+    @pytest.mark.asyncio
     async def test_uses_bitget_text_ping_not_json_or_rfc_ping(self):
         """Bitget public WS requires the literal application frame ``ping``."""
         data_plane, _, journal = _make_data_plane()

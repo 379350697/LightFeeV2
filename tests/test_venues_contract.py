@@ -410,6 +410,24 @@ class TestFixtureDrivenOrderSuccess:
                 "lightfee.venues.transport.get_symbol_rules_cache",
                 lambda: FakeRulesCache(),
             )
+        if venue_id == Venue.BITGET:
+            from lightfee.venues.symbol_rules import SymbolRule
+
+            class FakeRulesCache:
+                async def get(self, transport, venue, venue_symbol):
+                    assert venue == Venue.BITGET
+                    return SymbolRule(
+                        tick_size=0.000001,
+                        qty_step=0.001,
+                        min_qty=0.001,
+                        min_notional=5.0,
+                        rule_source="contracts",
+                    )
+
+            monkeypatch.setattr(
+                "lightfee.venues.transport.get_symbol_rules_cache",
+                lambda: FakeRulesCache(),
+            )
         if venue_id == Venue.ASTER:
             async def fake_aster_public_get(path, params=None):
                 assert path == "/fapi/v1/exchangeInfo"
@@ -1458,8 +1476,25 @@ class TestAckOnlyOrderIntegration:
             await transport.close()
 
     @pytest.mark.asyncio
-    async def test_bitget_ack_only_through_adapter_raises_uncertain(self):
+    async def test_bitget_ack_only_through_adapter_raises_uncertain(self, monkeypatch):
         """Bitget place_order with ack-only response must raise UNCERTAIN."""
+        from lightfee.venues.symbol_rules import SymbolRule
+
+        class FakeRulesCache:
+            async def get(self, transport, venue, venue_symbol):
+                assert venue == Venue.BITGET
+                return SymbolRule(
+                    tick_size=0.000001,
+                    qty_step=0.001,
+                    min_qty=0.001,
+                    min_notional=5.0,
+                    rule_source="contracts",
+                )
+
+        monkeypatch.setattr(
+            "lightfee.venues.transport.get_symbol_rules_cache",
+            lambda: FakeRulesCache(),
+        )
         ack_response = {"code": "00000", "data": {"orderId": "bg123", "clientOrderId": "client_1"}}
         mock = _build_mock_transport(ack_response)
         cred = LiveCredential(api_key="k", api_secret="s", api_passphrase="p")

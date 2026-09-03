@@ -85,6 +85,15 @@ they have a fixing commit. They are **local-green only**, not production facts:
   recorded in [2026-09-03](daily/2026-09-03.md). They have no fixing commit or
   production observation yet and must not be called deployed or closed.
 
+- 2026-09-04 local-green repairs: matched live-pair account-truth refresh for
+  stale `risk_only`; Bitget contracts-backed precision and shared decimal wire
+  formatting; and Bitget literal Local-L2 heartbeat parsing. The Aster/OI,
+  Local-L2 readiness, sidecar resource, and rotated-log observations only gain
+  typed evidence/regression coverage here; their independent production roots
+  remain unconfirmed. Full contract, counterexamples, rejected patterns, and
+  required production evidence are recorded in [2026-09-04](daily/2026-09-04.md).
+  Nothing in this batch is deployed or closed.
+
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
 [2026-08-30](daily/2026-08-30.md), and

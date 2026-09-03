@@ -356,6 +356,41 @@ class TestPublicTransportFailureRecovery:
         assert result["open_interest_client_retired"] is True
 
     @pytest.mark.asyncio
+    async def test_aster_network_error_keeps_shared_transport_evidence_for_oi(self):
+        """Aster uses the same typed transport/OI path; do not guess a venue reset."""
+        from lightfee.engine.market_data_runtime import EntryOpenInterestRefresher
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            try:
+                raise ConnectionResetError("aster peer reset stream")
+            except ConnectionResetError as cause:
+                raise httpx.ReadError("aster read failed", request=request) from cause
+
+        client = MarketDataClient(aster_spec())
+        failed_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client._client = failed_client
+        refresher = EntryOpenInterestRefresher()
+        refresher._clients["aster"] = client
+        try:
+            result = await refresher.refresh_open_interest(
+                "aster",
+                "BTCUSDT",
+                mark_price=100.0,
+                now_ms=1,
+            )
+        finally:
+            await refresher.close()
+
+        assert result is not None
+        assert result["open_interest_evidence_status"] == "http_error"
+        assert result["open_interest_request_phase"] == "read"
+        assert result["open_interest_transport_error_type"] == "ReadError"
+        assert result["open_interest_transport_error_cause_type"] == "ConnectionResetError"
+        assert result["open_interest_transport_error_cause"] == "aster peer reset stream"
+        assert result["open_interest_client_generation"] == 1
+        assert result["open_interest_client_retired"] is True
+
+    @pytest.mark.asyncio
     async def test_failed_client_waits_for_inflight_public_request_before_close(self):
         slow_started = asyncio.Event()
         allow_slow_response = asyncio.Event()

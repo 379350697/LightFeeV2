@@ -2846,6 +2846,7 @@ class TestRuntimePreflight:
             ]
 
             await runtime._maybe_recover_clean_live_positions(1700000005000)
+            await runtime._maybe_recover_clean_live_positions(1700000005001)
             await runtime.stop()
 
             assert len(runtime.state.open_positions) == 1
@@ -4592,6 +4593,88 @@ class TestRuntimePreflight:
             assert bybit.symbol_position_calls == 0
             assert binance.symbol_open_order_calls == 0
             assert bybit.symbol_open_order_calls == 0
+            runtime.journal.close()
+
+    @pytest.mark.asyncio
+    async def test_runtime_active_pair_refreshes_account_truth_before_releasing_risk_only(self):
+        """An active matched pair must not self-block the account-truth release path."""
+
+        class AccountPairTruthAdapter(FakeVenueAdapter):
+            def __init__(self, venue: Venue, position: PositionSnapshot):
+                super().__init__(venue)
+                self.position = position
+                self.account_position_calls = 0
+                self.account_open_order_calls = 0
+
+            async def fetch_all_positions(self):
+                self.account_position_calls += 1
+                return [self.position]
+
+            async def fetch_open_orders(self, symbol: str | None):
+                assert symbol is None
+                self.account_open_order_calls += 1
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_test_config(td)
+            binance = AccountPairTruthAdapter(
+                Venue.BINANCE,
+                PositionSnapshot(
+                    venue=Venue.BINANCE,
+                    symbol="TUSDT",
+                    side=Side.BUY,
+                    quantity=1.0,
+                    entry_price=10.0,
+                    observed_at_ms=1700000005000,
+                ),
+            )
+            bybit = AccountPairTruthAdapter(
+                Venue.BYBIT,
+                PositionSnapshot(
+                    venue=Venue.BYBIT,
+                    symbol="TUSDT",
+                    side=Side.SELL,
+                    quantity=1.0,
+                    entry_price=10.0,
+                    observed_at_ms=1700000005000,
+                ),
+            )
+            runtime = LiveRuntime(
+                config,
+                venue_adapters={Venue.BINANCE: binance, Venue.BYBIT: bybit},
+            )
+            runtime.journal.open()
+            runtime.state.lifecycle = EngineLifecycle.RISK_ONLY
+            runtime.state.risk_mode = GlobalRiskMode.FAIL_CLOSED
+            runtime.state.recovery_blocked_reason = "owned_pending_entry_live_conflict"
+            runtime.state.recovery_blocked_at_ms = 123
+            runtime.state.open_positions["entry-tusdt"] = OpenPosition(
+                position_id="entry-tusdt",
+                symbol="TUSDT",
+                long_venue=Venue.BINANCE,
+                short_venue=Venue.BYBIT,
+                long_quantity=1.0,
+                short_quantity=1.0,
+                long_entry_price=10.0,
+                short_entry_price=10.0,
+                opened_at_ms=1700000004000,
+                matched_quantity=1.0,
+            )
+
+            await runtime._maybe_recover_clean_live_positions(1700000005000)
+
+            assert runtime.state.lifecycle == EngineLifecycle.RUNNING
+            assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+            assert runtime.state.recovery_blocked_reason is None
+            assert binance.account_position_calls == 1
+            assert bybit.account_position_calls == 1
+            assert binance.account_open_order_calls == 1
+            assert bybit.account_open_order_calls == 1
+            assert any(
+                event["kind"] == "recovery.ledger_clear"
+                and event["payload"].get("reason") == "core_running_clean"
+                for event in runtime.journal.read_all()
+            )
             runtime.journal.close()
 
     def test_unsupported_account_truth_keeps_previous_live_artifact_blocker(self):
