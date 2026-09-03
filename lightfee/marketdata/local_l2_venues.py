@@ -414,8 +414,12 @@ def parse_gate_l2_update(
         bids=bids, asks=asks,
         first_sequence=first_sequence,
         sequence=seq,
-        previous_sequence=first_sequence,
-        previous_sequence_present=first_sequence > 0,
+        # Gate's U..u is an update range, not a previous-link (pu) field.
+        # Keep it in first_sequence so the data plane can accept an overlap
+        # with the next expected book sequence; claiming U as pu causes every
+        # valid batch to look like a continuity break.
+        previous_sequence=0,
+        previous_sequence_present=False,
         event_time_ms=int(data.get("t", now_ms)), received_at_ms=now_ms,
         update_kind=kind,
     )

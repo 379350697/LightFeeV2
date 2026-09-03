@@ -1495,8 +1495,11 @@ class PassiveCloseExecutor:
                         return False
                     else:
                         # Terminal non-filled maker orders must not be polled forever.
-                        # Clear the stale order and fall through to the normal zero-fill
-                        # phase budget so recovery can switch phase or arm DUAL_TAKER.
+                        # Before discarding the maker identity, reconcile both
+                        # live legs.  A delayed hedge fill can leave the other
+                        # venue one-sided even though this maker is canceled;
+                        # V1 closes that live exposure before advancing the
+                        # passive phase budget.
                         self._journal.append(
                             "exit.passive_close_maker_terminal_no_fill",
                             {
@@ -1509,6 +1512,20 @@ class PassiveCloseExecutor:
                                 "zero_fill_cycles": pending.phase_state.zero_fill_cycles_in_phase,
                             },
                         )
+                        live_truth_resolution = await self._resolve_flat_maker_leg_from_live_truth(
+                            state,
+                            pending,
+                            position,
+                            maker_leg_label=maker_leg_label,
+                            retain_on_untrusted=True,
+                        )
+                        if live_truth_resolution == PassiveCloseLiveTruthResolution.CLEARED:
+                            return True
+                        if live_truth_resolution == PassiveCloseLiveTruthResolution.STOP_RETRY:
+                            return False
+                        # The maker leg is still live; only now is it safe to
+                        # clear the terminal order identity and continue the
+                        # existing phase budget.
                         pending.phase_state.maker_order_id = ""
                         pending.phase_state.maker_client_order_id = ""
                         pending.phase_state.maker_resting_limit_price = None
@@ -5982,6 +5999,7 @@ class PassiveCloseExecutor:
         position: OpenPosition,
         *,
         maker_leg_label: str,
+        retain_on_untrusted: bool = False,
     ) -> PassiveCloseLiveTruthResolution:
         """Avoid submitting a reduce-only maker order to a leg live truth says is flat."""
         live_long, live_long_error = await self._fetch_live_position_snapshot(
@@ -6006,7 +6024,11 @@ class PassiveCloseExecutor:
                     "decision": "continue_pending_passive_close",
                 },
             )
-            return PassiveCloseLiveTruthResolution.CONTINUE_MAKER
+            return (
+                PassiveCloseLiveTruthResolution.STOP_RETRY
+                if retain_on_untrusted
+                else PassiveCloseLiveTruthResolution.CONTINUE_MAKER
+            )
 
         live_long_qty = self._live_position_quantity(live_long)
         live_short_qty = self._live_position_quantity(live_short)

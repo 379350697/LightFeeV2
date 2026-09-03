@@ -77,6 +77,14 @@ they have a fixing commit. They are **local-green only**, not production facts:
   change the existing terminalization-budget cleanup or submit an order during
   verification.
 
+- 2026-09-03 local-green repairs: CYS terminal-maker live-flatness before phase
+  advance; Gate `U..u` range continuity; Aster structured rejection evidence
+  through entry admission; immutable ownership of terminal automatic-history
+  debts; and post-probe snapshot-health clock selection. These are working-tree
+  changes only. Their contract, evidence, counterexamples, and validation are
+  recorded in [2026-09-03](daily/2026-09-03.md). They have no fixing commit or
+  production observation yet and must not be called deployed or closed.
+
 Their contract, rejected prior repair patterns, counterexamples, and local
 evidence are recorded in [2026-08-29](daily/2026-08-29.md),
 [2026-08-30](daily/2026-08-30.md), and

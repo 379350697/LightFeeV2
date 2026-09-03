@@ -22,6 +22,7 @@ _ADMISSIBLE_FIRST_FUNDING_MS = 1778787600000
 
 class TrustedVenueAdapter:
     trading_capability_trusted = True
+    supports_entry_leverage_preparation = True
     okx_base_quantity_step = 0.001
 
     def passive_metadata(self, symbol: str):
@@ -33,6 +34,9 @@ class TrustedVenueAdapter:
 
     async def precheck_entry_tradability(self, symbol: str) -> dict:
         return {"symbol": symbol, "status": "ok"}
+
+    async def ensure_entry_leverage(self, symbol: str, leverage: int, **kwargs) -> None:
+        return None
 
 
 def _runtime_with_metadata(tmp_path: str) -> LiveRuntime:
@@ -69,8 +73,9 @@ def _candidate(symbol: str, long_venue: str, short_venue: str) -> SimpleNamespac
 
 
 class RejectingExecutor:
-    def __init__(self, reject_reason: str):
+    def __init__(self, reject_reason: str, reject_evidence: dict | None = None):
         self.reject_reason = reject_reason
+        self.reject_evidence = dict(reject_evidence or {})
         self.calls = 0
 
     async def execute(self, ctx):
@@ -79,6 +84,7 @@ class RejectingExecutor:
             route=ExecutionRoute.REJECTED,
             state=EntryState.FAILED,
             reject_reason=self.reject_reason,
+            reject_evidence=self.reject_evidence,
         )
 
 
@@ -221,6 +227,49 @@ async def test_exchange_rule_rejects_create_admission_blocks_with_evidence_paylo
         assert event_payload["official_doc_url"] == official_doc_url
         assert event_payload["evidence_gap"] is evidence_gap
 
+        runtime.journal.close()
+
+
+@pytest.mark.asyncio
+async def test_aster_structured_max_notional_evidence_survives_entry_boundary():
+    """Aster -5018 must set the venue-wide cooldown from canonical evidence."""
+    with tempfile.TemporaryDirectory() as td:
+        runtime = _runtime_with_metadata(td)
+        runtime.journal.open()
+        evidence = {
+            "venue": "aster",
+            "operation": "submit_passive_order",
+            "http_status": 400,
+            "exchange_code": "-5018",
+            "exchange_msg": "maximum notional value limit",
+            "raw_body": '{"code":-5018,"msg":"maximum notional value limit"}',
+        }
+        executor = RejectingExecutor("maker rejected", evidence)
+        runtime.entry_executor = executor
+
+        first_candidate = _candidate("MAX1USDT", "aster", "binance")
+        second_candidate = _candidate("MAX2USDT", "aster", "binance")
+
+        assert await runtime._dispatch_entry(
+            first_candidate, 1778787000000, price_hint=1.0
+        ) is True
+        # The Aster max-notional admission is venue-wide, so an unrelated
+        # symbol is rejected before the executor is called again.
+        assert await runtime._dispatch_entry(
+            second_candidate, 1778787001000, price_hint=1.0
+        ) is False
+        assert executor.calls == 1
+        assert runtime.state.venue_entry_cooldowns["aster:*"]["reason"] == (
+            "max_notional_admission_blocked"
+        )
+
+        blocked = [
+            record for record in runtime.journal.read_all()
+            if record["kind"] == "runtime.entry_admission_blocked"
+        ]
+        assert blocked
+        assert blocked[-1]["payload"]["exchange_error"]["exchange_code"] == "-5018"
+        assert blocked[-1]["payload"]["evidence_gap"] is False
         runtime.journal.close()
 
 

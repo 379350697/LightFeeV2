@@ -112,9 +112,19 @@ class EntryDispatchRuntime:
     def _record_post_only_reject_cooldown(self, *args: Any, **kwargs: Any):
         return self.ctx._record_post_only_reject_cooldown(*args, **kwargs)
 
-    def _record_entry_result_admission_blocks(self, candidate, reject_reason: str, now_ms: int) -> None:
+    def _record_entry_result_admission_blocks(
+        self,
+        candidate,
+        reject_reason: str,
+        now_ms: int,
+        exchange_error: dict[str, Any] | None = None,
+    ) -> None:
         symbol = str(getattr(candidate, "symbol", "") or "")
         candidate_pair_id = self._candidate_pair_id(candidate)
+        has_exchange_error = isinstance(exchange_error, dict) and bool(exchange_error)
+        classification_input: str | dict[str, Any] = (
+            exchange_error if has_exchange_error else reject_reason
+        )
         for raw_venue in (
             getattr(candidate, "long_venue", ""),
             getattr(candidate, "short_venue", ""),
@@ -123,7 +133,7 @@ class EntryDispatchRuntime:
                 venue = Venue.from_str(str(raw_venue))
             except ValueError:
                 continue
-            metadata = self._entry_admission_reject_metadata(venue, reject_reason)
+            metadata = self._entry_admission_reject_metadata(venue, classification_input)
             if metadata:
                 reason = str(metadata["reason"])
                 self._record_symbol_admission_block(
@@ -135,6 +145,11 @@ class EntryDispatchRuntime:
                     evidence=metadata,
                     source="initial_entry",
                     candidate_pair_id=candidate_pair_id,
+                    extra_payload=(
+                        {"exchange_error": dict(exchange_error)}
+                        if has_exchange_error
+                        else None
+                    ),
                 )
 
     async def _prepare_live_entry_leverage_for_candidate(
@@ -1532,6 +1547,7 @@ class EntryDispatchRuntime:
                     candidate,
                     str(result.reject_reason),
                     now_ms,
+                    getattr(result, "reject_evidence", None),
                 )
             if result.pending_entry is not None:
                 if getattr(result.pending_entry, "outcome", "") == "rejected":

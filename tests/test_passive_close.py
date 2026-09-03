@@ -7774,9 +7774,26 @@ class TestReduceOnlyRejectedEscalation:
         ))
         maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
         maker_adapter.submit_passive_order = AsyncMock()
+        maker_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.SELL,
+            quantity=1.0,
+            entry_price=50_000.0,
+            observed_at_ms=2_000,
+        ))
+        hedge_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        hedge_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.OKX,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=1.0,
+            entry_price=50_000.0,
+            observed_at_ms=2_000,
+        ))
 
         executor = PassiveCloseExecutor(
-            {Venue.BINANCE: maker_adapter, Venue.OKX: _mock_adapter_passive_ok(Venue.OKX)},
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
             journal,
         )
         executor.set_l2_mid_resolver(lambda venue, symbol: 50000.0)
@@ -7827,6 +7844,98 @@ class TestReduceOnlyRejectedEscalation:
         assert not any(
             e.get("kind") == "exit.passive_close_terminal_zero_fill_truth_unavailable"
             for e in events
+        )
+
+    def test_terminal_maker_reject_flattens_delayed_one_sided_live_leg_before_phase_advance(self):
+        """A rejected maker with a flat leg must close the other live leg first."""
+        journal = _open_journal()
+        maker_adapter = _mock_adapter_with_tick(Venue.BINANCE)
+        maker_adapter.query_passive_order_progress = AsyncMock(return_value=_make_passive_progress(
+            venue=Venue.BINANCE,
+            side=Side.SELL,
+            order_id="canceled-maker",
+            client_order_id="canceled-client",
+            cumulative_quantity=0.0,
+            average_price=0.0,
+            state=PassiveOrderState.REJECTED,
+        ))
+        maker_adapter.fetch_order_fill_reconciliation = AsyncMock(return_value=None)
+        maker_adapter.fetch_position = AsyncMock(return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="BTCUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=2_000,
+        ))
+        maker_adapter.submit_passive_order = AsyncMock()
+
+        hedge_adapter = _mock_adapter_passive_ok(Venue.OKX)
+        hedge_adapter.fetch_position = AsyncMock(side_effect=[
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="BTCUSDT",
+                side=Side.SELL,
+                quantity=1.0,
+                entry_price=50_000.0,
+                observed_at_ms=2_000,
+            ),
+            PositionSnapshot(
+                venue=Venue.OKX,
+                symbol="BTCUSDT",
+                side=Side.SELL,
+                quantity=0.0,
+                entry_price=0.0,
+                observed_at_ms=2_001,
+            ),
+        ])
+
+        executor = PassiveCloseExecutor(
+            {Venue.BINANCE: maker_adapter, Venue.OKX: hedge_adapter},
+            journal,
+        )
+        executor.set_l2_mid_resolver(lambda venue, symbol: 50_000.0)
+
+        state = EngineState()
+        position = _make_position(matched_quantity=1.0, long_quantity=1.0, short_quantity=1.0)
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=1.0,
+            chunk_quantities=[1.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.LOW_SLIPPAGE_MAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+                zero_fill_cycles_in_phase=PASSIVE_CLOSE_MAX_ZERO_FILL_CYCLES - 1,
+                maker_order_id="canceled-maker",
+                maker_client_order_id="canceled-client",
+                maker_resting_limit_price=50_000.0,
+            ),
+            maker_fill=PendingPassiveLegFill(),
+            hedge_fill=PendingPassiveLegFill(),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        result = asyncio.run(asyncio.wait_for(
+            executor.drive_pending_passive_close(
+                state, position.position_id, wait_until_terminal=False,
+            ),
+            timeout=0.1,
+        ))
+
+        assert result is True
+        maker_adapter.submit_passive_order.assert_not_called()
+        hedge_adapter.place_order.assert_awaited_once()
+        request = hedge_adapter.place_order.await_args.args[0]
+        assert request.reduce_only is True
+        assert request.time_in_force == TimeInForce.IOC
+        assert position.position_id not in state.pending_passive_closes
+        assert position.position_id not in state.open_positions
+        assert any(
+            event["kind"] == "exit.passive_close_live_one_sided_flatten"
+            for event in journal.read_all()
         )
 
     def test_canceled_zero_fill_retains_maker_until_execution_truth_is_available(self):

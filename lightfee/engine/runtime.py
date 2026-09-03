@@ -448,8 +448,19 @@ class LiveRuntime:
         }.get(venue, "")
 
     @staticmethod
-    def _entry_admission_reject_metadata(venue: Venue, reason: str) -> dict | None:
-        text = str(reason or "").lower()
+    def _entry_admission_reject_metadata(
+        venue: Venue, reason: str | dict[str, Any]
+    ) -> dict | None:
+        # Admission classification consumes canonical exchange evidence from
+        # entry_sync. Include code/message/body without venue-specific reparsing.
+        if isinstance(reason, dict):
+            text = " ".join(
+                str(reason.get(key) or "")
+                for key in ("exchange_code", "exchange_msg", "raw_body")
+            ).lower()
+            text = f"{text} {str(reason.get('reason') or '')}".lower()
+        else:
+            text = str(reason or "").lower()
         if "entry-tradability-blocked" in text:
             return {
                 "reason": "new_position_not_allowed",
@@ -915,11 +926,13 @@ class LiveRuntime:
         candidate,
         reject_reason: str,
         now_ms: int,
+        exchange_error: dict[str, Any] | None = None,
     ) -> None:
         return self.entry_dispatch_runtime._record_entry_result_admission_blocks(
             candidate,
             reject_reason,
             now_ms,
+            exchange_error,
         )
 
     async def _precheck_live_entry_admission(

@@ -61,6 +61,11 @@ class EntryExecutionResult:
     maker_fill: Optional[OrderFill] = None
     hedge_fill: Optional[OrderFill] = None
     reject_reason: str = ""
+    # Preserve the exchange-owned rejection evidence through the entry result
+    # boundary.  Admission classification must see the structured code/body;
+    # stringifying the transport error loses venue semantics (for example
+    # Aster -5018 max-notional).
+    reject_evidence: dict[str, Any] = field(default_factory=dict)
     journal_entries: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -197,6 +202,7 @@ class EntrySyncExecutor:
             result.state = EntryState.FAILED
             result.route = ExecutionRoute.REJECTED
             result.reject_reason = maker_result.get("reason", "maker rejected")
+            result.reject_evidence = dict(maker_result.get("exchange_error") or {})
             self.journal.append(
                 "entry.aborted",
                 {

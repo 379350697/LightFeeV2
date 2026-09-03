@@ -5206,15 +5206,6 @@ def run_diagnose(
         all_events = [e for e in all_events if _event_matches_scope(e, symbol, venues)]
 
     health = _build_health(state, service_status)
-    sidecar_health_report, sidecar_snapshot_health = _build_sidecar_snapshot_health(
-        runtime_dir=runtime_dir,
-        unit_dir=unit_dir,
-        snapshot_path=snapshot_path,
-        config_path=config_path,
-        now_ms=generated_at_ms,
-    )
-    if sidecar_health_report is not None:
-        _merge_health_report(health, sidecar_health_report)
     local_state = _build_local_state(state, all_events)
 
     pos_symbols: list[str] = []
@@ -5236,6 +5227,21 @@ def run_diagnose(
             pos_symbols if pos_symbols else [],
             venues if venues is not None else (pos_venues if pos_venues else None),
         )
+
+    # Snapshot publication is concurrent with diagnosis.  Use a fresh wall
+    # clock after the read-only probes so a newly published snapshot cannot be
+    # judged against the timestamp captured before those probes.  Explicit
+    # ``now_ms`` remains deterministic for fixture/replay callers.
+    health_now_ms = generated_at_ms if now_ms else _now_ms()
+    sidecar_health_report, sidecar_snapshot_health = _build_sidecar_snapshot_health(
+        runtime_dir=runtime_dir,
+        unit_dir=unit_dir,
+        snapshot_path=snapshot_path,
+        config_path=config_path,
+        now_ms=health_now_ms,
+    )
+    if sidecar_health_report is not None:
+        _merge_health_report(health, sidecar_health_report)
 
     state_consistency = _build_state_consistency(local_state, exchange_truth)
     resolved_order_truth_gap_summary = _build_resolved_order_truth_gap_summary(

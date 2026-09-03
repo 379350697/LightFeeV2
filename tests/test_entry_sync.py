@@ -40,6 +40,7 @@ from lightfee.persistence.journal import Journal
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import PositionSnapshot
+from lightfee.venues.transport import TransportError, TransportErrorCategory
 
 
 # Inline test helpers (avoid cross-file import issues during pytest collection)
@@ -204,6 +205,36 @@ class TestEntrySyncMakerReject:
         assert okx_ada.place_order_call_count == 0
         kinds = [record["kind"] for record in journal.read_all()]
         assert "entry.aborted_failed_pending_retained" not in kinds
+
+    @pytest.mark.asyncio
+    async def test_maker_reject_preserves_exchange_evidence_at_result_boundary(
+        self, adapters, journal, btc_context
+    ):
+        """Entry admission must receive the exchange-owned rejection code/body."""
+        binance_ada = adapters[Venue.BINANCE]
+        exchange_error = TransportError(
+            TransportErrorCategory.REQUEST_REJECTED,
+            'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}',
+            status_code=400,
+            body='{"code":-5018,"msg":"maximum notional value limit"}',
+        )
+        binance_ada.place_order_outcomes = [
+            OrderSubmitError(
+                SubmitFailureClass.REJECTED,
+                "maximum notional value limit",
+                transport_error=exchange_error,
+            )
+        ]
+
+        result = await EntrySyncExecutor(adapters=adapters, journal=journal).execute(
+            btc_context
+        )
+
+        assert result.route == ExecutionRoute.REJECTED
+        assert result.reject_evidence["exchange_code"] == "-5018"
+        assert result.reject_evidence["raw_body"] == (
+            '{"code":-5018,"msg":"maximum notional value limit"}'
+        )
 
     @pytest.mark.asyncio
     async def test_maker_uncertain_marks_pending(self, adapters, journal, btc_context):

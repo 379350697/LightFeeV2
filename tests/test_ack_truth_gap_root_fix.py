@@ -838,6 +838,45 @@ class TestBillingEvidenceIdentityGap:
 
         assert restored.pending_close_reconciliations == [terminalized]
 
+    def test_terminal_history_debt_cannot_be_replaced_by_ordinary_close_registration(self):
+        """A repeated close observation must not reopen a terminal accounting owner."""
+        from lightfee.engine.state import EngineState
+
+        terminal = {
+            "position_id": "entry-history-terminal-owner",
+            "symbol": "ONGUSDT",
+            "kind": "final",
+            "closed_at_ms": 1_780_000_000_000,
+            "position_snapshot": {
+                "position_id": "entry-history-terminal-owner",
+                "symbol": "ONGUSDT",
+                "long_venue": "binance",
+                "short_venue": "bybit",
+                "matched_quantity": 149.0,
+            },
+            "long_legs": [],
+            "short_legs": [],
+            "reconciliation_status": "evidence_debt",
+            "evidence_debt_reason": "missing_close_order_identity",
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "ambiguous_candidates",
+            "next_attempt_ms": 0,
+        }
+        repeated_observation = {
+            **terminal,
+            "reconciliation_status": None,
+            "long_legs": [
+                {"venue": "binance", "order_id": "late-observation"}
+            ],
+            "reconciliation_mode": "order_identity",
+        }
+
+        state = EngineState()
+        state.enqueue_pending_close_reconciliation(terminal)
+        state.enqueue_pending_close_reconciliation(repeated_observation)
+
+        assert state.pending_close_reconciliations == [terminal]
+
     def test_external_recovery_reclassification_replays_as_debt_removal(self):
         """A crash after reclassification cannot resurrect external debt."""
         from lightfee.engine.recovery import _apply_journal_replay_to_state

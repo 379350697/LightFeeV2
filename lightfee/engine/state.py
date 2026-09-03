@@ -1504,6 +1504,20 @@ class EngineState:
                 str(existing.get("position_id") or "") == position_id
                 and str(existing.get("kind") or "final") == kind
             ):
+                # A strict automatic-history conclusion is an accounting-only
+                # terminal owner.  A later ordinary close registration must not
+                # replace it with a retryable task merely because it carries a
+                # newly observed order identity; only another terminal record
+                # or the explicit operator-evidence import path may supersede
+                # that owner.
+                existing_terminal_history_debt = (
+                    is_terminal_automatic_history_evidence_debt(existing)
+                )
+                incoming_terminal_history_debt = (
+                    is_terminal_automatic_history_evidence_debt(item)
+                )
+                if existing_terminal_history_debt and not incoming_terminal_history_debt:
+                    return
                 existing_keys = _reconciliation_identity_keys(existing)
                 existing_coverage = _reconciliation_identity_coverage(existing)
                 identity_evidence_not_weaker = all(

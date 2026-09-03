@@ -841,8 +841,11 @@ class GateL2WsClient(LocalL2WsClient):
             asks=[PriceLevel(price=float(p), quantity=float(q)) for p, q in map(_price_size, asks_raw)],
             first_sequence=first_sequence,
             sequence=sequence,
-            previous_sequence=first_sequence,
-            previous_sequence_present=first_sequence > 0,
+            # Gate's U..u identifies the inclusive update range.  It is not
+            # a previous-link (pu), so feeding U into the generic pu check
+            # makes every valid overlapping batch look discontinuous.
+            previous_sequence=0,
+            previous_sequence_present=False,
             event_time_ms=int(result.get("t", int(raw.get("time", 0)) * 1000) or 0),
             received_at_ms=now_ms,
             update_kind=kind,

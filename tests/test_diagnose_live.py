@@ -335,6 +335,56 @@ def test_run_diagnose_rejects_fresh_wrapper_with_degraded_source(monkeypatch):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_run_diagnose_uses_fresh_clock_for_concurrent_snapshot_health(monkeypatch):
+    """Snapshot health must use the post-probe clock, not the early window clock."""
+    import scripts.diagnose_live as dl
+
+    d = _make_tmpdir()
+    try:
+        _write_json(os.path.join(d, "state-current.json"), {
+            "schema": "lightfee.current_state.v1",
+            "lifecycle": "running",
+            "risk_mode": "running",
+            "open_position_count": 0,
+            "open_positions": [],
+            "pending_close_count": 0,
+            "last_tick_ms": 0,
+        })
+        _write_jsonl(os.path.join(d, "events.jsonl"), [])
+
+        # Keep the test focused on run_diagnose's clock handoff; the health
+        # builder itself is covered by the source-age matrix.
+        monkeypatch.setattr(
+            dl,
+            "_build_health",
+            lambda state, service_status: {
+                "ok": True,
+                "critical_count": 0,
+                "warning_count": 0,
+                "fingerprints": [],
+            },
+        )
+        clock = iter((1_000, 2_000))
+        monkeypatch.setattr(dl, "_now_ms", lambda: next(clock))
+        observed = {}
+
+        def fake_sidecar_snapshot_health(**kwargs):
+            observed["now_ms"] = kwargs["now_ms"]
+            return None, {"checked": False, "reason": "test"}
+
+        monkeypatch.setattr(
+            dl, "_build_sidecar_snapshot_health", fake_sidecar_snapshot_health
+        )
+        monkeypatch.setattr(dl, "_build_exchange_truth", _flat_exchange_truth)
+
+        dl.run_diagnose(runtime_dir=d, unit_dir="/nonexistent")
+
+        assert observed["now_ms"] == 2_000
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_acceptance_gate_blocks_only_when_open_positions_exceed_max():
     from scripts.diagnose_live import _build_production_acceptance_gate
 

@@ -331,9 +331,47 @@ def test_gate_ws_uses_v1_obu_subscription_and_range_parser(tmp_path):
         assert update is not None
         assert update.update_kind == LocalL2UpdateKind.DELTA
         assert update.first_sequence == 100
-        assert update.previous_sequence == 100
-        assert update.previous_sequence_present is True
+        assert update.previous_sequence == 0
+        assert update.previous_sequence_present is False
         assert update.sequence == 101
+    finally:
+        journal.close()
+
+
+def test_gate_ws_update_range_overlaps_expected_sequence_without_rebuild(tmp_path):
+    """Gate U..u is a range bridge, not a previous-sequence link."""
+    dp, runtime, journal = _make_data_plane(tmp_path)
+    try:
+        book = runtime.ensure_book("gate", "BTCUSDT")
+        book.status = L2BookStatus.BOOTSTRAPPING
+        book.apply_snapshot(
+            [PriceLevel(64998.0, 1.0)],
+            [PriceLevel(65002.0, 1.0)],
+            sequence=100,
+            now_ms=1,
+        )
+        book.transition_to_hot()
+        update = GateL2WsClient(
+            venue="gate", symbol="BTCUSDT", venue_symbol="BTC_USDT", data_plane=dp
+        ).parse_depth_message(
+            {
+                "channel": "futures.obu",
+                "data": {
+                    "name": "BTC_USDT",
+                    "t": 1710001234500,
+                    "U": 100,
+                    "u": 101,
+                    "b": [{"p": "64999.0", "s": "1"}],
+                    "a": [],
+                },
+            }
+        )
+
+        result = runtime.record_update_result(update, now_ms=2)
+
+        assert result.applied is True
+        assert result.rebuild_required is False
+        assert runtime.get_book("gate", "BTCUSDT").sequence == 101
     finally:
         journal.close()
 
