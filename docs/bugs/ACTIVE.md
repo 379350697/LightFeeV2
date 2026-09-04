@@ -37,8 +37,10 @@ production-evidence cell.
 - Last production SHA checked: `d230f8df`
 - Checked on: `2026-09-05`. Runtime code `d230f8df` was fast-forwarded from
   `47c94b24` over Tailscale SSH and both services restarted active; the
-  subsequent docs-only commits were pulled without a restart, and the runtime
-  deployment marker remains `d230f8df`. All critical manifest hashes
+  local `main` ledger subsequently gained docs-only commits, while the cloud
+  runtime checkout remains pinned to `d230f8df` because docs are excluded from
+  the runtime sync; the deployment marker remains `d230f8df`. All critical
+  manifest hashes
   matched; systemd cgroups showed exactly one sidecar and one live main process;
   all seven source domains were fresh; the initial two resource samples showed
   zero `CLOSE_WAIT`, and the later sample showed one live `CLOSE_WAIT` with
