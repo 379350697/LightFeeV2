@@ -34,14 +34,19 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `47c94b24`
-- Checked on: `2026-09-04`. `47c94b24` was fast-forwarded and deployed after
-  the remote working-tree changes were preserved in a recoverable stash. All 16
-  critical manifest hashes matched, both services restarted active with one
-  process each, all seven source domains were fresh, and both processes had
-  zero `CLOSE_WAIT`. Fresh high-confidence exchange truth was complete-flat/no-order;
-  `diagnose_live --since-deploy` returned `healthy`, `risk=low`, and
-  `gate_passed=true`. No order or cancel was submitted by deployment checks.
+- Last production SHA checked: `d230f8df`
+- Checked on: `2026-09-05`. `d230f8df` was fast-forwarded from `47c94b24` over
+  Tailscale SSH and both services restarted active. All critical manifest hashes
+  matched; systemd cgroups showed exactly one sidecar and one live main process;
+  all seven source domains were fresh; and two resource samples showed zero
+  `CLOSE_WAIT` (live FD delta `+2`, sidecar FD delta `0`). The six enabled
+  private-WS venues each started exactly once in the post-deploy window, and the
+  Binance listenKey was newly created with a valid expiry. Fresh high-confidence
+  exchange truth was complete-flat/no-order and state-consistent. Acceptance is
+  warning-only, not green, because seven historical close-reconciliation owners
+  remain (six evidence debts, one partial); lifecycle/risk are nevertheless
+  `running` and `entry_allowed=true`. No order or cancel was submitted by
+  deployment checks.
 - Prior checked deployment: `2026-09-02`. `dbb591b` was fast-forwarded and deployed; all 16
   critical manifest hashes matched, both services restarted active, singleton
   passed, all seven source domains were fresh, and both processes had zero
@@ -157,7 +162,7 @@ until this table receives real fixing commits and a production observation.
 | CL-143 | closed | `5d64b5a` | production-shaped CLI RED/GREEN: five controls formerly accepted generic defaults; all six mutating forms now require an explicit pair, retain/clear and lease/discovery complements pass (`46` ops tests); close profile `481 passed`; full release profile `1,604 passed` before final test-only amend | `dbb591b` is deployed. The remote command without a pair rejects with exit `2` before mutation; the one explicit pair wrote the matching authoritative event/state. The earlier generic pair was preserved in the recovery backup, and post-start acceptance is fully green. | [2026-09-02](daily/2026-09-02.md#cl-143--state-mutating-lightfee-ops-could-target-a-non-authoritative-default-pair) |
 | CL-144 | deployed-awaiting-verification | `b33aa6c` | Bitget identity/HTTP detail, Local-L2 protocol, pending-entry hedge, immutable close owner including strict partial→final promotion, close/replay, and entry-runtime suites; full validation profile `1,612 passed` plus ACK-state `32 passed`; compile and whitespace checks passed | Deploy `b33aa6c`, then observe naturally: Bitget null-order-ID ACK, owned-hedge retry, Gate/Bitget Local-L2 bridge, and uncertain-submit full-fill close. No order is to be forced for verification. | [2026-09-02](daily/2026-09-02.md#cl-144--bitget-order-identity-owned-hedge-close-owner-and-local-l2-contract-drift) |
 | CL-145 | deployed-awaiting-verification | `47c94b24` | 2026-09-03/04 shared recovery/live-truth, Gate/Aster/Bitget contract, diagnosis, Local-L2, Bitget dynamic precision/heartbeat, and typed-transport production-path regressions; full validation profile 10/10; changed regression suite 364 passed | Deployment manifest, singleton, source freshness, FD/CLOSE_WAIT, private WS, listenKey, high-confidence flat/no-order truth, and `diagnose_live --since-deploy` passed. Await only natural matched-pair release, eligible Bitget order, and terminal evidence-debt observations; no order is to be forced. | [2026-09-04](daily/2026-09-04.md) |
-| CL-146 | local-green | working tree (not deployed) | Bitget duplicate-client-id production-path regression; inherited close-evidence owner/restart/terminal-debt end-to-end verification; ledger drift correction; Aster/OI request identity, Local-L2 sequence/generation, source-age, and two-sample resource evidence tests; shared Bitget diagnosis predicate and persisted resource baseline | Local only. Remote remains `47c94b24`; deploy and read-only observation are still required. The four instrumentation families intentionally do not alter trading decisions or claim an independent root cause. The verifier will emit FD/CLOSE_WAIT deltas from the second timer run using the atomic runtime baseline. | [2026-09-04](daily/2026-09-04.md#current-working-tree-follow-up--wt-20260904-5) |
+| CL-146 | deployed-awaiting-verification | `d230f8df` | Bitget duplicate-client-id production-path regression; inherited close-evidence owner/restart/terminal-debt end-to-end verification; ledger drift correction; Aster/OI request identity, Local-L2 sequence/generation, source-age, and two-sample resource evidence tests; shared Bitget diagnosis predicate and persisted resource baseline | Deployed and observed `2026-09-05`: manifest and systemd service checks passed; seven venue sources fresh; exchange truth high-confidence flat/no-order; six private WS workers started once; two resource samples had zero `CLOSE_WAIT`. Acceptance remains warning-only for seven existing close-reconciliation owners, so natural Bitget duplicate-id and evidence-debt completion observations remain pending; no order was forced. | [2026-09-04](daily/2026-09-04.md#current-working-tree-follow-up--wt-20260904-5) |
 
 ## Pre-CL-093 Historical Boundary
 
