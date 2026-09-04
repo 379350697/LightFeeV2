@@ -544,6 +544,46 @@ async def test_bitget_history_discovery_uses_family_contract_and_exact_recheck(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "collection_key"),
+    [
+        (BitgetAccountProfile.CLASSIC, "entrustedList"),
+        (BitgetAccountProfile.UTA, "list"),
+    ],
+)
+async def test_bitget_history_discovery_treats_null_collection_as_empty_page(
+    profile,
+    collection_key,
+):
+    """Empty Bitget history windows may encode their collection as JSON null."""
+    adapter = BitgetAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass"),
+    )
+    adapter._profile = profile
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del method, params, body, private
+        assert path in {"/api/v2/mix/order/orders-history", "/api/v3/trade/history-orders"}
+        return {"code": "00000", "data": {collection_key: None, "endId": "", "cursor": ""}}
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="COTIUSDT",
+            side=Side.BUY,
+            position_side="SHORT",
+            quantity=2400.0,
+            closed_at_ms=NOW_MS - 60_000,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "no_candidate"
+    assert result.candidate_count == 0
+
+
+@pytest.mark.asyncio
 async def test_bitget_history_discovery_follows_uta_cursor_before_matching():
     adapter = BitgetAdapter(
         mode="live",

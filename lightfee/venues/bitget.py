@@ -140,6 +140,10 @@ def _bitget_history_rows(
     if not isinstance(data, dict):
         raise ValueError("Bitget order history response is malformed")
     rows = data.get("entrustedList", data.get("list", data.get("rows", [])))
+    # Bitget returns a null collection when a bounded history window has no
+    # rows.  That is an ordinary empty page, not a malformed response.
+    if rows is None:
+        rows = []
     if not isinstance(rows, list):
         raise ValueError("Bitget order history rows are malformed")
     cursor = str(data.get("cursor", data.get("endId", "")) or "")
