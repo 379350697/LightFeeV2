@@ -34,9 +34,11 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `d230f8df`
-- Checked on: `2026-09-05`. `d230f8df` was fast-forwarded from `47c94b24` over
-  Tailscale SSH and both services restarted active. All critical manifest hashes
+- Last production SHA checked: `e08fffcb`
+- Checked on: `2026-09-05`. Runtime code `d230f8df` was fast-forwarded from
+  `47c94b24` over Tailscale SSH and both services restarted active; the
+  subsequent docs-only commit `e08fffcb` was pulled without a restart. All
+  critical manifest hashes
   matched; systemd cgroups showed exactly one sidecar and one live main process;
   all seven source domains were fresh; and two resource samples showed zero
   `CLOSE_WAIT` (live FD delta `+2`, sidecar FD delta `0`). The six enabled
