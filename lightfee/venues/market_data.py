@@ -52,6 +52,11 @@ class FundingTicker:
     open_interest_transport_error_cause: str = ""
     open_interest_client_generation: int = 0
     open_interest_client_retired: bool = False
+    open_interest_request_id: str = ""
+    open_interest_request_method: str = ""
+    open_interest_request_path: str = ""
+    open_interest_request_started_at_ms: int = 0
+    open_interest_request_elapsed_ms: int = 0
     oi_candidate_count: int = 0
     oi_cache_hit_count: int = 0
     oi_cache_miss_count: int = 0
@@ -175,6 +180,7 @@ class MarketDataClient:
         # release it, so one peer-side failure cannot interrupt a healthy peer.
         self._client_lifecycle_lock = asyncio.Lock()
         self._client_generation = 0
+        self._request_sequence = 0
         self._client_generations: dict[int, int] = {}
         self._client_leases: dict[int, int] = {}
         self._retired_clients: dict[int, httpx.AsyncClient] = {}
@@ -277,6 +283,10 @@ class MarketDataClient:
         *,
         client_generation: int,
         client_retired: bool,
+        request_id: str = "",
+        method: str = "",
+        path: str = "",
+        started_at_ms: int = 0,
     ) -> dict[str, Any]:
         """Return safe, structured diagnostics for an httpx transport failure."""
         if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
@@ -300,6 +310,13 @@ class MarketDataClient:
             cause = next_cause
 
         return {
+            "request_id": request_id,
+            "request_method": method.upper(),
+            "request_path": path,
+            "request_started_at_ms": started_at_ms,
+            "request_elapsed_ms": max(_now_ms() - started_at_ms, 0)
+            if started_at_ms > 0
+            else 0,
             "request_phase": phase,
             "transport_error_type": type(exc).__name__,
             "transport_error_detail": str(exc)[:200],
@@ -415,6 +432,9 @@ class MarketDataClient:
             await global_rt.async_wait_until_ready_for_scopes(scopes)
 
         url = base_url + path
+        self._request_sequence += 1
+        request_id = f"{self.venue.value}:{self._request_sequence}"
+        started_at_ms = _now_ms()
         client, client_generation = await self._borrow_client()
         try:
             if method.upper() == "GET":
@@ -457,6 +477,10 @@ class MarketDataClient:
                 exc,
                 client_generation=client_generation,
                 client_retired=False,
+                request_id=request_id,
+                method=method,
+                path=path,
+                started_at_ms=started_at_ms,
             )
             raise PublicTransportError(
                 PublicTransportErrorCategory.TIMEOUT,
@@ -469,6 +493,10 @@ class MarketDataClient:
                 e,
                 client_generation=client_generation,
                 client_retired=retired,
+                request_id=request_id,
+                method=method,
+                path=path,
+                started_at_ms=started_at_ms,
             )
             raise PublicTransportError(
                 PublicTransportErrorCategory.TRANSPORT_FAILURE,
@@ -655,6 +683,21 @@ class MarketDataClient:
                     ),
                     open_interest_client_retired=bool(
                         getattr(exc, "client_retired", False)
+                    ),
+                    open_interest_request_id=str(
+                        getattr(exc, "request_id", "") or ""
+                    ),
+                    open_interest_request_method=str(
+                        getattr(exc, "request_method", "") or ""
+                    ),
+                    open_interest_request_path=str(
+                        getattr(exc, "request_path", "") or ""
+                    ),
+                    open_interest_request_started_at_ms=int(
+                        getattr(exc, "request_started_at_ms", 0) or 0
+                    ),
+                    open_interest_request_elapsed_ms=int(
+                        getattr(exc, "request_elapsed_ms", 0) or 0
                     ),
                     oi_cache_miss_count=1,
                     oi_refresh_attempt_count=1,
@@ -1580,6 +1623,11 @@ class PublicTransportError(Exception):
         transport_error_cause: str = "",
         client_generation: int = 0,
         client_retired: bool = False,
+        request_id: str = "",
+        request_method: str = "",
+        request_path: str = "",
+        request_started_at_ms: int = 0,
+        request_elapsed_ms: int = 0,
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -1592,6 +1640,11 @@ class PublicTransportError(Exception):
         self.transport_error_cause = transport_error_cause
         self.client_generation = client_generation
         self.client_retired = client_retired
+        self.request_id = request_id
+        self.request_method = request_method
+        self.request_path = request_path
+        self.request_started_at_ms = request_started_at_ms
+        self.request_elapsed_ms = request_elapsed_ms
 
 
 def open_interest_evidence_status_from_error(exc: Exception) -> str:

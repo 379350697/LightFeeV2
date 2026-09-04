@@ -184,6 +184,19 @@ def analyze_runtime_resources(
             "fd_count": fd_count,
             "socket_count": socket_count,
             "close_wait_count": close_wait_count,
+            **{
+                key: raw[key]
+                for key in (
+                    "baseline_sampled_at_ms",
+                    "sample_interval_ms",
+                    "baseline_fd_count",
+                    "baseline_close_wait_count",
+                    "delta_fd_count",
+                    "delta_close_wait_count",
+                    "slope_evidence_available",
+                )
+                if key in raw
+            },
         }
         if (
             pid is None

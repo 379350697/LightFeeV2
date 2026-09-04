@@ -25,12 +25,11 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.bybit_duplicate_reconcile import (
-    BYBIT_DUPLICATE_RECONCILE_ENDPOINTS,
-    BybitDuplicateReconcileResult,
-    build_order_reconcile_result_payload,
-    reconcile_bybit_duplicate_client_order,
+    build_duplicate_reconcile_result_payload,
+    DuplicateClientOrderReconcileResult,
+    is_duplicate_client_order_error,
+    reconcile_duplicate_client_order,
 )
-from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.engine.entry_dispatch_runtime import EntryDispatchRuntime
 from lightfee.engine.entry_gate_runtime import EntryGateRuntime
@@ -7675,19 +7674,17 @@ class LiveRuntime:
                     pass
             except Exception as e:
                 self._flush_adapter_order_diagnostics(adapter)
-                is_bybit_duplicate = (
-                    venue == Venue.BYBIT
-                    and _is_bybit_duplicate_order_link_id(str(e))
-                )
-                if is_bybit_duplicate:
+                is_duplicate_client_order = is_duplicate_client_order_error(venue, e)
+                if is_duplicate_client_order:
                     next_client_order_id = (
                         cleanup_client_order_id_for_attempt(attempt + 1)
                         if attempt < max_attempts
                         else ""
                     )
-                    duplicate_reconcile = await self._reconcile_bybit_duplicate_cleanup_order(
+                    duplicate_reconcile = await self._reconcile_duplicate_cleanup_order(
                         adapter=adapter,
                         symbol=symbol,
+                        venue=venue,
                         entry_id=entry_id,
                         stage=stage,
                         attempt=attempt,
@@ -7753,7 +7750,7 @@ class LiveRuntime:
 
         return False
 
-    async def _reconcile_bybit_duplicate_cleanup_order(
+    async def _reconcile_duplicate_cleanup_order(
         self,
         *,
         adapter,
@@ -7767,15 +7764,17 @@ class LiveRuntime:
         target_qty: float,
         live_pos_before: PositionSnapshot,
         original_error: str,
-    ) -> BybitDuplicateReconcileResult:
-        """Reconcile Bybit duplicate cleanup order ids before retrying.
+        venue: Venue = Venue.BYBIT,
+    ) -> DuplicateClientOrderReconcileResult:
+        """Reconcile duplicate cleanup order ids before retrying.
 
         This intentionally uses the same adapter.fetch_order_fill_reconciliation
         contract as passive close/close execution so Bybit endpoint semantics
         stay centralized in the venue adapter.
         """
-        result = await reconcile_bybit_duplicate_client_order(
+        result = await reconcile_duplicate_client_order(
             adapter=adapter,
+            venue=venue,
             symbol=symbol,
             client_order_id=client_order_id,
             target_qty=target_qty,
@@ -7787,11 +7786,13 @@ class LiveRuntime:
             "stage": stage,
             "attempt": attempt,
             "max_attempts": max_attempts,
-            "venue": Venue.BYBIT.value,
+            "venue": venue.value,
             "symbol": symbol,
             "client_order_id": client_order_id,
             "next_client_order_id": next_client_order_id,
-            "reconcile_endpoints": list(BYBIT_DUPLICATE_RECONCILE_ENDPOINTS),
+            "reconcile_endpoints": list(
+                ORDER_TRUTH_LEDGER.duplicate_reconcile_endpoints(venue)
+            ),
             "classification": result.classification,
             "reconciled_quantity": result.reconciled_qty,
             "target_quantity": result.target_qty,
@@ -7815,8 +7816,9 @@ class LiveRuntime:
 
         self.journal.append(
             "order.reconcile_result",
-            build_order_reconcile_result_payload(
+            build_duplicate_reconcile_result_payload(
                 result=result,
+                venue=venue,
                 symbol=symbol,
                 client_order_id=client_order_id,
                 reason="duplicate_client_id",

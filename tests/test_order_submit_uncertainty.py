@@ -8,7 +8,11 @@ from lightfee.core.domain import Venue
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.engine.bybit_duplicate_reconcile import (
     BybitDuplicateReconcileResult,
+    DuplicateClientOrderReconcileResult,
     build_order_reconcile_result_payload,
+    build_duplicate_reconcile_result_payload,
+    is_duplicate_client_order_error,
+    reconcile_duplicate_client_order,
     reconcile_bybit_duplicate_client_order,
 )
 from lightfee.engine.order_truth_ledger import (
@@ -98,6 +102,52 @@ def test_bitget_truth_gap_probe_paths_are_family_aware_for_uta_v3():
     assert paths["live_position_probe"] == "GET /api/v3/position/current-position"
     assert paths["symbol_shape"] == "BTCUSDT"
     assert paths["required_params"] == "category=USDT-FUTURES"
+
+
+@pytest.mark.parametrize(
+    ("venue", "error", "expected"),
+    [
+        (Venue.BYBIT, 'HTTP 400: {"retCode":110072,"retMsg":"OrderLinkedID is duplicate"}', True),
+        (Venue.BYBIT, "110072", True),
+        (Venue.BYBIT, "order validation duplicate quantity", False),
+        (Venue.BITGET, 'HTTP 400: {"code":"40786","msg":"Duplicate clientOid"}', True),
+        (Venue.BITGET, "Duplicate clientOid", True),
+        (Venue.BITGET, "duplicate order size", False),
+        (Venue.BINANCE, "duplicate clientOrderId", False),
+    ],
+)
+def test_duplicate_client_order_detection_uses_documented_venue_signatures(
+    venue, error, expected
+):
+    assert is_duplicate_client_order_error(venue, error) is expected
+
+
+def test_bitget_duplicate_reconcile_payload_uses_bitget_probe_contract():
+    result = DuplicateClientOrderReconcileResult(
+        classification="partial",
+        decision="retry_new_client_order_id",
+        target_qty=10.0,
+        reconciled_qty=4.0,
+        live_qty=6.0,
+        remaining_qty=6.0,
+        retry_qty=6.0,
+        client_order_id="cid-duplicate",
+    )
+    payload = build_duplicate_reconcile_result_payload(
+        result=result,
+        venue=Venue.BITGET,
+        symbol="HOMEUSDT",
+        client_order_id="cid-duplicate",
+        reason="duplicate_client_id",
+    )
+
+    assert payload["venue"] == Venue.BITGET.value
+    assert payload["order_truth_probe_paths"] == ORDER_TRUTH_LEDGER.probe_paths(
+        Venue.BITGET
+    )
+    assert payload["queried_endpoints"] == list(
+        ORDER_TRUTH_LEDGER.duplicate_reconcile_endpoints(Venue.BITGET)
+    )
 
 
 def test_hyperliquid_truth_gap_documents_account_address_info_endpoint():
@@ -491,4 +541,56 @@ async def test_bybit_duplicate_facade_delegates_decision_to_order_truth_ledger(m
     assert calls[0]["client_order_id"] == "cid-ledger"
     assert result.classification == "ledger_decided"
     assert result.order_truth_state == "resolved_position"
+    assert result.should_retry_with_new_client_id is True
+
+
+@pytest.mark.asyncio
+async def test_bitget_duplicate_reconcile_uses_bitget_venue_in_shared_ledger(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class Adapter:
+        async def fetch_order_fill_reconciliation(self, symbol, order_id, client_order_id):
+            return type(
+                "Fill",
+                (),
+                {
+                    "quantity": 0.0,
+                    "order_id": "",
+                    "client_order_id": client_order_id,
+                    "average_price": 0.0,
+                },
+            )()
+
+        async def fetch_position(self, symbol):
+            return type("Position", (), {"quantity": 3.0, "side": None})()
+
+    def fake_resolve_duplicate_conflict(**kwargs):
+        calls.append(kwargs)
+        return OrderTruthDecision(
+            state="resolved_position",
+            classification="ledger_decided",
+            decision="retry_new_client_order_id",
+            target_qty=3.0,
+            reconciled_qty=0.0,
+            live_qty=3.0,
+            remaining_qty=3.0,
+            retry_qty=3.0,
+            client_order_id="cid-ledger",
+        )
+
+    monkeypatch.setattr(
+        ORDER_TRUTH_LEDGER,
+        "resolve_duplicate_conflict",
+        fake_resolve_duplicate_conflict,
+    )
+
+    result = await reconcile_duplicate_client_order(
+        adapter=Adapter(),
+        venue=Venue.BITGET,
+        symbol="HOMEUSDT",
+        client_order_id="cid-ledger",
+        target_qty=3.0,
+    )
+
+    assert calls and calls[0]["venue"] == Venue.BITGET
     assert result.should_retry_with_new_client_id is True

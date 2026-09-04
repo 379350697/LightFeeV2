@@ -109,6 +109,21 @@ class EntryOpenInterestRefresher:
                 "open_interest_client_retired": bool(
                     getattr(exc, "client_retired", False)
                 ),
+                "open_interest_request_id": str(
+                    getattr(exc, "request_id", "") or ""
+                ),
+                "open_interest_request_method": str(
+                    getattr(exc, "request_method", "") or ""
+                ),
+                "open_interest_request_path": str(
+                    getattr(exc, "request_path", "") or ""
+                ),
+                "open_interest_request_started_at_ms": int(
+                    getattr(exc, "request_started_at_ms", 0) or 0
+                ),
+                "open_interest_request_elapsed_ms": int(
+                    getattr(exc, "request_elapsed_ms", 0) or 0
+                ),
             }
         ticker = result.get(f"{venue_key}:{symbol_key}")
         if ticker is None:
@@ -155,6 +170,21 @@ class EntryOpenInterestRefresher:
             ),
             "open_interest_client_retired": bool(
                 getattr(ticker, "open_interest_client_retired", False)
+            ),
+            "open_interest_request_id": str(
+                getattr(ticker, "open_interest_request_id", "") or ""
+            ),
+            "open_interest_request_method": str(
+                getattr(ticker, "open_interest_request_method", "") or ""
+            ),
+            "open_interest_request_path": str(
+                getattr(ticker, "open_interest_request_path", "") or ""
+            ),
+            "open_interest_request_started_at_ms": int(
+                getattr(ticker, "open_interest_request_started_at_ms", 0) or 0
+            ),
+            "open_interest_request_elapsed_ms": int(
+                getattr(ticker, "open_interest_request_elapsed_ms", 0) or 0
             ),
             "oi_candidate_count": int(getattr(ticker, "oi_candidate_count", 0) or 0),
             "oi_cache_hit_count": int(getattr(ticker, "oi_cache_hit_count", 0) or 0),
@@ -1457,6 +1487,23 @@ class MarketDataRuntime:
                 "open_interest_client_retired": bool(
                     (result or {}).get("open_interest_client_retired", False)
                 ),
+                "open_interest_request_id": str(
+                    (result or {}).get("open_interest_request_id", "") or ""
+                ),
+                "open_interest_request_method": str(
+                    (result or {}).get("open_interest_request_method", "") or ""
+                ),
+                "open_interest_request_path": str(
+                    (result or {}).get("open_interest_request_path", "") or ""
+                ),
+                "open_interest_request_started_at_ms": int(
+                    (result or {}).get("open_interest_request_started_at_ms", 0)
+                    or 0
+                ),
+                "open_interest_request_elapsed_ms": int(
+                    (result or {}).get("open_interest_request_elapsed_ms", 0)
+                    or 0
+                ),
                 "elapsed_ms": elapsed_ms,
                 "ts_ms": now_ms,
             }
@@ -2017,6 +2064,44 @@ class MarketDataRuntime:
                 if reason and lifecycle_name not in domains:
                     domains.append(lifecycle_name)
 
+        # The publication timestamp only proves that the sidecar wrote a new
+        # envelope.  Keep the source observation age by domain and venue so a
+        # fresh envelope containing an old venue feed remains diagnosable.
+        source_observed_at_ms_by_domain: dict[str, dict[str, int | None]] = {
+            "market": {},
+            "funding": {},
+            "liquidity": {},
+            "transfer": {},
+        }
+        source_observed_age_ms_by_domain: dict[str, dict[str, int | None]] = {
+            "market": {},
+            "funding": {},
+            "liquidity": {},
+            "transfer": {},
+        }
+        for lifecycle_name, rows in (
+            ("market", getattr(snapshot, "market_lifecycle", []) or []),
+            ("funding", getattr(snapshot, "funding_lifecycle", []) or []),
+            ("liquidity", getattr(snapshot, "liquidity_lifecycle", []) or []),
+            ("transfer", getattr(snapshot, "transfer_lifecycle", []) or []),
+        ):
+            for row in rows:
+                if lifecycle_name == "transfer":
+                    from_venue = str(getattr(row, "from_venue", "") or "")
+                    to_venue = str(getattr(row, "to_venue", "") or "")
+                    key = f"{from_venue}->{to_venue}" if from_venue or to_venue else "unknown"
+                else:
+                    key = str(getattr(row, "venue", "") or "") or "unknown"
+                observed_at_ms = int(getattr(row, "observed_at_ms", 0) or 0)
+                previous = source_observed_at_ms_by_domain[lifecycle_name].get(key)
+                if previous is not None and previous >= observed_at_ms:
+                    continue
+                observed = observed_at_ms if observed_at_ms > 0 else None
+                source_observed_at_ms_by_domain[lifecycle_name][key] = observed
+                source_observed_age_ms_by_domain[lifecycle_name][key] = (
+                    max(now_ms - observed_at_ms, 0) if observed_at_ms > 0 else None
+                )
+
         snapshot_path = str(self.ctx.config.runtime.sidecar_snapshot_path)
         config_hash = hashlib.sha256(
             f"{snapshot_path}|{max_age_ms}|{self.ctx.config.runtime.mode}".encode()
@@ -2053,6 +2138,8 @@ class MarketDataRuntime:
             "fallback_duration_ms": fallback_duration_ms,
             "last_good_age_ms": max(snapshot_publish_age_ms, 0),
             "fresh_source_age_ms": fresh_source_age_ms,
+            "source_observed_at_ms_by_domain": source_observed_at_ms_by_domain,
+            "source_observed_age_ms_by_domain": source_observed_age_ms_by_domain,
             "candidate_freshness_candidate_scope": candidate_scope_mode,
             "candidate_freshness_candidate_count": len(candidate_scope_candidates),
             "candidate_freshness_all_candidate_count": candidate_scope_all_count,

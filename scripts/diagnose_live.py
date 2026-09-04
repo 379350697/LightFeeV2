@@ -34,6 +34,9 @@ from lightfee.marketdata.local_l2_incident_classification import (
     has_official_sequence_rebuild_evidence,
 )
 from lightfee.core.domain import Venue
+from lightfee.engine.bybit_duplicate_reconcile import (
+    is_duplicate_client_order_error,
+)
 from lightfee.engine.exchange_truth import (
     normalize_exchange_truth_payload,
     request_venue_operation,
@@ -2177,21 +2180,40 @@ def _payload_is_ack_only_order_truth_gap(payload: dict[str, Any]) -> bool:
     )
 
 
-def _payload_is_bybit_duplicate_client_id(payload: dict[str, Any]) -> bool:
+def _payload_is_duplicate_client_id(payload: dict[str, Any]) -> bool:
+    """Classify documented duplicate client-id errors for every supported venue.
+
+    The execution path owns the venue-specific signatures.  Diagnostics must
+    consume that same predicate so a resolved Bitget duplicate cannot remain
+    visible as an unresolved order error merely because this reporter still
+    speaks in Bybit-only terms.
+    """
     exchange_error = _exchange_error_dict(payload)
-    exchange_code = str(
-        payload.get("exchange_code") or exchange_error.get("exchange_code") or ""
+    request_context = _payload_request_context(payload)
+    venue_text = str(
+        payload.get("venue")
+        or payload.get("hedge_venue")
+        or exchange_error.get("venue")
+        or request_context.get("venue")
+        or ""
+    ).strip().lower()
+    try:
+        venue = Venue(venue_text)
+    except ValueError:
+        return False
+    error_text = " ".join(
+        str(value or "")
+        for value in (
+            payload.get("reason"),
+            payload.get("error"),
+            payload.get("exchange_code"),
+            payload.get("exchange_msg"),
+            exchange_error.get("exchange_code"),
+            exchange_error.get("exchange_msg"),
+            exchange_error.get("raw_body"),
+        )
     )
-    exchange_msg = str(
-        payload.get("exchange_msg") or exchange_error.get("exchange_msg") or ""
-    ).lower()
-    reason = str(payload.get("reason") or payload.get("error") or "").lower()
-    return (
-        exchange_code == "110072"
-        or ("110072" in reason)
-        or ("orderlinkedid" in exchange_msg and "duplicate" in exchange_msg)
-        or ("orderlinkedid" in reason and "duplicate" in reason)
-    )
+    return is_duplicate_client_order_error(venue, error_text)
 
 
 def _payload_is_bybit_terminal_zero_qty_reduce_only(payload: dict[str, Any]) -> bool:
@@ -2337,7 +2359,7 @@ def _order_error_resolved_by_truth_gap(
         return False
     if not (
         _payload_is_ack_only_order_truth_gap(payload)
-        or _payload_is_bybit_duplicate_client_id(payload)
+        or _payload_is_duplicate_client_id(payload)
     ):
         return False
     resolved = set(resolved_truth_gap_summary.get("resolved_identities", []) or [])

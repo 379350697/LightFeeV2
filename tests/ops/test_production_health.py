@@ -966,6 +966,13 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
     evidence = vps.collect_runtime_resource_evidence(
         command_runner=command_runner,
         proc_root=proc_root,
+        previous_evidence={
+            "sampled_at_ms": now_ms - 5_000,
+            "processes": {
+                "sidecar": {"fd_count": 10, "close_wait_count": 0},
+                "live": {"fd_count": 20, "close_wait_count": 1},
+            },
+        },
     )
     report = analyze_runtime_resources(evidence, now_ms=now_ms)
 
@@ -973,6 +980,14 @@ def test_runtime_resource_collector_attributes_close_wait_to_the_service_pid_and
     assert evidence["processes"]["live"]["close_wait_count"] == 0
     assert evidence["private_ws_worker_starts"] == {"binance": 1, "bybit": 1}
     assert evidence["private_ws_journal_since_ms"] == active_entered_at_ms
+    assert evidence["processes"]["sidecar"]["slope_evidence_available"] is True
+    assert evidence["processes"]["sidecar"]["sample_interval_ms"] == 5_000
+    assert evidence["processes"]["sidecar"]["delta_fd_count"] == -9
+    assert evidence["processes"]["sidecar"]["delta_close_wait_count"] == 1
+    assert evidence["processes"]["live"]["delta_fd_count"] == -19
+    assert evidence["processes"]["live"]["delta_close_wait_count"] == -1
+    assert report.details["processes"]["sidecar"]["slope_evidence_available"] is True
+    assert report.details["processes"]["sidecar"]["sample_interval_ms"] == 5_000
     assert report.ok
 
 
@@ -1087,6 +1102,30 @@ def test_runtime_resource_collector_converts_command_timeout_to_a_critical_repor
 
     assert report.ok is False
     assert "runtime_resource_collection_failed" in report.fingerprints
+
+
+def test_runtime_resource_baseline_round_trips_only_slope_counters(tmp_path):
+    path = tmp_path / "production-resource-baseline.json"
+    evidence = {
+        "sampled_at_ms": 1_000,
+        "processes": {
+            "sidecar": {
+                "pid": 7,
+                "fd_count": 12,
+                "close_wait_count": 3,
+                "sensitive_field": "must-not-persist",
+            }
+        },
+    }
+
+    vps._write_runtime_resource_baseline(path, evidence)
+
+    assert vps._load_runtime_resource_baseline(path) == {
+        "sampled_at_ms": 1_000,
+        "processes": {
+            "sidecar": {"pid": 7, "fd_count": 12, "close_wait_count": 3}
+        },
+    }
 
 
 def test_verify_production_services_cli_json_success(tmp_path):

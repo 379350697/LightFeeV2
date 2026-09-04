@@ -14,7 +14,9 @@ from lightfee.marketdata.local_l2_runtime import LocalL2BookKey
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.sidecar.snapshot import (
     CandidateInput,
+    FundingLifecycle,
     LiquidityLifecycle,
+    MarketLifecycle,
     QuoteSnapshot,
     SidecarSnapshot,
     SnapshotFreshness,
@@ -437,6 +439,48 @@ def test_runtime_snapshot_freshness_status_includes_transfer_domain(tmp_path):
     key = "transfer|okx->bybit|BTCUSDT|sidecar_transfer"
     assert statuses[key]["status"] == "fresh"
     assert statuses[key]["age_ms"] == 5000
+
+
+def test_snapshot_health_payload_exposes_source_observation_age_by_domain(tmp_path):
+    config = AppConfig(
+        runtime=RuntimeConfig(
+            mode="live",
+            sidecar_snapshot_path=str(tmp_path / "sidecar.json"),
+        ),
+        persistence=PersistenceConfig(
+            event_log_path=str(tmp_path / "events.jsonl"),
+            snapshot_path=str(tmp_path / "state.json"),
+        ),
+    )
+    runtime = LiveRuntime(config)
+    snapshot = SidecarSnapshot(
+        published_at_ms=100_000,
+        market_observed_at_ms=100_000,
+        market_lifecycle=[MarketLifecycle("bitget", 98_000, 2)],
+        funding_lifecycle=[FundingLifecycle("bitget", 97_000, 2)],
+        liquidity_lifecycle=[LiquidityLifecycle("bitget", 96_000, 2)],
+        transfer_lifecycle=[TransferLifecycle("bitget", "gate", 95_000, 1)],
+    )
+
+    payload = runtime._snapshot_health_payload(
+        snapshot=snapshot,
+        now_ms=100_000,
+        max_age_ms=10_000,
+        freshness="fresh",
+    )
+
+    assert payload["source_observed_at_ms_by_domain"] == {
+        "market": {"bitget": 98_000},
+        "funding": {"bitget": 97_000},
+        "liquidity": {"bitget": 96_000},
+        "transfer": {"bitget->gate": 95_000},
+    }
+    assert payload["source_observed_age_ms_by_domain"] == {
+        "market": {"bitget": 2_000},
+        "funding": {"bitget": 3_000},
+        "liquidity": {"bitget": 4_000},
+        "transfer": {"bitget->gate": 5_000},
+    }
 
 
 @pytest.mark.asyncio

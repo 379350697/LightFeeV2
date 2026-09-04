@@ -1355,6 +1355,8 @@ class TestBinanceAsterV1BufferCapParity:
         assert payload["status_after"] == "rebuilding"
         assert payload["replay_failure_alert"] is False
         assert payload["root_bug_suspected"] is False
+        assert payload["stream_generation_before"] == 1
+        assert payload["sequence_gap_delta"] == -1
 
     @pytest.mark.asyncio
     async def test_binance_buffered_replay_same_symbol_alert_threshold(self):

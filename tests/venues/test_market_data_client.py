@@ -837,6 +837,11 @@ class TestProductionSidecarParserRegressions:
         assert ticker.open_interest_evidence_status == "timeout"
         assert ticker.open_interest_evidence_reason.startswith("timeout:")
         assert ticker.oi_timeout_count == 1
+        assert ticker.open_interest_request_id.startswith("binance:")
+        assert ticker.open_interest_request_method == "GET"
+        assert ticker.open_interest_request_path == "/fapi/v1/openInterest"
+        assert ticker.open_interest_request_started_at_ms > 0
+        assert ticker.open_interest_request_elapsed_ms >= 0
 
     @pytest.mark.asyncio
     async def test_binance_open_interest_error_does_not_drop_quotes(self):

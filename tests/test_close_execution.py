@@ -1959,6 +1959,91 @@ class TestCloseChunkExecutor:
         assert payload["status"] == "partial"
 
     @pytest.mark.asyncio
+    async def test_bitget_duplicate_close_reconciles_original_client_id_before_retry(self):
+        """Bitget 40786 is the same idempotency contract as Bybit 110072.
+
+        An ACK-only submission followed by a duplicate response must query the
+        original client id and use that evidence; it must never resubmit the
+        same id blindly.
+        """
+        from lightfee.engine.close_executor import CloseExecutor
+        from lightfee.venues.cid import compact_client_order_id
+
+        class DuplicateBitgetAdapter(FakeVenueAdapter):
+            def __init__(self):
+                super().__init__(Venue.BITGET, default_fill_price=0.2911)
+                self.reconciliation_lookups = []
+
+            async def fetch_order_fill_reconciliation(
+                self, symbol, order_id, client_order_id=None,
+            ):
+                self.reconciliation_lookups.append((symbol, order_id, client_order_id))
+                return OrderFillReconciliation(
+                    venue=Venue.BITGET,
+                    symbol=symbol,
+                    side=Side.BUY,
+                    quantity=40.0,
+                    average_price=0.2911,
+                    order_id="bitget-partial-close",
+                    client_order_id=client_order_id,
+                    filled_at_ms=2100,
+                )
+
+            async def fetch_position(self, symbol: str):
+                return PositionSnapshot(
+                    venue=Venue.BITGET,
+                    symbol=symbol,
+                    side=Side.SELL,
+                    quantity=42.0,
+                    entry_price=0.2911,
+                    observed_at_ms=2200,
+                )
+
+        adapter = DuplicateBitgetAdapter()
+        adapter.place_order_outcomes = [
+            _make_rejected_error(
+                'bitget order failed: HTTP 400 {"code":"40786",'
+                '"msg":"Duplicate clientOid"}'
+            )
+        ]
+        journal = Journal(Path(tempfile.mkdtemp()) / "journal.jsonl")
+        journal.open()
+        executor = CloseExecutor(
+            adapters={Venue.BITGET: adapter},
+            journal=journal,
+            config_overrides={"max_close_retries": 1},
+        )
+        client_order_id = compact_client_order_id("p001", "exit_short")
+        request = OrderRequest(
+            venue=Venue.BITGET,
+            symbol="PROVEUSDT",
+            side=Side.BUY,
+            quantity=82.0,
+            price=0.2911,
+            reduce_only=True,
+            time_in_force=TimeInForce.IOC,
+            client_order_id=client_order_id,
+        )
+
+        result = await executor._submit_close_leg_with_retry(
+            request, "p001", "short", 2000,
+        )
+
+        assert result["outcome"] == "filled"
+        assert result["fill"].quantity == pytest.approx(40.0)
+        assert result["fill"].client_order_id == client_order_id
+        assert adapter.reconciliation_lookups == [
+            ("PROVEUSDT", "", client_order_id)
+        ]
+        payload = [
+            record["payload"] for record in journal.read_all()
+            if record["kind"] == "order.reconcile_result"
+        ][-1]
+        assert payload["venue"] == Venue.BITGET.value
+        assert payload["client_order_id"] == client_order_id
+        assert payload["status"] == "partial"
+
+    @pytest.mark.asyncio
     async def test_multichunk_pnl_aggregation_correct(self):
         """PnL across multiple chunks sums correctly via build_close_execution_from_legs."""
         # 2 chunks manually built and aggregated

@@ -18,11 +18,10 @@ from lightfee.core.domain import (
 )
 from lightfee.core.errors import OrderSubmitError
 from lightfee.engine.bybit_duplicate_reconcile import (
-    BYBIT_DUPLICATE_RECONCILE_ENDPOINTS,
-    build_order_reconcile_result_payload,
-    reconcile_bybit_duplicate_client_order,
+    build_duplicate_reconcile_result_payload,
+    is_duplicate_client_order_error,
+    reconcile_duplicate_client_order,
 )
-from lightfee.engine.close_executor import _is_bybit_duplicate_order_link_id
 from lightfee.engine.exchange_truth import (
     require_open_orders_response,
     request_venue_operation,
@@ -591,11 +590,11 @@ class ResidualRepairRuntime:
             except Exception as e:
                 self._flush_adapter_order_diagnostics(adapter)
                 if (
-                    repair_venue == Venue.BYBIT
-                    and _is_bybit_duplicate_order_link_id(str(e))
+                    is_duplicate_client_order_error(repair_venue, e)
                 ):
-                    duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+                    duplicate_reconcile = await reconcile_duplicate_client_order(
                         adapter=adapter,
+                        venue=repair_venue,
                         symbol=symbol,
                         client_order_id=req.client_order_id or "",
                         target_qty=repair_quantity,
@@ -603,8 +602,9 @@ class ResidualRepairRuntime:
                     )
                     self.ctx.journal.append(
                         "order.reconcile_result",
-                        build_order_reconcile_result_payload(
+                        build_duplicate_reconcile_result_payload(
                             result=duplicate_reconcile,
+                            venue=repair_venue,
                             symbol=symbol,
                             client_order_id=req.client_order_id or "",
                             reason="duplicate_client_id",
@@ -618,7 +618,11 @@ class ResidualRepairRuntime:
                         "repair_venue": repair_venue.value,
                         "repair_side": repair_side.value,
                         "client_order_id": req.client_order_id,
-                        "reconcile_endpoints": list(BYBIT_DUPLICATE_RECONCILE_ENDPOINTS),
+                        "reconcile_endpoints": list(
+                            ORDER_TRUTH_LEDGER.duplicate_reconcile_endpoints(
+                                repair_venue
+                            )
+                        ),
                         "classification": duplicate_reconcile.classification,
                         "decision": duplicate_reconcile.decision,
                         "target_qty": duplicate_reconcile.target_qty,
@@ -700,8 +704,9 @@ class ResidualRepairRuntime:
                         except Exception as retry_error:
                             self._flush_adapter_order_diagnostics(adapter)
                             if (
-                                repair_venue == Venue.BYBIT
-                                and _is_bybit_duplicate_order_link_id(str(retry_error))
+                                is_duplicate_client_order_error(
+                                    repair_venue, retry_error
+                                )
                                 and duplicate_reconcile.live_qty > 1e-9
                             ):
                                 next_retry_count = (

@@ -267,12 +267,26 @@ class TransportError(Exception):
                  transport_error_cause_type: str = "",
                  transport_error_cause: str = "",
                  client_generation: int = 0,
-                 client_retired: bool = False) -> None:
+                 client_retired: bool = False,
+                 request_id: str = "",
+                 request_method: str = "",
+                 request_path: str = "",
+                 request_started_at_ms: int = 0,
+                 request_elapsed_ms: int = 0) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.body = body
         self.headers: dict[str, str] = headers or {}
+        # Keep request identity alongside the typed transport failure.  The
+        # public MarketDataClient and private VenueTransport share this error
+        # contract so diagnostics cannot be dropped or raise while handling
+        # an httpx failure.
+        self.request_id = request_id
+        self.request_method = request_method
+        self.request_path = request_path
+        self.request_started_at_ms = request_started_at_ms
+        self.request_elapsed_ms = request_elapsed_ms
         self.request_phase = request_phase
         self.transport_error_type = transport_error_type
         self.transport_error_detail = transport_error_detail

@@ -21,6 +21,33 @@ import pytest
 from scripts.diagnose_live import _find_event_files, run_diagnose
 
 
+def test_order_error_truth_gap_accepts_bitget_duplicate_client_id():
+    """Diagnosis must share the execution predicate for Bitget 40786."""
+    from scripts import diagnose_live
+
+    payload = {
+        "position_id": "p1",
+        "symbol": "ZORAUSDT",
+        "venue": "bitget",
+        "reason": (
+            'bitget order failed: HTTP 400 {"code":"40786",'
+            '"msg":"Duplicate clientOid"}'
+        ),
+        "exchange_error": {
+            "venue": "bitget",
+            "exchange_code": "40786",
+            "exchange_msg": "Duplicate clientOid",
+        },
+        "client_order_id": "cid1",
+    }
+    truth_gap = {
+        "count": 1,
+        "resolved_identities": ["position_id:p1", "client_order_id:cid1"],
+    }
+
+    assert diagnose_live._order_error_resolved_by_truth_gap(payload, truth_gap)
+
+
 def test_deploy_status_treats_short_git_head_as_matching_full_deploy_version(monkeypatch):
     import scripts.diagnose_live as diagnose_live
 

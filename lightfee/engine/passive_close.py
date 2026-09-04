@@ -40,8 +40,9 @@ from lightfee.core.domain import (
     Venue,
 )
 from lightfee.engine.bybit_duplicate_reconcile import (
-    build_order_reconcile_result_payload,
-    reconcile_bybit_duplicate_client_order,
+    build_duplicate_reconcile_result_payload,
+    is_duplicate_client_order_error,
+    reconcile_duplicate_client_order,
 )
 from lightfee.engine.close_executor import (
     CloseExecutionLeg,
@@ -3249,21 +3250,22 @@ class PassiveCloseExecutor:
                     operation="place_order",
                     request_context=req_ctx,
                 )
-            is_bybit_duplicate = (
-                hedge_venue == Venue.BYBIT
-                and _is_bybit_duplicate_order_link_id(str(e))
+            is_duplicate_client_order = is_duplicate_client_order_error(
+                hedge_venue, e
             )
-            if is_bybit_duplicate:
-                duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+            if is_duplicate_client_order:
+                duplicate_reconcile = await reconcile_duplicate_client_order(
                     adapter=adapter,
+                    venue=hedge_venue,
                     symbol=position.symbol,
                     client_order_id=hedge_cid,
                     target_qty=normalized_delta,
                 )
                 self._journal.append(
                     "order.reconcile_result",
-                    build_order_reconcile_result_payload(
+                    build_duplicate_reconcile_result_payload(
                         result=duplicate_reconcile,
+                        venue=hedge_venue,
                         symbol=position.symbol,
                         client_order_id=hedge_cid,
                         reason="duplicate_client_id",
@@ -3446,7 +3448,7 @@ class PassiveCloseExecutor:
                     order_id=duplicate_reconcile.order_id,
                 ), reconciled=True)
 
-            should_reconcile = isinstance(e, OrderSubmitError) or is_bybit_duplicate
+            should_reconcile = isinstance(e, OrderSubmitError) or is_duplicate_client_order
             fill_reconciliation_attempted = False
             fill_reconciliation_result = ""
             if should_reconcile:
@@ -3524,7 +3526,7 @@ class PassiveCloseExecutor:
                     success = residual < 1e-12
                     event_kind = (
                         "exit.passive_close_hedge_duplicate_client_order_reconciled"
-                        if is_bybit_duplicate
+                        if is_duplicate_client_order
                         else (
                             "exit.passive_close_hedge_confirmed_after_ack"
                             if accepted_ack_confirmation
@@ -3544,7 +3546,7 @@ class PassiveCloseExecutor:
                             "residual": residual,
                             "classification": (
                                 "duplicate_client_order_reconciled"
-                                if is_bybit_duplicate
+                                if is_duplicate_client_order
                                 else (
                                     "accepted_ack_confirmed"
                                     if accepted_ack_confirmation
@@ -3555,7 +3557,7 @@ class PassiveCloseExecutor:
                             "order_submit_uncertain": isinstance(e, OrderSubmitError),
                             "decision": (
                                 "duplicate_client_order_reconciled_by_client_id"
-                                if is_bybit_duplicate
+                                if is_duplicate_client_order
                                 else "accepted_order_reconciled_by_client_id"
                             ),
                             "order_truth_fill_status": truth_decision.fill_status.value,
@@ -3581,7 +3583,7 @@ class PassiveCloseExecutor:
                         order_id=fill.order_id,
                     ), reconciled=True)
 
-                if is_bybit_duplicate:
+                if is_duplicate_client_order:
                     self._journal.append(
                         "exit.passive_close_hedge_duplicate_client_order_pending_reconcile",
                         {

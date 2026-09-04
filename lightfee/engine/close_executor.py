@@ -27,8 +27,9 @@ from lightfee.core.exchange_errors import (
 )
 from lightfee.engine.bootstrap import wall_clock_now_ms
 from lightfee.engine.bybit_duplicate_reconcile import (
-    build_order_reconcile_result_payload,
-    reconcile_bybit_duplicate_client_order,
+    build_duplicate_reconcile_result_payload,
+    is_duplicate_client_order_error,
+    reconcile_duplicate_client_order,
 )
 from lightfee.engine.exit import CloseExecution
 from lightfee.engine.lifecycle import enter_fail_closed
@@ -199,8 +200,8 @@ def _classify_close_leg_error(error_str: str) -> dict[str, Any]:
 
 
 def _is_bybit_duplicate_order_link_id(reason: str) -> bool:
-    lower = reason.lower()
-    return "110072" in lower or ("orderlinkedid" in lower and "duplicate" in lower)
+    """Legacy Bybit predicate retained for compatibility with old callers."""
+    return is_duplicate_client_order_error(Venue.BYBIT, reason)
 
 
 def _is_terminal_reduce_only(error_class: dict[str, Any], reason: str) -> bool:
@@ -1811,13 +1812,14 @@ class CloseExecutor:
             if result["outcome"] == "rejected":
                 # V1: check for terminal reduce-only success (venue already flat)
                 reason = result.get("reason", "")
-                if request.venue == Venue.BYBIT and _is_bybit_duplicate_order_link_id(reason):
+                if is_duplicate_client_order_error(request.venue, reason):
                     adapter = self.adapters.get(request.venue)
                     duplicate_reconcile = None
                     if adapter is not None:
                         try:
-                            duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+                            duplicate_reconcile = await reconcile_duplicate_client_order(
                                 adapter=adapter,
+                                venue=request.venue,
                                 symbol=request.symbol,
                                 client_order_id=request.client_order_id or "",
                                 target_qty=request.quantity,
@@ -1836,8 +1838,9 @@ class CloseExecutor:
                     if duplicate_reconcile is not None:
                         self.journal.append(
                             "order.reconcile_result",
-                            build_order_reconcile_result_payload(
+                            build_duplicate_reconcile_result_payload(
                                 result=duplicate_reconcile,
+                                venue=request.venue,
                                 symbol=request.symbol,
                                 client_order_id=request.client_order_id or "",
                                 reason="duplicate_client_id",
@@ -2369,17 +2372,19 @@ class CloseExecutor:
                 _record_compensation_submission_identity(
                     outcome, accepted_order_id, accepted_client_order_id,
                 )
-            if venue == Venue.BYBIT and _is_bybit_duplicate_order_link_id(str(exc)):
-                duplicate_reconcile = await reconcile_bybit_duplicate_client_order(
+            if is_duplicate_client_order_error(venue, exc):
+                duplicate_reconcile = await reconcile_duplicate_client_order(
                     adapter=adapter,
+                    venue=venue,
                     symbol=symbol,
                     client_order_id=client_order_id,
                     target_qty=quantity,
                 )
                 self.journal.append(
                     "order.reconcile_result",
-                    build_order_reconcile_result_payload(
+                    build_duplicate_reconcile_result_payload(
                         result=duplicate_reconcile,
+                        venue=venue,
                         symbol=symbol,
                         client_order_id=client_order_id,
                         reason="duplicate_client_id",

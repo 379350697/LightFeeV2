@@ -37,6 +37,9 @@ from scripts.diagnose_live import _environment_file_scope
 
 EXCHANGE_TRUTH_PROBE_TIMEOUT_S = 60.0
 RUNTIME_RESOURCE_JOURNAL_WINDOW = "-1h"
+DEFAULT_RUNTIME_RESOURCE_BASELINE = (
+    "/opt/lightfee-v2/runtime/production-resource-baseline.json"
+)
 _SOCKET_LINK_RE = re.compile(r"^socket:\[(?P<inode>\d+)\]$")
 _PRIVATE_WS_STARTED_RE = re.compile(
     r"\b(?P<venue>aster|binance|bitget|bybit|gate|hyperliquid|okx)\s+"
@@ -59,6 +62,53 @@ def _read_json(path: str) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"JSON root must be object: {path}")
     return data
+
+
+def _load_runtime_resource_baseline(path: Path) -> dict | None:
+    """Load the prior bounded resource sample, if one is available."""
+    try:
+        data = _read_json(str(path))
+    except (OSError, ValueError, TypeError):
+        return None
+    return data
+
+
+def _write_runtime_resource_baseline(path: Path, evidence: dict) -> None:
+    """Persist only the counters needed for the next slope comparison.
+
+    The verifier is still read-only with respect to trading state.  This
+    small operational evidence file is replaced atomically so a timer run
+    cannot leave a partial baseline for the next invocation.
+    """
+    processes = evidence.get("processes")
+    if not isinstance(processes, dict):
+        processes = {}
+    baseline = {
+        "sampled_at_ms": int(evidence.get("sampled_at_ms", 0) or 0),
+        "processes": {
+            str(name): {
+                key: int(metrics[key])
+                for key in ("pid", "fd_count", "close_wait_count")
+                if isinstance(metrics, dict)
+                and isinstance(metrics.get(key), (int, float))
+            }
+            for name, metrics in processes.items()
+            if isinstance(metrics, dict)
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(baseline, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _run_readonly_command(command: list[str]) -> str:
@@ -190,11 +240,14 @@ def collect_runtime_resource_evidence(
     *,
     command_runner=None,
     proc_root: Path = Path("/proc"),
+    previous_evidence: dict | None = None,
 ) -> dict:
     """Collect bounded, read-only OS and journal evidence for the health gate."""
     if command_runner is None:
         command_runner = _run_readonly_command
+    sampled_at_ms = int(time.time() * 1000)
     evidence: dict = {
+        "sampled_at_ms": sampled_at_ms,
         "processes": {},
         "private_ws_worker_starts": {},
         "private_ws_window_ms": 60 * 60 * 1000,
@@ -218,7 +271,7 @@ def collect_runtime_resource_evidence(
             evidence["collection_errors"].append(f"{name}:{str(exc)[:300]}")
 
     try:
-        now_ms = int(time.time() * 1000)
+        now_ms = sampled_at_ms
         window_start_ms = now_ms - (60 * 60 * 1000)
         # One private worker per venue is expected after an intentional deploy;
         # only count churn from the current live-service lifecycle.
@@ -241,6 +294,49 @@ def collect_runtime_resource_evidence(
         evidence["binance_listen_key"] = listen_key
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         evidence["collection_errors"].append(f"live-journal:{str(exc)[:300]}")
+    # A single sample can enforce absolute ceilings but cannot establish a
+    # leak slope.  When the caller supplies the immediately preceding sample,
+    # retain deltas as evidence only; the existing health thresholds remain the
+    # decision contract.
+    previous_sampled_at_ms = (
+        previous_evidence.get("sampled_at_ms")
+        if isinstance(previous_evidence, dict)
+        else None
+    )
+    if isinstance(previous_sampled_at_ms, (int, float)):
+        interval_ms = sampled_at_ms - int(previous_sampled_at_ms)
+    else:
+        interval_ms = 0
+    if interval_ms > 0 and isinstance(previous_evidence, dict):
+        previous_processes = previous_evidence.get("processes")
+        if isinstance(previous_processes, dict):
+            for name, current in evidence["processes"].items():
+                previous = previous_processes.get(name)
+                if not isinstance(previous, dict) or not isinstance(current, dict):
+                    continue
+                current_fd = current.get("fd_count")
+                current_close_wait = current.get("close_wait_count")
+                previous_fd = previous.get("fd_count")
+                previous_close_wait = previous.get("close_wait_count")
+                if not all(
+                    isinstance(value, (int, float))
+                    for value in (
+                        current_fd,
+                        current_close_wait,
+                        previous_fd,
+                        previous_close_wait,
+                    )
+                ):
+                    continue
+                current["baseline_sampled_at_ms"] = int(previous_sampled_at_ms)
+                current["sample_interval_ms"] = interval_ms
+                current["baseline_fd_count"] = int(previous_fd)
+                current["baseline_close_wait_count"] = int(previous_close_wait)
+                current["delta_fd_count"] = int(current_fd) - int(previous_fd)
+                current["delta_close_wait_count"] = (
+                    int(current_close_wait) - int(previous_close_wait)
+                )
+                current["slope_evidence_available"] = True
     return evidence
 
 
@@ -395,6 +491,14 @@ def main() -> None:
             "production default path always collects it."
         ),
     )
+    parser.add_argument(
+        "--runtime-resource-baseline",
+        default=DEFAULT_RUNTIME_RESOURCE_BASELINE,
+        help=(
+            "Path for the last bounded FD/CLOSE_WAIT sample used to expose "
+            "growth deltas; defaults to the production runtime directory."
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--deployment-acceptance",
@@ -487,8 +591,19 @@ def main() -> None:
         ))
 
     if args.runtime_resources or args.current_state == default_current_state:
+        baseline_path = Path(args.runtime_resource_baseline)
+        previous_evidence = _load_runtime_resource_baseline(baseline_path)
+        resource_evidence = collect_runtime_resource_evidence(
+            previous_evidence=previous_evidence,
+        )
+        try:
+            _write_runtime_resource_baseline(baseline_path, resource_evidence)
+        except OSError as exc:
+            resource_evidence.setdefault("collection_errors", []).append(
+                f"baseline-write:{str(exc)[:300]}"
+            )
         reports.append(analyze_runtime_resources(
-            collect_runtime_resource_evidence(),
+            resource_evidence,
             now_ms=now_ms,
         ))
 

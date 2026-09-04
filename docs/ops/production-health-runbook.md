@@ -67,6 +67,16 @@ inode. Do not diagnose from a global host `CLOSE_WAIT` count: unrelated
 processes would be a false positive. A failure is fail-closed for deployment
 acceptance; inspect its JSON report before restarting either trading service.
 
+The verifier persists the last bounded sample (PID, FD count, and
+`CLOSE_WAIT` count only) to
+`/opt/lightfee-v2/runtime/production-resource-baseline.json` using an atomic
+replace. The first run establishes the baseline; subsequent runs include
+`baseline_*`, `delta_*`, `sample_interval_ms`, and
+`slope_evidence_available` for each process. This is diagnostic evidence only;
+it does not alter trading state or thresholds. If the file is missing or
+unreadable, the current run still applies the absolute resource ceilings and
+the next successful run starts a new baseline.
+
 ## Remediate Sidecar Config Drift
 
 The sidecar runs as a Python V2 service (not Rust V1 bridge). Install the versioned template:

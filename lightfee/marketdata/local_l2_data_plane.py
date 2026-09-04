@@ -960,6 +960,12 @@ class LocalL2DataPlane:
         previous_present = bool(
             getattr(failure_update, "previous_sequence_present", False)
         ) if failure_update else False
+        stream_generation_before = self._current_stream_generation(venue, symbol)
+        sequence_gap_delta = 0
+        if expected_previous_sequence > 0 and raw_pu > 0:
+            sequence_gap_delta = raw_pu - expected_previous_sequence
+        elif expected_previous_sequence > 0 and raw_U > 0:
+            sequence_gap_delta = raw_U - (expected_previous_sequence + 1)
         return {
             "venue": venue,
             "symbol": symbol,
@@ -967,6 +973,8 @@ class LocalL2DataPlane:
             "reason": reason,
             "rebuild_trigger": reason,
             "rebuild_attempt_id": rebuild_attempt_id,
+            "stream_generation_before": stream_generation_before,
+            "sequence_gap_delta": sequence_gap_delta,
             "snapshot_lastUpdateId": snapshot_last_update_id,
             "snapshot_last_update_id": snapshot_last_update_id,
             "expected_previous_sequence": expected_previous_sequence,
@@ -1274,6 +1282,14 @@ class LocalL2DataPlane:
             first_buffered_sequence = int(getattr(buf[0].update, "sequence", 0) or 0)
             last_buffered_sequence = int(getattr(buf[-1].update, "sequence", 0) or 0)
         policy = policy_for_venue(update.venue)
+        stream_generation_before = self._current_stream_generation(
+            update.venue, update.symbol
+        )
+        sequence_gap_delta = 0
+        if expected_sequence > 0 and incoming_first_sequence > 0:
+            sequence_gap_delta = incoming_first_sequence - expected_sequence
+        elif update.previous_sequence > 0 and previous_book_seq > 0:
+            sequence_gap_delta = update.previous_sequence - previous_book_seq
 
         book.sequence = 0
         book.last_update_id = 0
@@ -1305,6 +1321,8 @@ class LocalL2DataPlane:
                 expected_previous_sequence=previous_book_seq,
                 snapshot_last_update_id=previous_book_last_update_id,
                 rebuild_attempt_id=rebuild_attempt_id,
+                stream_generation_before=stream_generation_before,
+                sequence_gap_delta=sequence_gap_delta,
                 buffered_count=buffered_count,
                 first_buffered_sequence=first_buffered_sequence,
                 last_buffered_sequence=last_buffered_sequence,
