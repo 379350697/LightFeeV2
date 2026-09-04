@@ -5966,25 +5966,39 @@ class VenueTransport(MarketDataClient):
                 f"bitget order status has invalid/missing side value {side_str!r}",
             )
 
-        # Fee extraction with multi-key fallback (V1: bitget.rs:2934-2938)
+        # Fee extraction with multi-key fallback (V1: bitget.rs:2934-2938).
+        # A present zero is valid fee evidence; only a missing/malformed value
+        # keeps the reconciliation incomplete.
         fee_quote = None
+        fee_evidence_complete = False
         fee_val = data.get("fee", data.get("totalFee", data.get("filledFee")))
         if fee_val is not None:
-            fee_quote = abs(_safe_float(fee_val))
-        if fee_quote is None and "feeDetail" in data:
+            parsed_fee = _parse_optional_float(fee_val)
+            if parsed_fee is not None and math.isfinite(parsed_fee):
+                fee_quote = abs(parsed_fee)
+                fee_evidence_complete = True
+        if not fee_evidence_complete and "feeDetail" in data:
             fd = data["feeDetail"]
             if isinstance(fd, list):
                 # Sum individual fee entries (official UTA shape)
-                fee_sum = 0.0
+                parsed_fees: list[float] = []
                 for entry in fd:
-                    if isinstance(entry, dict):
-                        fee_sum += abs(_safe_float(entry.get("fee", "0")))
-                if fee_sum > 0:
-                    fee_quote = fee_sum
+                    if not isinstance(entry, dict):
+                        parsed_fees = []
+                        break
+                    parsed = _parse_optional_float(entry.get("fee", entry.get("totalFee")))
+                    if parsed is None or not math.isfinite(parsed):
+                        parsed_fees = []
+                        break
+                    parsed_fees.append(abs(parsed))
+                if parsed_fees:
+                    fee_quote = sum(parsed_fees)
+                    fee_evidence_complete = True
             elif isinstance(fd, dict):
-                tf = fd.get("totalFee")
-                if tf is not None:
-                    fee_quote = abs(_safe_float(tf))
+                parsed = _parse_optional_float(fd.get("totalFee", fd.get("fee")))
+                if parsed is not None and math.isfinite(parsed):
+                    fee_quote = abs(parsed)
+                    fee_evidence_complete = True
 
         family = (
             getattr(resolved_account_family, "value", None)
@@ -6012,6 +6026,7 @@ class VenueTransport(MarketDataClient):
             fee_quote=fee_quote,
             filled_at_ms=filled_at,
             metadata={
+                "fee_evidence_complete": fee_evidence_complete,
                 "resolved_account_family": str(family),
                 "side": side_str,
                 "raw_exchange_status": raw_status,

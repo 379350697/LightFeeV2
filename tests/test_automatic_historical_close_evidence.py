@@ -29,6 +29,11 @@ from lightfee.venues.bybit import (
     find_bybit_historical_close_order_candidates,
 )
 from lightfee.venues.aster import AsterAdapter
+from lightfee.venues.bitget import (
+    BitgetAccountProfile,
+    BitgetAdapter,
+    find_bitget_historical_close_order_candidates,
+)
 from lightfee.venues.transport import LiveCredential
 
 
@@ -297,6 +302,400 @@ async def test_coti_debt_unique_binance_history_exactly_rechecks_and_reconciles(
         "system_client_id_execution"
     )
     assert payload["venue_statement_reconciled"] is True
+
+
+def test_bitget_history_candidates_use_executed_quantity_and_close_ownership():
+    """History discovery must not promote submitted size or an opening row."""
+    rows = [
+        {
+            "symbol": "COTIUSDT",
+            "side": "buy",
+            "posSide": "short",
+            "tradeSide": "close",
+            "status": "filled",
+            "baseVolume": "2400",
+            "size": "9999",
+            "orderId": "executed-quantity",
+            "clientOid": "lf-close-1",
+            "uTime": str(NOW_MS - 60_000),
+        },
+        {
+            "symbol": "COTIUSDT",
+            "side": "buy",
+            "posSide": "net",
+            "reduceOnly": "NO",
+            "tradeSide": "open",
+            "status": "filled",
+            "cumExecQty": "2400",
+            "size": "2400",
+            "orderId": "opening-row",
+            "uTime": str(NOW_MS - 60_000),
+        },
+        {
+            "symbol": "COTIUSDT",
+            "side": "buy",
+            "posSide": "short",
+            "tradeSide": "close",
+            "status": "filled",
+            "baseVolume": "0",
+            "size": "2400",
+            "orderId": "zero-execution",
+            "uTime": str(NOW_MS - 60_000),
+        },
+    ]
+
+    candidates = find_bitget_historical_close_order_candidates(
+        rows,
+        symbol="COTIUSDT",
+        side=Side.BUY,
+        position_side="SHORT",
+        quantity=2400.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+
+    assert [candidate["order_id"] for candidate in candidates] == [
+        "executed-quantity"
+    ]
+    assert candidates[0]["executed_quantity"] == pytest.approx(2400.0)
+
+
+def test_bitget_history_close_ownership_covers_official_trade_side_variants():
+    """Every documented close marker is accepted; missing UTA marker is not."""
+    close_markers = (
+        "offset_close_short",
+        "burst_close_short",
+        "delivery_close_short",
+        "dte_sys_adl_close_short",
+        "reduce_buy_single",
+        "burst_buy_single",
+        "delivery_buy_single",
+        "dte_sys_adl_buy_in_single_side_mode",
+    )
+    rows = [
+        {
+            "symbol": "COTIUSDT",
+            "side": "buy",
+            "posSide": "short",
+            "tradeSide": marker,
+            "status": "filled",
+            "baseVolume": "1",
+            "orderId": f"close-{index}",
+            "uTime": str(NOW_MS - 60_000 + index),
+        }
+        for index, marker in enumerate(close_markers)
+    ]
+    rows.append(
+        {
+            "symbol": "COTIUSDT",
+            "side": "buy",
+            "posSide": "short",
+            "tradeSide": "open",
+            "status": "filled",
+            "cumExecQty": "1",
+            "orderId": "uta-hedge-opening-row",
+            "uTime": str(NOW_MS - 60_000),
+        }
+    )
+
+    candidates = find_bitget_historical_close_order_candidates(
+        rows,
+        symbol="COTIUSDT",
+        side=Side.BUY,
+        position_side="SHORT",
+        quantity=1.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+
+    assert [candidate["order_id"] for candidate in candidates] == [
+        f"close-{index}" for index in range(len(close_markers))
+    ]
+
+    uta_hedge_close = find_bitget_historical_close_order_candidates(
+        [
+            {
+                "symbol": "COTIUSDT",
+                "side": "buy",
+                "posSide": "short",
+                "status": "filled",
+                "cumExecQty": "1",
+                "orderId": "uta-hedge-close-without-reduce-marker",
+                "uTime": str(NOW_MS - 60_000),
+            }
+        ],
+        symbol="COTIUSDT",
+        side=Side.BUY,
+        position_side="SHORT",
+        quantity=1.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+    assert [candidate["order_id"] for candidate in uta_hedge_close] == [
+        "uta-hedge-close-without-reduce-marker"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "history_path", "detail_path", "history_row", "detail_row"),
+    [
+        (
+            BitgetAccountProfile.CLASSIC,
+            "/api/v2/mix/order/orders-history",
+            "/api/v2/mix/order/detail",
+            {
+                "symbol": "COTIUSDT",
+                "side": "buy",
+                "posSide": "short",
+                "tradeSide": "close",
+                "status": "filled",
+                "baseVolume": "2400",
+                "size": "9999",
+                "orderId": "classic-history-order",
+                "clientOid": "lf-classic-close",
+                "uTime": str(NOW_MS - 60_000),
+            },
+            {
+                "symbol": "COTIUSDT",
+                "side": "buy",
+                "status": "filled",
+                "baseVolume": "2400",
+                "priceAvg": "0.010112",
+                "fee": "0",
+                "orderId": "classic-history-order",
+                "clientOid": "lf-classic-close",
+                "uTime": str(NOW_MS - 59_000),
+            },
+        ),
+        (
+            BitgetAccountProfile.UTA,
+            "/api/v3/trade/history-orders",
+            "/api/v3/trade/order-info",
+            {
+                "symbol": "COTIUSDT",
+                "side": "buy",
+                "posSide": "net",
+                "reduceOnly": "YES",
+                "orderStatus": "filled",
+                "cumExecQty": "2400",
+                "orderId": "uta-history-order",
+                "clientOid": "lf-uta-close",
+                "updatedTime": str(NOW_MS - 60_000),
+            },
+            {
+                "symbol": "COTIUSDT",
+                "side": "buy",
+                "orderStatus": "filled",
+                "cumExecQty": "2400",
+                "avgPrice": "0.010112",
+                "feeDetail": [{"fee": "0", "feeCoin": "USDT"}],
+                "orderId": "uta-history-order",
+                "clientOid": "lf-uta-close",
+                "updatedTime": str(NOW_MS - 59_000),
+            },
+        ),
+    ],
+)
+async def test_bitget_history_discovery_uses_family_contract_and_exact_recheck(
+    profile,
+    history_path,
+    detail_path,
+    history_row,
+    detail_row,
+):
+    adapter = BitgetAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass"),
+    )
+    adapter._profile = profile
+    calls: list[tuple[str, str, dict]] = []
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del body, private
+        calls.append((method, path, dict(params or {})))
+        if path == history_path:
+            return {"code": "00000", "data": {"entrustedList" if profile is BitgetAccountProfile.CLASSIC else "list": [history_row], "endId" if profile is BitgetAccountProfile.CLASSIC else "cursor": ""}}
+        if path == detail_path:
+            return {"code": "00000", "data": detail_row}
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="COTIUSDT",
+            side=Side.BUY,
+            position_side="SHORT",
+            quantity=2400.0,
+            closed_at_ms=NOW_MS - 60_000,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "unique_candidate_exact_recheck"
+    assert result.candidate_count == 1
+    assert result.reconciliation is not None
+    assert result.reconciliation.fee_quote == pytest.approx(0.0)
+    assert result.reconciliation.metadata["fee_evidence_complete"] is True
+    assert result.reconciliation.metadata["historical_candidate_endpoint"] == history_path
+    assert calls[0][0:2] == ("GET", history_path)
+    assert calls[0][2]["symbol"] == "COTIUSDT"
+    assert calls[0][2]["limit"] == 100
+    required_family_param = "productType" if profile is BitgetAccountProfile.CLASSIC else "category"
+    assert calls[0][2][required_family_param] == "USDT-FUTURES"
+    assert calls[1][0:2] == ("GET", detail_path)
+
+
+@pytest.mark.asyncio
+async def test_bitget_history_discovery_follows_uta_cursor_before_matching():
+    adapter = BitgetAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass"),
+    )
+    adapter._profile = BitgetAccountProfile.UTA
+    history_calls: list[dict] = []
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del method, body, private
+        if path == "/api/v3/trade/history-orders":
+            history_calls.append(dict(params or {}))
+            if len(history_calls) == 1:
+                return {
+                    "code": "00000",
+                    "data": {
+                        "list": [],
+                        "cursor": "next-page",
+                    },
+                }
+            return {
+                "code": "00000",
+                "data": {
+                    "list": [{
+                        "symbol": "COTIUSDT",
+                        "side": "buy",
+                        "posSide": "net",
+                        "reduceOnly": "YES",
+                        "orderStatus": "filled",
+                        "cumExecQty": "2400",
+                        "orderId": "cursor-history-order",
+                        "clientOid": "lf-cursor-close",
+                        "updatedTime": str(NOW_MS - 60_000),
+                    }],
+                    "cursor": "",
+                },
+            }
+        if path == "/api/v3/trade/order-info":
+            return {
+                "code": "00000",
+                "data": {
+                    "symbol": "COTIUSDT",
+                    "side": "buy",
+                    "orderStatus": "filled",
+                    "cumExecQty": "2400",
+                    "avgPrice": "0.010112",
+                    "feeDetail": [{"fee": "0"}],
+                    "orderId": "cursor-history-order",
+                    "clientOid": "lf-cursor-close",
+                    "updatedTime": str(NOW_MS - 59_000),
+                },
+            }
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="COTIUSDT",
+            side=Side.BUY,
+            position_side="SHORT",
+            quantity=2400.0,
+            closed_at_ms=NOW_MS - 60_000,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "unique_candidate_exact_recheck"
+    assert len(history_calls) == 2
+    assert history_calls[1]["cursor"] == "next-page"
+
+
+@pytest.mark.asyncio
+async def test_bitget_history_discovery_is_wired_through_close_runtime():
+    """The live close path must settle a Bitget evidence debt via the contract."""
+    snapshot = _snapshot(
+        position_id="entry-bitget-history",
+        symbol="COTIUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BITGET,
+        long_quantity=0.0,
+        short_quantity=2400.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    bitget = BitgetAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass"),
+    )
+    bitget._profile = BitgetAccountProfile.CLASSIC
+    bitget.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.BITGET,
+            symbol="COTIUSDT",
+            side=Side.SELL,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    bitget.fetch_open_orders = AsyncMock(return_value=[])
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del method, body, private
+        if path == "/api/v2/mix/order/orders-history":
+            return {
+                "code": "00000",
+                "data": {
+                    "entrustedList": [{
+                        "symbol": "COTIUSDT",
+                        "side": "buy",
+                        "posSide": "short",
+                        "tradeSide": "close",
+                        "status": "filled",
+                        "baseVolume": "2400",
+                        "orderId": "runtime-history-order",
+                        "clientOid": "lf-runtime-close",
+                        "uTime": str(NOW_MS - 60_000),
+                    }],
+                    "endId": "",
+                },
+            }
+        if path == "/api/v2/mix/order/detail":
+            return {
+                "code": "00000",
+                "data": {
+                    "symbol": "COTIUSDT",
+                    "side": "buy",
+                    "status": "filled",
+                    "baseVolume": "2400",
+                    "priceAvg": "0.010112",
+                    "fee": "0",
+                    "orderId": "runtime-history-order",
+                    "clientOid": "lf-runtime-close",
+                    "uTime": str(NOW_MS - 59_000),
+                },
+            }
+        raise AssertionError(path)
+
+    bitget._transport._request = request
+    bybit = _Adapter(Venue.BYBIT)
+    ctx = _ctx(task, {Venue.BYBIT: bybit, Venue.BITGET: bitget})
+
+    try:
+        await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+    finally:
+        await bitget.shutdown()
+
+    assert ctx.state.pending_close_reconciliations == []
+    payload = _critical_payload(ctx, "exit.reconciled")
+    assert payload is not None
+    assert payload["historical_evidence_resolution"]["short"]["order_id"] == (
+        "runtime-history-order"
+    )
 
 
 @pytest.mark.asyncio

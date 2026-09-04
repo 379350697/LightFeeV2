@@ -6,17 +6,22 @@ import logging
 import json
 import math
 import time
+from dataclasses import replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import (
     AccountFeeSnapshot,
+    HistoricalCloseEvidenceDiscovery,
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
+    Side,
     Venue,
     VenueMarketSnapshot,
+    close_order_side_for_position,
 )
 from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
@@ -34,10 +39,195 @@ from lightfee.venues.specs import (
 from lightfee.venues.transport import LiveCredential, TransportError, TransportErrorCategory, VenueTransport
 
 if TYPE_CHECKING:
-    from lightfee.core.domain import OrderFillReconciliation
     from lightfee.marketdata.l2 import LocalL2Update
 
 logger = logging.getLogger("lightfee.venues.bitget")
+
+
+_BITGET_HISTORY_TIME_WINDOW_MS = 300_000
+_BITGET_HISTORY_PAGE_LIMIT = 100
+_BITGET_HISTORY_MAX_PAGES = 20
+_BITGET_CLOSE_TRADE_SIDES = frozenset({
+    "close",
+    "close_long",
+    "close_short",
+    "reduce_close_long",
+    "reduce_close_short",
+    "offset_close_long",
+    "offset_close_short",
+    "burst_close_long",
+    "burst_close_short",
+    "delivery_close_long",
+    "delivery_close_short",
+    "dte_sys_adl_close_long",
+    "dte_sys_adl_close_short",
+    "reduce_buy_single",
+    "reduce_sell_single",
+    "burst_buy_single",
+    "burst_sell_single",
+    "delivery_sell_single",
+    "delivery_buy_single",
+    "dte_sys_adl_buy_in_single_side_mode",
+    "dte_sys_adl_sell_in_single_side_mode",
+    "reduce_only",
+    "reduceonly",
+})
+
+
+def _bitget_history_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed >= 0.0 else None
+
+
+def _bitget_history_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed if parsed >= 10_000_000_000 else parsed * 1000
+
+
+def _bitget_reduce_only(value: Any) -> bool:
+    if value is True:
+        return True
+    return str(value or "").strip().lower() in {"true", "yes", "y", "1"}
+
+
+def _bitget_history_row_closes_position_side(
+    raw: dict[str, Any], expected_position_side: str,
+) -> bool:
+    """Apply Bitget hedge/one-way close ownership semantics.
+
+    Hedge rows identify the position side with ``posSide``; the caller already
+    requires the opposite (close) order side, while an explicit ``open`` marker
+    is rejected. One-way rows must carry an explicit close/reduce marker
+    because ``net`` alone cannot distinguish an opening order from a close.
+    """
+    observed_position_side = str(
+        raw.get("posSide", raw.get("positionSide", "")) or ""
+    ).strip().lower()
+    expected = str(expected_position_side or "").strip().lower()
+    trade_side = str(raw.get("tradeSide", "") or "").strip().lower()
+    if observed_position_side in {"long", "short"}:
+        if observed_position_side != expected:
+            return False
+        # UTA hedge orders use ``posSide`` plus the opposite order side and do
+        # not send Classic's tradeSide/reduceOnly marker.  The caller has
+        # already enforced that opposite side; reject only an explicit open
+        # marker or another unknown marker.
+        return not trade_side or trade_side in _BITGET_CLOSE_TRADE_SIDES
+    if observed_position_side not in {"net", "both"}:
+        return False
+    return _bitget_reduce_only(raw.get("reduceOnly")) or (
+        trade_side in _BITGET_CLOSE_TRADE_SIDES
+    )
+
+
+def _bitget_history_rows(
+    raw: Any,
+) -> tuple[list[dict[str, Any]], str]:
+    """Extract one Classic ``entrustedList`` or UTA ``list`` page."""
+    if not isinstance(raw, dict) or str(raw.get("code", "")) not in {"00000", "0"}:
+        raise ValueError("Bitget order history response is unsuccessful")
+    data = raw.get("data")
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)], ""
+    if not isinstance(data, dict):
+        raise ValueError("Bitget order history response is malformed")
+    rows = data.get("entrustedList", data.get("list", data.get("rows", [])))
+    if not isinstance(rows, list):
+        raise ValueError("Bitget order history rows are malformed")
+    cursor = str(data.get("cursor", data.get("endId", "")) or "")
+    return [row for row in rows if isinstance(row, dict)], cursor
+
+
+def find_bitget_historical_close_order_candidates(
+    orders: Iterable[dict[str, Any]],
+    *,
+    symbol: str,
+    side: Side | str,
+    position_side: str,
+    quantity: float,
+    closed_at_ms: int,
+    time_window_ms: int = _BITGET_HISTORY_TIME_WINDOW_MS,
+    quantity_relative_tolerance: float = 1e-9,
+) -> list[dict[str, Any]]:
+    """Return every Bitget history row satisfying the close identity contract.
+
+    ``baseVolume`` (Classic) and ``cumExecQty`` (UTA) are executed quantities;
+    submitted ``size``/``qty`` is intentionally not a fallback.  The runtime
+    still performs an exact order-status/fee recheck before accepting a row.
+    """
+    expected_side = (
+        side.value.lower() if isinstance(side, Side) else str(side).strip().lower()
+    )
+    if expected_side not in {"buy", "sell"}:
+        raise ValueError(f"Bitget historical close side is invalid: {side!r}")
+    if not math.isfinite(quantity) or quantity <= 1e-12 or closed_at_ms <= 0:
+        raise ValueError("Bitget historical close query requires quantity and closed_at_ms")
+    quantity_tolerance = max(quantity * quantity_relative_tolerance, 1e-12)
+    candidates: list[dict[str, Any]] = []
+    for raw in orders:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("orderId", raw.get("ordId", "")) or "").strip()
+        client_order_id = str(
+            raw.get("clientOid", raw.get("clientOrderId", "")) or ""
+        ).strip()
+        executed_quantity: float | None = None
+        for field in ("baseVolume", "cumExecQty", "filledQty", "fillQty", "fillSz"):
+            if field not in raw or raw[field] is None or str(raw[field]).strip() == "":
+                continue
+            executed_quantity = _bitget_history_float(raw[field])
+            break
+        updated_at_ms = _bitget_history_int(
+            raw.get(
+                "uTime",
+                raw.get("updatedTime", raw.get("updateTime", raw.get("cTime"))),
+            )
+        )
+        status = str(
+            raw.get("status", raw.get("orderStatus", raw.get("state", ""))) or ""
+        ).strip().lower().replace("_", "-")
+        if (
+            not order_id
+            or str(raw.get("symbol", "") or "").upper() != symbol.upper()
+            or str(raw.get("side", "") or "").strip().lower() != expected_side
+            or not _bitget_history_row_closes_position_side(raw, position_side)
+            or status not in {"filled", "full-fill", "completed", "done", "success"}
+            or executed_quantity is None
+            or executed_quantity <= 1e-12
+            or updated_at_ms is None
+            or abs(updated_at_ms - closed_at_ms) > time_window_ms
+        ):
+            continue
+        quantity_delta = abs(executed_quantity - quantity)
+        if quantity_delta > quantity_tolerance:
+            continue
+        candidates.append(
+            {
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "system_client_order_id": client_order_id.startswith("lf"),
+                "executed_quantity": executed_quantity,
+                "updated_at_ms": updated_at_ms,
+                "time_delta_ms": updated_at_ms - closed_at_ms,
+                "quantity_delta": quantity_delta,
+            }
+        )
+    candidates.sort(
+        key=lambda candidate: (
+            abs(int(candidate["time_delta_ms"])),
+            float(candidate["quantity_delta"]),
+            str(candidate["order_id"]),
+        )
+    )
+    return candidates
 
 
 class BitgetAccountProfile(Enum):
@@ -1067,14 +1257,161 @@ class BitgetAdapter(VenueAdapter):
         Falls through to transport.fetch_order_status then converts to
         OrderFillReconciliation.
         """
-        from lightfee.core.domain import OrderFillReconciliation
-
         status = await self._transport.fetch_order_status(
             symbol, order_id=order_id, client_order_id=client_order_id or "",
         )
         if status is not None:
             return status
         return None
+
+    async def discover_historical_close_fill_reconciliation(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        position_side: str,
+        quantity: float,
+        closed_at_ms: int,
+    ) -> HistoricalCloseEvidenceDiscovery:
+        """Find one bounded Bitget history row, then recheck exact order truth.
+
+        Classic Mix V2 exposes ``entrustedList``/``endId`` while UTA V3
+        exposes ``list``/``cursor``.  Both are selected through the existing
+        account-family operation contract; no raw endpoint is duplicated in
+        the close runtime.
+        """
+        if side != close_order_side_for_position(position_side):
+            raise ValueError("Bitget historical close side contradicts position side")
+        if not math.isfinite(quantity) or quantity <= 1e-12 or closed_at_ms <= 0:
+            raise ValueError(
+                "Bitget historical close query requires quantity and closed_at_ms"
+            )
+
+        family = await self.resolve_contract_family()
+        contract = get_operation_contract(
+            self._transport._spec,
+            VenueOperation.ORDER_HISTORY,
+            resolved_account_family=family,
+        )
+        if not contract.supported:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="history_discovery_unsupported",
+                candidate_count=0,
+            )
+
+        venue_symbol = self._transport._venue_symbol(symbol)
+        start_time = max(0, closed_at_ms - _BITGET_HISTORY_TIME_WINDOW_MS)
+        end_time = closed_at_ms + _BITGET_HISTORY_TIME_WINDOW_MS
+        rows: list[dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for page_number in range(_BITGET_HISTORY_MAX_PAGES):
+            extra: dict[str, Any] = {
+                "symbol": venue_symbol,
+                "startTime": start_time,
+                "endTime": end_time,
+                "limit": _BITGET_HISTORY_PAGE_LIMIT,
+            }
+            if cursor:
+                extra[
+                    "idLessThan"
+                    if family == BitgetContractFamily.CLASSIC_MIX_V2
+                    else "cursor"
+                ] = cursor
+            params = _bitget_contract_params(contract)
+            params.update(extra)
+            raw = await self._transport._request(
+                contract.method,
+                contract.path,
+                params=params,
+                private=contract.private,
+            )
+            page_rows, next_cursor = _bitget_history_rows(raw)
+            rows.extend(page_rows)
+            if not next_cursor:
+                break
+            if next_cursor in seen_cursors:
+                raise ValueError("Bitget order history cursor repeated")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="history_incomplete",
+                candidate_count=0,
+            )
+
+        candidates = find_bitget_historical_close_order_candidates(
+            rows,
+            symbol=venue_symbol,
+            side=side,
+            position_side=position_side,
+            quantity=quantity,
+            closed_at_ms=closed_at_ms,
+            time_window_ms=_BITGET_HISTORY_TIME_WINDOW_MS,
+        )
+        if len(candidates) != 1:
+            return HistoricalCloseEvidenceDiscovery(
+                classification=(
+                    "ambiguous_candidates" if candidates else "no_candidate"
+                ),
+                candidate_count=len(candidates),
+            )
+
+        candidate = candidates[0]
+        reconciliation = await self.fetch_order_fill_reconciliation(
+            symbol,
+            candidate["order_id"],
+            candidate["client_order_id"],
+        )
+        if reconciliation is None:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_unavailable",
+                candidate_count=1,
+            )
+        if (
+            reconciliation.venue != Venue.BITGET
+            or reconciliation.symbol.upper() != venue_symbol.upper()
+            or reconciliation.side != side
+            or reconciliation.order_id != candidate["order_id"]
+            or not math.isclose(
+                reconciliation.quantity,
+                quantity,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_identity_mismatch",
+                candidate_count=1,
+            )
+        metadata = dict(reconciliation.metadata or {})
+        fee_quote = reconciliation.fee_quote
+        if (
+            metadata.get("fee_evidence_complete") is not True
+            or fee_quote is None
+            or not math.isfinite(fee_quote)
+            or fee_quote < 0.0
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_incomplete",
+                candidate_count=1,
+            )
+        metadata.update(
+            {
+                "historical_candidate_endpoint": contract.path,
+                "historical_candidate_updated_at_ms": candidate["updated_at_ms"],
+                "historical_evidence_provenance": (
+                    "system_client_id_execution"
+                    if candidate["system_client_order_id"]
+                    else "exchange_execution_unattributed"
+                ),
+            }
+        )
+        return HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=replace(reconciliation, metadata=metadata),
+        )
 
     async def shutdown(self) -> None:
         await self._transport.close()
