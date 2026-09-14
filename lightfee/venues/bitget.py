@@ -106,17 +106,21 @@ def _bitget_close_wire_side_matches(
     Classic hedge closes repeat the position's open side on the wire (the
     order builder inverts the business side, e.g. ``buy`` + ``tradeSide=
     close`` + ``posSide=long`` closes a long), while UTA and one-way closes
-    carry the opposite business side.  ``posSide`` plus the close marker in
-    ``_bitget_history_row_closes_position_side`` already proves which position
-    the row closes, so a hedge row may use either convention; a one-way row
-    must carry the business close side because its markers alone cannot
-    reject an opening side.
+    carry the opposite business side.  The repeated-open-side convention is
+    granted only to rows with an explicit close marker: a marker-less UTA
+    hedge row is discriminated by its side alone, so its side must already
+    be the business close side, which keeps opening rows out of the close
+    candidate set.  A one-way row likewise must carry the business close
+    side because its markers alone cannot reject an opening side.
     """
     observed_side = str(raw.get("side", "") or "").strip().lower()
     if observed_side not in {"buy", "sell"}:
         return False
     if observed_side == expected_close_side:
         return True
+    trade_side = str(raw.get("tradeSide", "") or "").strip().lower()
+    if trade_side not in _BITGET_CLOSE_TRADE_SIDES:
+        return False
     observed_position_side = str(
         raw.get("posSide", raw.get("positionSide", "")) or ""
     ).strip().lower()
@@ -132,10 +136,12 @@ def _bitget_history_row_closes_position_side(
 ) -> bool:
     """Apply Bitget hedge/one-way close ownership semantics.
 
-    Hedge rows identify the position side with ``posSide``; the caller already
-    requires the opposite (close) order side, while an explicit ``open`` marker
-    is rejected. One-way rows must carry an explicit close/reduce marker
-    because ``net`` alone cannot distinguish an opening order from a close.
+    Hedge rows identify the position side with ``posSide``.  Classic rows
+    prove the close with ``tradeSide`` (our closes always send it; an
+    explicit ``open`` marker is rejected), while marker-less UTA hedge rows
+    rely on the close wire side enforced by the caller.  One-way rows must
+    carry an explicit close/reduce marker because ``net`` alone cannot
+    distinguish an opening order from a close.
     """
     observed_position_side = str(
         raw.get("posSide", raw.get("positionSide", "")) or ""

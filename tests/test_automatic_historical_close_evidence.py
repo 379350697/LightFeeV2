@@ -486,13 +486,25 @@ def test_bitget_history_candidates_accept_classic_hedge_close_wire_side():
         "orderId": "one-way-open-side-row",
         "uTime": str(NOW_MS - 60_000),
     }
+    uta_opening_row = {
+        "symbol": "ONGUSDT",
+        "side": "buy",
+        "posSide": "long",
+        "status": "filled",
+        "baseVolume": "303",
+        "orderId": "uta-opening-row",
+        "uTime": str(NOW_MS - 60_000),
+    }
     rows = [
         classic_long_close,
         classic_short_close,
         hedge_open_row,
         one_way_open_side_row,
+        uta_opening_row,
     ]
 
+    # A marker-less UTA hedge row is discriminated by side alone, so its
+    # opening side must not borrow the Classic repeated-open-side convention.
     long_candidates = find_bitget_historical_close_order_candidates(
         rows,
         symbol="ONGUSDT",
