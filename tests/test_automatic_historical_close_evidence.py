@@ -1773,6 +1773,77 @@ async def test_fixed_binance_no_candidate_debt_never_reopens():
 
 
 @pytest.mark.asyncio
+async def test_mixed_debt_with_persistent_generic_miss_scans_only_once():
+    """A sibling leg that still terminalizes with the legacy generic reason
+    (bybit) must not re-arm the shared reason every cycle: the repair grant is
+    one scan per debt, so the reactivation cannot loop."""
+    snapshot = _snapshot(
+        position_id="entry-mixed-binance-bybit-generic-miss",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=247.0,
+        short_quantity=247.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    binance = _Adapter(
+        Venue.BINANCE,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=_fill(
+                venue=Venue.BINANCE,
+                symbol="ONGUSDT",
+                side=Side.SELL,
+                quantity=247.0,
+                price=0.0969,
+                order_id="3277215179",
+                client_order_id="lfexa38f361f087bc2c6",
+                fee_quote=0.0119,
+                provenance="binance_user_trades_execution",
+            ),
+        ),
+    )
+    bybit = _Adapter(
+        Venue.BYBIT,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="no_candidate",
+            candidate_count=0,
+        ),
+    )
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: bybit})
+    runtime = CloseRuntime(ctx)
+
+    for offset in (0, 60_000, 120_000):
+        await runtime._process_pending_close_reconciliations(NOW_MS + offset)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    binance.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    bybit.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert task["automatic_history_terminal_reason"] == "no_candidate"
+    reactivations = [
+        call
+        for call in ctx.journal.append.call_args_list
+        if call.args and call.args[0] == (
+            "reconciliation.automatic_historical_evidence_reactivated"
+        )
+    ]
+    assert len(reactivations) == 1
+
+
+@pytest.mark.asyncio
 async def test_strict_history_terminal_debt_never_reopens_for_new_adapter_capability():
     """Capability upgrades cannot turn an ambiguous history into evidence."""
     snapshot = _snapshot(

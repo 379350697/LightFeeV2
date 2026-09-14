@@ -571,6 +571,12 @@ class CloseRuntime:
         )
         if not (capability_upgrade or legacy_no_candidate_repair):
             return False
+        # The repair grant is one scan per debt, not one per cycle: a sibling
+        # venue that still terminalizes with the legacy generic reason (bybit)
+        # must not re-arm the shared reason every cycle.  The reactivation
+        # marker is written below and consumed here.
+        if reconciliation.get("automatic_history_reactivated_at_ms"):
+            return False
         snapshot = reconciliation.get("position_snapshot")
         if not isinstance(snapshot, dict):
             return False
