@@ -6348,6 +6348,11 @@ class PassiveCloseExecutor:
             )
 
         stage = "exit_live_one_sided_short" if leg_label == "short" else "exit_live_one_sided_long"
+        # A truth-gap retry must not reuse the accepted order's client OID:
+        # Bitget rejects a duplicate clientOid instead of returning the live
+        # order idempotently.  Scope the stage to this attempt like the maker
+        # path's per-attempt suffix.
+        stage = f"{stage}_attempt_{self._now_ms() // 1000}"
         client_order_id = compact_client_order_id(position.position_id, stage)
         request = OrderRequest(
             venue=venue,
@@ -6751,7 +6756,9 @@ class PassiveCloseExecutor:
 
         client_order_id = compact_client_order_id(
             position.position_id,
-            f"exit_live_excess_{excess_leg}",
+            # Per-attempt scope: a retry after an uncertain submission must
+            # not resend the accepted order's clientOid (Bitget 40786).
+            f"exit_live_excess_{excess_leg}_attempt_{self._now_ms() // 1000}",
         )
         request = OrderRequest(
             venue=excess_venue,

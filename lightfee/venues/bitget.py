@@ -98,6 +98,35 @@ def _bitget_reduce_only(value: Any) -> bool:
     return str(value or "").strip().lower() in {"true", "yes", "y", "1"}
 
 
+def _bitget_close_wire_side_matches(
+    raw: dict[str, Any], expected_close_side: str, position_side: str,
+) -> bool:
+    """Accept both hedge-mode close wire-side conventions for a posSide row.
+
+    Classic hedge closes repeat the position's open side on the wire (the
+    order builder inverts the business side, e.g. ``buy`` + ``tradeSide=
+    close`` + ``posSide=long`` closes a long), while UTA and one-way closes
+    carry the opposite business side.  ``posSide`` plus the close marker in
+    ``_bitget_history_row_closes_position_side`` already proves which position
+    the row closes, so a hedge row may use either convention; a one-way row
+    must carry the business close side because its markers alone cannot
+    reject an opening side.
+    """
+    observed_side = str(raw.get("side", "") or "").strip().lower()
+    if observed_side not in {"buy", "sell"}:
+        return False
+    if observed_side == expected_close_side:
+        return True
+    observed_position_side = str(
+        raw.get("posSide", raw.get("positionSide", "")) or ""
+    ).strip().lower()
+    if observed_position_side != str(position_side or "").strip().lower():
+        return False
+    if observed_position_side not in {"long", "short"}:
+        return False
+    return observed_side == ("buy" if observed_position_side == "long" else "sell")
+
+
 def _bitget_history_row_closes_position_side(
     raw: dict[str, Any], expected_position_side: str,
 ) -> bool:
@@ -201,7 +230,7 @@ def find_bitget_historical_close_order_candidates(
         if (
             not order_id
             or str(raw.get("symbol", "") or "").upper() != symbol.upper()
-            or str(raw.get("side", "") or "").strip().lower() != expected_side
+            or not _bitget_close_wire_side_matches(raw, expected_side, position_side)
             or not _bitget_history_row_closes_position_side(raw, position_side)
             or status not in {"filled", "full-fill", "completed", "done", "success"}
             or executed_quantity is None
@@ -1356,7 +1385,9 @@ class BitgetAdapter(VenueAdapter):
         if len(candidates) != 1:
             return HistoricalCloseEvidenceDiscovery(
                 classification=(
-                    "ambiguous_candidates" if candidates else "no_candidate"
+                    "ambiguous_candidates"
+                    if candidates
+                    else "bitget_history_no_candidate"
                 ),
                 candidate_count=len(candidates),
             )

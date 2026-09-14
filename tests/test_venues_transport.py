@@ -8585,6 +8585,119 @@ class TestBitgetParseOrderStatusRedLight:
         result = transport._parse_order_status_bitget(raw, "BTCUSDT", 1000000)
         assert result is None, f"zero baseVolume should return None, got {result}"
 
+    def test_bitget_classic_hedge_close_side_normalizes_to_business_side(self):
+        """Classic hedge closes repeat the open side; report the business side.
+
+        Production evidence (entry-1789066343561-ONGUSDT): the filled close of
+        the Bitget long leg reported side=buy + tradeSide=close + posSide=long.
+        Billing evidence compares against the business close side (sell).
+        """
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        long_close = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "orderId": "oid-close-long",
+                "clientOid": "cid-close-long",
+                "side": "buy",
+                "posSide": "long",
+                "tradeSide": "close",
+                "baseVolume": "303",
+                "priceAvg": "0.07912",
+                "fee": "0.012",
+                "uTime": "1000000",
+            },
+        }
+        result = transport._parse_order_status_bitget(long_close, "ONGUSDT", 1000000)
+        assert result is not None
+        assert result.side == Side.SELL
+
+        short_close = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "orderId": "oid-close-short",
+                "clientOid": "cid-close-short",
+                "side": "sell",
+                "posSide": "short",
+                "tradeSide": "close",
+                "baseVolume": "292",
+                "priceAvg": "0.08174",
+                "fee": "0.01",
+                "uTime": "1000000",
+            },
+        }
+        result = transport._parse_order_status_bitget(short_close, "ONGUSDT", 1000000)
+        assert result is not None
+        assert result.side == Side.BUY
+
+    def test_bitget_open_and_one_way_rows_keep_wire_side(self):
+        """Open hedge rows and one-way close rows keep their wire side."""
+        from lightfee.venues.transport import VenueTransport
+        from lightfee.venues.specs import bitget_spec
+
+        transport = VenueTransport(spec=bitget_spec(), mode="paper")
+        open_row = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "orderId": "oid-open",
+                "clientOid": "cid-open",
+                "side": "buy",
+                "posSide": "long",
+                "tradeSide": "open",
+                "baseVolume": "303",
+                "priceAvg": "0.07899",
+                "fee": "0.01",
+                "uTime": "1000000",
+            },
+        }
+        result = transport._parse_order_status_bitget(open_row, "ONGUSDT", 1000000)
+        assert result is not None
+        assert result.side == Side.BUY
+
+        uta_close_row = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "orderId": "oid-uta-close",
+                "clientOid": "cid-uta-close",
+                "side": "sell",
+                "posSide": "long",
+                "baseVolume": "303",
+                "priceAvg": "0.07912",
+                "fee": "0.01",
+                "uTime": "1000000",
+            },
+        }
+        result = transport._parse_order_status_bitget(uta_close_row, "ONGUSDT", 1000000)
+        assert result is not None
+        assert result.side == Side.SELL
+
+        one_way_close_row = {
+            "code": "00000",
+            "msg": "success",
+            "data": {
+                "orderId": "oid-one-way",
+                "clientOid": "cid-one-way",
+                "side": "sell",
+                "posSide": "net",
+                "reduceOnly": "YES",
+                "baseVolume": "303",
+                "priceAvg": "0.07912",
+                "fee": "0.01",
+                "uTime": "1000000",
+            },
+        }
+        result = transport._parse_order_status_bitget(
+            one_way_close_row, "ONGUSDT", 1000000
+        )
+        assert result is not None
+        assert result.side == Side.SELL
+
     def test_bitget_null_order_id_keeps_client_oid_as_the_only_ack_identity(self):
         """Bitget permits an accepted reduce-only ACK with ``orderId: null``.
 

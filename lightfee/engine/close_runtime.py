@@ -45,9 +45,12 @@ class CloseRuntime:
     )
     _AUTOMATIC_HISTORY_TERMINAL_STATUS = AUTOMATIC_HISTORY_TERMINAL_STATUS
     _AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON = "history_discovery_unsupported"
-    _AUTOMATIC_HISTORY_ASTER_LEGACY_NO_CANDIDATE_REASON = "no_candidate"
+    _AUTOMATIC_HISTORY_LEGACY_NO_CANDIDATE_REASON = "no_candidate"
     _AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON = (
         "aster_v3_user_trades_missing_reduce_only"
+    )
+    _AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON = (
+        "bitget_classic_hedge_close_side_convention"
     )
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
@@ -523,13 +526,17 @@ class CloseRuntime:
         reconciliation: dict[str, Any],
         now_ms: int,
     ) -> bool:
-        """Retry only a missing capability or the Aster V3 row-shape repair.
+        """Retry only a capability gap, the Aster V3 repair, or the Bitget one.
 
         Strict ambiguous and incomplete-evidence terminal states remain
         terminal.  A legacy Aster generic no-candidate result gets one new
         scan because V3 userTrades omitted reduceOnly and the old parser
-        incorrectly discarded that row.  The repaired adapter records future
-        misses as a distinct terminal reason, so they never re-open.
+        incorrectly discarded that row.  A legacy Bitget generic no-candidate
+        result gets one new scan because the history candidate filter
+        rejected the Classic hedge close wire side (the order builder repeats
+        the position's open side, e.g. buy+close for a long).  The repaired
+        adapters record future misses as distinct terminal reasons, so they
+        never re-open.
         """
         if (
             reconciliation.get("automatic_history_terminal_status")
@@ -547,11 +554,14 @@ class CloseRuntime:
         capability_upgrade = (
             terminal_reason == self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
         )
-        aster_schema_upgrade = (
-            terminal_reason == self._AUTOMATIC_HISTORY_ASTER_LEGACY_NO_CANDIDATE_REASON
+        # The legacy generic no-candidate terminal reason predates both the
+        # Aster V3 row-shape repair and the Bitget Classic hedge close-side
+        # repair, so either repaired leg earns one new scan.
+        legacy_no_candidate_repair = (
+            terminal_reason == self._AUTOMATIC_HISTORY_LEGACY_NO_CANDIDATE_REASON
             and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
         )
-        if not capability_upgrade and not aster_schema_upgrade:
+        if not (capability_upgrade or legacy_no_candidate_repair):
             return False
         snapshot = reconciliation.get("position_snapshot")
         if not isinstance(snapshot, dict):
@@ -571,15 +581,17 @@ class CloseRuntime:
             ),
         )
         has_aster_leg = False
+        has_bitget_leg = False
         for venue, quantity in zip(venues, expected_quantities):
             if quantity <= 1e-12:
                 continue
             has_aster_leg = has_aster_leg or venue == Venue.ASTER
+            has_bitget_leg = has_bitget_leg or venue == Venue.BITGET
             if venue is None or not self._adapter_supports_historical_close_discovery(
                 self.ctx.venue_adapters.get(venue)
             ):
                 return False
-        if aster_schema_upgrade and not has_aster_leg:
+        if legacy_no_candidate_repair and not (has_aster_leg or has_bitget_leg):
             return False
         # Legacy persisted debt may predate evidence_debt_reason.  The same
         # canonical predicate admitted this record to the bounded automatic
@@ -604,6 +616,8 @@ class CloseRuntime:
                     self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
                     if capability_upgrade
                     else self._AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON
+                    if has_aster_leg
+                    else self._AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON
                 ),
             },
         )

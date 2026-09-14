@@ -5965,6 +5965,25 @@ class VenueTransport(MarketDataClient):
                 TransportErrorCategory.REQUEST_REJECTED,
                 f"bitget order status has invalid/missing side value {side_str!r}",
             )
+        # Classic hedge-mode closes repeat the position's open side on the
+        # wire (the order builder inverts the business side, e.g. buy +
+        # tradeSide=close + posSide=long closes a long), while UTA hedge
+        # closes carry the opposite business side already.  A posSide row
+        # proven to close that position reports the business close side
+        # regardless of which wire convention the account family used; open
+        # and one-way rows keep their wire side.
+        hedge_pos_side = str(
+            data.get("posSide", data.get("positionSide", "")) or ""
+        ).strip().lower()
+        trade_side_marker = str(data.get("tradeSide", "") or "").strip().lower()
+        business_close_side = {"long": Side.SELL, "short": Side.BUY}.get(
+            hedge_pos_side
+        )
+        if business_close_side is not None and (
+            trade_side_marker == "close"
+            or (not trade_side_marker and side == business_close_side)
+        ):
+            side = business_close_side
 
         # Fee extraction with multi-key fallback (V1: bitget.rs:2934-2938).
         # A present zero is valid fee evidence; only a missing/malformed value

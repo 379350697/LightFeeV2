@@ -433,6 +433,94 @@ def test_bitget_history_close_ownership_covers_official_trade_side_variants():
     ]
 
 
+def test_bitget_history_candidates_accept_classic_hedge_close_wire_side():
+    """Classic hedge closes repeat the open side on the wire.
+
+    Production evidence (entry-1789066343561-ONGUSDT, 2026-09-10): the filled
+    close of the Bitget long leg reported ``side=buy`` + ``tradeSide=close`` +
+    ``posSide=long``; the old filter demanded the business close side (sell)
+    and returned no candidate, stranding the debt.
+    """
+    classic_long_close = {
+        "symbol": "ONGUSDT",
+        "side": "buy",
+        "posSide": "long",
+        "tradeSide": "close",
+        "status": "filled",
+        "baseVolume": "303",
+        "size": "303",
+        "orderId": "classic-long-close",
+        "clientOid": "lfex-close-long",
+        "uTime": str(NOW_MS - 60_000),
+    }
+    classic_short_close = {
+        "symbol": "ONGUSDT",
+        "side": "sell",
+        "posSide": "short",
+        "tradeSide": "close",
+        "status": "filled",
+        "baseVolume": "303",
+        "size": "303",
+        "orderId": "classic-short-close",
+        "clientOid": "lfex-close-short",
+        "uTime": str(NOW_MS - 60_000),
+    }
+    hedge_open_row = {
+        "symbol": "ONGUSDT",
+        "side": "buy",
+        "posSide": "long",
+        "tradeSide": "open",
+        "status": "filled",
+        "baseVolume": "303",
+        "orderId": "hedge-open-row",
+        "uTime": str(NOW_MS - 60_000),
+    }
+    one_way_open_side_row = {
+        "symbol": "ONGUSDT",
+        "side": "buy",
+        "posSide": "net",
+        "reduceOnly": "YES",
+        "tradeSide": "close",
+        "status": "filled",
+        "baseVolume": "303",
+        "orderId": "one-way-open-side-row",
+        "uTime": str(NOW_MS - 60_000),
+    }
+    rows = [
+        classic_long_close,
+        classic_short_close,
+        hedge_open_row,
+        one_way_open_side_row,
+    ]
+
+    long_candidates = find_bitget_historical_close_order_candidates(
+        rows,
+        symbol="ONGUSDT",
+        side=Side.SELL,
+        position_side="LONG",
+        quantity=303.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+    assert [candidate["order_id"] for candidate in long_candidates] == [
+        "classic-long-close"
+    ]
+
+    # A one-way buy reduce-only legitimately closes a short, so it is a
+    # candidate for the SHORT query while the LONG query rejects it.
+    short_candidates = find_bitget_historical_close_order_candidates(
+        rows,
+        symbol="ONGUSDT",
+        side=Side.BUY,
+        position_side="SHORT",
+        quantity=303.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+    assert [candidate["order_id"] for candidate in short_candidates] == [
+        "classic-short-close",
+        "one-way-open-side-row",
+    ]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("profile", "history_path", "detail_path", "history_row", "detail_row"),
@@ -579,7 +667,7 @@ async def test_bitget_history_discovery_treats_null_collection_as_empty_page(
     finally:
         await adapter.shutdown()
 
-    assert result.classification == "no_candidate"
+    assert result.classification == "bitget_history_no_candidate"
     assert result.candidate_count == 0
 
 
@@ -1083,6 +1171,219 @@ async def test_fixed_aster_no_candidate_debt_never_reopens():
     assert ctx.state.pending_close_reconciliations == [task]
     aster.discover_historical_close_fill_reconciliation.assert_not_awaited()
     assert task["automatic_history_terminal_reason"] == "aster_v3_no_candidate"
+
+
+@pytest.mark.asyncio
+async def test_bitget_discovery_resolves_classic_hedge_close_and_normalizes_side():
+    """Classic hedge close discovery must resolve the production row shape.
+
+    The order builder inverts the business close side on the Classic wire
+    (buy + tradeSide=close + posSide=long closes a long), so the exact
+    recheck must return the business side (SELL) for the billing evidence.
+    """
+    adapter = BitgetAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret", api_passphrase="pass"),
+    )
+    adapter._profile = BitgetAccountProfile.CLASSIC
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del body, private
+        if path == "/api/v2/mix/order/orders-history":
+            return {
+                "code": "00000",
+                "data": {
+                    "entrustedList": [
+                        {
+                            "symbol": "ONGUSDT",
+                            "side": "buy",
+                            "posSide": "long",
+                            "tradeSide": "close",
+                            "status": "filled",
+                            "baseVolume": "303",
+                            "size": "303",
+                            "orderId": "1482019161004191745",
+                            "clientOid": "lfexf948f037b1454a27",
+                            "uTime": str(NOW_MS - 60_000),
+                        }
+                    ],
+                    "endId": "",
+                },
+            }
+        if path == "/api/v2/mix/order/detail":
+            return {
+                "code": "00000",
+                "data": {
+                    "symbol": "ONGUSDT",
+                    "side": "buy",
+                    "posSide": "long",
+                    "tradeSide": "close",
+                    "status": "filled",
+                    "baseVolume": "303",
+                    "priceAvg": "0.07912",
+                    "fee": "0.012",
+                    "orderId": "1482019161004191745",
+                    "clientOid": "lfexf948f037b1454a27",
+                    "uTime": str(NOW_MS - 59_000),
+                },
+            }
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="ONGUSDT",
+            side=Side.SELL,
+            position_side="LONG",
+            quantity=303.0,
+            closed_at_ms=NOW_MS - 60_000,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "unique_candidate_exact_recheck"
+    assert result.candidate_count == 1
+    assert result.reconciliation is not None
+    assert result.reconciliation.side == Side.SELL
+    assert result.reconciliation.quantity == pytest.approx(303.0)
+    assert result.reconciliation.average_price == pytest.approx(0.07912)
+    assert result.reconciliation.metadata["fee_evidence_complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_bitget_no_candidate_debt_retries_the_side_repair_once():
+    """Legacy Bitget no-candidate debt re-enters the repaired discovery."""
+    snapshot = _snapshot(
+        position_id="entry-1789066343561-ONGUSDT",
+        symbol="ONGUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        long_quantity=303.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[
+            {
+                "venue": "bitget",
+                "order_id": "1482019066493939713",
+                "client_order_id": "lfexf975390724af3c89",
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": None,
+            }
+        ],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    bitget = _Adapter(
+        Venue.BITGET,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=_fill(
+                venue=Venue.BITGET,
+                symbol="ONGUSDT",
+                side=Side.SELL,
+                quantity=303.0,
+                price=0.07912,
+                order_id="1482019161004191745",
+                client_order_id="lfexf948f037b1454a27",
+                fee_quote=0.0,
+                provenance="bitget_history_exact_order",
+            ),
+        ),
+    )
+    ctx = _ctx(task, {Venue.BITGET: bitget, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    bitget.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert _critical_payload(ctx, "exit.reconciled") is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_bitget_no_candidate_debt_stays_terminal_after_one_fixed_miss():
+    """A legacy Bitget re-scan which still finds nothing must not loop."""
+    snapshot = _snapshot(
+        position_id="entry-bitget-legacy-fixed-miss",
+        symbol="ONGUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        long_quantity=303.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    bitget = _Adapter(
+        Venue.BITGET,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="bitget_history_no_candidate",
+            candidate_count=0,
+        ),
+    )
+    ctx = _ctx(task, {Venue.BITGET: bitget, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+    runtime = CloseRuntime(ctx)
+
+    await runtime._process_pending_close_reconciliations(NOW_MS)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    bitget.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert task["automatic_history_terminal_reason"] == "bitget_history_no_candidate"
+
+
+@pytest.mark.asyncio
+async def test_fixed_bitget_no_candidate_debt_never_reopens():
+    """A current strict Bitget miss remains terminal after the side repair."""
+    snapshot = _snapshot(
+        position_id="entry-bitget-current-no-candidate",
+        symbol="ONGUSDT",
+        long_venue=Venue.BITGET,
+        short_venue=Venue.BYBIT,
+        long_quantity=303.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "bitget_history_no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    bitget = _Adapter(Venue.BITGET)
+    ctx = _ctx(task, {Venue.BITGET: bitget, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    bitget.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    assert task["automatic_history_terminal_reason"] == "bitget_history_no_candidate"
 
 
 @pytest.mark.asyncio

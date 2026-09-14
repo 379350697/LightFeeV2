@@ -2514,6 +2514,111 @@ class TestFallbackResidualReal:
         assert "exit.passive_close_live_one_sided_force_close_problem" not in kinds
         assert "runtime.position_lifecycle_terminal" not in kinds
 
+    def test_truth_gap_one_sided_retry_mints_fresh_client_order_id(self):
+        """A truth-gap retry must not resend the accepted order's clientOid.
+
+        Production evidence (entry-1789105961703-ONGUSDT, 2026-09-11): the
+        first one-sided flatten was accepted ack-only, and the 5-second retry
+        reused the deterministic clientOid, which Bitget rejected with 40786
+        Duplicate clientOid.
+        """
+        journal = _open_journal()
+
+        class AckOnlyAdapter(VenueAdapter):
+            def __init__(self, venue, *, quantity, side):
+                self._venue = venue
+                self._quantity = quantity
+                self._side = side
+                self.place_order_calls = []
+
+            @property
+            def venue(self):
+                return self._venue
+
+            async def normalize_quantity(self, symbol, quantity):
+                return quantity
+
+            async def place_order(self, request):
+                self.place_order_calls.append(request)
+                error = OrderSubmitError(
+                    SubmitFailureClass.UNCERTAIN,
+                    "order accepted but fill not confirmed",
+                )
+                error.order_ack_only = True
+                error.accepted_order_id = f"ack-oid-{len(self.place_order_calls)}"
+                error.accepted_client_order_id = request.client_order_id
+                error.fill_confirmation_missing_fields = ["fill", "order_state"]
+                raise error
+
+            async def fetch_position(self, symbol):
+                return PositionSnapshot(
+                    venue=self._venue,
+                    symbol=symbol,
+                    side=self._side,
+                    quantity=self._quantity,
+                    entry_price=1.0211,
+                    observed_at_ms=2000,
+                )
+
+        okx = AckOnlyAdapter(Venue.OKX, quantity=0.0, side=Side.BUY)
+        bybit = AckOnlyAdapter(Venue.BYBIT, quantity=20.0, side=Side.SELL)
+        state = EngineState()
+        position = _make_position(
+            position_id="entry-ack-one-sided-retry",
+            symbol="BEATUSDT",
+            long_venue=Venue.OKX,
+            short_venue=Venue.BYBIT,
+            long_quantity=20.0,
+            short_quantity=20.0,
+            matched_quantity=20.0,
+        )
+        pending = PendingPassiveClose(
+            position_id=position.position_id,
+            reason="funding_capture",
+            position_snapshot=position,
+            target_quantity=20.0,
+            chunk_quantities=[20.0],
+            phase_state=PassivePhaseState(
+                phase=PassiveExecutionPhase.DUAL_TAKER,
+                active_maker_leg=ActiveMakerLeg.LONG,
+            ),
+        )
+        state.open_positions[position.position_id] = position
+        state.pending_passive_closes[position.position_id] = pending
+
+        executor = PassiveCloseExecutor({Venue.OKX: okx, Venue.BYBIT: bybit}, journal)
+        executor.set_l2_mid_resolver(lambda venue, symbol: 1.0211)
+        clock = {"now": 100_000}
+        executor._now_ms = lambda: clock["now"]
+
+        live_snapshot = PositionSnapshot(
+            venue=Venue.BYBIT,
+            symbol="BEATUSDT",
+            side=Side.SELL,
+            quantity=20.0,
+            entry_price=1.0211,
+            observed_at_ms=2000,
+        )
+        for _ in range(2):
+            result = asyncio.run(
+                executor._flatten_live_one_sided_position(
+                    state,
+                    pending,
+                    position,
+                    venue=Venue.BYBIT,
+                    live_snapshot=live_snapshot,
+                    leg_label="short",
+                )
+            )
+            assert result is False
+            clock["now"] += 5_000
+
+        client_order_ids = [
+            request.client_order_id for request in bybit.place_order_calls
+        ]
+        assert len(client_order_ids) == 2
+        assert client_order_ids[0] != client_order_ids[1]
+
     def test_one_sided_flatten_requires_open_order_flat_proof(self):
         """Do not submit one-sided reduce-only while an exchange order may still manage it."""
         journal = _open_journal()
