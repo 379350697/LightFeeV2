@@ -34,9 +34,10 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `07de958a`
-- Checked on: `2026-09-14`. Runtime fix commit `5baee72` plus deploy-manifest
-  sync `07de958a` (no runtime-code diff) were fast-forwarded over Tailscale
+- Last production SHA checked: `3be8d703`
+- Checked on: `2026-09-14`. Runtime fix `5baee72` plus deploy-manifest sync
+  `07de958a` and the review follow-up `3be8d703` (UTA marker-less rows cannot
+  borrow the repeated-open-side convention) were fast-forwarded over Tailscale
   SSH together with manifest sync `07de958a`; both services restarted as singletons
   during a verified complete-flat/no-order window. All manifest hashes matched. Eight
   seconds after restart, seven Bitget-leg close-reconciliation debts (six legacy
