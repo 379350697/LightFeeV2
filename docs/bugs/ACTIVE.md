@@ -34,8 +34,23 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `d230f8df`
-- Checked on: `2026-09-05`. Runtime code `d230f8df` was fast-forwarded from
+- Last production SHA checked: `07de958a`
+- Checked on: `2026-09-14`. Runtime fix commit `5baee72` plus deploy-manifest
+  sync `07de958a` (no runtime-code diff) were fast-forwarded over Tailscale
+  SSH together with manifest sync `07de958a`; both services restarted as singletons
+  during a verified complete-flat/no-order window. All manifest hashes matched. Eight
+  seconds after restart, seven Bitget-leg close-reconciliation debts (six legacy
+  `no_candidate` terminal plus one active retrier family member) were reactivated
+  under `bitget_classic_hedge_close_side_convention` and reconciled in the same
+  second; owners fell 13 → 6. The remaining six are outside this repair's contract:
+  two partial debts (operator-import by design), one Aster `aster_v3_no_candidate`
+  terminal (its one repaired re-scan already ran), two Binance/Bybit-leg legacy
+  `no_candidate` debts (no Bitget/Aster leg, unreactivated by scope), and one
+  Binance/Bybit active retrier on backoff. Seven-venue exchange truth stayed
+  high-confidence flat/no-order and state-consistent; no order was submitted or
+  cancelled by verification. The stale `lightfee-trade-optimization-report.timer`
+  (its script has never existed in the repo) was disabled on the host.
+- Prior checked deployment: `2026-09-05`. Runtime code `d230f8df` was fast-forwarded from
   `47c94b24` over Tailscale SSH and both services restarted active; the
   local `main` ledger subsequently gained docs-only commits, while the cloud
   runtime checkout remains pinned to `d230f8df` because docs are excluded from
@@ -168,7 +183,9 @@ until this table receives real fixing commits and a production observation.
 | CL-144 | deployed-awaiting-verification | `b33aa6c` | Bitget identity/HTTP detail, Local-L2 protocol, pending-entry hedge, immutable close owner including strict partial→final promotion, close/replay, and entry-runtime suites; full validation profile `1,612 passed` plus ACK-state `32 passed`; compile and whitespace checks passed | Deploy `b33aa6c`, then observe naturally: Bitget null-order-ID ACK, owned-hedge retry, Gate/Bitget Local-L2 bridge, and uncertain-submit full-fill close. No order is to be forced for verification. | [2026-09-02](daily/2026-09-02.md#cl-144--bitget-order-identity-owned-hedge-close-owner-and-local-l2-contract-drift) |
 | CL-145 | deployed-awaiting-verification | `47c94b24` | 2026-09-03/04 shared recovery/live-truth, Gate/Aster/Bitget contract, diagnosis, Local-L2, Bitget dynamic precision/heartbeat, and typed-transport production-path regressions; full validation profile 10/10; changed regression suite 364 passed | Deployment manifest, singleton, source freshness, FD/CLOSE_WAIT, private WS, listenKey, high-confidence flat/no-order truth, and `diagnose_live --since-deploy` passed. Await only natural matched-pair release, eligible Bitget order, and terminal evidence-debt observations; no order is to be forced. | [2026-09-04](daily/2026-09-04.md) |
 | CL-146 | deployed-awaiting-verification | `d230f8df` | Bitget duplicate-client-id production-path regression; inherited close-evidence owner/restart/terminal-debt end-to-end verification; ledger drift correction; Aster/OI request identity, Local-L2 sequence/generation, source-age, and two-sample resource evidence tests; shared Bitget diagnosis predicate and persisted resource baseline | Deployed and observed `2026-09-05`: manifest and systemd service checks passed; seven venue sources fresh; exchange truth high-confidence flat/no-order; six private WS workers started once; resource baseline showed no FD/CLOSE_WAIT growth (latest live `CLOSE_WAIT=1`, delta `0`; sidecar `0`). Acceptance remains warning-only for seven existing close-reconciliation owners, so natural Bitget duplicate-id and evidence-debt completion observations remain pending; no order was forced. | [2026-09-04](daily/2026-09-04.md#current-working-tree-follow-up--wt-20260904-5) |
-| CL-147 | closed | `98875c29` | Bitget Classic/UTA unified historical-close discovery; executed-vs-submitted quantity, close ownership, official trade-side variants, explicit zero execution/fee, cursor pagination, exact order-status recheck, and real `CloseRuntime → BitgetAdapter → VenueTransport` regression; production null-collection compatibility fix; close profile `494 passed`; full validation profile `10/10` passed | `98875c29` deployed and read-only verified: seven-venue exchange truth high-confidence flat/no-order, services singleton/healthy, and the four naturally reactivated Bitget debts now return bounded `no_candidate` (`candidate_count=0`, `retryable=false`) with no post-hotfix `history_query_error`. Seven historical evidence owners remain immutable debt/no-candidate records; no position or order risk. | [2026-09-05](daily/2026-09-05.md#bitget-historical-close-discovery-is-now-wired-to-the-unified-adapter-contract) |
+| CL-147 | superseded | `98875c29` | n/a; closure conclusion invalidated | Superseded by CL-148: exchange-side order history proved the post-fix `no_candidate` terminal result was itself wrong — the filled Classic hedge close row existed but was side-filtered. The wiring, pagination, and empty-page repairs remain in force inside CL-148. | [2026-09-14](daily/2026-09-14.md) |
+| CL-148 | closed | `5baee72` | Classic hedge close-side candidate regression (production row shape from `entry-1789066343561-ONGUSDT`), parser business-side normalization with open/one-way counterexamples, full adapter discovery exact-recheck regression, one-shot legacy `no_candidate` reactivation with no-reopen guards, and null-page reclassification; RED verified on the pre-fix tree (6/7 new tests fail without the fix); full suite `4,595 passed` with all 25 failures byte-identical to the pre-fix baseline | `5baee72` deployed `2026-09-14 18:43 CST` (manifest sync `07de958a`). Eight seconds after restart the journal recorded seven `automatic_historical_evidence_reactivated` (`bitget_classic_hedge_close_side_convention`) followed by seven `exit.reconciled` in the same second, including both traced incidents (`entry-1789066343561-ONGUSDT`, `entry-1789105961703-ONGUSDT`); reconciliation owners fell 13 → 6; seven-venue exchange truth remains high-confidence flat/no-order and state-consistent. | [2026-09-14](daily/2026-09-14.md) |
+| CL-149 | deployed-awaiting-verification | `5baee72` | Passive one-sided/excess IOC retry CID regression: two truth-gap retries must mint distinct client order ids (RED on pre-fix tree); adjacent close suites `280 passed` | Deployed with CL-148. Needs one natural Bitget ack-only truth-gap retry to observe a fresh `exit_live_one_sided_*` clientOid instead of a `40786 Duplicate clientOid` rejection; no order is to be forced. | [2026-09-14](daily/2026-09-14.md) |
 
 ## Pre-CL-093 Historical Boundary
 
