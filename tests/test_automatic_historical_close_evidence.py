@@ -22,6 +22,7 @@ from lightfee.engine.close_runtime import CloseRuntime
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.binance import (
     BinanceAdapter,
+    find_binance_historical_close_execution_candidates,
     find_binance_historical_close_order_candidates,
 )
 from lightfee.venues.bybit import (
@@ -233,42 +234,41 @@ async def test_coti_debt_unique_binance_history_exactly_rechecks_and_reconciles(
 
     async def request(_method: str, path: str, **kwargs):
         seen.append(path)
-        if path == "/fapi/v1/allOrders":
-            assert kwargs["params"]["limit"] == 1000
+        params = kwargs.get("params", {})
+        if path == "/fapi/v1/userTrades" and "orderId" not in params:
+            assert params["limit"] == 1000
             return [
                 {
                     "symbol": "COTIUSDT",
+                    "orderId": "wrong-hedge-leg",
                     "side": "BUY",
                     "positionSide": "LONG",
-                    "reduceOnly": True,
-                    "status": "FILLED",
-                    "executedQty": "2400",
-                    "avgPrice": "0.010000",
-                    "orderId": "wrong-hedge-leg",
-                    "clientOrderId": "",
-                    "updateTime": NOW_MS - 59_500,
+                    "qty": "2400",
+                    "price": "0.010000",
+                    "commission": "0.004",
+                    "time": NOW_MS - 59_500,
                 },
+                # Binance Hedge Mode identifies the close by positionSide;
+                # reduceOnly cannot be required by the matching contract.
                 {
                     "symbol": "COTIUSDT",
-                    "side": "BUY",
-                    "positionSide": "SHORT",
-                    # Binance Hedge Mode identifies the close by positionSide;
-                    # reduceOnly cannot be required by the matching contract.
-                    "reduceOnly": False,
-                    "status": "FILLED",
-                    "executedQty": "2400",
-                    "avgPrice": "0.010112",
                     "orderId": "7918051356",
                     "clientOrderId": "lfxsf1b3c859d1f7e023",
-                    "updateTime": NOW_MS - 59_000,
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "qty": "2400",
+                    "price": "0.010112",
+                    "commission": "0.004",
+                    "time": NOW_MS - 59_000,
                 },
             ]
         if path == "/fapi/v1/order":
-            assert kwargs["params"]["orderId"] == "7918051356"
+            assert params["orderId"] == "7918051356"
             return {
                 "symbol": "COTIUSDT",
                 "side": "BUY",
                 "positionSide": "SHORT",
+                "reduceOnly": False,
                 "status": "FILLED",
                 "executedQty": "2400",
                 "avgPrice": "0.010112",
@@ -277,7 +277,7 @@ async def test_coti_debt_unique_binance_history_exactly_rechecks_and_reconciles(
                 "updateTime": NOW_MS - 59_000,
             }
         if path == "/fapi/v1/userTrades":
-            assert kwargs["params"]["orderId"] == "7918051356"
+            assert params["orderId"] == "7918051356"
             return [
                 {"orderId": "7918051356", "commission": "0.004"},
                 {"orderId": "7918051356", "commission": "0.00813439"},
@@ -291,7 +291,12 @@ async def test_coti_debt_unique_binance_history_exactly_rechecks_and_reconciles(
     await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
 
     assert ctx.state.pending_close_reconciliations == []
-    assert seen == ["/fapi/v1/allOrders", "/fapi/v1/order", "/fapi/v1/userTrades"]
+    assert seen == [
+        "/fapi/v1/userTrades",
+        "/fapi/v1/order",
+        "/fapi/v1/order",
+        "/fapi/v1/userTrades",
+    ]
     payload = _critical_payload(ctx, "exit.reconciled")
     assert payload is not None
     assert payload["short_order_id"] == "7918051356"
@@ -1399,6 +1404,375 @@ async def test_fixed_bitget_no_candidate_debt_never_reopens():
 
 
 @pytest.mark.asyncio
+async def test_binance_history_discovery_anchors_on_execution_not_placement_window():
+    """/fapi/v1/allOrders filters by placement time, but the close contract
+    anchors on execution time versus closed_at_ms.  A passive close resting
+    far before the flat confirmation (entry-1788583981589-ONGUSDT shape) must
+    still be discovered and exactly rechecked."""
+    snapshot = _snapshot(
+        position_id="entry-1788583981589-ONGUSDT",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=247.0,
+        short_quantity=0.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    binance = BinanceAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret"),
+    )
+    binance.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="ONGUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    binance.fetch_open_orders = AsyncMock(return_value=[])
+    seen: list[str] = []
+
+    async def request(_method: str, path: str, **kwargs):
+        seen.append(path)
+        params = kwargs.get("params", {})
+        if path == "/fapi/v1/allOrders":
+            # Placement-time filtering excludes the resting passive order.
+            return []
+        if path == "/fapi/v1/userTrades" and "orderId" not in params:
+            assert params["limit"] == 1000
+            return [
+                {
+                    "symbol": "ONGUSDT",
+                    "orderId": "3277215179",
+                    "clientOrderId": "lfexa38f361f087bc2c6",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "247",
+                    "price": "0.0969",
+                    "commission": "0.0119",
+                    "time": NOW_MS - 61_000,
+                }
+            ]
+        if path == "/fapi/v1/order" and params.get("orderId") == "3277215179":
+            return {
+                "symbol": "ONGUSDT",
+                "side": "SELL",
+                "positionSide": "LONG",
+                "reduceOnly": True,
+                "status": "FILLED",
+                "executedQty": "247",
+                "origQty": "247",
+                "avgPrice": "0.0969",
+                "orderId": "3277215179",
+                "clientOrderId": "lfexa38f361f087bc2c6",
+                # Placed ~67h before the fill; outside any placement window.
+                "time": NOW_MS - 61_000 - 241_200_000,
+                "updateTime": NOW_MS - 61_000,
+            }
+        if path == "/fapi/v1/userTrades" and params.get("orderId") == "3277215179":
+            return [
+                {"orderId": "3277215179", "commission": "0.0119"},
+            ]
+        raise AssertionError((path, params))
+
+    binance._transport._request = AsyncMock(side_effect=request)
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    assert seen == [
+        "/fapi/v1/userTrades",
+        "/fapi/v1/order",
+        "/fapi/v1/order",
+        "/fapi/v1/userTrades",
+    ]
+    payload = _critical_payload(ctx, "exit.reconciled")
+    assert payload is not None
+    assert payload["long_order_id"] == "3277215179"
+    assert payload["historical_evidence_resolution"]["long"]["provenance"] == (
+        "system_client_id_execution"
+    )
+
+
+@pytest.mark.asyncio
+async def test_binance_history_discovery_split_fill_miss_is_distinct_terminal():
+    """A close split across two reduce-only orders (entry-1788537122325-ONGUSDT
+    shape: GTX partial EXPIRED 203 + residual market 49) is not one candidate
+    and must terminalize under the repaired-path reason without looping."""
+    snapshot = _snapshot(
+        position_id="entry-1788537122325-ONGUSDT",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=252.0,
+        short_quantity=0.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    binance = BinanceAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret"),
+    )
+    binance.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="ONGUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    binance.fetch_open_orders = AsyncMock(return_value=[])
+    discovery_calls: list[dict] = []
+
+    async def request(_method: str, path: str, **kwargs):
+        if path == "/fapi/v1/userTrades" and "orderId" not in kwargs.get(
+            "params", {}
+        ):
+            discovery_calls.append(kwargs["params"])
+            return [
+                {
+                    "symbol": "ONGUSDT",
+                    "orderId": "3274922181",
+                    "clientOrderId": "lfex081f61015871220b",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "203",
+                    "price": "0.09515",
+                    "commission": "0.0096",
+                    "time": NOW_MS - 61_000,
+                },
+                {
+                    "symbol": "ONGUSDT",
+                    "orderId": "3274923320",
+                    "clientOrderId": "lfxlbf3c33694b54acf2",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "49",
+                    "price": "0.0951",
+                    "commission": "0.0023",
+                    "time": NOW_MS - 61_000,
+                },
+            ]
+        raise AssertionError((path, kwargs.get("params")))
+
+    binance._transport._request = AsyncMock(side_effect=request)
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+    runtime = CloseRuntime(ctx)
+
+    await runtime._process_pending_close_reconciliations(NOW_MS)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    assert len(discovery_calls) == 1
+    assert task["automatic_history_terminal_reason"] == (
+        "binance_user_trades_no_candidate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_binance_history_discovery_ambiguous_full_groups_stay_blocked():
+    """Two execution groups each matching the full quantity stay ambiguous."""
+    snapshot = _snapshot(
+        position_id="entry-binance-ambiguous-window",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=247.0,
+        short_quantity=0.0,
+    )
+    task = _debt(snapshot=snapshot, long_legs=[], short_legs=[])
+    binance = BinanceAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret"),
+    )
+    binance.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="ONGUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    binance.fetch_open_orders = AsyncMock(return_value=[])
+
+    async def request(_method: str, path: str, **kwargs):
+        if path == "/fapi/v1/userTrades" and "orderId" not in kwargs.get(
+            "params", {}
+        ):
+            return [
+                {
+                    "symbol": "ONGUSDT",
+                    "orderId": "9001",
+                    "clientOrderId": "lfex-ambiguous-a",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "247",
+                    "price": "0.0969",
+                    "commission": "0.0119",
+                    "time": NOW_MS - 61_000,
+                },
+                {
+                    "symbol": "ONGUSDT",
+                    "orderId": "9002",
+                    "clientOrderId": "lfex-ambiguous-b",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "247",
+                    "price": "0.0969",
+                    "commission": "0.0119",
+                    "time": NOW_MS - 59_000,
+                },
+            ]
+        raise AssertionError((path, kwargs.get("params")))
+
+    binance._transport._request = AsyncMock(side_effect=request)
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    assert task["automatic_history_terminal_reason"] == "ambiguous_candidates"
+
+
+@pytest.mark.asyncio
+async def test_legacy_binance_no_candidate_debt_retries_the_window_repair_once():
+    """Legacy Binance no-candidate debt re-enters the repaired discovery."""
+    snapshot = _snapshot(
+        position_id="entry-1788583981589-ONGUSDT",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=247.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    binance = _Adapter(
+        Venue.BINANCE,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=_fill(
+                venue=Venue.BINANCE,
+                symbol="ONGUSDT",
+                side=Side.SELL,
+                quantity=247.0,
+                price=0.0969,
+                order_id="3277215179",
+                client_order_id="lfexa38f361f087bc2c6",
+                fee_quote=0.0119,
+                provenance="binance_user_trades_execution",
+            ),
+        ),
+    )
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    binance.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert _critical_payload(ctx, "exit.reconciled") is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_binance_no_candidate_debt_stays_terminal_after_one_fixed_miss():
+    """A legacy Binance re-scan which still finds nothing must not loop."""
+    snapshot = _snapshot(
+        position_id="entry-binance-legacy-fixed-miss",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=252.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    binance = _Adapter(
+        Venue.BINANCE,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="binance_user_trades_no_candidate",
+            candidate_count=0,
+        ),
+    )
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+    runtime = CloseRuntime(ctx)
+
+    await runtime._process_pending_close_reconciliations(NOW_MS)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    binance.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    assert task["automatic_history_terminal_reason"] == (
+        "binance_user_trades_no_candidate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixed_binance_no_candidate_debt_never_reopens():
+    """A current strict Binance miss remains terminal after the window repair."""
+    snapshot = _snapshot(
+        position_id="entry-binance-current-no-candidate",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=252.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "binance_user_trades_no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+        }
+    )
+    binance = _Adapter(Venue.BINANCE)
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    binance.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    assert task["automatic_history_terminal_reason"] == (
+        "binance_user_trades_no_candidate"
+    )
+
+
+@pytest.mark.asyncio
 async def test_strict_history_terminal_debt_never_reopens_for_new_adapter_capability():
     """Capability upgrades cannot turn an ambiguous history into evidence."""
     snapshot = _snapshot(
@@ -1479,19 +1853,18 @@ async def test_ong_bybit_takeover_is_reconciled_without_claiming_v2_submission()
             "lfexe2ab679cf8440975"
         ):
             return {"code": -2013, "msg": "Order does not exist"}
-        if path == "/fapi/v1/allOrders":
+        if path == "/fapi/v1/userTrades" and "orderId" not in params:
             return [
                 {
                     "symbol": "ONGUSDT",
-                    "side": "SELL",
-                    "positionSide": "LONG",
-                    "reduceOnly": False,
-                    "status": "FILLED",
-                    "executedQty": "270",
-                    "avgPrice": "0.08768",
                     "orderId": "2926675711",
                     "clientOrderId": "lfex07006fc64ee6ed2c",
-                    "updateTime": NOW_MS - 59_000,
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "270",
+                    "price": "0.08768",
+                    "commission": "0.00473472",
+                    "time": NOW_MS - 59_000,
                 }
             ]
         if path == "/fapi/v1/order" and params.get("orderId") == "2926675711":
@@ -1643,7 +2016,8 @@ async def test_ong_bybit_takeover_is_reconciled_without_claiming_v2_submission()
     }
     assert binance_seen == [
         "/fapi/v1/order",
-        "/fapi/v1/allOrders",
+        "/fapi/v1/userTrades",
+        "/fapi/v1/order",
         "/fapi/v1/order",
         "/fapi/v1/userTrades",
     ]
@@ -1655,7 +2029,10 @@ async def test_ong_bybit_takeover_is_reconciled_without_claiming_v2_submission()
 @pytest.mark.parametrize(
     ("classification", "candidate_count", "fee_quote"),
     [
-        ("no_candidate", 0, 0.01),
+        # The legacy generic "no_candidate" reason for a Binance leg now earns
+        # exactly one repair re-scan (see test_legacy_binance_no_candidate_*),
+        # so the terminalize-once contract here uses the repaired-path reason.
+        ("binance_user_trades_no_candidate", 0, 0.01),
         ("ambiguous_candidates", 2, 0.01),
         ("history_incomplete", 0, 0.01),
         ("unique_candidate_exact_recheck", 1, None),
@@ -1900,21 +2277,40 @@ async def test_unique_history_candidate_rejects_mismatched_exact_order_identity(
         mode="live",
         credential=LiveCredential(api_key="key", api_secret="secret"),
     )
-    adapter._transport._request = AsyncMock(
-        return_value=[
-            {
+
+    async def request(_method: str, path: str, **kwargs):
+        params = kwargs.get("params", {})
+        if path == "/fapi/v1/userTrades":
+            return [
+                {
+                    "symbol": "COTIUSDT",
+                    "orderId": "history-order",
+                    "clientOrderId": "lfx-history-order",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "qty": "2400",
+                    "price": "0.010112",
+                    "commission": "0.004",
+                    "time": NOW_MS - 60_000,
+                }
+            ]
+        if path == "/fapi/v1/order":
+            assert params.get("orderId") == "history-order"
+            return {
                 "symbol": "COTIUSDT",
                 "side": "BUY",
                 "positionSide": "SHORT",
                 "reduceOnly": False,
                 "status": "FILLED",
                 "executedQty": "2400",
+                "avgPrice": "0.010112",
                 "orderId": "history-order",
                 "clientOrderId": "lfx-history-order",
                 "updateTime": NOW_MS - 60_000,
             }
-        ]
-    )
+        raise AssertionError((path, params))
+
+    adapter._transport._request = AsyncMock(side_effect=request)
     adapter.fetch_order_fill_reconciliation = AsyncMock(
         return_value=_fill(
             venue=Venue.BINANCE,
@@ -1968,6 +2364,68 @@ def test_binance_history_close_semantics_cover_hedge_and_one_way_modes():
         "close-order",
         "one-way-close",
     }
+
+
+def test_binance_execution_candidates_group_by_order_and_window():
+    """Execution-time grouping admits resting closes and rejects the rest."""
+    base = {
+        "symbol": "ONGUSDT",
+        "side": "SELL",
+        "positionSide": "LONG",
+        "orderId": "3277215179",
+        "clientOrderId": "lfexa38f361f087bc2c6",
+        "price": "0.0969",
+        "commission": "0.0119",
+    }
+    trades = [
+        # Passive close split into two executions of the same order.
+        {**base, "qty": "147", "time": NOW_MS - 61_000},
+        {**base, "qty": "100", "time": NOW_MS - 60_000},
+        # Execution outside the window anchored on closed_at_ms.
+        {**base, "orderId": "stale-fill", "qty": "247", "time": NOW_MS - 500_000},
+        # Wrong side, wrong symbol, and the opposite hedge leg.
+        {**base, "orderId": "wrong-side", "side": "BUY", "qty": "247", "time": NOW_MS - 60_000},
+        {**base, "orderId": "wrong-symbol", "symbol": "COTIUSDT", "qty": "247", "time": NOW_MS - 60_000},
+        {**base, "orderId": "wrong-leg", "positionSide": "SHORT", "qty": "247", "time": NOW_MS - 60_000},
+        # One-way BOTH rows are candidate selection; the order row decides
+        # reduce-only ownership during the exact recheck.
+        {**base, "orderId": "one-way", "positionSide": "BOTH", "qty": "247", "time": NOW_MS - 60_000},
+        # Split close across two orders that each fall short of the position.
+        {**base, "orderId": "gtx-partial", "clientOrderId": "lfex081f61015871220b", "qty": "203", "time": NOW_MS - 61_000},
+        {**base, "orderId": "residual-market", "clientOrderId": "lfxlbf3c33694b54acf2", "qty": "49", "time": NOW_MS - 61_000},
+    ]
+
+    candidates = find_binance_historical_close_execution_candidates(
+        trades,
+        symbol="ONGUSDT",
+        side=Side.SELL,
+        position_side="LONG",
+        quantity=247.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+
+    assert {candidate["order_id"] for candidate in candidates} == {
+        "3277215179",
+        "one-way",
+    }
+    grouped = next(c for c in candidates if c["order_id"] == "3277215179")
+    assert grouped["quantity"] == pytest.approx(247.0)
+    assert grouped["updated_at_ms"] == NOW_MS - 60_000
+    assert grouped["system_client_order_id"] is True
+
+    # Two distinct full-quantity groups must both survive as ambiguous.
+    ambiguous = find_binance_historical_close_execution_candidates(
+        [
+            {**base, "orderId": "full-a", "qty": "247", "time": NOW_MS - 61_000},
+            {**base, "orderId": "full-b", "qty": "247", "time": NOW_MS - 60_000},
+        ],
+        symbol="ONGUSDT",
+        side=Side.SELL,
+        position_side="LONG",
+        quantity=247.0,
+        closed_at_ms=NOW_MS - 60_000,
+    )
+    assert {candidate["order_id"] for candidate in ambiguous} == {"full-a", "full-b"}
 
 
 def test_bybit_one_way_history_requires_reduce_only():

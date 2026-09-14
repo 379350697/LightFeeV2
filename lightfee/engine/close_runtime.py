@@ -52,6 +52,9 @@ class CloseRuntime:
     _AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON = (
         "bitget_classic_hedge_close_side_convention"
     )
+    _AUTOMATIC_HISTORY_BINANCE_EXECUTION_WINDOW_REPAIR_REASON = (
+        "binance_execution_window_anchor_repair"
+    )
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -526,7 +529,7 @@ class CloseRuntime:
         reconciliation: dict[str, Any],
         now_ms: int,
     ) -> bool:
-        """Retry only a capability gap, the Aster V3 repair, or the Bitget one.
+        """Retry only a capability gap or one of the three leg repairs.
 
         Strict ambiguous and incomplete-evidence terminal states remain
         terminal.  A legacy Aster generic no-candidate result gets one new
@@ -534,9 +537,13 @@ class CloseRuntime:
         incorrectly discarded that row.  A legacy Bitget generic no-candidate
         result gets one new scan because the history candidate filter
         rejected the Classic hedge close wire side (the order builder repeats
-        the position's open side, e.g. buy+close for a long).  The repaired
-        adapters record future misses as distinct terminal reasons, so they
-        never re-open.
+        the position's open side, e.g. buy+close for a long).  A legacy
+        Binance generic no-candidate result gets one new scan because
+        ``/fapi/v1/allOrders`` windows filter by placement time while the
+        close contract anchors on execution time, so a passive close resting
+        outside the placement window was invisible.  The repaired adapters
+        record future misses as distinct terminal reasons, so they never
+        re-open.
         """
         if (
             reconciliation.get("automatic_history_terminal_status")
@@ -554,9 +561,10 @@ class CloseRuntime:
         capability_upgrade = (
             terminal_reason == self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
         )
-        # The legacy generic no-candidate terminal reason predates both the
-        # Aster V3 row-shape repair and the Bitget Classic hedge close-side
-        # repair, so either repaired leg earns one new scan.
+        # The legacy generic no-candidate terminal reason predates the Aster
+        # V3 row-shape repair, the Bitget Classic hedge close-side repair, and
+        # the Binance execution-window anchor repair, so any repaired leg
+        # earns one new scan.
         legacy_no_candidate_repair = (
             terminal_reason == self._AUTOMATIC_HISTORY_LEGACY_NO_CANDIDATE_REASON
             and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
@@ -582,16 +590,21 @@ class CloseRuntime:
         )
         has_aster_leg = False
         has_bitget_leg = False
+        has_binance_leg = False
         for venue, quantity in zip(venues, expected_quantities):
             if quantity <= 1e-12:
                 continue
             has_aster_leg = has_aster_leg or venue == Venue.ASTER
             has_bitget_leg = has_bitget_leg or venue == Venue.BITGET
+            has_binance_leg = has_binance_leg or venue == Venue.BINANCE
             if venue is None or not self._adapter_supports_historical_close_discovery(
                 self.ctx.venue_adapters.get(venue)
             ):
                 return False
-        if legacy_no_candidate_repair and not (has_aster_leg or has_bitget_leg):
+        if (
+            legacy_no_candidate_repair
+            and not (has_aster_leg or has_bitget_leg or has_binance_leg)
+        ):
             return False
         # Legacy persisted debt may predate evidence_debt_reason.  The same
         # canonical predicate admitted this record to the bounded automatic
@@ -618,6 +631,8 @@ class CloseRuntime:
                     else self._AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON
                     if has_aster_leg
                     else self._AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON
+                    if has_bitget_leg
+                    else self._AUTOMATIC_HISTORY_BINANCE_EXECUTION_WINDOW_REPAIR_REASON
                 ),
             },
         )

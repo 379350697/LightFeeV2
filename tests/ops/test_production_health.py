@@ -1783,7 +1783,15 @@ def test_deploy_systemd_templates_pass_contract():
     timer = Path("deploy/systemd/lightfee-production-health.timer").read_text()
     assert analyze_systemd_unit("lightfee-sidecar.service", sidecar).ok
     assert analyze_systemd_unit("lightfee-live.service", live).ok
-    assert "verify_production_services.py --deployment-acceptance --json" in health
+    # The 5-minute timer must not dump the full JSON report into journald;
+    # operators run the script manually for the full report (deploy.sh does).
+    exec_start = next(
+        line
+        for line in health.splitlines()
+        if line.startswith("ExecStart=")
+    )
+    assert "verify_production_services.py --deployment-acceptance" in exec_start
+    assert "--json" not in exec_start
     assert "OnUnitActiveSec=5min" in timer
     assert "Unit=lightfee-production-health.service" in timer
 

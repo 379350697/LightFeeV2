@@ -9,6 +9,9 @@ User=root
 WorkingDirectory=/opt/lightfee-v2
 EnvironmentFile=/etc/lightfee/lightfee.env
 Environment=LIGHTFEE_PRODUCTION_GUARD=1
-ExecStart=/opt/lightfee-v2/.venv/bin/python3 /opt/lightfee-v2/scripts/verify_production_services.py --deployment-acceptance --json
+# Compact output only: the timer runs every 5 minutes and a full --json dump
+# per run flooded journald (~829MB over 9.5 days).  Operators wanting the full
+# report run the script manually with --json (deploy.sh does the same).
+ExecStart=/opt/lightfee-v2/.venv/bin/python3 /opt/lightfee-v2/scripts/verify_production_services.py --deployment-acceptance
 StandardOutput=journal
 StandardError=journal

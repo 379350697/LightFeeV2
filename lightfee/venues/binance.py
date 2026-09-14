@@ -136,6 +136,74 @@ def find_binance_historical_close_order_candidates(
     return candidates
 
 
+def find_binance_historical_close_execution_candidates(
+    trades: Iterable[dict[str, Any]],
+    *,
+    symbol: str,
+    side: Side | str,
+    position_side: str,
+    quantity: float,
+    closed_at_ms: int,
+    time_window_ms: int = 300_000,
+    quantity_relative_tolerance: float = 1e-9,
+) -> list[dict[str, Any]]:
+    """Group Binance user executions into strictly matching close candidates.
+
+    ``/fapi/v1/userTrades`` rows carry no ``reduceOnly``, so a ``BOTH``
+    positionSide row is candidate selection only; the order-row close-ownership
+    contract decides afterwards during the exact recheck.
+    """
+    expected_side = (
+        side.value.upper() if isinstance(side, Side) else str(side).upper()
+    )
+    expected_position_side = str(position_side).upper()
+    quantity_tolerance = max(quantity * quantity_relative_tolerance, 1e-12)
+    grouped: dict[str, dict[str, Any]] = {}
+    for raw in trades:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("orderId") or "").strip()
+        client_order_id = str(raw.get("clientOrderId") or "").strip()
+        trade_quantity = _binance_history_float(raw.get("qty"))
+        traded_at_ms = _binance_history_int(raw.get("time"))
+        observed_position_side = str(raw.get("positionSide") or "").upper()
+        if (
+            not order_id
+            or str(raw.get("symbol") or "").upper() != symbol.upper()
+            or str(raw.get("side") or "").upper() != expected_side
+            or observed_position_side not in (expected_position_side, "BOTH")
+            or trade_quantity is None
+            or trade_quantity <= 1e-12
+            or traded_at_ms is None
+            or abs(traded_at_ms - closed_at_ms) > time_window_ms
+        ):
+            continue
+        candidate = grouped.setdefault(
+            order_id,
+            {
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "system_client_order_id": client_order_id.startswith("lf"),
+                "quantity": 0.0,
+                "updated_at_ms": 0,
+            },
+        )
+        candidate["quantity"] += trade_quantity
+        candidate["updated_at_ms"] = max(candidate["updated_at_ms"], traded_at_ms)
+        if candidate["client_order_id"] and client_order_id != candidate["client_order_id"]:
+            candidate["client_order_id"] = ""
+    return [
+        candidate
+        for candidate in grouped.values()
+        if math.isclose(
+            candidate["quantity"],
+            quantity,
+            rel_tol=quantity_relative_tolerance,
+            abs_tol=quantity_tolerance,
+        )
+    ]
+
+
 class BinanceAdapter(VenueAdapter):
     """Binance USDⓈ-M futures adapter."""
 
@@ -327,16 +395,25 @@ class BinanceAdapter(VenueAdapter):
         quantity: float,
         closed_at_ms: int,
     ) -> HistoricalCloseEvidenceDiscovery:
-        """Find a unique allOrders row, then re-read exact order trades/fees."""
+        """Find a unique execution-window group, then re-read exact order/trades.
+
+        ``/fapi/v1/allOrders`` windows filter by order placement time, but the
+        close contract anchors on execution time versus ``closed_at_ms``; a
+        passive close resting outside the placement window (e.g. a GTX order
+        filled hours or days after placement) is invisible there.
+        ``/fapi/v1/userTrades`` windows filter by execution time, so candidate
+        groups come from executions; the order row then decides close-only
+        ownership because userTrades rows carry no ``reduceOnly``.
+        """
         if side != close_order_side_for_position(position_side):
             raise ValueError("Binance historical close side contradicts position side")
         if not math.isfinite(quantity) or quantity <= 1e-12 or closed_at_ms <= 0:
             raise ValueError("Binance historical close query requires quantity and closed_at_ms")
         venue_symbol = self._transport._venue_symbol(symbol)
         time_window_ms = 300_000
-        raw = await self._transport._request(
+        raw_trades = await self._transport._request(
             "GET",
-            "/fapi/v1/allOrders",
+            "/fapi/v1/userTrades",
             params={
                 "symbol": venue_symbol,
                 "startTime": max(0, closed_at_ms - time_window_ms),
@@ -345,17 +422,17 @@ class BinanceAdapter(VenueAdapter):
             },
             private=True,
         )
-        if not isinstance(raw, list):
-            raise ValueError("Binance allOrders response is malformed")
+        if not isinstance(raw_trades, list):
+            raise ValueError("Binance userTrades response is malformed")
         # Binance does not return a continuation cursor for this request shape.
         # A full page cannot prove that the bounded interval was exhaustive.
-        if len(raw) >= 1000:
+        if len(raw_trades) >= 1000:
             return HistoricalCloseEvidenceDiscovery(
                 classification="history_incomplete",
                 candidate_count=0,
             )
-        candidates = find_binance_historical_close_order_candidates(
-            raw,
+        candidates = find_binance_historical_close_execution_candidates(
+            raw_trades,
             symbol=venue_symbol,
             side=side,
             position_side=position_side,
@@ -366,12 +443,53 @@ class BinanceAdapter(VenueAdapter):
         if len(candidates) != 1:
             return HistoricalCloseEvidenceDiscovery(
                 classification=(
-                    "ambiguous_candidates" if candidates else "no_candidate"
+                    "ambiguous_candidates"
+                    if candidates
+                    else "binance_user_trades_no_candidate"
                 ),
                 candidate_count=len(candidates),
             )
 
         candidate = candidates[0]
+        raw_order = await self._transport._request(
+            "GET",
+            "/fapi/v1/order",
+            params={"symbol": venue_symbol, "orderId": candidate["order_id"]},
+            private=True,
+        )
+        executed_quantity = (
+            _binance_history_float(raw_order.get("executedQty"))
+            if isinstance(raw_order, dict)
+            else None
+        )
+        if (
+            not isinstance(raw_order, dict)
+            or str(raw_order.get("symbol") or "").upper() != venue_symbol.upper()
+            or str(raw_order.get("side") or "").upper() != side.value.upper()
+            or not _binance_history_row_closes_position_side(
+                raw_order,
+                str(position_side).upper(),
+            )
+            or str(raw_order.get("status") or "").upper() != "FILLED"
+            or executed_quantity is None
+            or not math.isclose(
+                executed_quantity,
+                quantity,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                executed_quantity,
+                candidate["quantity"],
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            or str(raw_order.get("orderId") or "") != candidate["order_id"]
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_identity_mismatch",
+                candidate_count=1,
+            )
         reconciliation = await self.fetch_order_fill_reconciliation(
             symbol,
             str(candidate["order_id"]),
@@ -404,7 +522,7 @@ class BinanceAdapter(VenueAdapter):
             )
         metadata.update(
             {
-                "historical_candidate_endpoint": "/fapi/v1/allOrders",
+                "historical_candidate_endpoint": "/fapi/v1/userTrades",
                 "historical_candidate_updated_at_ms": candidate["updated_at_ms"],
                 "historical_evidence_provenance": (
                     "system_client_id_execution"
