@@ -50,6 +50,15 @@ production-evidence cell.
   `1788537122325` partial; both operator import only). The health gate
   remains warning-only on `pending_close_owner_present` for those two. No
   order was submitted or cancelled by verification.
+- Docs-only sync `2026-09-15`: the runtime checkout was fast-forwarded to
+  `4cf87cbe` (CL-151/152 ledger documentation; no runtime-code diff from
+  `2be127cc`), all manifest hashes matched, and both services restarted in a
+  verified complete-flat/no-order window as singletons. Post-restart:
+  lifecycle/risk `running`, owners 2 (both by-design operator records),
+  entry allowed, and fresh high-confidence seven-venue truth complete-flat /
+  no-order with state-consistent local records. The deployment marker stays
+  at the last runtime-code SHA `2be127cc` because the fast-forward carries no
+  runtime-code change.
 - Checked on: `2026-09-15`. Runtime fix `3a50dcfb` (split-close complement
   discovery, Binance userTrades fee enrichment, zero-quantity leg skip, and
   per-repair one-scan reactivation grants) was fast-forwarded over Tailscale
