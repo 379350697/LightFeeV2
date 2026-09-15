@@ -55,6 +55,9 @@ class CloseRuntime:
     _AUTOMATIC_HISTORY_BINANCE_EXECUTION_WINDOW_REPAIR_REASON = (
         "binance_execution_window_anchor_repair"
     )
+    _AUTOMATIC_HISTORY_BINANCE_SPLIT_CLOSE_COMPLEMENT_REASON = (
+        "binance_split_close_complement"
+    )
 
     def __init__(self, ctx: CloseRuntimeContext) -> None:
         self.ctx = ctx
@@ -193,6 +196,25 @@ class CloseRuntime:
             fill = await fetch(symbol, order_id, client_order_id)
             self._flush_adapter_order_diagnostics(adapter)
             if fill is None:
+                # A leg recorded with zero executed quantity carries no fill
+                # evidence by construction: its lookup finding no fill skips
+                # the leg instead of failing the whole recheck.  A positive
+                # recorded quantity keeps failing closed — an unavailable
+                # lookup for real evidence must never be guessed away.  A
+                # stored-zero leg that unexpectedly returns a fill is kept.
+                stored_quantity = (
+                    leg.get("quantity") if isinstance(leg, dict) else None
+                )
+                try:
+                    stored_quantity = (
+                        float(stored_quantity)
+                        if stored_quantity is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    stored_quantity = None
+                if stored_quantity is not None and stored_quantity <= 1e-12:
+                    continue
                 return None
             fills.append(fill)
         return fills
@@ -529,7 +551,7 @@ class CloseRuntime:
         reconciliation: dict[str, Any],
         now_ms: int,
     ) -> bool:
-        """Retry only a capability gap or one of the three leg repairs.
+        """Retry only a capability gap or one of the named row-shape repairs.
 
         Strict ambiguous and incomplete-evidence terminal states remain
         terminal.  A legacy Aster generic no-candidate result gets one new
@@ -541,9 +563,13 @@ class CloseRuntime:
         Binance generic no-candidate result gets one new scan because
         ``/fapi/v1/allOrders`` windows filter by placement time while the
         close contract anchors on execution time, so a passive close resting
-        outside the placement window was invisible.  The repaired adapters
-        record future misses as distinct terminal reasons, so they never
-        re-open.
+        outside the placement window was invisible.  A post-anchor
+        ``binance_user_trades_no_candidate`` miss gets the split-close
+        complement repair's scan on a binance leg because a close split
+        across orders cannot match the single-group uniqueness contract.
+        Each repair grants at most one scan per debt: the recorded
+        reactivation reason plus the timestamp prevent any repair from
+        re-arming itself, so terminal misses never loop.
         """
         if (
             reconciliation.get("automatic_history_terminal_status")
@@ -569,13 +595,19 @@ class CloseRuntime:
             terminal_reason == self._AUTOMATIC_HISTORY_LEGACY_NO_CANDIDATE_REASON
             and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
         )
-        if not (capability_upgrade or legacy_no_candidate_repair):
-            return False
-        # The repair grant is one scan per debt, not one per cycle: a sibling
-        # venue that still terminalizes with the legacy generic reason (bybit)
-        # must not re-arm the shared reason every cycle.  The reactivation
-        # marker is written below and consumed here.
-        if reconciliation.get("automatic_history_reactivated_at_ms"):
+        # A post-anchor Binance miss predates the split-close complement
+        # repair (a close split across orders cannot match the single-group
+        # uniqueness contract), so a binance-leg debt terminalized by the
+        # anchored scanner earns that repair's one scan.
+        split_close_complement_repair = (
+            terminal_reason == "binance_user_trades_no_candidate"
+            and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
+        )
+        if not (
+            capability_upgrade
+            or legacy_no_candidate_repair
+            or split_close_complement_repair
+        ):
             return False
         snapshot = reconciliation.get("position_snapshot")
         if not isinstance(snapshot, dict):
@@ -612,6 +644,31 @@ class CloseRuntime:
             and not (has_aster_leg or has_bitget_leg or has_binance_leg)
         ):
             return False
+        if split_close_complement_repair and not has_binance_leg:
+            return False
+        # The repair grant is one scan per repair per debt, not one per cycle:
+        # a sibling venue that still terminalizes with the legacy generic
+        # reason must not re-arm the same repair every cycle, while a debt
+        # whose earlier scan was consumed by a different repair (e.g. the
+        # Binance execution-window anchor before the split-close complement)
+        # may receive the new repair's single scan.  The recorded reason plus
+        # the timestamp written below are consumed here.
+        repair_reason = (
+            self._AUTOMATIC_HISTORY_BINANCE_SPLIT_CLOSE_COMPLEMENT_REASON
+            if split_close_complement_repair
+            else self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
+            if capability_upgrade
+            else self._AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON
+            if has_aster_leg
+            else self._AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON
+            if has_bitget_leg
+            else self._AUTOMATIC_HISTORY_BINANCE_EXECUTION_WINDOW_REPAIR_REASON
+        )
+        if reconciliation.get("automatic_history_reactivated_at_ms") and (
+            str(reconciliation.get("automatic_history_reactivation_reason") or "")
+            == repair_reason
+        ):
+            return False
         # Legacy persisted debt may predate evidence_debt_reason.  The same
         # canonical predicate admitted this record to the bounded automatic
         # path, so persist its result before reactivation; otherwise the
@@ -625,21 +682,14 @@ class CloseRuntime:
         reconciliation.pop("automatic_history_terminal_reason", None)
         reconciliation.pop("automatic_history_terminalized_at_ms", None)
         reconciliation["automatic_history_reactivated_at_ms"] = now_ms
+        reconciliation["automatic_history_reactivation_reason"] = repair_reason
         reconciliation["next_attempt_ms"] = 0
         self.ctx.journal.append(
             "reconciliation.automatic_historical_evidence_reactivated",
             {
                 "position_id": str(reconciliation.get("position_id") or ""),
                 "symbol": str(reconciliation.get("symbol") or snapshot.get("symbol") or ""),
-                "reason": (
-                    self._AUTOMATIC_HISTORY_CAPABILITY_UPGRADE_REASON
-                    if capability_upgrade
-                    else self._AUTOMATIC_HISTORY_ASTER_SCHEMA_UPGRADE_REASON
-                    if has_aster_leg
-                    else self._AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON
-                    if has_bitget_leg
-                    else self._AUTOMATIC_HISTORY_BINANCE_EXECUTION_WINDOW_REPAIR_REASON
-                ),
+                "reason": repair_reason,
             },
         )
         return True
@@ -873,6 +923,8 @@ class CloseRuntime:
                 continue
             expected_side = close_order_side_for_position(position_side)
             replaced_incomplete_known_identity = False
+            known_fills: list[Any] = []
+            known_quantity = 0.0
             if leg not in missing_legs:
                 try:
                     fills = await self._call_fetch_close_leg_reconciliations(
@@ -902,6 +954,28 @@ class CloseRuntime:
                 # Re-enter the same bounded unique-history path used for a
                 # wholly missing identity, then require an exact recheck.
                 replaced_incomplete_known_identity = True
+                # A close split across orders leaves the stored identities
+                # covering only part of the segment.  Keep those exact fills
+                # and discover only the complementary portion, so the bounded
+                # single-candidate uniqueness contract still applies.
+                for known_fill in fills or []:
+                    known_quantity += self._close_reconciliation_fill_qty(
+                        known_fill
+                    )
+                if not (
+                    1e-12 < known_quantity < expected_quantity - 1e-12
+                    and self._close_leg_evidence_complete(
+                        fills,
+                        venue=venue,
+                        side=expected_side,
+                        expected_quantity=known_quantity,
+                        require_historical_provenance=False,
+                    )
+                ):
+                    known_fills = []
+                    known_quantity = 0.0
+                else:
+                    known_fills = list(fills or [])
 
             adapter = self.ctx.venue_adapters.get(venue)
             discover = getattr(
@@ -924,12 +998,13 @@ class CloseRuntime:
                     leg=leg,
                 )
                 return None
+            missing_quantity = expected_quantity - known_quantity
             try:
                 discovery = await discover(
                     symbol=symbol,
                     side=expected_side,
                     position_side=position_side,
-                    quantity=expected_quantity,
+                    quantity=missing_quantity,
                     closed_at_ms=closed_at_ms,
                 )
                 self._flush_adapter_order_diagnostics(adapter)
@@ -975,12 +1050,40 @@ class CloseRuntime:
                     "client_order_id": getattr(fill, "client_order_id", ""),
                 }
             )
+            known_order_ids = {
+                self._close_reconciliation_leg_identity(
+                    {
+                        "order_id": getattr(known_fill, "order_id", ""),
+                        "client_order_id": getattr(known_fill, "client_order_id", ""),
+                    }
+                )[0]
+                for known_fill in known_fills
+            }
+            if identity[0] and identity[0] in known_order_ids:
+                # The complement re-discovered an order the exact recheck
+                # already owns: contradictory evidence, never a larger total.
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification="complement_identity_overlap",
+                    candidate_count=candidate_count,
+                    leg=leg,
+                    retryable=False,
+                )
+                self._mark_automatic_history_evidence_irrecoverable(
+                    reconciliation,
+                    now_ms,
+                    classification="complement_identity_overlap",
+                    candidate_count=candidate_count,
+                    leg=leg,
+                )
+                return None
             provenance = str(metadata.get("historical_evidence_provenance") or "")
             if not self._close_leg_evidence_complete(
                 [fill],
                 venue=venue,
                 side=expected_side,
-                expected_quantity=expected_quantity,
+                expected_quantity=missing_quantity,
                 require_historical_provenance=True,
             ):
                 self._record_automatic_history_evidence_block(
@@ -999,13 +1102,40 @@ class CloseRuntime:
                     leg=leg,
                 )
                 return None
-            resolved_fills[leg] = [fill]
+            merged_fills = known_fills + [fill]
+            if not self._close_leg_evidence_complete(
+                merged_fills,
+                venue=venue,
+                side=expected_side,
+                expected_quantity=expected_quantity,
+                require_historical_provenance=False,
+            ):
+                self._record_automatic_history_evidence_block(
+                    reconciliation,
+                    now_ms,
+                    classification="merged_complement_evidence_incomplete",
+                    candidate_count=candidate_count,
+                    leg=leg,
+                    retryable=False,
+                )
+                self._mark_automatic_history_evidence_irrecoverable(
+                    reconciliation,
+                    now_ms,
+                    classification="merged_complement_evidence_incomplete",
+                    candidate_count=candidate_count,
+                    leg=leg,
+                )
+                return None
+            resolved_fills[leg] = merged_fills
             historical_resolution[leg] = {
                 "classification": classification,
                 "candidate_count": candidate_count,
                 "provenance": provenance,
                 "order_id": identity[0],
                 "client_order_id": identity[1],
+                "known_quantity": known_quantity,
+                "complement_quantity": missing_quantity,
+                "known_order_ids": sorted(order_id for order_id in known_order_ids if order_id),
                 "replaced_incomplete_known_identity": (
                     replaced_incomplete_known_identity
                 ),

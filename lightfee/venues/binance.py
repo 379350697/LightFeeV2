@@ -380,10 +380,53 @@ class BinanceAdapter(VenueAdapter):
         order_id: str,
         client_order_id: Optional[str] = None,
     ) -> Optional[OrderFillReconciliation]:
-        return await self._transport.fetch_order_status(
+        status = await self._transport.fetch_order_status(
             symbol,
             order_id=order_id,
             client_order_id=client_order_id or "",
+        )
+        if status is None:
+            return None
+        metadata = dict(status.metadata or {})
+        if (
+            status.fee_quote is not None
+            and metadata.get("fee_evidence_complete") is True
+        ):
+            return status
+        # The order row carries no commission, so fee-complete close evidence
+        # comes from the order's own executions — the same evidence source
+        # history discovery uses.  Missing or malformed rows leave the fee
+        # incomplete (fail closed); a present zero is complete evidence.
+        if not str(order_id).strip().isdigit():
+            return status
+        trades = await self._transport._request(
+            "GET",
+            "/fapi/v1/userTrades",
+            params={
+                "symbol": self._transport._venue_symbol(symbol),
+                "orderId": str(order_id),
+                "limit": 1000,
+            },
+            private=True,
+        )
+        if not isinstance(trades, list) or not trades:
+            return status
+        fees: list[float] = []
+        for row in trades:
+            if not isinstance(row, dict):
+                return status
+            fee = _binance_history_float(row.get("commission"))
+            if fee is None or str(row.get("orderId") or "") != str(order_id):
+                return status
+            fees.append(fee)
+        return replace(
+            status,
+            fee_quote=sum(fees),
+            metadata={
+                **metadata,
+                "fee_evidence_complete": True,
+                "fee_evidence_source": "/fapi/v1/userTrades",
+            },
         )
 
     async def discover_historical_close_fill_reconciliation(

@@ -1566,9 +1566,13 @@ async def test_binance_history_discovery_split_fill_miss_is_distinct_terminal():
 
     await runtime._process_pending_close_reconciliations(NOW_MS)
     await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 120_000)
 
     assert ctx.state.pending_close_reconciliations == [task]
-    assert len(discovery_calls) == 1
+    # The full-quantity miss earns the split-close complement repair's one
+    # re-scan; without stored partial identities the complement is the full
+    # quantity, so the miss repeats and stays terminal.
+    assert len(discovery_calls) == 2
     assert task["automatic_history_terminal_reason"] == (
         "binance_user_trades_no_candidate"
     )
@@ -1728,17 +1732,25 @@ async def test_legacy_binance_no_candidate_debt_stays_terminal_after_one_fixed_m
 
     await runtime._process_pending_close_reconciliations(NOW_MS)
     await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 120_000)
 
     assert ctx.state.pending_close_reconciliations == [task]
-    binance.discover_historical_close_fill_reconciliation.assert_awaited_once()
+    # The legacy generic miss first earns the window-repair scan; its post-
+    # anchor miss then earns the split-close complement repair's single scan.
+    assert (
+        binance.discover_historical_close_fill_reconciliation.await_count == 2
+    )
     assert task["automatic_history_terminal_reason"] == (
         "binance_user_trades_no_candidate"
+    )
+    assert task["automatic_history_reactivation_reason"] == (
+        "binance_split_close_complement"
     )
 
 
 @pytest.mark.asyncio
 async def test_fixed_binance_no_candidate_debt_never_reopens():
-    """A current strict Binance miss remains terminal after the window repair."""
+    """A complement-aware Binance miss stays terminal after its one scan."""
     snapshot = _snapshot(
         position_id="entry-binance-current-no-candidate",
         symbol="ONGUSDT",
@@ -1760,15 +1772,31 @@ async def test_fixed_binance_no_candidate_debt_never_reopens():
             "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
         }
     )
-    binance = _Adapter(Venue.BINANCE)
+    binance = _Adapter(
+        Venue.BINANCE,
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="binance_user_trades_no_candidate",
+            candidate_count=0,
+        ),
+    )
     ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+    runtime = CloseRuntime(ctx)
 
-    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+    await runtime._process_pending_close_reconciliations(NOW_MS)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 60_000)
+    await runtime._process_pending_close_reconciliations(NOW_MS + 120_000)
 
     assert ctx.state.pending_close_reconciliations == [task]
-    binance.discover_historical_close_fill_reconciliation.assert_not_awaited()
+    # The post-anchor miss earns exactly one split-close complement scan;
+    # its own miss stays terminal afterwards.
+    assert (
+        binance.discover_historical_close_fill_reconciliation.await_count == 1
+    )
     assert task["automatic_history_terminal_reason"] == (
         "binance_user_trades_no_candidate"
+    )
+    assert task["automatic_history_reactivation_reason"] == (
+        "binance_split_close_complement"
     )
 
 
@@ -1920,10 +1948,27 @@ async def test_ong_bybit_takeover_is_reconciled_without_claiming_v2_submission()
     async def binance_request(_method: str, path: str, **kwargs):
         binance_seen.append(path)
         params = kwargs.get("params", {})
-        if path == "/fapi/v1/order" and params.get("origClientOrderId") == (
-            "lfexe2ab679cf8440975"
+        if path == "/fapi/v1/order" and params.get("origClientOrderId") in (
+            "lfexe2ab679cf8440975",
+            "lfex07006fc64ee6ed2c",
         ):
             return {"code": -2013, "msg": "Order does not exist"}
+        if path == "/fapi/v1/userTrades" and params.get("orderId") == (
+            "2926675711"
+        ):
+            return [
+                {
+                    "symbol": "ONGUSDT",
+                    "orderId": "2926675711",
+                    "clientOrderId": "lfex07006fc64ee6ed2c",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "270",
+                    "price": "0.08768",
+                    "commission": "0.00473472",
+                    "time": NOW_MS - 59_000,
+                }
+            ]
         if path == "/fapi/v1/userTrades" and "orderId" not in params:
             return [
                 {
@@ -2083,9 +2128,13 @@ async def test_ong_bybit_takeover_is_reconciled_without_claiming_v2_submission()
         "provenance": "system_client_id_execution",
         "order_id": "2926675711",
         "client_order_id": "lfex07006fc64ee6ed2c",
+        "known_quantity": 0.0,
+        "complement_quantity": 270.0,
+        "known_order_ids": [],
         "replaced_incomplete_known_identity": True,
     }
     assert binance_seen == [
+        "/fapi/v1/order",
         "/fapi/v1/order",
         "/fapi/v1/userTrades",
         "/fapi/v1/order",
@@ -2166,14 +2215,23 @@ async def test_completed_automatic_history_failures_terminalize_audit_debt_once(
     assert terminal_payload["reconciliation"] == task
     assert _critical_payload(ctx, "exit.reconciled") is None
 
+    # The post-anchor miss classification earns the split-close complement
+    # repair's single re-scan on the next cycle; a third cycle scans no
+    # further, so the terminal state remains bounded.
     await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS + 600_000)
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(
+        NOW_MS + 1_200_000
+    )
 
     assert ctx.state.pending_close_reconciliations == [task]
     assert _critical_payload(ctx, "exit.reconciled") is None
+    expected_scans = (
+        2 if classification == "binance_user_trades_no_candidate" else 1
+    )
     assert (
         ctx.venue_adapters[Venue.BINANCE]
         .discover_historical_close_fill_reconciliation.await_count
-        == 1
+        == expected_scans
     )
 
 
@@ -2335,6 +2393,9 @@ async def test_known_exact_debt_uses_unique_history_only_after_exact_recheck_is_
             "provenance": "exact_exchange_execution",
             "order_id": "recovered-short",
             "client_order_id": "recovered-short-cid",
+            "known_quantity": 0.0,
+            "complement_quantity": 20.0,
+            "known_order_ids": [],
             "replaced_incomplete_known_identity": True,
         }
     }
@@ -2566,3 +2627,442 @@ async def test_nonflat_or_open_order_truth_blocks_history_discovery(
     binance.discover_historical_close_fill_reconciliation.assert_not_awaited()
     assert ctx.state.pending_close_reconciliations == [task]
     assert task["next_attempt_ms"] > NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_binance_split_close_complement_reconciles_production_debt_shape():
+    """A close split across orders settles from known + complement evidence.
+
+    Production shape (entry-1788537122325-ONGUSDT, 2026-09-14): the stored
+    long identity was the 203-filled IOC remainder (order ``3274922181``,
+    terminal ``EXPIRED``, fee absent from the order row) of a 252 close whose
+    remaining 49 filled on a second order (``3274923320``); the short leg
+    stored a complete 203 fill plus a zero-quantity lookup that returned no
+    fill.  The single-group uniqueness contract alone could only miss.
+    """
+    adapter = BinanceAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret"),
+    )
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del method, body, private
+        params = dict(params or {})
+        if path == "/fapi/v1/order":
+            if params.get("orderId") == "3274922181":
+                return {
+                    "orderId": 3274922181,
+                    "clientOrderId": "lfex081f61015871220b",
+                    "symbol": "ONGUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "origQty": "252",
+                    "executedQty": "203",
+                    "status": "EXPIRED",
+                    "avgPrice": "0.09515",
+                    "reduceOnly": True,
+                    "updateTime": NOW_MS - 60_000,
+                }
+            if params.get("orderId") == "3274923320":
+                return {
+                    "orderId": 3274923320,
+                    "clientOrderId": "lfxlbf3c33694b54acf2",
+                    "symbol": "ONGUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "origQty": "49",
+                    "executedQty": "49",
+                    "status": "FILLED",
+                    "avgPrice": "0.0951",
+                    "reduceOnly": True,
+                    "updateTime": NOW_MS - 59_000,
+                }
+            raise AssertionError(params)
+        if path == "/fapi/v1/userTrades":
+            if params.get("orderId") == "3274922181":
+                return [
+                    {
+                        "orderId": 3274922181,
+                        "symbol": "ONGUSDT",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "qty": "203",
+                        "price": "0.09515",
+                        "commission": "0.00386309",
+                        "time": NOW_MS - 60_000,
+                    }
+                ]
+            if params.get("orderId") == "3274923320":
+                return [
+                    {
+                        "orderId": 3274923320,
+                        "symbol": "ONGUSDT",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "qty": "49",
+                        "price": "0.0951",
+                        "commission": "0.00232995",
+                        "time": NOW_MS - 59_000,
+                    }
+                ]
+            # Discovery's bounded execution-window query.
+            return [
+                {
+                    "orderId": 3274922181,
+                    "symbol": "ONGUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "203",
+                    "price": "0.09515",
+                    "commission": "0.00386309",
+                    "time": NOW_MS - 60_000,
+                },
+                {
+                    "orderId": 3274923320,
+                    "symbol": "ONGUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "49",
+                    "price": "0.0951",
+                    "commission": "0.00232995",
+                    "time": NOW_MS - 59_000,
+                },
+            ]
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    adapter.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="ONGUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    adapter.fetch_open_orders = AsyncMock(return_value=[])
+
+    snapshot = _snapshot(
+        position_id="entry-1788537122325-ONGUSDT",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=252.0,
+        short_quantity=203.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[
+            {
+                "venue": "binance",
+                "order_id": "3274922181",
+                "client_order_id": "lfex081f61015871220b",
+                "quantity": 203.0,
+                "average_price": 0.09515,
+                "fee_quote": None,
+            }
+        ],
+        short_legs=[
+            {
+                "venue": "bybit",
+                "order_id": "cd1d0f7c-8a74-486d-8b12-85f76d02efbc",
+                "client_order_id": "lfex266bfc0e53c4dce9",
+                "quantity": 203.0,
+                "average_price": 0.09612,
+                "fee_quote": 0.0107318,
+            },
+            {
+                "venue": "bybit",
+                "order_id": "7d045241-16a7-45df-a74e-c9fb4df28456",
+                "client_order_id": "lfexe1bd07be64d8e60d",
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": None,
+            },
+        ],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task["owned_close_quantities"] = {"long": 252.0, "short": 203.0}
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "binance_user_trades_no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+            "automatic_history_reactivated_at_ms": NOW_MS - 90_000,
+        }
+    )
+    bybit = _Adapter(
+        Venue.BYBIT,
+        exact={
+            "cd1d0f7c-8a74-486d-8b12-85f76d02efbc": _fill(
+                venue=Venue.BYBIT,
+                symbol="ONGUSDT",
+                side=Side.BUY,
+                quantity=203.0,
+                price=0.09612,
+                order_id="cd1d0f7c-8a74-486d-8b12-85f76d02efbc",
+                client_order_id="lfex266bfc0e53c4dce9",
+                fee_quote=0.0107318,
+                provenance="exact_exchange_execution",
+            )
+        },
+    )
+    ctx = _ctx(task, {Venue.BINANCE: adapter, Venue.BYBIT: bybit})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    payload = _critical_payload(ctx, "exit.reconciled")
+    assert payload is not None
+    resolution = payload.get("historical_evidence_resolution") or {}
+    long_resolution = resolution.get("long") or {}
+    assert long_resolution.get("known_quantity") == pytest.approx(203.0)
+    assert long_resolution.get("complement_quantity") == pytest.approx(49.0)
+    assert long_resolution.get("order_id") == "3274923320"
+    long_legs = payload.get("long_legs") or []
+    assert sorted(str(leg.get("order_id")) for leg in long_legs) == [
+        "3274922181",
+        "3274923320",
+    ]
+    assert sum(float(leg.get("quantity") or 0.0) for leg in long_legs) == (
+        pytest.approx(252.0)
+    )
+    reactivated = [
+        record
+        for record in ctx.journal.append.call_args_list
+        if record.args
+        and record.args[0]
+        == "reconciliation.automatic_historical_evidence_reactivated"
+    ]
+    assert reactivated
+    assert (
+        reactivated[0].args[1].get("reason")
+        == "binance_split_close_complement"
+    )
+
+
+@pytest.mark.asyncio
+async def test_binance_split_close_complement_scan_runs_once():
+    """A complement repair scan that still misses must not loop."""
+    adapter = BinanceAdapter(
+        mode="live",
+        credential=LiveCredential(api_key="key", api_secret="secret"),
+    )
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del method, body, private
+        params = dict(params or {})
+        if path == "/fapi/v1/order":
+            if params.get("orderId") == "3274922181":
+                return {
+                    "orderId": 3274922181,
+                    "clientOrderId": "lfex081f61015871220b",
+                    "symbol": "ONGUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "origQty": "252",
+                    "executedQty": "203",
+                    "status": "EXPIRED",
+                    "avgPrice": "0.09515",
+                    "reduceOnly": True,
+                    "updateTime": NOW_MS - 60_000,
+                }
+            raise AssertionError(params)
+        if path == "/fapi/v1/userTrades":
+            if params.get("orderId") == "3274922181":
+                return [
+                    {
+                        "orderId": 3274922181,
+                        "symbol": "ONGUSDT",
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "qty": "203",
+                        "price": "0.09515",
+                        "commission": "0.00386309",
+                        "time": NOW_MS - 60_000,
+                    }
+                ]
+            # Discovery's bounded window holds only the known partial group,
+            # so the complement scan must miss.
+            return [
+                {
+                    "orderId": 3274922181,
+                    "symbol": "ONGUSDT",
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "qty": "203",
+                    "price": "0.09515",
+                    "commission": "0.00386309",
+                    "time": NOW_MS - 60_000,
+                },
+            ]
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    adapter.fetch_position = AsyncMock(
+        return_value=PositionSnapshot(
+            venue=Venue.BINANCE,
+            symbol="ONGUSDT",
+            side=Side.BUY,
+            quantity=0.0,
+            entry_price=0.0,
+            observed_at_ms=NOW_MS,
+        )
+    )
+    adapter.fetch_open_orders = AsyncMock(return_value=[])
+
+    snapshot = _snapshot(
+        position_id="entry-binance-complement-miss",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=252.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[
+            {
+                "venue": "binance",
+                "order_id": "3274922181",
+                "client_order_id": "lfex081f61015871220b",
+                "quantity": 203.0,
+                "average_price": 0.09515,
+                "fee_quote": None,
+            }
+        ],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task["owned_close_quantities"] = {"long": 252.0, "short": 0.0}
+    task.update(
+        {
+            "automatic_history_terminal_status": "irrecoverable_audit_debt",
+            "automatic_history_terminal_reason": "binance_user_trades_no_candidate",
+            "automatic_history_terminalized_at_ms": NOW_MS - 120_000,
+            "automatic_history_reactivated_at_ms": NOW_MS - 90_000,
+            "automatic_history_reactivation_reason": (
+                "binance_split_close_complement"
+            ),
+        }
+    )
+    ctx = _ctx(task, {Venue.BINANCE: adapter, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS + 60_000)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+
+
+@pytest.mark.asyncio
+async def test_complement_identity_overlap_fails_closed():
+    """A complement re-discovering a known order never double counts."""
+    snapshot = _snapshot(
+        position_id="entry-complement-overlap",
+        symbol="ONGUSDT",
+        long_venue=Venue.BINANCE,
+        short_venue=Venue.BYBIT,
+        long_quantity=252.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[
+            {
+                "venue": "binance",
+                "order_id": "3274922181",
+                "client_order_id": "lfex081f61015871220b",
+                "quantity": 203.0,
+                "average_price": 0.09515,
+                "fee_quote": 0.00386309,
+            }
+        ],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task["owned_close_quantities"] = {"long": 252.0, "short": 0.0}
+    overlapping_fill = _fill(
+        venue=Venue.BINANCE,
+        symbol="ONGUSDT",
+        side=Side.SELL,
+        quantity=49.0,
+        price=0.0951,
+        order_id="3274922181",
+        client_order_id="lfex081f61015871220b",
+        fee_quote=0.001,
+        provenance="system_client_id_execution",
+    )
+    binance = _Adapter(
+        Venue.BINANCE,
+        exact={
+            "3274922181": _fill(
+                venue=Venue.BINANCE,
+                symbol="ONGUSDT",
+                side=Side.SELL,
+                quantity=203.0,
+                price=0.09515,
+                order_id="3274922181",
+                client_order_id="lfex081f61015871220b",
+                fee_quote=0.00386309,
+                provenance="exact_exchange_execution",
+            )
+        },
+        discovery=HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=overlapping_fill,
+        ),
+    )
+    ctx = _ctx(task, {Venue.BINANCE: binance, Venue.BYBIT: _Adapter(Venue.BYBIT)})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    assert task["automatic_history_terminal_reason"] == "complement_identity_overlap"
+
+
+@pytest.mark.asyncio
+async def test_zero_quantity_leg_lookup_miss_does_not_fail_leg_recheck():
+    """A stored zero-fill leg contributes nothing; a positive miss still fails.
+
+    Complementary outcomes: the zero-quantity lookup returning no fill must
+    not fail the whole leg, while the same miss on a positive stored leg
+    keeps the leg unavailable (fail closed).
+    """
+    positive_fill = _fill(
+        venue=Venue.BYBIT,
+        symbol="ONGUSDT",
+        side=Side.BUY,
+        quantity=203.0,
+        price=0.09612,
+        order_id="cd1d0f7c-8a74-486d-8b12-85f76d02efbc",
+        client_order_id="lfex266bfc0e53c4dce9",
+        fee_quote=0.0107318,
+        provenance="exact_exchange_execution",
+    )
+    bybit = _Adapter(
+        Venue.BYBIT,
+        exact={"cd1d0f7c-8a74-486d-8b12-85f76d02efbc": positive_fill},
+    )
+
+    runtime = CloseRuntime(_ctx({"position_id": "unused"}, {}))
+    runtime.ctx.venue_adapters = {Venue.BYBIT: bybit}
+
+    legs_with_zero = [
+        {"order_id": "cd1d0f7c-8a74-486d-8b12-85f76d02efbc", "quantity": 203.0},
+        {"order_id": "7d045241-16a7-45df-a74e-c9fb4df28456", "quantity": 0.0},
+    ]
+    fills = await runtime._fetch_close_leg_reconciliations(
+        symbol="ONGUSDT", venue=Venue.BYBIT, legs=legs_with_zero,
+    )
+    assert fills == [positive_fill]
+
+    legs_with_positive_miss = [
+        {"order_id": "cd1d0f7c-8a74-486d-8b12-85f76d02efbc", "quantity": 203.0},
+        {"order_id": "7d045241-16a7-45df-a74e-c9fb4df28456", "quantity": 30.0},
+    ]
+    fills = await runtime._fetch_close_leg_reconciliations(
+        symbol="ONGUSDT", venue=Venue.BYBIT, legs=legs_with_positive_miss,
+    )
+    assert fills is None
