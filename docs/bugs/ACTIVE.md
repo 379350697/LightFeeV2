@@ -34,7 +34,22 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `3a50dcfb`
+- Last production SHA checked: `2be127cc`
+- Checked on: `2026-09-15`. Runtime fix `2be127cc` (empty-owned final debts
+  terminalize through the existing provisional billing terminal instead of
+  retrying forever) was fast-forwarded over Tailscale SSH in a verified
+  complete-flat/no-order window; manifest hashes matched, both services
+  restarted as singletons. Four minutes after restart the last active
+  retrier (`entry-1789091700691-ONGUSDT`, 1,287 attempts over four days)
+  settled: two-leg flat truth plus no open orders produced
+  `exit.billing_evidence_unavailable` with
+  `terminal_live_flat_incomplete_close_quantity_evidence` /
+  `provisional_close_quantity_evidence_incomplete`, no manufactured PnL keys,
+  and the record left the pending list (owners 3 → 2). The two remaining
+  records are terminal by design (Aster `aster_v3_no_candidate` final and the
+  `1788537122325` partial; both operator import only). The health gate
+  remains warning-only on `pending_close_owner_present` for those two. No
+  order was submitted or cancelled by verification.
 - Checked on: `2026-09-15`. Runtime fix `3a50dcfb` (split-close complement
   discovery, Binance userTrades fee enrichment, zero-quantity leg skip, and
   per-repair one-scan reactivation grants) was fast-forwarded over Tailscale
@@ -225,6 +240,7 @@ until this table receives real fixing commits and a production observation.
 | CL-149 | deployed-awaiting-verification | `5baee72` | Passive one-sided/excess IOC retry CID regression: two truth-gap retries must mint distinct client order ids (RED on pre-fix tree); adjacent close suites `280 passed` | Deployed with CL-148. Needs one natural Bitget ack-only truth-gap retry to observe a fresh `exit_live_one_sided_*` clientOid instead of a `40786 Duplicate clientOid` rejection; no order is to be forced. | [2026-09-14](daily/2026-09-14.md) |
 | CL-150 | deployed-awaiting-verification | `b6481a3` | Binance execution-window discovery regression (production row shapes from `entry-1788583981589-ONGUSDT` resting GTX close and `entry-1788537122325-ONGUSDT` split close), grouper counterexample matrix, exact-recheck identity/fee/one-way guards, one-shot legacy `no_candidate` Binance-leg reactivation with no-reopen guards; RED verified on the pre-fix tree (5/6 new tests fail without the fix); evidence file 47 passed, adjacent 109/496/214 passed; full suite `4,602 passed` with all 25 failures byte-identical to the clean-HEAD baseline. Independent closure review returned one P1 (no one-scan guard: a bybit leg terminalizing with the legacy generic reason re-armed reactivation every cycle); fixed by consuming `automatic_history_reactivated_at_ms` (`b6481a3`, loop regression RED-verified by stashing the guard alone; evidence file 48 passed; final full suite `4,603 passed`, 25 failures byte-identical to baseline). Also drops `--json` from the 5-minute health timer (journald flood, 829 MB / 9.5 days). | `b6481a3` deployed `2026-09-14 21:00 CST` (manifest regenerated over the whole tree, `.deploy_version=b6481a3`, all critical hashes verified). Eight seconds after restart both Binance-leg legacy debts reactivated under `binance_execution_window_anchor_repair`; `entry-1788583981589-ONGUSDT` reconciled in the same second (`exit.reconciled`, 247/247, `venue_statement_reconciled=true`, exit fee `0.00962559`, long leg `unique_candidate_exact_recheck` with the phantom stored identity replaced) and `entry-1788537122325-ONGUSDT` re-scanned once and terminalized under the distinct `binance_user_trades_no_candidate` (split 203+49 close; later settled automatically by CL-151's complement repair). Owners fell 6 → 5; exactly one reactivation per debt observed since restart (one-scan guard held); an IOSTUSDT position that opened at the restart boundary was recovered by startup reconciliation. The health timer now logs 8 compact lines per fire instead of ≈1,370. Remaining natural observations: none forced; Bybit/bitget placement-time-shaped history windows stay a latent monitored risk with no production instance. | [2026-09-14](daily/2026-09-14.md#cl-150--binance-historical-close-discovery-anchored-on-placement-time-instead-of-execution-time) |
 | CL-151 | closed | `3a50dcfb` | Split-close complement production-path regression (real `CloseRuntime → BinanceAdapter → VenueTransport` chain with the exact `entry-1788537122325-ONGUSDT` shape: 203 `EXPIRED` + 49 `FILLED` of a 252 close), overlap and merged-incompleteness fail-closed counterexamples, zero-quantity leg skip with positive-quantity miss retained, and per-repair one-scan guards (legacy → window → complement tiering); RED on the pre-fix tree (3/4 new tests fail without the fix); evidence file 52 passed; adjacent close/passive/engine suites 606 passed; full suite zero new failures against the same-tree baseline | `3a50dcfb` deployed `2026-09-15 19:11 CST`. Seven seconds after restart the debt reactivated under `binance_split_close_complement` and reconciled in the same second with merged long-leg evidence (203 + 49 = 252, both fees proven), short recheck unblocked by the zero-quantity skip, billing `final` (exit fee `0.01692484`). Owners 5 → 3; seven-venue truth stayed high-confidence flat/no-order through the restart. | [2026-09-15](daily/2026-09-15.md#cl-151--拆单平仓的补集证据闭环) |
+| CL-152 | closed | `2be127cc` | Empty-owned final debt production-path regression: flat-truth two-leg terminalization with no manufactured PnL keys, non-flat/open-order counterexamples staying retryable, and a positive-owned empty-fills shape keeping the invalid backoff; RED on the pre-fix tree (1/3 new tests fail; the two safety counterexamples pass on both trees by design); evidence file 56 passed; full suite failures byte-identical to the same-tree baseline (25 pre-existing) | `2be127cc` deployed `2026-09-15 21:52 CST`. Four minutes after restart `entry-1789091700691-ONGUSDT` (four-day active retrier, 1,287 attempts) settled as `provisional_close_quantity_evidence_incomplete` with `long_live_size=0.0`, `short_live_size=0.0`, `open_order_truth_flat=true`, and zero manufactured PnL keys; owners 3 → 2, both remaining by-design operator records. | [2026-09-15](daily/2026-09-15.md#cl-152--空-owned-终债的无限重试) |
 
 ## Pre-CL-093 Historical Boundary
 
