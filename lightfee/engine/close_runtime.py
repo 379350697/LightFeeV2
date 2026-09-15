@@ -2299,7 +2299,25 @@ class CloseRuntime:
                     venue=short_venue,
                     legs=reconciliation.get("short_legs"),
                 )
-            if long_fills is not None and short_fills is not None and (long_fills or short_fills):
+            # A final debt whose immutable owned segment is empty on both legs
+            # has nothing to discover (venue history contracts require a
+            # positive quantity), so its empty exact recheck must reach the
+            # provisional billing terminal instead of the invalid-retry loop.
+            owned_quantities = self._close_reconciliation_expected_quantities(
+                reconciliation,
+                reconciliation.get("position_snapshot") or {},
+            )
+            empty_owned_segment = (
+                long_fills == []
+                and short_fills == []
+                and owned_quantities is not None
+                and owned_quantities[0] <= 1e-12
+                and owned_quantities[1] <= 1e-12
+                and str(reconciliation.get("kind") or "final") == "final"
+            )
+            if long_fills is not None and short_fills is not None and (
+                (long_fills or short_fills) or empty_owned_segment
+            ):
                 settled_reconciliation = self._reclassify_full_uncertain_submission(
                     reconciliation,
                     long_fills,

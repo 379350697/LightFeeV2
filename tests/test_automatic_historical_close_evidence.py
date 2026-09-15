@@ -3023,6 +3023,169 @@ async def test_complement_identity_overlap_fails_closed():
 
 
 @pytest.mark.asyncio
+async def test_empty_owned_segment_debt_terminalizes_provisional_when_flat():
+    """A final debt owning nothing on either leg must settle, not retry.
+
+    Production shape (entry-1789091700691-ONGUSDT, 2026-09-11): the deadline
+    fallback closed both legs before any fill identity was learned, so the
+    record owns zero quantity on both legs with zero-quantity stored
+    identities.  The automatic path returns empty fills every cycle and the
+    invalid branch retried forever instead of reaching the designed
+    provisional billing terminal.
+    """
+    snapshot = _snapshot(
+        position_id="entry-1789091700691-ONGUSDT",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BITGET,
+        long_quantity=0.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[
+            {
+                "venue": "bybit",
+                "order_id": "db66ce99-8d49-42e5-a39b-23d77bcc66de",
+                "client_order_id": "lfex9fb7b6eb547e94b6",
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": None,
+            }
+        ],
+        short_legs=[
+            {
+                "venue": "bitget",
+                "order_id": "1482124806810382426",
+                "client_order_id": "lfexeecd2166724a7d81",
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": None,
+            }
+        ],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task["owned_close_quantities"] = {"long": 0.0, "short": 0.0}
+    bybit = _Adapter(Venue.BYBIT)
+    bitget = _Adapter(Venue.BITGET)
+    ctx = _ctx(task, {Venue.BYBIT: bybit, Venue.BITGET: bitget})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == []
+    terminal_payload = _critical_payload(ctx, "exit.billing_evidence_unavailable")
+    assert terminal_payload is not None
+    assert terminal_payload["terminal_reason"] == (
+        "terminal_live_flat_incomplete_close_quantity_evidence"
+    )
+    assert terminal_payload["terminal_accounting_status"] == (
+        "provisional_close_quantity_evidence_incomplete"
+    )
+    # A close with no learnable fill evidence must not manufacture PnL.
+    assert "net_quote" not in terminal_payload
+    assert terminal_payload["net_quote_status"] == "provisional"
+    # The stored zero-fill identities are not usable import targets; the
+    # terminal honestly reports that no close order identity is available.
+    assert terminal_payload["billing_reconciliation_targets"] == {
+        "long": [],
+        "short": [],
+    }
+    assert terminal_payload["close_order_identity_available"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("position_quantity", "open_orders"),
+    [(292.0, []), (0.0, [{"orderId": "still-open"}])],
+)
+async def test_empty_owned_segment_debt_stays_retryable_without_flat_truth(
+    position_quantity: float,
+    open_orders: list[dict],
+):
+    """Non-flat legs or open orders keep the empty-segment debt retryable."""
+    snapshot = _snapshot(
+        position_id="entry-empty-owned-not-flat",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BITGET,
+        long_quantity=0.0,
+        short_quantity=0.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[],
+        short_legs=[],
+        reason="known_close_fill_temporarily_unavailable",
+    )
+    task["owned_close_quantities"] = {"long": 0.0, "short": 0.0}
+    bybit = _Adapter(
+        Venue.BYBIT,
+        position_quantity=position_quantity,
+        open_orders=open_orders,
+    )
+    bitget = _Adapter(Venue.BITGET)
+    ctx = _ctx(task, {Venue.BYBIT: bybit, Venue.BITGET: bitget})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    assert _critical_payload(ctx, "exit.billing_evidence_unavailable") is None
+    assert task["next_attempt_ms"] > NOW_MS
+
+
+@pytest.mark.asyncio
+async def test_positive_owned_empty_fills_keep_invalid_retry():
+    """Only the empty owned segment reroutes; a positive segment still retries.
+
+    A non-debt reconciliation whose stored legs are all zero-quantity keeps
+    the invalid close-lookup backoff: its positive segment still expects
+    fill evidence that a later cycle may find.
+    """
+    snapshot = _snapshot(
+        position_id="entry-positive-owned-empty-fills",
+        symbol="ONGUSDT",
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.BITGET,
+        long_quantity=292.0,
+        short_quantity=292.0,
+    )
+    task = _debt(
+        snapshot=snapshot,
+        long_legs=[
+            {
+                "venue": "bybit",
+                "order_id": "zero-fill-long",
+                "client_order_id": "zero-fill-long-cid",
+                "quantity": 0.0,
+                "average_price": 0.0,
+                "fee_quote": None,
+            }
+        ],
+        short_legs=[],
+        reason="",
+    )
+    task.pop("reconciliation_status", None)
+    task.pop("evidence_debt_reason", None)
+    task["owned_close_quantities"] = {"long": 292.0, "short": 0.0}
+    bybit = _Adapter(Venue.BYBIT)
+    bitget = _Adapter(Venue.BITGET)
+    ctx = _ctx(task, {Venue.BYBIT: bybit, Venue.BITGET: bitget})
+
+    await CloseRuntime(ctx)._process_pending_close_reconciliations(NOW_MS)
+
+    assert ctx.state.pending_close_reconciliations == [task]
+    invalid = [
+        record
+        for record in ctx.journal.append.call_args_list
+        if record.args
+        and record.args[0]
+        == "reconciliation.pending_close_reconciliation_invalid"
+    ]
+    assert invalid
+    assert task["next_attempt_ms"] > NOW_MS
+
+
+@pytest.mark.asyncio
 async def test_zero_quantity_leg_lookup_miss_does_not_fail_leg_recheck():
     """A stored zero-fill leg contributes nothing; a positive miss still fails.
 
