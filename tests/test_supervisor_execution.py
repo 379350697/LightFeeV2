@@ -602,3 +602,29 @@ class TestWarningStateTransitions:
         )
         assert triggered[0]["payload"]["position_id"] == "p001"
         journal.close()
+
+
+class TestWarningLineGate:
+    def test_disabled_warning_line_never_enters_warning_state(self):
+        """V1 risk.rs:382-384: warning_active requires risk_monitor_enabled
+        AND warning_line_enabled AND the risk view condition.  With the line
+        disabled a degraded position must not journal a warning and must not
+        stay in risk_warning_positions (reviewer repro 2026-09-16)."""
+        config = _make_config(
+            unsupported_risk_snapshot_behavior="warning_only",
+            warning_line_enabled=False,
+        )
+        state = EngineState()
+        journal = _make_journal()
+        supervisor = Supervisor(config, state, journal)
+        pos = _make_position()
+        long_snap = _snapshot(Venue.BINANCE, 500.0, 100.0, 10000)
+
+        supervisor.supervise_position(pos, 10000, long_snap, None)
+        supervisor.supervise_position(pos, 11000, long_snap, None)
+
+        kinds = {e.get("kind") for e in journal.read_all()}
+        assert "risk.warning_triggered" not in kinds
+        assert "risk.warning_cleared" not in kinds
+        assert pos.position_id not in supervisor.risk_warning_positions
+        journal.close()

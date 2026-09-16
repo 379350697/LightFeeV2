@@ -424,7 +424,12 @@ class Supervisor:
 
         position_id = position.position_id
         was_warning_active = position_id in self.risk_warning_positions
-        warning_active = bool(risk_view.warning_condition)
+        # V1 update_warning_state_for_position (risk.rs:382-384): the warning
+        # state also requires the warning line to be enabled.
+        warning_active = (
+            bool(strategy.warning_line_enabled)
+            and bool(risk_view.warning_condition)
+        )
 
         if warning_active and not was_warning_active:
             self.risk_warning_positions.add(position_id)
@@ -439,24 +444,6 @@ class Supervisor:
                     "degraded_reason": risk_view.degraded_reason,
                 },
             )
-            if not strategy.warning_line_enabled:
-                self.journal.append(
-                    "risk.line_disabled",
-                    {
-                        "position_id": position.position_id,
-                        "line": "warning",
-                        "symbol": position.symbol,
-                    },
-                )
-            if not strategy.warning_pause_new_entries_enabled:
-                self.journal.append(
-                    "risk.line_disabled",
-                    {
-                        "position_id": position.position_id,
-                        "line": "warning_pause_new_entries",
-                        "symbol": position.symbol,
-                    },
-                )
         elif not warning_active and was_warning_active:
             self.risk_warning_positions.discard(position_id)
             self.journal.append(
