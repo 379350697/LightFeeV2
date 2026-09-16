@@ -256,16 +256,30 @@ class GateAdapter(VenueAdapter):
         return None
 
     @staticmethod
-    def _gate_set_leverage_response(raw: Any) -> int:
-        if not isinstance(raw, dict):
+    def _gate_set_leverage_response(raw: Any) -> list[int]:
+        """Read the applied leverage from a set-leverage response.
+
+        Gate answers with one Position object in single mode and a Position
+        array for dual-mode accounts; dual rows carry the applied value in
+        `lever` while the legacy `leverage` field can read "0" there."""
+        rows = raw if isinstance(raw, list) else [raw]
+        if not rows or not all(isinstance(row, dict) for row in rows):
             raise ValueError("Gate set-leverage response is malformed")
-        try:
-            leverage = float(raw.get("leverage"))
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError("Gate set-leverage response leverage is missing or invalid")
-        if not math.isfinite(leverage) or leverage <= 0 or not leverage.is_integer():
-            raise ValueError("Gate set-leverage response leverage is missing or invalid")
-        return int(leverage)
+        applied: list[int] = []
+        for row in rows:
+            for field in ("lever", "leverage"):
+                try:
+                    value = float(row.get(field))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(value) and value > 0 and value.is_integer():
+                    applied.append(int(value))
+                    break
+            else:
+                raise ValueError(
+                    "Gate set-leverage response leverage is missing or invalid"
+                )
+        return applied
 
     @staticmethod
     def _gate_requires_dual_leverage_retry(error: Exception) -> bool:
@@ -319,7 +333,10 @@ class GateAdapter(VenueAdapter):
                     "POST", path, params=params, private=True
                 )
                 applied = self._gate_set_leverage_response(response)
-                if applied != effective:
+                payload["position_mode"] = (
+                    "dual" if isinstance(response, list) else "single"
+                )
+                if any(value != effective for value in applied):
                     raise OrderSubmitError(
                         SubmitFailureClass.REJECTED,
                         "Gate entry leverage response mismatch "
@@ -328,13 +345,11 @@ class GateAdapter(VenueAdapter):
 
             try:
                 await set_leverage()
-                payload["position_mode"] = "single"
             except Exception as exc:
                 if not self._gate_requires_dual_leverage_retry(exc):
                     raise
                 await set_leverage("dual_long")
                 await set_leverage("dual_short")
-                payload["position_mode"] = "dual"
 
             payload["outcome"] = "set_and_verified"
             self._transport._record_order_diagnostic("order.entry_leverage_ready", payload)

@@ -1391,6 +1391,68 @@ class TestAdditionalVenueEntryLeverage:
         ]
 
     @pytest.mark.asyncio
+    async def test_gate_verifies_leverage_from_every_documented_response_shape(self):
+        """Gate answers set_leverage with one Position object (single mode) or a
+        Position array (dual-mode accounts); dual rows carry the applied value
+        in `lever` while the legacy `leverage` field can read "0" there. Every
+        documented shape must verify when it carries the effective leverage and
+        any mismatched or malformed body must stay rejected."""
+        adapter = GateAdapter(
+            mode="live", credential=LiveCredential(api_key="k", api_secret="s")
+        )
+        accepted = [
+            # Real dual-mode production shape (LSK_USDT 2026-09-16): one call
+            # updates both sides and returns both position rows.
+            [
+                {
+                    "mode": "dual_long",
+                    "leverage": "0",
+                    "lever": "4",
+                    "cross_leverage_limit": "4",
+                },
+                {
+                    "mode": "dual_short",
+                    "leverage": "0",
+                    "lever": "4",
+                    "cross_leverage_limit": "4",
+                },
+            ],
+            [{"lever": "4"}],
+            {"lever": "4"},
+            {"leverage": "4"},
+            [{"leverage": "4"}],
+        ]
+        for response in accepted:
+
+            async def fake_request_ok(
+                method, path, params=None, body=None, private=False, _r=response
+            ):
+                return _r
+
+            adapter._transport._request = fake_request_ok
+            await adapter.ensure_entry_leverage("HUSDT", 4)
+
+        rejected = [
+            [],  # empty body
+            ["4"],  # non-object rows
+            [{"mode": "dual_long"}],  # row without leverage evidence
+            {"leverage": "4.5"},  # fractional leverage
+            {"leverage": "0"},  # zero leverage
+            [{"lever": "4"}, {"lever": "5"}],  # one row not at the effective value
+        ]
+        for response in rejected:
+
+            async def fake_request_reject(
+                method, path, params=None, body=None, private=False, _r=response
+            ):
+                return _r
+
+            adapter._transport._request = fake_request_reject
+            with pytest.raises(OrderSubmitError):
+                await adapter.ensure_entry_leverage("HUSDT", 4)
+        await adapter._transport.close()
+
+    @pytest.mark.asyncio
     async def test_hyperliquid_clamps_to_public_max_and_requires_ack(self):
         adapter = HyperliquidAdapter(
             mode="live",
