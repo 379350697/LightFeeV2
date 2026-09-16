@@ -6871,6 +6871,9 @@ class LiveRuntime:
                 reason="pending_close_owner_semantics_changed",
             )
 
+    def _merge_pending_close_leg_evidence(self, pending_close) -> int:
+        return self.close_runtime._merge_pending_close_leg_evidence(pending_close)
+
     def _pending_close_recovery_owner_fingerprint(self) -> tuple[Any, ...]:
         """Return the close-owner semantics represented by the cached ledger."""
 
