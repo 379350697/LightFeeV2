@@ -53,6 +53,8 @@ class Supervisor:
         self._venue_health_views: dict[Venue, VenueHealthView] = {}
         # V1: per-venue risk snapshot cache (set by runtime before each tick)
         self._risk_snapshot_cache: dict[Venue, dict] = {}
+        # V1: risk_warning_positions — positions currently in the warning state
+        self.risk_warning_positions: set[str] = set()
 
     # ------------------------------------------------------------------
     # Per-venue health → global risk mode
@@ -408,12 +410,24 @@ class Supervisor:
     def _update_warning_state(
         self, position: OpenPosition, risk_view: PositionRiskView
     ) -> None:
-        """Track positions currently under warning (V1 update_warning_state_for_position)."""
+        """Track positions entering/leaving the warning state.
+
+        V1 update_warning_state_for_position (engine/risk.rs:376) journals
+        `risk.warning_triggered` only on the transition into the warning
+        state and `risk.warning_cleared` on the way out; a persistent
+        degraded condition (e.g. a missing risk snapshot) must not re-journal
+        the same warning on every supervision tick.
+        """
         strategy = self.config.strategy
         if not strategy.risk_monitor_enabled:
             return
 
-        if risk_view.warning_condition:
+        position_id = position.position_id
+        was_warning_active = position_id in self.risk_warning_positions
+        warning_active = bool(risk_view.warning_condition)
+
+        if warning_active and not was_warning_active:
+            self.risk_warning_positions.add(position_id)
             self.journal.append(
                 "risk.warning_triggered",
                 {
@@ -443,9 +457,18 @@ class Supervisor:
                         "symbol": position.symbol,
                     },
                 )
-        elif position.single_side_protection_triggered:
-            # Warning was previously active but now cleared
-            pass  # risk.warning_cleared emitted by risk mode transition handler
+        elif not warning_active and was_warning_active:
+            self.risk_warning_positions.discard(position_id)
+            self.journal.append(
+                "risk.warning_cleared",
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "long_health_ratio": risk_view.long_health_ratio,
+                    "short_health_ratio": risk_view.short_health_ratio,
+                    "min_health_ratio": risk_view.min_health_ratio,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Risk plan execution

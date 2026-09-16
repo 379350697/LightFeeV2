@@ -548,3 +548,57 @@ class TestSuperviseTick:
         assert "risk.death_line_triggered" in kinds
         assert "risk.global_mode_changed" in kinds
         assert "risk.fail_closed_entered" in kinds
+
+
+class TestWarningStateTransitions:
+    def test_warning_journaled_on_transition_not_every_tick(self):
+        """V1 update_warning_state_for_position (engine/risk.rs:376): a
+        persistent degraded condition journals `risk.warning_triggered` once
+        on entry and `risk.warning_cleared` once on exit — never one event
+        per supervision tick (production 2026-09-16: 830 duplicate warnings
+        while an OKX leg snapshot stayed unavailable)."""
+        config = _make_config(unsupported_risk_snapshot_behavior="warning_only")
+        state = EngineState()
+        journal = _make_journal()
+        supervisor = Supervisor(config, state, journal)
+        pos = _make_position()
+        long_snap = _snapshot(Venue.BINANCE, 500.0, 100.0, 10000)
+
+        def count(kind: str) -> int:
+            return sum(
+                1 for e in journal.read_all() if e.get("kind") == kind
+            )
+
+        # Tick 1: short snapshot unavailable -> warn once.
+        supervisor.supervise_position(pos, 10000, long_snap, None)
+        assert count("risk.warning_triggered") == 1
+
+        # Ticks 2-3: same degraded condition -> no new warning events.
+        supervisor.supervise_position(pos, 11000, long_snap, None)
+        supervisor.supervise_position(pos, 12000, long_snap, None)
+        assert count("risk.warning_triggered") == 1
+        assert count("risk.warning_cleared") == 0
+
+        # Recovery: healthy short snapshot -> cleared exactly once.
+        short_snap = _snapshot(Venue.OKX, 500.0, 100.0, 12000)
+        supervisor.supervise_position(pos, 13000, long_snap, short_snap)
+        assert count("risk.warning_cleared") == 1
+
+        # Staying healthy -> no further transitions.
+        supervisor.supervise_position(pos, 14000, long_snap, short_snap)
+        assert count("risk.warning_cleared") == 1
+
+        # Re-degrade -> warn once again.
+        supervisor.supervise_position(pos, 15000, long_snap, None)
+        assert count("risk.warning_triggered") == 2
+        assert count("risk.warning_cleared") == 1
+
+        events = journal.read_all()
+        triggered = [
+            e for e in events if e.get("kind") == "risk.warning_triggered"
+        ]
+        assert triggered[0]["payload"]["degraded_reason"] == (
+            "short_snapshot_unavailable"
+        )
+        assert triggered[0]["payload"]["position_id"] == "p001"
+        journal.close()
