@@ -664,10 +664,6 @@ class PendingEntryRuntime:
 
                 pos = self.ctx.state.open_positions.get(pending.position_id)
                 if pos is None:
-                    # The position is already terminal; the only route left for
-                    # this close's executed-order evidence is the durable
-                    # billing reconciliation owner for the same position.
-                    self.ctx._merge_pending_close_leg_evidence(pending)
                     resolved_ids.append(close_id)
                     self.ctx.journal.append(
                         "reconciliation.pending_close_orphaned",
@@ -694,10 +690,6 @@ class PendingEntryRuntime:
                     continue
 
                 if result.is_flat:
-                    # Merge before resolving: a flat probe settles exposure but
-                    # not billing, and this PendingClose may hold the only
-                    # executed-order identities the billing owner can query.
-                    self.ctx._merge_pending_close_leg_evidence(pending)
                     resolved_ids.append(close_id)
                     self.ctx.state.open_positions.pop(pending.position_id, None)
                     self.ctx.journal.append(
