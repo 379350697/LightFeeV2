@@ -193,7 +193,27 @@ class CloseRuntime:
             if identity in seen:
                 continue
             seen.add(identity)
-            fill = await fetch(symbol, order_id, client_order_id)
+            try:
+                fill = await fetch(symbol, order_id, client_order_id)
+            except Exception as exc:
+                # A venue lookup failure (expired API key, 5xx, network) is
+                # evidence-unavailable, never process-fatal: degrade to the
+                # same None semantics below so the owner stays fail-closed
+                # (stored zero skips, stored positive keeps the leg
+                # unavailable) instead of killing the runtime mid-recovery.
+                self._flush_adapter_order_diagnostics(adapter)
+                self.ctx.journal.append(
+                    "reconciliation.close_leg_lookup_error",
+                    {
+                        "venue": getattr(venue, "value", str(venue)),
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:300],
+                    },
+                )
+                fill = None
             self._flush_adapter_order_diagnostics(adapter)
             if fill is None:
                 # A leg recorded with zero executed quantity carries no fill
