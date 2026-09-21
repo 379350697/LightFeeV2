@@ -4081,6 +4081,29 @@ class VenueTransport(MarketDataClient):
                             maint = parsed
                             break
                 if maint is None or maint <= 0.0:
+                    # Cross accounts can report the account-level maintenance
+                    # margin as 0 while positions are open (production
+                    # 2026-09-21: a gate long stayed risk-blind for its whole
+                    # life).  The per-position rows carry the real per-position
+                    # requirement, so derive the account maintenance margin
+                    # from them instead of going blind.
+                    try:
+                        position_rows = await self._request(
+                            "GET",
+                            "/api/v4/futures/usdt/positions",
+                            private=True,
+                        )
+                    except TransportError:
+                        position_rows = None
+                    derived = 0.0
+                    for row in position_rows if isinstance(position_rows, list) else []:
+                        if not isinstance(row, dict):
+                            continue
+                        value = _parse_optional_float(row.get("maintenance_margin"))
+                        if value is not None:
+                            derived += abs(value)
+                    maint = derived if derived > 0.0 else maint
+                if maint is None or maint <= 0.0:
                     return None
                 equity = None
                 for key in ("total", "equity", "total_balance"):

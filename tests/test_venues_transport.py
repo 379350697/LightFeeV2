@@ -4480,6 +4480,52 @@ class TestGateRiskHealth:
         maint = raw.get("maintenance_margin")
         assert maint is None
 
+    @pytest.mark.asyncio
+    async def test_gate_account_risk_derives_maintenance_from_positions(self):
+        """CL-155: gate cross accounts can report account-level maintenance
+        margin as 0 while positions are open (production 2026-09-21: a gate
+        long stayed risk-blind for its whole life).  The account maintenance
+        margin derives from the per-position rows so the leg is not blind."""
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="live",
+                                   credential=LiveCredential(api_key="k", api_secret="s"))
+        calls: list[str] = []
+
+        async def fake_request(method, path, *, params=None, private=False, **kw):
+            calls.append(path)
+            if path == spec.account_risk_path:
+                return {"total": "10000.0", "maintenance_margin": "0", "available": "8000.0"}
+            if path == "/api/v4/futures/usdt/positions":
+                return [
+                    {"contract": "LSK_USDT", "maintenance_margin": "0.35"},
+                    {"contract": "ZEC_USDT", "maintenance_margin": "0.15"},
+                ]
+            raise AssertionError(path)
+
+        transport._request = fake_request
+        snapshot = await transport.fetch_account_risk_snapshot()
+        assert snapshot is not None
+        assert snapshot.maintenance_margin_quote == pytest.approx(0.50)
+        assert snapshot.health_ratio == pytest.approx(10000.0 / 0.50)
+
+    @pytest.mark.asyncio
+    async def test_gate_account_risk_flat_without_positions_stays_none(self):
+        """No open positions and zero account maintenance -> no snapshot
+        (unchanged fail-closed semantics; nothing to assess)."""
+        spec = gate_spec()
+        transport = VenueTransport(spec=spec, mode="live",
+                                   credential=LiveCredential(api_key="k", api_secret="s"))
+
+        async def fake_request(method, path, *, params=None, private=False, **kw):
+            if path == spec.account_risk_path:
+                return {"total": "10000.0", "maintenance_margin": "0", "available": "8000.0"}
+            if path == "/api/v4/futures/usdt/positions":
+                return []
+            raise AssertionError(path)
+
+        transport._request = fake_request
+        assert await transport.fetch_account_risk_snapshot() is None
+
     def test_gate_supports_risk_health_false_in_live_mode(self):
         """V1 parity: Gate risk_health is UNSUPPORTED even in live mode."""
         from lightfee.venues.gate import GateAdapter
