@@ -5111,13 +5111,21 @@ class VenueTransport(MarketDataClient):
             if isinstance(row, dict)
             and str(row.get("order_id", "")) == str(order_id).strip()
         ]
-        fee_values = [
-            _parse_optional_float(row.get("commission"))
-            for row in matching_trades
-        ]
+        fee_values = []
+        for row in matching_trades:
+            # Gate names the field `fee` (older fixtures used `commission`);
+            # a present-but-unparseable fee stays incomplete fail-closed.
+            value = None
+            for key in ("fee", "commission"):
+                parsed = _parse_optional_float(row.get(key))
+                if parsed is not None:
+                    value = parsed
+                    break
+            fee_values.append(value)
         fee_quote = (
             sum(value for value in fee_values if value is not None)
-            if matching_trades and all(value is not None for value in fee_values)
+            if matching_trades and fee_values
+            and all(value is not None for value in fee_values)
             else None
         )
         if average_price is None or average_price <= 0.0:

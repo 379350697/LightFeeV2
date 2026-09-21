@@ -714,10 +714,14 @@ class CloseRuntime:
             terminal_reason == "binance_user_trades_no_candidate"
             and debt_reason in self._AUTOMATIC_EVIDENCE_DEBT_REASONS
         )
+        # A gate-leg debt terminalized before the Gate adapter grew order
+        # status / fill reconciliation / discovery earns one new scan.
+        gate_capability_repair = terminal_reason == "exact_recheck_incomplete"
         if not (
             capability_upgrade
             or legacy_no_candidate_repair
             or split_close_complement_repair
+            or gate_capability_repair
         ):
             return False
         snapshot = reconciliation.get("position_snapshot")
@@ -740,22 +744,28 @@ class CloseRuntime:
         has_aster_leg = False
         has_bitget_leg = False
         has_binance_leg = False
+        has_gate_leg = False
         for venue, quantity in zip(venues, expected_quantities):
             if quantity <= 1e-12:
                 continue
             has_aster_leg = has_aster_leg or venue == Venue.ASTER
             has_bitget_leg = has_bitget_leg or venue == Venue.BITGET
             has_binance_leg = has_binance_leg or venue == Venue.BINANCE
+            has_gate_leg = has_gate_leg or venue == Venue.GATE
             if venue is None or not self._adapter_supports_historical_close_discovery(
                 self.ctx.venue_adapters.get(venue)
             ):
                 return False
+        if gate_capability_repair and not has_gate_leg:
+            return False
         if (
             legacy_no_candidate_repair
             and not (has_aster_leg or has_bitget_leg or has_binance_leg)
         ):
             return False
         if split_close_complement_repair and not has_binance_leg:
+            return False
+        if gate_capability_repair and not has_gate_leg:
             return False
         # The repair grant is one scan per repair per debt, not one per cycle:
         # a sibling venue that still terminalizes with the legacy generic
@@ -773,6 +783,8 @@ class CloseRuntime:
             if has_aster_leg
             else self._AUTOMATIC_HISTORY_BITGET_CLOSE_SIDE_REPAIR_REASON
             if has_bitget_leg
+            else "gate_exact_recheck_fee_enrichment"
+            if gate_capability_repair
             else self._AUTOMATIC_HISTORY_BINANCE_EXECUTION_WINDOW_REPAIR_REASON
         )
         if reconciliation.get("automatic_history_reactivated_at_ms") and (

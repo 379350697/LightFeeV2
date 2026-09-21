@@ -62,6 +62,7 @@ class _Adapter:
     async def discover_historical_close_fill_reconciliation(
         self, *, symbol, side, position_side, quantity, closed_at_ms
     ):
+        import sys
         from lightfee.core.domain import HistoricalCloseEvidenceDiscovery
 
         fill = self.results.get(("discovered", side.value.upper()))
@@ -133,6 +134,11 @@ class _Ctx(CloseRuntime):
 
     async def _fetch_pending_close_terminal_live_sizes(self, **kw):
         return self._terminal_sizes
+
+    async def _fetch_pending_close_terminal_live_flat_truth(self, **kw):
+        if self._terminal_sizes is None:
+            return None, "terminal truth unavailable"
+        return self._terminal_sizes, None
 
     async def _fetch_pending_close_terminal_live_flat_truth(self, **kw):
         if self._terminal_sizes is None:
@@ -478,6 +484,12 @@ async def test_granted_debt_settles_via_unique_history_discovery():
         adapter_results={
             # Unique-window discoveries: the long leg's stored identity is a
             # cancelled maker (no fill), so both legs are discovered.
+            ("103019842112259486", "lfex-gate-long"): _FakeFill(
+                quantity=62.0, fee_quote=0.003, price=0.397,
+                order_id="103019842112259486", client_order_id="lfex-gate-long",
+                venue=Venue.GATE, side=Side.SELL,
+                metadata={"fee_evidence_complete": True},
+            ),
             ("discovered", "SELL"): _FakeFill(
                 quantity=62.0, fee_quote=0.003, price=0.397,
                 order_id="2679230467", client_order_id="lfex-taker-long",
@@ -520,3 +532,119 @@ async def test_grant_requires_flat_terminal_truth():
     owner = state.pending_close_reconciliations[0]
     assert owner.get("all_no_fill_discovery_grant") is None
     assert "exit.reconciled" not in journal.kinds()
+
+
+def _terminal_gate_debt() -> dict[str, Any]:
+    owner = {
+        "position_id": "entry-2-LSKUSDT",
+        "symbol": "LSKUSDT",
+        "kind": "final",
+        "reason": "funding_capture",
+        "source": "aggressive_close_execution",
+        "closed_at_ms": 1_000_000,
+        "created_cycle": 10,
+        "owned_close_quantities": {"long": 22.0, "short": 22.0},
+        "position_snapshot": {
+            "position_id": "entry-2-LSKUSDT",
+            "symbol": "LSKUSDT",
+            "long_venue": "gate",
+            "short_venue": "bybit",
+            "long_quantity": 22.0,
+            "short_quantity": 22.0,
+            "matched_quantity": 22.0,
+            "long_entry_price": 0.79,
+            "short_entry_price": 0.82,
+            "total_entry_fee_quote": 0.01,
+            "entry_fee_evidence_complete": True,
+            "captured_funding_quote": 0.0,
+            "second_stage_funding_quote": 0.0,
+            "opened_at_ms": 900_000,
+        },
+        "long_legs": [
+            {
+                "venue": "gate",
+                "order_id": "103019842112259486",
+                "client_order_id": "lfex-gate-long",
+                "quantity": 22.0,
+                "average_price": 0.8208,
+                "fee_quote": None,
+            }
+        ],
+        "short_legs": [
+            {
+                "venue": "bybit",
+                "order_id": "fda2d7a3-0b01",
+                "client_order_id": "lfex-bybit-short",
+                "quantity": 22.0,
+                "average_price": 0.8249,
+                "fee_quote": None,
+            }
+        ],
+        "attempt_count": 2,
+        "next_attempt_ms": 0,
+        "reconciliation_status": "evidence_debt",
+        "evidence_debt_reason": "known_close_fill_temporarily_unavailable",
+        "automatic_history_terminal_status": "irrecoverable_audit_debt",
+        "automatic_history_terminal_reason": "exact_recheck_incomplete",
+    }
+    return owner
+
+
+@pytest.mark.asyncio
+async def test_gate_capability_repair_rescans_terminal_gate_debt_and_settles():
+    """The 2026-09-21 gate-LSK debt: terminalized exact_recheck_incomplete
+    before the Gate adapter grew fill reconciliation. The new one-scan
+    gate_capability repair re-arms it; the exact rechecks now complete with
+    real gate/bybit fees and the debt settles."""
+    final = _terminal_gate_debt()
+    ctx, state, journal, adapter = _harness(
+        owners=[final], terminal_sizes=(0.0, 0.0)
+    )
+    ctx._venue_adapters[Venue.GATE] = adapter
+    runtime = PendingEntryRuntime(ctx)
+
+    adapter.results = {
+        ("103019842112259486", "lfex-gate-long"): _FakeFill(
+            quantity=22.0, fee_quote=0.009, price=0.8208,
+            order_id="103019842112259486", client_order_id="lfex-gate-long",
+            venue=Venue.GATE, side=Side.SELL,
+            average_price=0.8208,
+            metadata={"fee_evidence_complete": True},
+        ),
+        ("fda2d7a3-0b01", "lfex-bybit-short"): _FakeFill(
+            quantity=22.0, fee_quote=0.004, price=0.8249,
+            order_id="fda2d7a3-0b01", client_order_id="lfex-bybit-short",
+            venue=Venue.BYBIT,
+            metadata={"fee_evidence_complete": True},
+        ),
+        ("discovered", "SELL"): _FakeFill(
+            quantity=22.0, fee_quote=0.009, price=0.8208,
+            order_id="103019842112259486", client_order_id="lfex-gate-long",
+            venue=Venue.GATE, side=Side.SELL,
+            average_price=0.8208,
+            metadata={
+                "fee_evidence_complete": True,
+                "historical_evidence_provenance": "exchange_execution_unattributed",
+            },
+        ),
+        ("discovered", "BUY"): _FakeFill(
+            quantity=22.0, fee_quote=0.004, price=0.8249,
+            order_id="fda2d7a3-0b01", client_order_id="lfex-bybit-short",
+            venue=Venue.BYBIT, side=Side.BUY,
+            average_price=0.8249,
+            metadata={
+                "fee_evidence_complete": True,
+                "historical_evidence_provenance": "exchange_execution_unattributed",
+            },
+        ),
+    }
+    await runtime._reconcile_pending_state(1_000_100)
+
+    reactivated = [p for k, p in journal.events if k == "reconciliation.automatic_historical_evidence_reactivated"]
+    assert reactivated and reactivated[0]["reason"] == "gate_exact_recheck_fee_enrichment"
+
+    await runtime._reconcile_pending_state(1_000_200)
+
+    reconciled = [p for k, p in journal.events if k == "exit.reconciled"]
+    assert reconciled and reconciled[0]["venue_statement_reconciled"] is True
+    assert state.pending_close_reconciliations == []
