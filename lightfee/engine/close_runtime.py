@@ -1459,6 +1459,121 @@ class CloseRuntime:
         )
         reconciliation["next_attempt_ms"] = now_ms + delay
 
+    def _merge_pending_close_leg_evidence(self, pending_close: Any) -> int:
+        """Hand an executor PendingClose's durable legs to its billing owner.
+
+        The passive-close fallback can terminalize a position while the
+        CloseExecutor's uncertain-leg PendingClose still holds the only
+        record of the executed order identities (CL-154).  Ownership rules
+        from the circuit-breaker attribution analysis: evidence merges into
+        the single ``final`` owner of the same position only — partial
+        owners keep their own immutable segment untouched; a proved fill
+        upgrades a stored zero-fill identity, never the reverse; and the
+        executor's proven close totals may raise the final owner's
+        mid-writeback ``owned_close_quantities`` (never lower them).
+        """
+        position_id = str(getattr(pending_close, "position_id", "") or "")
+        if not position_id:
+            return 0
+        merged_total = 0
+        for reconciliation in getattr(
+            self.ctx.state, "pending_close_reconciliations", []
+        ):
+            if not isinstance(reconciliation, dict):
+                continue
+            if str(reconciliation.get("position_id") or "") != position_id:
+                continue
+            if str(reconciliation.get("kind") or "final") != "final":
+                continue
+            merged_per_owner = 0
+            for side, legs in (
+                ("long_legs", getattr(pending_close, "long_legs", None)),
+                ("short_legs", getattr(pending_close, "short_legs", None)),
+            ):
+                target = reconciliation.get(side)
+                if not isinstance(target, list):
+                    target = []
+                    reconciliation[side] = target
+                by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+                for record in target:
+                    if not isinstance(record, dict):
+                        continue
+                    order_id = str(record.get("order_id") or "")
+                    client_order_id = str(record.get("client_order_id") or "")
+                    key = (
+                        str(record.get("venue") or ""),
+                        order_id,
+                        "" if order_id else client_order_id,
+                    )
+                    by_identity[key] = record
+                for leg in legs if isinstance(legs, list) else []:
+                    order_id = str(getattr(leg, "order_id", "") or "")
+                    client_order_id = str(getattr(leg, "client_order_id", "") or "")
+                    if not order_id and not client_order_id:
+                        continue
+                    venue = getattr(leg, "venue", "")
+                    record = {
+                        "venue": getattr(venue, "value", "") or str(venue or ""),
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "quantity": self._safe_reconciliation_float(
+                            getattr(leg, "quantity", 0.0)
+                        ),
+                        "average_price": self._safe_reconciliation_float(
+                            getattr(leg, "average_price", 0.0)
+                        ),
+                        "fee_quote": self._safe_reconciliation_float(
+                            getattr(leg, "fee_quote", 0.0)
+                        ),
+                    }
+                    key = (
+                        record["venue"],
+                        order_id,
+                        "" if order_id else client_order_id,
+                    )
+                    existing = by_identity.get(key)
+                    if existing is not None:
+                        if (
+                            record["quantity"] > 1e-12
+                            and self._safe_reconciliation_float(
+                                existing.get("quantity")
+                            )
+                            <= 1e-12
+                        ):
+                            existing.update(record)
+                            merged_per_owner += 1
+                        continue
+                    by_identity[key] = record
+                    target.append(record)
+                    merged_per_owner += 1
+            owned = reconciliation.get("owned_close_quantities")
+            if isinstance(owned, dict):
+                for side_label, attr in (
+                    ("long", "long_closed"),
+                    ("short", "short_closed"),
+                ):
+                    closed = self._safe_reconciliation_float(
+                        getattr(pending_close, attr, 0.0)
+                    )
+                    if closed > self._safe_reconciliation_float(
+                        owned.get(side_label)
+                    ):
+                        owned[side_label] = closed
+                        merged_per_owner += 1
+            if merged_per_owner:
+                merged_total += merged_per_owner
+                self.ctx.journal.append(
+                    "reconciliation.pending_close_evidence_merged",
+                    {
+                        "position_id": position_id,
+                        "close_id": str(
+                            getattr(pending_close, "close_id", "") or ""
+                        ),
+                        "merged_leg_count": merged_per_owner,
+                    },
+                )
+        return merged_total
+
     @staticmethod
     def _close_reconciliation_expected_quantities(
         reconciliation: dict[str, Any],

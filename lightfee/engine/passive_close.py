@@ -5096,6 +5096,10 @@ class PassiveCloseExecutor:
         )
         closed_at_ms = self._now_ms()
         position_snapshot = self._position_snapshot_for_close_reconciliation(position)
+        owned_close_quantities = {
+            "long": max(float(position_snapshot.get("long_quantity") or 0.0), 0.0),
+            "short": max(float(position_snapshot.get("short_quantity") or 0.0), 0.0),
+        }
         reconciliation = {
             "position_id": pending.position_id,
             "symbol": position.symbol,
@@ -5106,15 +5110,62 @@ class PassiveCloseExecutor:
             "created_cycle": int(getattr(state, "tick_count", 0) or 0),
             "position_snapshot": position_snapshot,
             "original_payload": dict(payload),
-            "owned_close_quantities": {
-                "long": max(float(position_snapshot.get("long_quantity") or 0.0), 0.0),
-                "short": max(float(position_snapshot.get("short_quantity") or 0.0), 0.0),
-            },
+            "owned_close_quantities": owned_close_quantities,
             "long_legs": long_legs,
             "short_legs": short_legs,
             "attempt_count": 0,
             "next_attempt_ms": closed_at_ms,
         }
+        # The position object this snapshot reads can be mid-writeback: the
+        # same fallback flow's CloseExecutor may have already decremented a
+        # confirmed leg while its uncertain-leg evidence sits in a
+        # PendingClose (production 2026-09-16: owned long 62 / short 0 with
+        # both taker legs filled).  Absorb that same-position executor
+        # evidence here so the final owner is born truthful — never from a
+        # partial owner, and never downwards.
+        for pending_close in getattr(state, "pending_closes", {}).values():
+            if str(getattr(pending_close, "position_id", "") or "") != str(
+                pending.position_id
+            ):
+                continue
+            for side_label, attr, side_key in (
+                ("long", "long_closed", "long_legs"),
+                ("short", "short_closed", "short_legs"),
+            ):
+                closed = float(getattr(pending_close, attr, 0.0) or 0.0)
+                if closed > owned_close_quantities[side_label]:
+                    owned_close_quantities[side_label] = closed
+                executor_legs = getattr(pending_close, side_key, None)
+                for leg in executor_legs if isinstance(executor_legs, list) else []:
+                    order_id = str(getattr(leg, "order_id", "") or "")
+                    client_order_id = str(getattr(leg, "client_order_id", "") or "")
+                    if not order_id and not client_order_id:
+                        continue
+                    venue = getattr(leg, "venue", "")
+                    record = {
+                        "venue": getattr(venue, "value", "") or str(venue or ""),
+                        "order_id": order_id,
+                        "client_order_id": client_order_id,
+                        "quantity": float(getattr(leg, "quantity", 0.0) or 0.0),
+                        "average_price": float(
+                            getattr(leg, "average_price", 0.0) or 0.0
+                        ),
+                        "fee_quote": float(getattr(leg, "fee_quote", 0.0) or 0.0),
+                    }
+                    target = reconciliation[side_key]
+                    duplicate = any(
+                        isinstance(existing, dict)
+                        and existing.get("venue") == record["venue"]
+                        and existing.get("order_id") == record["order_id"]
+                        and (
+                            record["order_id"]
+                            or existing.get("client_order_id")
+                            == record["client_order_id"]
+                        )
+                        for existing in target
+                    )
+                    if not duplicate:
+                        target.append(record)
         missing_identity_legs = pending_close_reconciliation_missing_legs(
             reconciliation
         )
