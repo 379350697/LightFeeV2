@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 import time
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import (
     AccountFeeSnapshot,
+    HistoricalCloseEvidenceDiscovery,
     OrderFill,
     OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
+    Side,
     Venue,
     VenueMarketSnapshot,
+    close_order_side_for_position,
 )
 from lightfee.venues.account_fees import fee_rate_from_mapping, first_mapping
 from lightfee.venues.entry_tradability import (
@@ -249,6 +253,161 @@ class GateAdapter(VenueAdapter):
             symbol, order_id=order_id, client_order_id=client_order_id or ""
         )
 
+    async def discover_historical_close_fill_reconciliation(
+        self,
+        *,
+        symbol: str,
+        side: Side,
+        position_side: str,
+        quantity: float,
+        closed_at_ms: int,
+    ) -> HistoricalCloseEvidenceDiscovery:
+        """Find a unique execution-window group, then re-read the exact order.
+
+        Gate ``my_trades`` windows filter by execution time (seconds), so
+        candidate groups come from executions; the order row then decides
+        close-only ownership via ``is_reduce_only`` and confirms the full
+        executed quantity before the fee-complete exact reconciliation.
+        """
+        if side != close_order_side_for_position(position_side):
+            raise ValueError("Gate historical close side contradicts position side")
+        if not math.isfinite(quantity) or quantity <= 1e-12 or closed_at_ms <= 0:
+            raise ValueError("Gate historical close query requires quantity and closed_at_ms")
+        venue_symbol = self._transport._venue_symbol(symbol)
+        time_window_ms = 300_000
+        window_sec = time_window_ms // 1000
+        from_sec = max(0, int(closed_at_ms / 1000) - window_sec)
+        to_sec = int(closed_at_ms / 1000) + window_sec
+        raw_trades = await self._transport._request(
+            "GET",
+            "/api/v4/futures/usdt/my_trades",
+            params={
+                "contract": venue_symbol,
+                "from": str(from_sec),
+                "to": str(to_sec),
+                "limit": "1000",
+            },
+            private=True,
+        )
+        if not isinstance(raw_trades, list):
+            raise ValueError("Gate my_trades response is malformed")
+        # Gate returns no continuation cursor for this request shape.  A full
+        # page cannot prove that the bounded interval was exhaustive.
+        if len(raw_trades) >= 1000:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="history_incomplete",
+                candidate_count=0,
+            )
+        candidates = find_gate_historical_close_execution_candidates(
+            raw_trades,
+            contract=venue_symbol,
+            side=side,
+            quantity=quantity,
+            closed_at_ms=closed_at_ms,
+            time_window_ms=time_window_ms,
+        )
+        if len(candidates) != 1:
+            return HistoricalCloseEvidenceDiscovery(
+                classification=(
+                    "ambiguous_candidates"
+                    if candidates
+                    else "gate_my_trades_no_candidate"
+                ),
+                candidate_count=len(candidates),
+            )
+
+        candidate = candidates[0]
+        raw_order = await self._transport._request(
+            "GET",
+            f"/api/v4/futures/usdt/orders/{candidate['order_id']}",
+            private=True,
+        )
+        order_size = (
+            _gate_history_float(raw_order.get("size"))
+            if isinstance(raw_order, dict)
+            else None
+        )
+        executed_quantity = (
+            abs(_gate_history_float(raw_order.get("size", "0")) or 0.0)
+            - abs(_gate_history_float(raw_order.get("left", "0")) or 0.0)
+            if isinstance(raw_order, dict)
+            else None
+        )
+        order_side = (
+            Side.BUY
+            if order_size is not None and order_size > 0
+            else Side.SELL
+            if order_size is not None
+            else None
+        )
+        if (
+            not isinstance(raw_order, dict)
+            or str(raw_order.get("contract") or "").upper() != venue_symbol.upper()
+            or order_side != side
+            or raw_order.get("is_reduce_only") is not True
+            or str(raw_order.get("finish_as") or "") != "filled"
+            or executed_quantity is None
+            or not math.isclose(
+                executed_quantity,
+                quantity,
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                executed_quantity,
+                candidate["quantity"],
+                rel_tol=1e-9,
+                abs_tol=1e-12,
+            )
+            or str(raw_order.get("id") or "") != candidate["order_id"]
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_identity_mismatch",
+                candidate_count=1,
+            )
+        reconciliation = await self.fetch_order_fill_reconciliation(
+            symbol,
+            str(candidate["order_id"]),
+            "",
+        )
+        if reconciliation is None:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_unavailable",
+                candidate_count=1,
+            )
+        if (
+            reconciliation.symbol.upper() != venue_symbol.upper()
+            or reconciliation.order_id != str(candidate["order_id"])
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_identity_mismatch",
+                candidate_count=1,
+            )
+        metadata = dict(reconciliation.metadata or {})
+        fee_quote = reconciliation.fee_quote
+        if (
+            metadata.get("fee_evidence_complete") is not True
+            or fee_quote is None
+            or not math.isfinite(fee_quote)
+            or fee_quote < 0.0
+        ):
+            return HistoricalCloseEvidenceDiscovery(
+                classification="exact_recheck_incomplete",
+                candidate_count=1,
+            )
+        metadata.update(
+            {
+                "historical_candidate_endpoint": "/api/v4/futures/usdt/my_trades",
+                "historical_candidate_updated_at_ms": candidate["updated_at_ms"],
+                "historical_evidence_provenance": "exchange_execution_unattributed",
+            }
+        )
+        return HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=replace(reconciliation, metadata=metadata),
+        )
+
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
 
@@ -382,3 +541,77 @@ class GateAdapter(VenueAdapter):
 
     async def shutdown(self) -> None:
         await self._transport.close()
+
+
+def _gate_history_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def find_gate_historical_close_execution_candidates(
+    trades: Iterable[dict[str, Any]],
+    *,
+    contract: str,
+    side: Side | str,
+    quantity: float,
+    closed_at_ms: int,
+    time_window_ms: int = 300_000,
+    quantity_relative_tolerance: float = 1e-9,
+) -> list[dict[str, Any]]:
+    """Group Gate my_trades rows into strictly matching close candidates.
+
+    Gate ``my_trades`` rows carry a signed ``size`` (negative = sell) and no
+    reduce-only marker, so sign-filtered rows are candidate selection only;
+    the order row's ``is_reduce_only`` decides close ownership during the
+    exact recheck.  Gate timestamps are seconds.
+    """
+    expected_side = (
+        side.value.upper() if isinstance(side, Side) else str(side).upper()
+    )
+    expected_sign = -1.0 if expected_side == "SELL" else 1.0
+    quantity_tolerance = max(quantity * quantity_relative_tolerance, 1e-12)
+    grouped: dict[str, dict[str, Any]] = {}
+    for raw in trades:
+        if not isinstance(raw, dict):
+            continue
+        order_id = str(raw.get("order_id") or "").strip()
+        trade_size = _gate_history_float(raw.get("size"))
+        created_at_sec = _gate_history_float(raw.get("create_time"))
+        if (
+            not order_id
+            or str(raw.get("contract") or "").upper() != contract.upper()
+            or trade_size is None
+            or trade_size == 0.0
+            or (trade_size > 0) != (expected_sign > 0)
+            or created_at_sec is None
+            or created_at_sec <= 0
+        ):
+            continue
+        traded_at_ms = int(created_at_sec * 1000)
+        if abs(traded_at_ms - closed_at_ms) > time_window_ms:
+            continue
+        candidate = grouped.setdefault(
+            order_id,
+            {
+                "order_id": order_id,
+                "quantity": 0.0,
+                "updated_at_ms": 0,
+            },
+        )
+        candidate["quantity"] += abs(trade_size)
+        candidate["updated_at_ms"] = max(candidate["updated_at_ms"], traded_at_ms)
+    return [
+        candidate
+        for candidate in grouped.values()
+        if math.isclose(
+            candidate["quantity"],
+            quantity,
+            rel_tol=quantity_relative_tolerance,
+            abs_tol=quantity_tolerance,
+        )
+    ]

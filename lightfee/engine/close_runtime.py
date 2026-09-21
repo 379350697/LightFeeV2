@@ -238,6 +238,97 @@ class CloseRuntime:
                 return None
             fills.append(fill)
         return fills
+
+    async def _grant_discovery_for_all_no_fill_debt(
+        self,
+        reconciliation: dict[str, Any],
+        now_ms: int,
+        *,
+        symbol: str,
+        long_venue: Venue,
+        short_venue: Venue,
+    ) -> bool:
+        """One-time reclassification of a dead exact-retry loop into the
+        bounded unique-history discovery path.
+
+        A ``final`` owner whose every stored close identity rechecks to no
+        fill carries phantom identities (CL-150 family): the executions
+        exist on the wire but their orders were never recorded.  After two
+        clean all-no-fill cycles, with terminal exchange truth provably flat
+        and no open orders, the debt reclassifies to
+        ``missing_close_order_identity`` so the existing per-venue history
+        discovery machinery runs once.  The mid-writeback owned segment is
+        corrected from the snapshot's ``matched_quantity`` (the recorded
+        paired quantity both legs were opened against) so discovery has a
+        truthful uniqueness target on every leg; that correction is
+        monotonic and journaled.  The grant is armed once per debt
+        (``all_no_fill_discovery_grant``) and never re-arms.
+        """
+        if str(reconciliation.get("kind") or "final") != "final":
+            return False
+        if reconciliation.get("all_no_fill_discovery_grant") is True:
+            return False
+        if self._safe_reconciliation_int(
+            reconciliation.get("attempt_count")
+        ) < 2:
+            return False
+        terminal_sizes = await self._call_fetch_pending_close_terminal_live_sizes(
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+        )
+        if terminal_sizes is None:
+            return False
+        long_live_size, short_live_size = terminal_sizes
+        if abs(long_live_size) > 1e-9 or abs(short_live_size) > 1e-9:
+            return False
+        snapshot = reconciliation.get("position_snapshot") or {}
+        if not isinstance(snapshot, dict):
+            return False
+        matched = self._safe_reconciliation_float(
+            snapshot.get("matched_quantity")
+        )
+        if matched <= 1e-12:
+            return False
+        owned = reconciliation.get("owned_close_quantities")
+        if not isinstance(owned, dict):
+            return False
+        corrected: dict[str, float] = {}
+        for side_label in ("long", "short"):
+            if self._safe_reconciliation_float(owned.get(side_label)) < matched:
+                owned[side_label] = matched
+                corrected[side_label] = matched
+        if corrected:
+            self.ctx.journal.append(
+                "reconciliation.discovery_grant_segment_corrected",
+                {
+                    "position_id": str(
+                        reconciliation.get("position_id") or ""
+                    ),
+                    "corrected_owned_close_quantities": dict(owned),
+                },
+            )
+        reconciliation["all_no_fill_discovery_grant"] = True
+        self.ctx.journal.append(
+            "reconciliation.discovery_grant_armed",
+            {
+                "position_id": str(reconciliation.get("position_id") or ""),
+                "reason": "all_close_lookups_no_fill_with_flat_terminal_truth",
+                "grant_cycles": self._safe_reconciliation_int(
+                    reconciliation.get("attempt_count")
+                ),
+            },
+        )
+        self._mark_pending_close_reconciliation_evidence_debt(
+            reconciliation,
+            reason="missing_close_order_identity",
+            now_ms=now_ms,
+            symbol=symbol,
+            long_venue=long_venue,
+            short_venue=short_venue,
+        )
+        return True
+
     @staticmethod
     def _close_reconciliation_live_size(position: Any) -> float:
         if position is None:
@@ -2543,7 +2634,17 @@ class CloseRuntime:
                         "reason": "close_order_lookup_returned_no_fill",
                     },
                 )
-                self._call_apply_pending_close_reconciliation_backoff(reconciliation, now_ms)
+                granted = await self._grant_discovery_for_all_no_fill_debt(
+                    reconciliation,
+                    now_ms,
+                    symbol=symbol,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                )
+                if not granted:
+                    self._call_apply_pending_close_reconciliation_backoff(
+                        reconciliation, now_ms
+                    )
                 retained.append(reconciliation)
                 changed = True
                 continue

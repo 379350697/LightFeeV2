@@ -3229,3 +3229,189 @@ async def test_zero_quantity_leg_lookup_miss_does_not_fail_leg_recheck():
         symbol="ONGUSDT", venue=Venue.BYBIT, legs=legs_with_positive_miss,
     )
     assert fills is None
+
+
+# ---------------------------------------------------------------------------
+# Gate history discovery (CL-154 v2c): unique execution-window group then
+# exact order recheck with my_trades commission enrichment.
+# ---------------------------------------------------------------------------
+
+
+def _gate_discovery_adapter():
+    from lightfee.venues.gate import GateAdapter
+
+    return GateAdapter(mode="live", credential=LiveCredential(api_key="k", api_secret="s"))
+
+
+def _gate_close_order_row(**overrides):
+    row = {
+        "id": 103019842112259486,
+        "contract": "LSK_USDT",
+        "size": -22,
+        "left": 0,
+        "status": "finished",
+        "finish_as": "filled",
+        "is_reduce_only": True,
+        "fill_price": "0.8208",
+        "finish_time": 1789578305.8,
+    }
+    row.update(overrides)
+    return row
+
+
+def _gate_close_trades(**overrides):
+    row = {
+        "order_id": 103019842112259486,
+        "contract": "LSK_USDT",
+        "size": -22,
+        "price": "0.8208",
+        "commission": "0.009",
+        "create_time": 1789578305.5,
+    }
+    row.update(overrides)
+    return [row]
+
+
+@pytest.mark.asyncio
+async def test_gate_history_discovery_unique_candidate_exact_recheck():
+    adapter = _gate_discovery_adapter()
+    calls: list[tuple[str, str, dict]] = []
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        del body, private
+        calls.append((method, path, dict(params or {})))
+        if path == "/api/v4/futures/usdt/my_trades":
+            assert params["contract"] == "LSK_USDT"
+            assert params["limit"] == "1000"
+            return _gate_close_trades()
+        if path == "/api/v4/futures/usdt/orders/103019842112259486":
+            return _gate_close_order_row()
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="LSKUSDT",
+            side=Side.SELL,
+            position_side="LONG",
+            quantity=22.0,
+            closed_at_ms=1789578305800,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "unique_candidate_exact_recheck"
+    assert result.candidate_count == 1
+    assert result.reconciliation is not None
+    assert result.reconciliation.quantity == 22.0
+    assert result.reconciliation.fee_quote == pytest.approx(0.009)
+    assert result.reconciliation.metadata["fee_evidence_complete"] is True
+    assert (
+        result.reconciliation.metadata["historical_candidate_endpoint"]
+        == "/api/v4/futures/usdt/my_trades"
+    )
+    assert calls[0][0:2] == ("GET", "/api/v4/futures/usdt/my_trades")
+    assert calls[1][0:2] == ("GET", "/api/v4/futures/usdt/orders/103019842112259486")
+
+
+@pytest.mark.asyncio
+async def test_gate_history_discovery_no_candidate_stays_unsettled():
+    adapter = _gate_discovery_adapter()
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        if path == "/api/v4/futures/usdt/my_trades":
+            return []
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="LSKUSDT",
+            side=Side.SELL,
+            position_side="LONG",
+            quantity=22.0,
+            closed_at_ms=1789578305800,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "gate_my_trades_no_candidate"
+    assert result.candidate_count == 0
+    assert result.reconciliation is None
+
+
+@pytest.mark.asyncio
+async def test_gate_history_discovery_requires_reduce_only_close_marker():
+    """An opening sell in the window is not close evidence: the order row's
+    is_reduce_only decides close ownership during the exact recheck."""
+    adapter = _gate_discovery_adapter()
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        if path == "/api/v4/futures/usdt/my_trades":
+            return _gate_close_trades()
+        if path == "/api/v4/futures/usdt/orders/103019842112259486":
+            return _gate_close_order_row(is_reduce_only=False)
+        raise AssertionError(path)
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="LSKUSDT",
+            side=Side.SELL,
+            position_side="LONG",
+            quantity=22.0,
+            closed_at_ms=1789578305800,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "exact_recheck_identity_mismatch"
+    assert result.reconciliation is None
+
+
+@pytest.mark.asyncio
+async def test_gate_history_discovery_rejects_side_contradiction():
+    adapter = _gate_discovery_adapter()
+    with pytest.raises(ValueError, match="contradicts position side"):
+        await adapter.discover_historical_close_fill_reconciliation(
+            symbol="LSKUSDT",
+            side=Side.BUY,
+            position_side="LONG",
+            quantity=22.0,
+            closed_at_ms=1789578305800,
+        )
+
+
+@pytest.mark.asyncio
+async def test_gate_history_discovery_full_page_is_incomplete():
+    adapter = _gate_discovery_adapter()
+    full_page = [
+        {
+            "order_id": f"order-{i}",
+            "contract": "LSK_USDT",
+            "size": -1,
+            "price": "0.82",
+            "commission": "0.0001",
+            "create_time": 1789578305.0,
+        }
+        for i in range(1000)
+    ]
+
+    async def request(method, path, *, params=None, body=None, private=False):
+        assert path == "/api/v4/futures/usdt/my_trades"
+        return full_page
+
+    adapter._transport._request = request
+    try:
+        result = await adapter.discover_historical_close_fill_reconciliation(
+            symbol="LSKUSDT",
+            side=Side.SELL,
+            position_side="LONG",
+            quantity=22.0,
+            closed_at_ms=1789578305800,
+        )
+    finally:
+        await adapter.shutdown()
+
+    assert result.classification == "history_incomplete"
+    assert result.candidate_count == 0

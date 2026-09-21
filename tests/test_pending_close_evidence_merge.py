@@ -42,6 +42,8 @@ class _FakeFill:
         self.order_id = kw.pop("order_id")
         self.client_order_id = kw.pop("client_order_id")
         self.venue = kw.pop("venue", "")
+        self.side = kw.pop("side", None)
+        self.symbol = kw.pop("symbol", "LSK_USDT")
         self.filled_at_ms = kw.pop("filled_at_ms", 0)
         self.metadata = kw.pop("metadata", {}) or {}
 
@@ -56,6 +58,22 @@ class _Adapter:
     ):
         self.calls.append((order_id, client_order_id))
         return self.results.get((order_id, client_order_id))
+
+    async def discover_historical_close_fill_reconciliation(
+        self, *, symbol, side, position_side, quantity, closed_at_ms
+    ):
+        from lightfee.core.domain import HistoricalCloseEvidenceDiscovery
+
+        fill = self.results.get(("discovered", side.value.upper()))
+        if fill is None:
+            return HistoricalCloseEvidenceDiscovery(
+                classification="gate_my_trades_no_candidate", candidate_count=0
+            )
+        return HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=fill,
+        )
 
 
 class _Journal:
@@ -115,6 +133,11 @@ class _Ctx(CloseRuntime):
 
     async def _fetch_pending_close_terminal_live_sizes(self, **kw):
         return self._terminal_sizes
+
+    async def _fetch_pending_close_terminal_live_flat_truth(self, **kw):
+        if self._terminal_sizes is None:
+            return None, "terminal truth unavailable"
+        return self._terminal_sizes, None
 
 
 def _final_owner() -> dict[str, Any]:
@@ -383,3 +406,117 @@ def test_registration_boundary_absorbs_same_position_executor_evidence():
     short_ids = {leg["order_id"] for leg in owner["short_legs"]}
     assert "cfd5d547-2e1b" in short_ids
     assert "exit.pending_close_reconciliation_registered" in journal.kinds()
+
+
+class _DiscoveringAdapter(_Adapter):
+    """Adapter with fill reconciliation plus unique-window discovery."""
+
+    async def fetch_position(self, symbol: str):
+        class _Pos:
+            quantity = 0.0
+
+        return _Pos()
+
+    async def discover_historical_close_fill_reconciliation(
+        self, *, symbol, side, position_side, quantity, closed_at_ms
+    ):
+        from lightfee.core.domain import HistoricalCloseEvidenceDiscovery
+
+        return HistoricalCloseEvidenceDiscovery(
+            classification="unique_candidate_exact_recheck",
+            candidate_count=1,
+            reconciliation=self.results.get(("discovered", side.value)),
+        )
+
+
+def _phantom_debt() -> dict[str, Any]:
+    owner = _final_owner()
+    owner["attempt_count"] = 0
+    return owner
+
+
+def _grant_ctx(terminal_sizes=(0.0, 0.0), adapter_results=None):
+    """Pre-merge phantom shape: passive identities only, no executor merge,
+    two clean all-no-fill cycles already served."""
+    final = _final_owner()
+    final["attempt_count"] = 2
+    ctx, state, journal, adapter = _harness(
+        owners=[final],
+        adapter_results=adapter_results,
+        terminal_sizes=terminal_sizes,
+        with_pending_close=False,
+    )
+    return ctx, state, journal, adapter, final
+
+
+@pytest.mark.asyncio
+async def test_all_no_fill_debt_arms_one_time_discovery_grant():
+    """v2c: with two clean all-no-fill cycles and provably flat terminal
+    truth, the dead exact-retry loop reclassifies once into the bounded
+    unique-history discovery path; the mid-writeback segment corrects from
+    the snapshot's matched quantity."""
+    ctx, state, journal, adapter, final = _grant_ctx()
+    runtime = PendingEntryRuntime(ctx)
+
+    await runtime._reconcile_pending_state(1_000_100)
+
+    assert "reconciliation.discovery_grant_armed" in journal.kinds()
+    owner = state.pending_close_reconciliations[0]
+    assert owner["all_no_fill_discovery_grant"] is True
+    assert owner["owned_close_quantities"] == {"long": 62.0, "short": 62.0}
+    assert owner["evidence_debt_reason"] == "missing_close_order_identity"
+    assert owner["reconciliation_status"] == "evidence_debt"
+    # The corrected segment demands both legs: the invalid loop is over.
+    assert "reconciliation.pending_close_reconciliation_invalid" in journal.kinds()
+
+
+@pytest.mark.asyncio
+async def test_granted_debt_settles_via_unique_history_discovery():
+    """After the grant, the machinery's unique-window discovery finds both
+    executions and the fee-complete exact rechecks settle the debt."""
+    ctx, state, journal, adapter, final = _grant_ctx(
+        adapter_results={
+            # Unique-window discoveries: the long leg's stored identity is a
+            # cancelled maker (no fill), so both legs are discovered.
+            ("discovered", "SELL"): _FakeFill(
+                quantity=62.0, fee_quote=0.003, price=0.397,
+                order_id="2679230467", client_order_id="lfex-taker-long",
+                venue=Venue.BINANCE, side=Side.SELL,
+                metadata={
+                    "fee_evidence_complete": True,
+                    "historical_evidence_provenance": "exchange_execution_unattributed",
+                },
+            ),
+            ("discovered", "BUY"): _FakeFill(
+                quantity=62.0, fee_quote=0.004, price=0.39705,
+                order_id="cfd5d547-2e1b", client_order_id="lfex-taker-short",
+                venue=Venue.BYBIT, side=Side.BUY,
+                metadata={
+                    "fee_evidence_complete": True,
+                    "historical_evidence_provenance": "exchange_execution_unattributed",
+                },
+            ),
+        }
+    )
+    runtime = PendingEntryRuntime(ctx)
+
+    await runtime._reconcile_pending_state(1_000_100)
+    await runtime._reconcile_pending_state(1_000_200)
+
+    reconciled = [p for k, p in journal.events if k == "exit.reconciled"]
+    assert reconciled and reconciled[0]["venue_statement_reconciled"] is True
+    assert state.pending_close_reconciliations == []
+
+
+@pytest.mark.asyncio
+async def test_grant_requires_flat_terminal_truth():
+    ctx, state, journal, _ = _harness(
+        owners=[_final_owner()], terminal_sizes=None
+    )
+    runtime = PendingEntryRuntime(ctx)
+    for now in (1_000_100, 1_030_200, 1_060_300):
+        await runtime._reconcile_pending_state(now)
+    assert "reconciliation.discovery_grant_armed" not in journal.kinds()
+    owner = state.pending_close_reconciliations[0]
+    assert owner.get("all_no_fill_discovery_grant") is None
+    assert "exit.reconciled" not in journal.kinds()
