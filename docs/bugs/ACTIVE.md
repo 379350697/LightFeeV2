@@ -34,7 +34,18 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `f9fa2463`
+- Last production SHA checked: `80ba91b4`
+- Checked on: `2026-09-21 22:3x`. 两步处置：(1) CL-157 `80ba91b4`（gate
+  order-status 对账分支 + 适配器方法，TestGateOrderStatus RED/GREEN，
+  transport 502 通过）部署后，gate 对冲单 103019842165780963 经新端点
+  对账为 filled，pending entry 双腿 finalize_fill_reconciled 首次成立。
+  (2) 用户授权的搁浅仓位处置：reduce-only IOC 平掉 gate dual_long
+  57 LSKUSDT（订单 103019842202528118，成交 0.387，实现 -2.7075 USDT），
+  七所全平。runtime 现以 `owned_recovery_work` fail-closed 管理：pending
+  entry 的「正量成交 vs 全平真值」冲突按设计等操作员裁决
+  （lifecycle=risk_only，不开新仓），处置工具与 v2 一并规划。
+  债务 6 条（2 by-design + 4 待 v2）不变。未下单（runtime 侧零订单）。
+- Prior checked deployment: `f9fa2463`
 - Checked on: `2026-09-19 17:0x`. P0 事故遏制部署：`f9fa2463`（CL-156，venue
   查单失败降级护栏）。崩溃循环自 09-19 00:25（Bybit key 过期 33004 × 无护栏
   计费查单）持续至 16:58，2,376 次重启；部署后对账循环对三条债打出
@@ -290,6 +301,7 @@ until this table receives real fixing commits and a production observation.
 | CL-152 | closed | `2be127cc` | Empty-owned final debt production-path regression: flat-truth two-leg terminalization with no manufactured PnL keys, non-flat/open-order counterexamples staying retryable, and a positive-owned empty-fills shape keeping the invalid backoff; RED on the pre-fix tree (1/3 new tests fail; the two safety counterexamples pass on both trees by design); evidence file 56 passed; full suite failures byte-identical to the same-tree baseline (25 pre-existing) | `2be127cc` deployed `2026-09-15 21:52 CST`. Four minutes after restart `entry-1789091700691-ONGUSDT` (four-day active retrier, 1,287 attempts) settled as `provisional_close_quantity_evidence_incomplete` with `long_live_size=0.0`, `short_live_size=0.0`, `open_order_truth_flat=true`, and zero manufactured PnL keys; owners 3 → 2, both remaining by-design operator records. | [2026-09-15](daily/2026-09-15.md#cl-152--空-owned-终债的无限重试) |
 | CL-153 | closed | `935ef683` | Gate dual-mode `set_leverage` production-shape regression: single-mode dict, array shape with the `lever` alias, mismatch/malformed/empty rejections, and the unchanged dual-retry path; RED on the pre-fix tree reproducing the exact production raw error | **自然验证完成（2026-09-17 00:52:53）**：`order.entry_leverage_ready gate LSK_USDT position_mode=dual`（形状派生标签=生产观察到的数组响应），窗口内零 `entry_leverage_unavailable`；随后真实交易回合 00:53 开仓 22 张（gate→bybit，被堵两天的对）→ 01:00 资金费捕获 → 01:05 平仓，交易所全平高置信度。残留：dual-side retry 反例作为 monitored 风险记于 09-17 ledger。 | [2026-09-17](daily/2026-09-17.md) |
 | CL-156 | closed | `f9fa2463` | Venue reconciliation lookup failure production-shape regression: positive-quantity bybit legs + retCode=33004 TransportError must degrade to `reconciliation.close_leg_lookup_error` + fail-closed evidence debt, never propagate into the runtime loop; RED on the pre-fix tree (exception escapes `_process_pending_close_reconciliations`) | **生产自证（2026-09-19）**：key 过期事故中 16:58:25-27 三条债（LSK×2+BRUSDT）撞上同一 33004，三条 typed 事件安全降级；进程自 16:58:10 起单一连续生命周期（对比崩溃循环期 15-30 秒/次 ×2,376 次）。运营残留：Bybit key 续期为用户操作，见 09-19 ledger。 | [2026-09-19](daily/2026-09-19.md) |
+| CL-157 | closed | `80ba91b4` | Gate order-status reconciliation wire-shape regression (filled sell / open zero-fill / cancelled-with-leftover / 404 fail-closed / cid-only fail-closed / adapter delegation); RED on the pre-fix tree (3 wire tests fail) | 生产自证：部署后 gate 对冲单 103019842165780963 经新端点对账 filled，pending entry 双腿 finalize_fill_reconciled 成立（2026-09-21 22:21）。残留：gate discovery 方法在 v2c。 | [2026-09-21](daily/2026-09-21.md) |
 | CL-154 | root-cause-confirmed | `69da782e` reverted | — | **implemented but not closed；circuit breaker 已触发。** 已部署版本（`6610b4d4`，已 revert）存在 P1：merge 按 position_id 广播给合法并存的 partial+final 双 owner，并把两者不可变 `owned_close_quantities` 提升为 PendingClose 总量（审核者真实路径反例复现 62/62×2 + 相同 legs）。遏制：`450d76c9` revert 已于 2026-09-16 21:0x 部署（`71efecb2`）。**2026-09-17 01:05 事故族实时复现**：新一笔 gate→bybit 平仓走 dual-taker 兜底，executor PendingClose 再遭孤儿丢弃，产出新债；并暴露 **GateAdapter 缺 `fetch_order_fill_reconciliation` 与 discovery 方法**（gate 腿无法证费 → 33 秒内被判 `irrecoverable_audit_debt`）。**09-19 起结算被 Bybit key 过期二次阻塞**（见 CL-156/09-19 ledger）。v2c 范围：Gate 适配器两方法补齐 + discovery grant；存量结算范围 = 四笔非 by-design 债（LSK×2、gate-LSK、BRUSDT）。v2 未实现，原验收目标未完成，不得改写范围。 | [2026-09-17](daily/2026-09-17.md) |
 | CL-155 | local-green | `6610b4d4` + `71efecb2` | Warning-transition V1-parity regression: persistent degraded condition journals `risk.warning_triggered` once on entry, `risk.warning_cleared` once on exit, re-degrade re-arms once; warning line disabled never enters the state (reviewer repro RED on pre-gate tree) | **implemented but not closed**：初版（`6610b4d4`）缺 `warning_line_enabled` 条件，`71efecb2` 已补齐并部署（2026-09-16 21:0x）；"一腿快照长期缺失"根因未修（仅事件去重），另列跟进。自然验证待一条 degraded position 产生一对 triggered/cleared。 | [2026-09-16](daily/2026-09-16.md#cl-155--风险警告按-tick-刷屏v1-转换语义漂移-per-tick-risk-warning-storm) |
 
