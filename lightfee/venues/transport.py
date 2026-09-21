@@ -4867,6 +4867,11 @@ class VenueTransport(MarketDataClient):
                     venue_sym, order_id, client_order_id, now_ms,
                 )
 
+            elif spec.venue_id == Venue.GATE:
+                return await self._fetch_order_status_gate(
+                    venue_sym, order_id, client_order_id, now_ms,
+                )
+
             elif spec.venue_id == Venue.BITGET:
                 query_params: dict[str, Any] = {}
                 if order_id:
@@ -5002,6 +5007,174 @@ class VenueTransport(MarketDataClient):
             return None
 
         return None
+
+    async def _fetch_order_status_gate(
+        self,
+        venue_sym: str,
+        order_id: str,
+        client_order_id: str,
+        now_ms: int,
+    ) -> Optional["OrderFillReconciliation"]:
+        """Resolve one Gate futures order into fill-reconciliation truth.
+
+        Gate stores no client order id on futures orders, so identity is the
+        exchange order id alone; a client-order-id-only lookup has no exact
+        wire query and returns None fail-closed.  The order row carries the
+        executed size (``size - left``) but no commission, so fee-complete
+        evidence comes from the order's own ``my_trades`` rows, mirroring the
+        Binance userTrades enrichment.
+        """
+        if not order_id and not client_order_id:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                queried_endpoints=["/api/v4/futures/usdt/orders/{order_id}"],
+                response_classification="missing_order_identifier",
+                uncertain_subtype="execution_not_found",
+            )
+            return None
+        if not str(order_id).strip():
+            # A client-order-id-only identity has no exact Gate wire query.
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=["/api/v4/futures/usdt/orders/{order_id}"],
+                response_classification="gate_client_order_id_not_queryable",
+                uncertain_subtype="execution_not_found",
+                next_action="check_live_position",
+            )
+            return None
+
+        path = f"/api/v4/futures/usdt/orders/{str(order_id).strip()}"
+        queried_endpoints = [path]
+        try:
+            raw = await self._request("GET", path, private=True)
+        except TransportError as error:
+            body = str(error.body or "")
+            if error.status_code == 404 and "order_not_found" in body.lower():
+                self._record_order_reconcile_query(
+                    symbol=venue_sym,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    queried_endpoints=queried_endpoints,
+                    response_classification="gate_order_not_found",
+                    uncertain_subtype="open_order_not_found",
+                    next_action="check_live_position",
+                )
+                return None
+            raise
+
+        if not isinstance(raw, dict):
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=queried_endpoints,
+                response_classification="malformed_gate_order_status",
+                uncertain_subtype="execution_not_found",
+                next_action="check_live_position",
+            )
+            return None
+
+        size = _safe_float(raw.get("size", "0"))
+        executed = abs(size) - abs(_safe_float(raw.get("left", "0")))
+        if executed <= 0.0:
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=queried_endpoints,
+                response_classification=(
+                    "stale_accepted_order"
+                    if str(raw.get("status", "")) == "open"
+                    else "closed_order_not_found"
+                ),
+                uncertain_subtype="execution_not_found",
+                next_action="check_live_position",
+            )
+            return None
+
+        side = Side.BUY if size > 0 else Side.SELL
+        average_price = _parse_optional_float(raw.get("fill_price"))
+
+        trade_raw = await self._request(
+            "GET",
+            "/api/v4/futures/usdt/my_trades",
+            params={"contract": venue_sym, "order_id": str(order_id).strip(), "limit": "1000"},
+            private=True,
+        )
+        queried_endpoints.append("/api/v4/futures/usdt/my_trades")
+        trade_rows = trade_raw if isinstance(trade_raw, list) else []
+        matching_trades = [
+            row
+            for row in trade_rows
+            if isinstance(row, dict)
+            and str(row.get("order_id", "")) == str(order_id).strip()
+        ]
+        fee_values = [
+            _parse_optional_float(row.get("commission"))
+            for row in matching_trades
+        ]
+        fee_quote = (
+            sum(value for value in fee_values if value is not None)
+            if matching_trades and all(value is not None for value in fee_values)
+            else None
+        )
+        if average_price is None or average_price <= 0.0:
+            quote_volume = 0.0
+            traded_size = 0.0
+            for row in matching_trades:
+                trade_size = abs(_safe_float(row.get("size", "0")))
+                trade_price = _parse_optional_float(row.get("price"))
+                if trade_size > 0.0 and trade_price is not None and trade_price > 0.0:
+                    quote_volume += trade_size * trade_price
+                    traded_size += trade_size
+            if traded_size > 0.0:
+                average_price = quote_volume / traded_size
+        if average_price is None or average_price <= 0.0:
+            # Fill truth without a provable price stays fail-closed rather
+            # than inventing an average from the order book.
+            self._record_order_reconcile_query(
+                symbol=venue_sym,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                queried_endpoints=queried_endpoints,
+                response_classification="gate_fill_price_unavailable",
+                uncertain_subtype="execution_fields_unavailable",
+                next_action="reconcile_again_after_backoff",
+            )
+            return None
+
+        finished_time = _safe_float(raw.get("finish_time", raw.get("create_time", "0")))
+        filled_at_ms = (
+            int(finished_time * 1000) if finished_time > 0 else now_ms
+        )
+        result = OrderFillReconciliation(
+            venue=Venue.GATE,
+            symbol=venue_sym,
+            side=side,
+            quantity=executed,
+            average_price=average_price,
+            order_id=str(raw.get("id", order_id)),
+            client_order_id=client_order_id or None,
+            fee_quote=fee_quote,
+            filled_at_ms=filled_at_ms,
+            metadata={
+                "queried_endpoints": queried_endpoints,
+                "response_classification": "filled",
+                "evidence_source": "gate_order_status",
+                "fee_evidence_complete": fee_quote is not None,
+            },
+        )
+        self._record_order_reconcile_query(
+            symbol=venue_sym,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            queried_endpoints=queried_endpoints,
+            response_classification="filled",
+            next_action="clear_uncertain_state",
+        )
+        return result
 
     async def _fetch_bitget_order_history(
         self,

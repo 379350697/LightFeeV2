@@ -12915,3 +12915,162 @@ class TestBinanceAsterPrecisionFix:
         assert rule.qty_step == pytest.approx(1.0)
         assert rule.min_qty == pytest.approx(1.0)
         await transport.close()
+
+
+class TestGateOrderStatus:
+    """CL-154 family: gate orders must reconcile like every other venue.
+
+    Production 2026-09-19: the pending entry's gate hedge (order
+    103019842165780963, size -57, filled) reconciled as `uncertain` forever
+    because transport.fetch_order_status had no GATE branch, which kept the
+    runtime fail-closed (owned_pending_entry_live_conflict) for days.
+    """
+
+    def _transport(self):
+        from lightfee.venues.specs import gate_spec
+        from lightfee.venues.transport import VenueTransport, LiveCredential
+
+        return VenueTransport(
+            spec=gate_spec(),
+            mode="live",
+            credential=LiveCredential(api_key="k", api_secret="s"),
+        )
+
+    async def _stub(self, transport, handler):
+        async def fake_request(method, path, params=None, **kwargs):
+            return await handler(method, path, params or {})
+
+        transport._request = fake_request
+
+    @pytest.mark.asyncio
+    async def test_filled_sell_order_returns_fee_complete_reconciliation(self):
+        transport = self._transport()
+
+        async def handler(method, path, params):
+            if path == "/api/v4/futures/usdt/orders/103019842165780963":
+                return {
+                    "id": 103019842165780963,
+                    "contract": "LSK_USDT",
+                    "size": -57,
+                    "left": 0,
+                    "status": "finished",
+                    "fill_price": "0.4345",
+                    "finish_as": "filled",
+                    "create_time": 1789680720.123,
+                    "finish_time": 1789680781.5,
+                }
+            if path == "/api/v4/futures/usdt/my_trades":
+                assert params.get("contract") == "LSK_USDT"
+                assert params.get("order_id") == "103019842165780963"
+                return [
+                    {"order_id": 103019842165780963, "size": -30, "price": "0.4345", "commission": "0.0065"},
+                    {"order_id": 103019842165780963, "size": -27, "price": "0.4346", "commission": "0.0059"},
+                ]
+            raise AssertionError(f"unexpected path {path}")
+
+        await self._stub(transport, handler)
+        result = await transport.fetch_order_status(
+            "LSKUSDT", order_id="103019842165780963"
+        )
+
+        assert result is not None
+        assert result.quantity == 57.0
+        assert result.side == Side.SELL
+        assert result.average_price == pytest.approx(0.4345)
+        assert result.order_id == "103019842165780963"
+        assert result.fee_quote == pytest.approx(0.0065 + 0.0059)
+        assert result.metadata["fee_evidence_complete"] is True
+        assert result.metadata["evidence_source"] == "gate_order_status"
+        assert "/api/v4/futures/usdt/my_trades" in result.metadata["queried_endpoints"]
+
+    @pytest.mark.asyncio
+    async def test_open_order_with_zero_fill_is_not_fill_evidence(self):
+        transport = self._transport()
+
+        async def handler(method, path, params):
+            if path == "/api/v4/futures/usdt/orders/1":
+                return {"id": 1, "contract": "LSK_USDT", "size": 36, "left": 36, "status": "open"}
+            raise AssertionError(f"unexpected path {path}")
+
+        await self._stub(transport, handler)
+        result = await transport.fetch_order_status("LSKUSDT", order_id="1")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_order_with_leftover_is_partial_or_none_not_crash(self):
+        transport = self._transport()
+
+        async def handler(method, path, params):
+            if path == "/api/v4/futures/usdt/orders/2":
+                return {
+                    "id": 2, "contract": "LSK_USDT", "size": -57, "left": -22,
+                    "status": "finished", "finish_as": "cancelled",
+                    "fill_price": "0", "finish_time": 1789680781.5,
+                }
+            if path == "/api/v4/futures/usdt/my_trades":
+                return [{"order_id": 2, "size": -35, "price": "0.40", "commission": "0.007"}]
+            raise AssertionError(f"unexpected path {path}")
+
+        await self._stub(transport, handler)
+        result = await transport.fetch_order_status("LSKUSDT", order_id="2")
+        # A finished order with 35 executed still carries real fill truth.
+        assert result is not None
+        assert result.quantity == 35.0
+        assert result.average_price == pytest.approx(0.40)
+
+    @pytest.mark.asyncio
+    async def test_order_not_found_returns_none_fail_closed(self):
+        transport = self._transport()
+
+        async def handler(method, path, params):
+            if path == "/api/v4/futures/usdt/orders/404":
+                raise TransportError(
+                    TransportErrorCategory.REQUEST_REJECTED,
+                    "HTTP 404: {\"label\":\"ORDER_NOT_FOUND\"}",
+                    status_code=404,
+                    body='{"label":"ORDER_NOT_FOUND"}',
+                )
+            raise AssertionError(f"unexpected path {path}")
+
+        await self._stub(transport, handler)
+        result = await transport.fetch_order_status("LSKUSDT", order_id="404")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_client_order_id_only_lookup_is_not_queryable(self):
+        transport = self._transport()
+
+        async def handler(method, path, params):
+            raise AssertionError("gate has no client-order-id wire query")
+
+        await self._stub(transport, handler)
+        result = await transport.fetch_order_status(
+            "LSKUSDT", order_id="", client_order_id="lfex-abc"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_adapter_delegates_to_transport(self):
+        from lightfee.core.domain import OrderFillReconciliation
+        from lightfee.venues.gate import GateAdapter
+
+        adapter = GateAdapter(mode="live", credential=LiveCredential(api_key="k", api_secret="s"))
+        expected = OrderFillReconciliation(
+            venue=Venue.GATE,
+            symbol="LSK_USDT",
+            side=Side.SELL,
+            quantity=57.0,
+            average_price=0.4345,
+            order_id="103019842165780963",
+        )
+
+        async def fake_fetch_order_status(symbol, *, order_id="", client_order_id=""):
+            assert order_id == "103019842165780963"
+            return expected
+
+        adapter._transport.fetch_order_status = fake_fetch_order_status
+        result = await adapter.fetch_order_fill_reconciliation(
+            "LSKUSDT", "103019842165780963", "ignored"
+        )
+        assert result is expected
+        await adapter._transport.close()

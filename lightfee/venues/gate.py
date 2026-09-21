@@ -11,6 +11,7 @@ from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
 from lightfee.core.domain import (
     AccountFeeSnapshot,
     OrderFill,
+    OrderFillReconciliation,
     OrderRequest,
     PositionSnapshot,
     Venue,
@@ -234,6 +235,19 @@ class GateAdapter(VenueAdapter):
 
     async def fetch_account_risk_snapshot(self):
         return await self._transport.fetch_account_risk_snapshot()
+
+    async def fetch_order_fill_reconciliation(
+        self,
+        symbol: str,
+        order_id: str,
+        client_order_id: Optional[str] = None,
+    ) -> Optional[OrderFillReconciliation]:
+        # Gate keeps no client order id on futures orders: identity is the
+        # exchange order id, and the transport branch enriches the order row
+        # with the order's own my_trades commission.
+        return await self._transport.fetch_order_status(
+            symbol, order_id=order_id, client_order_id=client_order_id or ""
+        )
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
