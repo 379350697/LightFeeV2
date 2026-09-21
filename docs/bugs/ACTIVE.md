@@ -34,7 +34,7 @@ production-evidence cell.
 
 ## Deployment Record
 
-- Last production SHA checked: `9d1e3ca8`
+- Last production SHA checked: `33906421`
 - Checked on: `2026-09-21 22:3x`. 两步处置：(1) CL-157 `80ba91b4`（gate
   order-status 对账分支 + 适配器方法，TestGateOrderStatus RED/GREEN，
   transport 502 通过）部署后，gate 对冲单 103019842165780963 经新端点
