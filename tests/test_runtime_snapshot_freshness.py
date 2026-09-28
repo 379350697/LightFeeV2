@@ -43,6 +43,10 @@ class CapturingEntryExecutor:
 class OkxMetadataAdapter:
     okx_base_quantity_step = 0.0
     trading_capability_trusted = True
+    supports_entry_leverage_preparation = True
+
+    async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+        pass
 
     def passive_metadata(self, symbol: str) -> dict:
         return {
@@ -61,6 +65,10 @@ class OkxMetadataAdapter:
 
 class BybitMetadataAdapter:
     trading_capability_trusted = True
+    supports_entry_leverage_preparation = True
+
+    async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+        pass
 
     def passive_metadata(self, symbol: str) -> dict:
         return {

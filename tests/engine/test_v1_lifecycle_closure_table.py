@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from lightfee.engine.loop_control import _export_current_state_snapshot
 from lightfee.engine.state import EngineState
 from lightfee.ops.production_health import analyze_current_state
@@ -8,6 +10,115 @@ from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from scripts.diagnose_live import _build_production_acceptance_gate
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("shape", ["root_error", "venue_error", "symbol_error", "list_error", "bad_row", "mixed_position", "mixed_order"])
+def test_exchange_evidence_normalization_preserves_gaps_and_live_artifacts(shape):
+    from lightfee.engine.recovery_decision_core import RecoveryEvidenceSnapshot, V1RecoveryDecisionCore
+    from lightfee.engine.recovery_ledger import RecoveryLedger
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    error = {"error": "endpoint unavailable"}
+    truth = {"truth_scope": "account", "truth_supported": True, "truth_available": True,
+             "positions": {}, "open_orders": {}}
+    if shape == "root_error":
+        truth["positions"] = error
+    elif shape == "venue_error":
+        truth["positions"] = {"gate": error}
+    elif shape == "symbol_error":
+        truth["positions"] = {"gate": {"SAGAUSDT": error}}
+    elif shape == "list_error":
+        truth["positions"] = [error]
+    elif shape == "bad_row":
+        truth["positions"] = {"gate": {"SAGAUSDT": {"quantity": "invalid", "side": "long"}}}
+    elif shape == "mixed_position":
+        truth["positions"] = {"binance": error, "gate": {"SAGAUSDT": {
+            "quantity": 501, "side": "long", "error": "row annotation"}}}
+    else:
+        truth["positions"] = {"gate": error}
+        truth["open_orders"] = {"binance": {"SAGAUSDT": [{
+            "order_id": "live", "quantity": 1, "error": "row annotation"}]}}
+    blocked = shape in {"bad_row", "mixed_position", "mixed_order"}
+    ledger = RecoveryLedger.from_local_and_exchange_truth(local={}, exchange_truth=truth)
+    direct = V1RecoveryDecisionCore().decide(RecoveryEvidenceSnapshot(exchange_truth=truth))
+    summary = build_v1_lifecycle_closure_table(local_state={}, exchange_truth=truth).summary
+
+    assert direct.entry_allowed is (not blocked)
+    assert summary["entry_allowed"] is (not blocked)
+    assert summary["recovery_decision_kind"] == direct.kind.value
+    assert any(item.blocks_all_new_entries for item in ledger.work_items) is blocked
+    assert sum(len(item.artifacts) for item in ledger.work_items) == int(blocked)
+    if not blocked:
+        assert direct.kind.value == "RUNNING_WITH_EVIDENCE_GAP"
+        assert not V1RecoveryDecisionCore.is_complete_account_flat_truth(truth)
+
+
+@pytest.mark.parametrize("coverage", ["complete", "symbols", "partial", "missing_orders"])
+@pytest.mark.parametrize("prior_block", [False, True])
+def test_missing_leg_requires_account_coverage_and_cannot_clear_prior_block(coverage, prior_block):
+    from lightfee.engine.recovery_ledger import RecoveryLedger
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    local = {"open_positions": [{"position_id": "pair", "symbol": "SAGAUSDT",
+        "long_venue": "gate", "short_venue": "binance", "long_quantity": 501, "short_quantity": 501}]}
+    if prior_block:
+        local["recovery_blocked_reason"] = "unpaired_live_position"
+    truth = {"truth_scope": "account", "truth_supported": True, "truth_available": True,
+             "positions": [{"venue": "gate", "symbol": "SAGAUSDT", "side": "long", "quantity": 501}],
+             "open_orders": []}
+    if coverage == "symbols":
+        truth["truth_scope"] = "symbols"
+    elif coverage == "partial":
+        truth["positions"].append({"error": "binance unavailable"})
+    elif coverage == "missing_orders":
+        truth.pop("open_orders")
+    ledger = RecoveryLedger.from_local_and_exchange_truth(local=local, exchange_truth=truth)
+    missing = [a for item in ledger.work_items for a in item.artifacts if a.kind == "missing_position"]
+    summary = build_v1_lifecycle_closure_table(local_state=local, exchange_truth=truth).summary
+    assert len(missing) == int(coverage == "complete")
+    assert summary["entry_allowed"] is (coverage != "complete" and not prior_block)
+
+
+def test_legacy_export_quantity_does_not_prove_each_live_leg_owned():
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    summary = build_v1_lifecycle_closure_table(
+        local_state={"positions": [{"position_id": "legacy", "symbol": "SAGAUSDT",
+            "long_venue": "gate", "short_venue": "binance", "quantity": 501}]},
+        exchange_truth={"positions": [{"venue": "gate", "symbol": "SAGAUSDT", "side": "long", "quantity": 501}],
+                        "open_orders": [], "truth_available": True},
+    ).summary
+    assert summary["entry_allowed"] is False
+    assert summary["recovery_block_reason"] == "unpaired_live_position"
+
+
+@pytest.mark.parametrize("owner_kind", ["none", "residual", "passive_close"])
+@pytest.mark.parametrize("short_quantity", [0, 300])
+def test_unbalanced_open_requires_existing_recovery_owner(owner_kind, short_quantity):
+    from lightfee.core.domain import Venue
+    from lightfee.engine.recovery import ResidualExposureTask
+    from lightfee.engine.state import OpenPosition, PendingPassiveClose
+    from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+
+    position = OpenPosition(position_id="pair", symbol="SAGAUSDT", long_venue=Venue.GATE,
+        short_venue=Venue.BINANCE, long_quantity=501, short_quantity=short_quantity,
+        long_entry_price=.05, short_entry_price=.05, opened_at_ms=1)
+    state = EngineState()
+    state.open_positions[position.position_id] = position
+    if owner_kind == "residual":
+        state.pending_residual_repairs.append(ResidualExposureTask(position_id="pair", pair_id="pair",
+            symbol="SAGAUSDT", long_venue="gate", short_venue="binance", origin="live_recovery",
+            repair_venue="gate", repair_side="sell", repair_quantity=501-short_quantity))
+    elif owner_kind == "passive_close":
+        state.pending_passive_closes["pair"] = PendingPassiveClose(position_id="pair", reason="close", position_snapshot=position)
+    positions = [{"venue": "gate", "symbol": "SAGAUSDT", "side": "long", "quantity": 501}]
+    if short_quantity:
+        positions.append({"venue": "binance", "symbol": "SAGAUSDT", "side": "short", "quantity": short_quantity})
+    summary = build_v1_lifecycle_closure_table(local_state=state,
+        exchange_truth={"truth_scope": "account", "truth_supported": True, "truth_available": True,
+                        "positions": positions, "open_orders": []}).summary
+    assert summary["entry_allowed"] is False
+    assert summary["recovery_block_reason"] == ("unpaired_live_position" if owner_kind == "none" else "owned_recovery_work")
 
 
 def _clean_exchange_truth():
@@ -568,24 +679,24 @@ def test_recent_cloud_event_kinds_are_mapped_or_diagnostic_only():
     )
 
 
-def test_exported_positions_alias_prevents_diagnose_orphan_drift():
+def test_exported_positions_alias_prevents_diagnose_orphan_drift(tmp_path):
     from lightfee.engine.v1_lifecycle_closure import build_v1_lifecycle_closure_table
+    from lightfee.engine.state import OpenPosition
+    from lightfee.core.domain import Venue
 
+    state = EngineState(lifecycle=EngineLifecycle.RISK_ONLY, risk_mode=GlobalRiskMode.RUNNING)
+    position = OpenPosition(position_id="entry-1781286800856-HOMEUSDT", symbol="HOMEUSDT",
+        long_venue=Venue.OKX, short_venue=Venue.BYBIT, long_quantity=1500, short_quantity=1500,
+        long_entry_price=.01, short_entry_price=.01, opened_at_ms=1)
+    state.open_positions[position.position_id] = position
+    path = tmp_path / "current.json"
+    _export_current_state_snapshot(state, str(path))
+    payload = json.loads(path.read_text())
+    assert payload["open_positions"][0]["long_quantity"] == 1500
+    assert payload["open_positions"][0]["short_quantity"] == 1500
+    payload["positions"] = payload.pop("open_positions")
     table = build_v1_lifecycle_closure_table(
-        local_state={
-            "lifecycle": "risk_only",
-            "risk_mode": "running",
-            "open_position_count": 1,
-            "positions": [
-                {
-                    "position_id": "entry-1781286800856-HOMEUSDT",
-                    "symbol": "HOMEUSDT",
-                    "long_venue": "okx",
-                    "short_venue": "bybit",
-                    "quantity": 1500.0,
-                }
-            ],
-        },
+        local_state=payload,
         exchange_truth={
             "available": True,
             "truth_available": True,

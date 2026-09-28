@@ -898,6 +898,8 @@ def analyze_current_state(
         else ""
     )
     recovery_decision = _recovery_decision_payload(state, exchange_truth)
+    if recovery_decision["diagnostic_severity"] == "critical":
+        fingerprints.append("recovery_decision_critical")
     reconciliation_summary = state.get("pending_close_reconciliation_summary")
     pending_close_reconciliation_unknown_count = (
         int(reconciliation_summary.get("unknown_status_count") or 0)

@@ -41,6 +41,381 @@ from lightfee.venues.transport import TransportError, TransportErrorCategory
 from tests.fake_adapters import FakeVenueAdapter, make_fake_fill, make_uncertain_error
 
 
+@pytest.mark.asyncio
+async def test_pending_reconcile_diagnostic_preserves_cached_critical_context(config, tmp_journal):
+    from lightfee.engine.recovery_decision_core import RecoveryEvidenceSnapshot, V1RecoveryDecisionCore
+
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: FakeVenueAdapter(Venue.GATE)})
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(PositionReconciliationResult(position_id="diagnostic", symbol="SAGAUSDT"))
+    runtime.state.lifecycle = EngineLifecycle.RECONCILING
+    runtime.state.recovery_blocked_reason = "historical_block_for_diagnosis"
+    runtime.recovery_decision = V1RecoveryDecisionCore().decide(RecoveryEvidenceSnapshot(operator_fail_closed=True))
+    await runtime._reconcile_pending_state(3000)
+    payload = next(e["payload"] for e in tmp_journal.read_all() if e["kind"] == "runtime.reconciling_complete")
+    assert payload["lifecycle_writer"] == "PendingEntryRuntime._reconcile_pending_state"
+    assert payload["lifecycle_before"] == "reconciling"
+    assert payload["lifecycle_after"] == "running"
+    assert payload["recovery_blocked_reason_after"] == "historical_block_for_diagnosis"
+    assert payload["recovery_decision_source"] == "cached"
+    assert payload["recovery_decision"]["diagnostic_severity"] == "critical"
+    assert payload["recovery_decision"]["entry_allowed"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actual_side", [Side.BUY, Side.SELL])
+async def test_owned_wrong_direction_live_leg_is_not_lost(config, tmp_journal, actual_side):
+    _mark_live(config)
+    gate = _OwnedConflictCleanupAdapter(Venue.GATE)
+    binance = _OwnedConflictCleanupAdapter(Venue.BINANCE)
+    live = PositionSnapshot(venue=Venue.GATE, symbol="SAGAUSDT", side=actual_side,
+                            quantity=501, entry_price=.048207, observed_at_ms=1790349000000)
+    gate.position_snapshots = [live, live]
+    gate.default_position_qty = 0
+    runtime = LiveRuntime(config, venue_adapters={Venue.BINANCE: binance, Venue.GATE: gate})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="entry-saga-audit", symbol="SAGAUSDT",
+                            long_venue=Venue.BINANCE, short_venue=Venue.GATE,
+                            target_quantity=501, maker_leg="short", maker_leg_filled=501,
+                            hedge_leg_filled=501, maker_fill_price=.048207,
+                            hedge_fill_price=.04812, maker_order_id="160159262129906499")
+    runtime.state.pending_entries[pending.pending_id] = pending
+    done = await runtime._finalize_pending_entry(pending, pending.pending_id, 1790349000000)
+    assert done
+    assert gate.last_request.reduce_only
+    assert gate.last_request.side == actual_side.opposite()
+    assert gate.last_request.quantity == pytest.approx(501)
+    assert not binance.place_order_call_count
+    assert pending.pending_id not in runtime.state.pending_entries
+    assert not runtime.state.open_positions
+
+
+@pytest.mark.asyncio
+async def test_partial_live_truth_preserves_known_opposite_exposure(config, tmp_journal):
+    _mark_live(config)
+    gate = _OwnedConflictCleanupAdapter(Venue.GATE)
+    gate.default_position_side = Side.BUY
+    gate.default_position_qty = 501
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="entry-saga-partial", symbol="SAGAUSDT",
+                            long_venue=Venue.BINANCE, short_venue=Venue.GATE,
+                            maker_leg="short", maker_leg_filled=501, hedge_leg_filled=501)
+    truth = await runtime._pending_entry_positive_fill_live_truth(pending, pending.pending_id, 1790349000000)
+    assert not truth.available
+    assert truth.has_live_position
+    assert truth.live_positions[0].quantity == 501
+    assert truth.live_positions[0].side == Side.BUY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue,artifact,phase", [
+    (Venue.GATE, "timeout", "before"),
+    (Venue.BINANCE, "timeout", "before"),
+    (Venue.GATE, "maker_cid", "before"),
+    (Venue.GATE, "orphan", "before"),
+    (Venue.BINANCE, "hedge", "before"),
+    (Venue.GATE, "malformed", "before"),
+    (Venue.GATE, "timeout", "after"),
+    (Venue.BINANCE, "timeout", "after"),
+    (Venue.GATE, "orphan", "after"),
+    (Venue.BINANCE, "hedge", "after"),
+])
+async def test_live_cleanup_requires_complete_pair_order_truth(
+    config, tmp_journal, venue, artifact, phase,
+):
+    _mark_live(config)
+
+    class Orders(_OwnedConflictCleanupAdapter):
+        async def fetch_open_orders(self, symbol):
+            active = phase == "before" or gate.place_order_call_count > 0
+            if self.venue != venue or not active:
+                return []
+            if artifact == "timeout":
+                raise RuntimeError("open-orders timeout")
+            if artifact == "malformed":
+                return [{}]
+            if venue == Venue.GATE:
+                return [{"id": "123" if artifact == "maker_cid" else "999",
+                         "contract": "SAGA_USDT", "text": "t-maker-cid" if artifact == "maker_cid" else "t-other",
+                         "size": "501", "left": "501", "status": "open"}]
+            return [{"orderId": "hedge-1", "symbol": "SAGAUSDT", "status": "NEW"}]
+
+    gate, binance = Orders(Venue.GATE), Orders(Venue.BINANCE)
+    live = PositionSnapshot(venue=Venue.GATE, symbol="SAGAUSDT", side=Side.BUY,
+                            quantity=501, entry_price=.048, observed_at_ms=1000)
+    gate.position_snapshots = [live, live]
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate, Venue.BINANCE: binance})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="order-evidence", symbol="SAGAUSDT",
+                            long_venue=Venue.BINANCE, short_venue=Venue.GATE,
+                            target_quantity=501, maker_leg="short", maker_leg_filled=501,
+                            hedge_leg_filled=501, maker_fill_price=.048, hedge_fill_price=.048,
+                            maker_order_id="" if artifact == "maker_cid" else "123",
+                            hedge_order_id="hedge-1")
+    runtime.state.pending_entries[pending.pending_id] = pending
+    done = await runtime._finalize_pending_entry(pending, pending.pending_id, 1000)
+    assert not done
+    assert gate.place_order_call_count == (1 if phase == "after" else 0)
+    assert not binance.place_order_call_count
+    assert pending.pending_id in runtime.state.pending_entries
+    assert not runtime.state.open_positions
+
+
+@pytest.mark.asyncio
+async def test_gate_cid_order_identity_reaches_maker_matcher(config, tmp_journal):
+    _mark_live(config)
+
+    class Orders(_OwnedConflictCleanupAdapter):
+        async def fetch_open_orders(self, symbol):
+            return [{"id": "123", "contract": "SAGA_USDT", "text": "t-maker-cid",
+                     "size": "501", "left": "501", "status": "open"}]
+
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: Orders(Venue.GATE)})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(symbol="SAGAUSDT", long_venue=Venue.BINANCE,
+                            short_venue=Venue.GATE, maker_leg="short", maker_order_id="")
+    truth = await runtime._pending_entry_zero_fill_has_live_maker_open_order(pending, pending.pending_id, 1000)
+    assert truth.available
+    assert truth.has_live_open_order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["finalize", "known_zero", "rejected", "force", "stale", "remove", "abort"])
+@pytest.mark.parametrize("artifact", ["flat", "maker_order", "hedge_order", "hedge_position", "missing_adapter", "order_error", "position_error"])
+async def test_all_live_pending_release_routes_require_pair_truth(config, tmp_journal, route, artifact):
+    _mark_live(config)
+
+    class Adapter(_TerminalNoFillClearOpenOrdersFlatPositionAdapter):
+        async def fetch_open_orders(self, symbol):
+            self.open_order_calls.append(symbol)
+            if self.venue == Venue.BINANCE and artifact == "order_error":
+                raise RuntimeError("order evidence unavailable")
+            if ((self.venue == Venue.GATE and artifact == "maker_order")
+                    or (self.venue == Venue.BINANCE and artifact == "hedge_order")):
+                return [{"id": "orphan", "contract": "SAGA_USDT", "text": "t-orphan"}]
+            return []
+
+        async def fetch_position(self, symbol):
+            if self.venue == Venue.BINANCE and artifact == "position_error":
+                raise RuntimeError("position evidence unavailable")
+            position = await super().fetch_position(symbol)
+            if self.venue == Venue.BINANCE and artifact == "hedge_position":
+                return PositionSnapshot(venue=self.venue, symbol=symbol, side=Side.BUY,
+                                        quantity=501, entry_price=.048, observed_at_ms=1000)
+            return position
+
+    gate, hedge = Adapter(venue=Venue.GATE), Adapter(venue=Venue.BINANCE)
+    adapters = {Venue.GATE: gate, Venue.BINANCE: hedge}
+    if artifact == "missing_adapter":
+        del adapters[Venue.BINANCE]
+    runtime = LiveRuntime(config, venue_adapters=adapters)
+    runtime.journal = tmp_journal
+    runtime.reconciler = _CapturingReconciler(PositionReconciliationResult(
+        position_id="release-proof", symbol="SAGAUSDT", long_status="uncertain",
+        short_status="uncertain", is_flat=False))
+    pending = _pending_entry(pending_id="release-proof", symbol="SAGAUSDT",
+        long_venue=Venue.BINANCE, short_venue=Venue.GATE, maker_leg="short",
+        target_quantity=501, maker_order_id="123", hedge_order_id="hedge-1",
+        uncertain_outcome=route not in {"known_zero", "force"},
+        outcome="rejected" if route == "rejected" else "uncertain",
+        maker_leg_filled=501 if route in {"stale", "abort"} else 0,
+        hedge_leg_filled=501 if route == "stale" else 0,
+        reconcile_attempt=1 if route == "stale" else 0)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    if route == "finalize":
+        done = await runtime._finalize_pending_entry(pending, pending.pending_id, 1000)
+        assert done == (artifact == "flat")
+    elif route == "force":
+        await runtime._reconcile_pending_entries_force(1000)
+    elif route == "remove":
+        await runtime._complete_pending_entry_terminal_removal(pending.pending_id, reason="test-terminal", now_ms=1000)
+    elif route == "abort":
+        done = await runtime._abort_pending_entry(pending, pending.pending_id, "test-abort")
+        assert done == (artifact == "flat")
+    else:
+        await runtime._reconcile_pending_state(1000)
+    assert (pending.pending_id not in runtime.state.pending_entries) == (artifact == "flat")
+    closures = [e for e in tmp_journal.read_all() if e["kind"] == "pending_entry.removed_by_v1_lifecycle_closure"]
+    assert bool(closures) == (artifact == "flat")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("successor_kind", ["open", "residual"])
+@pytest.mark.parametrize("evidence", ["complete", "order", "unavailable", "wrong_side", "undersized"])
+async def test_live_pending_transfer_requires_successor_and_order_evidence(config, tmp_journal, successor_kind, evidence):
+    _mark_live(config)
+    class Adapter(_OwnedConflictCleanupAdapter):
+        async def fetch_open_orders(self, symbol):
+            if evidence == "unavailable":
+                raise RuntimeError("order evidence unavailable")
+            return [{"id": "resting", "contract": "SAGA_USDT"}] if evidence == "order" else []
+    gate, hedge = Adapter(Venue.GATE), Adapter(Venue.BINANCE)
+    gate.default_position_qty = 501
+    gate.default_position_side = Side.SELL if evidence != "wrong_side" else Side.BUY
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate, Venue.BINANCE: hedge})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="transfer-proof", symbol="SAGAUSDT",
+        long_venue=Venue.BINANCE, short_venue=Venue.GATE, maker_leg="short", maker_leg_filled=501)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    qty = 500 if evidence == "undersized" else 501
+    if successor_kind == "open":
+        runtime.state.open_positions[pending.pending_id] = _open_position(
+            position_id=pending.pending_id, symbol=pending.symbol,
+            long_venue=pending.long_venue, short_venue=pending.short_venue,
+            long_quantity=qty, short_quantity=qty)
+    else:
+        runtime.state.pending_residual_repairs = [{"position_id": pending.pending_id,
+            "symbol": pending.symbol, "repair_venue": "gate", "repair_side": "buy", "repair_quantity": qty}]
+    done = await runtime._complete_pending_entry_terminal_removal(pending.pending_id, reason="test-transfer", now_ms=1000)
+    assert done == (evidence == "complete")
+    assert (pending.pending_id not in runtime.state.pending_entries) == (evidence == "complete")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fills,prior_quantity", [
+    ((500, 500), None), ((501, 500), None), ((501, 0), None),
+    ((501, 501), 500), ((501, 500), 499), ((500, 500), 501),
+])
+@pytest.mark.parametrize("evidence", ["complete", "undersized", "open_order", "unavailable"])
+async def test_pending_successor_publication_is_safe_at_every_replay_prefix(
+    config, tmp_journal, fills, prior_quantity, evidence,
+):
+    import copy
+    from lightfee.engine.recovery import (
+        _apply_journal_replay_to_state, build_persistent_state_view, recover_from_snapshot,
+    )
+
+    _mark_live(config)
+
+    class Adapter(_OwnedConflictCleanupAdapter):
+        async def fetch_open_orders(self, symbol):
+            if evidence == "unavailable":
+                raise RuntimeError("order truth unavailable")
+            return [{"id": "orphan", "contract": "SAGA_USDT"}] if evidence == "open_order" else []
+
+    maker, hedge = Adapter(Venue.GATE), Adapter(Venue.BINANCE)
+    maker.default_position_qty = fills[0] + (1 if evidence == "undersized" else 0)
+    maker.default_position_side = Side.SELL
+    hedge.default_position_qty = fills[1]
+    hedge.default_position_side = Side.BUY
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: maker, Venue.BINANCE: hedge})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="durable-transfer", symbol="SAGAUSDT",
+        long_venue=Venue.BINANCE, short_venue=Venue.GATE, maker_leg="short",
+        target_quantity=501, maker_leg_filled=fills[0], hedge_leg_filled=fills[1],
+        maker_fill_price=.048, hedge_fill_price=.048, uncertain_outcome=True)
+    pending.passive_order = PendingPassiveOrder(
+        order_id=pending.maker_order_id, client_order_id=pending.maker_client_order_id,
+        target_quantity=fills[0], accepted_at_ms=1, timeout_at_ms=1000,
+        last_progress_state=PassiveOrderState.FILLED)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    if prior_quantity is not None:
+        runtime.state.open_positions[pending.pending_id] = _open_position(
+            position_id=pending.pending_id, symbol=pending.symbol,
+            long_venue=pending.long_venue, short_venue=pending.short_venue,
+            long_quantity=prior_quantity, short_quantity=prior_quantity)
+    before = copy.deepcopy(runtime.state)
+    # Superseded audit history must stay before the snapshot checkpoint.
+    tmp_journal.append_critical(1, "entry.opened", {
+        "position_id": "historical-already-closed", "long_quantity": 999,
+        "short_quantity": 999, "symbol": pending.symbol,
+    })
+    checkpoint_index = len(tmp_journal.read_all())
+    runtime.snapshot_store.write(build_persistent_state_view(
+        before, journal_checkpoint=tmp_journal.snapshot_checkpoint()))
+
+    done = await runtime._finalize_pending_entry(pending, pending.pending_id, 1000)
+    assert done == (evidence == "complete")
+    rows = tmp_journal.read_all()[checkpoint_index:]
+    for stop in range(len(rows) + 1):
+        restored = copy.deepcopy(before)
+        _apply_journal_replay_to_state(restored, rows[:stop])
+        if pending.pending_id in restored.pending_entries:
+            continue
+        assert evidence == "complete", (stop, rows[:stop])
+        position = restored.open_positions.get(pending.pending_id)
+        maker_covered = position.short_quantity if position is not None else 0
+        hedge_covered = position.long_quantity if position is not None else 0
+        for task in restored.pending_residual_repairs:
+            venue, side, quantity = runtime._pending_residual_repair_fields(task)
+            assert venue == Venue.GATE and side == Side.BUY
+            maker_covered += quantity
+        assert maker_covered == pytest.approx(fills[0]), (stop, rows[:stop])
+        assert hedge_covered == pytest.approx(fills[1]), (stop, rows[:stop])
+    if evidence != "complete":
+        assert runtime.state.open_positions == before.open_positions
+        assert not runtime.state.pending_residual_repairs
+        assert not any(e["kind"] == "entry.opened" for e in rows)
+    else:
+        assert pending.pending_id not in runtime.state.pending_entries
+        assert pending.pending_id not in restored.pending_entries
+
+    for _ in range(2):
+        recovered = recover_from_snapshot(runtime.snapshot_store, tmp_journal)
+        assert "historical-already-closed" not in recovered.open_positions
+        assert (pending.pending_id in recovered.pending_entries) == (evidence != "complete")
+        for pid, position in runtime.state.open_positions.items():
+            assert recovered.open_positions[pid].long_quantity == position.long_quantity
+            assert recovered.open_positions[pid].short_quantity == position.short_quantity
+            assert recovered.open_positions[pid].long_entry_price == position.long_entry_price
+        assert recovered.pending_residual_repairs == runtime.state.pending_residual_repairs
+    if evidence == "complete":
+        tmp_journal.append_critical(2000, "exit.closed", {"position_id": pending.pending_id})
+        for _ in range(2):
+            recovered = recover_from_snapshot(runtime.snapshot_store, tmp_journal)
+            assert not recovered.open_positions
+            assert not recovered.pending_entries
+            assert not recovered.pending_residual_repairs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["two_live_legs", "residual_owner", "other_pending", "missing_owner", "unknown_hedge"])
+async def test_owned_conflict_cleanup_keeps_ambiguous_owner(config, tmp_journal, blocker):
+    _mark_live(config)
+    gate = _OwnedConflictCleanupAdapter(Venue.GATE)
+    gate.default_position_qty = 501
+    gate.default_position_side = Side.BUY
+    binance = _OwnedConflictCleanupAdapter(Venue.BINANCE)
+    if blocker == "two_live_legs":
+        binance.default_position_qty = 501
+    adapters = {Venue.GATE: gate, Venue.BINANCE: binance}
+    if blocker == "unknown_hedge":
+        adapters.pop(Venue.BINANCE)
+    runtime = LiveRuntime(config, venue_adapters=adapters)
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="entry-owner-check", symbol="SAGAUSDT",
+                            long_venue=Venue.BINANCE, short_venue=Venue.GATE,
+                            target_quantity=501, maker_leg="short", maker_leg_filled=501,
+                            hedge_leg_filled=501, maker_fill_price=.048, hedge_fill_price=.048)
+    if blocker != "missing_owner":
+        runtime.state.pending_entries[pending.pending_id] = pending
+    if blocker == "residual_owner":
+        runtime.state.pending_residual_repairs = [{"symbol": "SAGAUSDT", "venue": "gate", "repair_id": "other"}]
+    if blocker == "other_pending":
+        runtime.state.pending_entries["other"] = _pending_entry(pending_id="other", symbol="SAGAUSDT")
+    done = await runtime._finalize_pending_entry(pending, pending.pending_id, 1000)
+    assert not done
+    assert gate.place_order_call_count == 0
+    assert binance.place_order_call_count == 0
+    if blocker != "missing_owner":
+        assert pending.pending_id in runtime.state.pending_entries
+
+
+@pytest.mark.asyncio
+async def test_risk_capability_gap_is_logged_once_without_fetch(config, tmp_journal):
+    _mark_live(config)
+    gate = _OwnedConflictCleanupAdapter(Venue.GATE)
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate})
+    runtime.journal = tmp_journal
+    for now in (1000, 2000):
+        assert await runtime._fetch_venue_risk_snapshot(Venue.GATE, gate, False, now) == (None, False)
+    events = [e for e in tmp_journal.read_all() if e["kind"] == "runtime.risk_snapshot_capability"]
+    assert len(events) == 1
+    assert events[0]["payload"]["fetch_enabled"] is False
+    assert events[0]["payload"]["source"] == "adapter_capability"
+
+
 @pytest.fixture
 def tmp_journal(tmp_path):
     journal = Journal(str(tmp_path / "events.jsonl"))
@@ -479,6 +854,8 @@ def _pending_close_reconciliation(**overrides) -> dict:
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "long_entry_price": 1.0,
             "short_entry_price": 1.03,
             "total_entry_fee_quote": 0.0,
@@ -880,6 +1257,8 @@ async def test_pending_close_reconciliation_waits_until_next_live_cycle(config, 
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "total_entry_fee_quote": 0.0,
             "entry_fee_evidence_complete": True,
         },
@@ -968,6 +1347,8 @@ async def test_pending_close_reconciliation_drain_restores_running_lifecycle(
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "total_entry_fee_quote": 0.0,
             "entry_fee_evidence_complete": True,
         },
@@ -1022,6 +1403,8 @@ async def test_pending_close_reconciliation_keeps_flat_final_fill_evidence_debt_
             "symbol": "COTIUSDT",
             "long_venue": Venue.BINANCE.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "long_entry_price": 0.05,
             "short_entry_price": 0.051,
             "total_entry_fee_quote": 0.0,
@@ -1093,6 +1476,7 @@ async def test_pending_close_reconciliation_keeps_flat_final_fill_evidence_debt_
             order_id="binance-coti-close",
             client_order_id="binance-coti-close-cid",
             fee_quote=0.01,
+            metadata={"fee_evidence_complete": True},
             filled_at_ms=4000,
         )
     )
@@ -1106,6 +1490,7 @@ async def test_pending_close_reconciliation_keeps_flat_final_fill_evidence_debt_
             order_id="bybit-coti-close",
             client_order_id="bybit-coti-close-cid",
             fee_quote=0.01,
+            metadata={"fee_evidence_complete": True},
             filled_at_ms=4001,
         )
     )
@@ -1156,6 +1541,8 @@ async def test_journal_replay_revives_historical_flat_fill_abandonment_for_exact
             "symbol": "COTIUSDT",
             "long_venue": Venue.BINANCE.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "long_entry_price": 0.05,
             "short_entry_price": 0.051,
             "total_entry_fee_quote": 0.0,
@@ -1327,6 +1714,8 @@ async def test_pending_close_reconciliation_processor_keeps_ledger_for_single_di
             "symbol": "BABYUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
         },
         "long_legs": [{"venue": Venue.OKX.value, "order_id": "close-long"}],
         "short_legs": [
@@ -1852,6 +2241,8 @@ async def test_pending_close_reconciliation_fetches_all_v1_leg_records(
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "long_entry_price": 1.0,
             "short_entry_price": 1.05,
             "captured_funding_quote": 0.5,
@@ -1890,6 +2281,13 @@ async def test_pending_close_reconciliation_fetches_all_v1_leg_records(
     assert reconciled["evidence_gap"] is False
     assert reconciled["long_legs"][1]["order_id"] == "okx-close-2"
     assert reconciled["short_legs"][1]["order_id"] == "bybit-close-2"
+    assert reconciled["funding_pnl_source"] == "entry_edge_estimate"
+    assert reconciled["funding_statement_reconciled"] is False
+    lifecycle = next(record["payload"] for record in tmp_journal.read_all()
+                     if record["kind"] == "runtime.close_reconciliation_lifecycle_decision")
+    assert lifecycle["lifecycle_writer"] == "CloseRuntime._process_pending_close_reconciliations"
+    assert lifecycle["lifecycle_decision_reason"] == "no_active_or_pending_close_work"
+    assert lifecycle["pending_close_reconciliation_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1937,6 +2335,8 @@ async def test_pending_close_reconciliation_does_not_depend_on_entry_reconciler(
             "symbol": "BEATUSDT",
             "long_venue": Venue.OKX.value,
             "short_venue": Venue.BYBIT.value,
+            "long_quantity": 20.0,
+            "short_quantity": 20.0,
             "long_entry_price": 1.0,
             "short_entry_price": 1.03,
             "total_entry_fee_quote": 0.0,
@@ -2992,7 +3392,7 @@ async def test_live_zero_fill_open_order_match_routes_to_deferred_live_open_orde
     )
     runtime = LiveRuntime(
         config,
-        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: _TerminalNoFillClearOpenOrdersFlatPositionAdapter(venue=Venue.HYPERLIQUID)},
     )
     runtime.journal = tmp_journal
     pending = _pending_entry(
@@ -3022,7 +3422,7 @@ async def test_live_zero_fill_open_order_match_routes_to_deferred_live_open_orde
 
     events = tmp_journal.read_all()
     kinds = [event["kind"] for event in events]
-    assert "pending_entry.finalize_deferred_maker_open_order" in kinds
+    assert "pending_entry.pair_open_order_truth" in kinds
     decisions = [
         event["payload"]
         for event in events
@@ -3158,7 +3558,7 @@ async def test_live_terminal_zero_fill_with_clear_truth_allows_passive_unfilled(
     adapter = _TerminalNoFillClearOpenOrdersFlatPositionAdapter()
     runtime = LiveRuntime(
         config,
-        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: object()},
+        venue_adapters={Venue.BYBIT: adapter, Venue.HYPERLIQUID: _TerminalNoFillClearOpenOrdersFlatPositionAdapter(venue=Venue.HYPERLIQUID)},
     )
     runtime.journal = tmp_journal
     pending = _pending_entry(
@@ -3836,8 +4236,8 @@ async def test_positive_fill_finalize_defers_when_live_truth_is_flat(
     runtime = LiveRuntime(
         config,
         venue_adapters={
-            Venue.OKX: _LivePositionAdapter(flat_long),
-            Venue.BYBIT: _LivePositionAdapter(flat_short),
+            Venue.OKX: _LivePositionOpenOrdersAdapter(flat_long),
+            Venue.BYBIT: _LivePositionOpenOrdersAdapter(flat_short),
         },
     )
     runtime.journal = tmp_journal
@@ -4058,7 +4458,7 @@ async def test_positive_fill_finalize_records_balanced_live_truth_on_open(
     runtime = LiveRuntime(
         config,
         venue_adapters={
-            Venue.OKX: _LivePositionAdapter(PositionSnapshot(
+            Venue.OKX: _LivePositionOpenOrdersAdapter(PositionSnapshot(
                 venue=Venue.OKX,
                 symbol="HOMEUSDT",
                 side=Side.BUY,
@@ -4066,7 +4466,7 @@ async def test_positive_fill_finalize_records_balanced_live_truth_on_open(
                 entry_price=0.02852,
                 observed_at_ms=1781376760000,
             )),
-            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+            Venue.BYBIT: _LivePositionOpenOrdersAdapter(PositionSnapshot(
                 venue=Venue.BYBIT,
                 symbol="HOMEUSDT",
                 side=Side.SELL,
@@ -4130,7 +4530,7 @@ async def test_confirmed_replay_fill_finalizes_once_instead_of_erasing_owner(
     runtime = LiveRuntime(
         config,
         venue_adapters={
-            Venue.OKX: _LivePositionAdapter(PositionSnapshot(
+            Venue.OKX: _LivePositionOpenOrdersAdapter(PositionSnapshot(
                 venue=Venue.OKX,
                 symbol="HOMEUSDT",
                 side=Side.BUY,
@@ -4138,7 +4538,7 @@ async def test_confirmed_replay_fill_finalizes_once_instead_of_erasing_owner(
                 entry_price=0.02852,
                 observed_at_ms=1781376760000,
             )),
-            Venue.BYBIT: _LivePositionAdapter(PositionSnapshot(
+            Venue.BYBIT: _LivePositionOpenOrdersAdapter(PositionSnapshot(
                 venue=Venue.BYBIT,
                 symbol="HOMEUSDT",
                 side=Side.SELL,
@@ -5213,3 +5613,47 @@ async def test_finalize_zero_fill_does_not_query_planned_hedge_client_order_id(
 
     assert maker_adapter.fill_reconciliation_calls
     assert hedge_adapter.fill_reconciliation_calls == []
+
+
+@pytest.mark.parametrize("other_quantity", [500, 0, float("nan")])
+async def test_cleanup_protects_partial_or_unknown_competing_owner(config, tmp_journal, other_quantity):
+    _mark_live(config)
+    gate, binance = _OwnedConflictCleanupAdapter(Venue.GATE), _OwnedConflictCleanupAdapter(Venue.BINANCE)
+    gate.default_position_qty = 501
+    gate.default_position_side = Side.BUY
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate, Venue.BINANCE: binance})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="candidate", symbol="SAGAUSDT", long_venue=Venue.GATE,
+        short_venue=Venue.BINANCE, maker_leg="long", target_quantity=501, maker_leg_filled=501,
+        hedge_leg_filled=501, maker_fill_price=.05, hedge_fill_price=.05)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    runtime.state.open_positions["other"] = _open_position(position_id="other", symbol=pending.symbol,
+        long_venue=Venue.GATE, short_venue=Venue.BINANCE, long_quantity=other_quantity, short_quantity=0)
+    assert not await runtime._finalize_pending_entry(pending, pending.pending_id, 1000)
+    assert pending.pending_id in runtime.state.pending_entries
+    assert gate.place_order_call_count == binance.place_order_call_count == 0
+    assert any(e["payload"].get("reason") == "missing_or_competing_owner" for e in tmp_journal.read_all())
+
+
+@pytest.mark.parametrize("fees", [(0.1, 0.2), (0., 0.), (None, None)])
+async def test_pending_finalizer_journal_replays_full_position(config, tmp_journal, fees):
+    from lightfee.engine.recovery import build_persistent_state_view, recover_from_snapshot, _serialize_open_position
+    _mark_live(config)
+    gate, binance = _OwnedConflictCleanupAdapter(Venue.GATE), _OwnedConflictCleanupAdapter(Venue.BINANCE)
+    gate.default_position_qty = binance.default_position_qty = 501
+    gate.default_position_side, binance.default_position_side = Side.BUY, Side.SELL
+    runtime = LiveRuntime(config, venue_adapters={Venue.GATE: gate, Venue.BINANCE: binance})
+    runtime.journal = tmp_journal
+    pending = _pending_entry(pending_id="journal-complete", symbol="SAGAUSDT", long_venue=Venue.GATE,
+        short_venue=Venue.BINANCE, maker_leg="long", target_quantity=501, maker_leg_filled=501,
+        hedge_leg_filled=501, maker_fill_price=.05, hedge_fill_price=.05,
+        maker_fee_quote=fees[0], hedge_fee_quote=fees[1], first_funding_leg="long",
+        long_funding_timestamp_ms=10000, short_funding_timestamp_ms=20000)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    runtime.snapshot_store.write(build_persistent_state_view(runtime.state,
+        journal_checkpoint=tmp_journal.snapshot_checkpoint()))
+    assert await runtime._finalize_pending_entry(pending, pending.pending_id, 1000)
+    live = runtime.state.open_positions[pending.pending_id]
+    restored = recover_from_snapshot(runtime.snapshot_store, tmp_journal).open_positions[pending.pending_id]
+    assert _serialize_open_position(restored) == _serialize_open_position(live)
+    assert restored.entry_fee_evidence_complete is (fees[0] is not None)

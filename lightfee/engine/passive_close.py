@@ -53,7 +53,9 @@ from lightfee.engine.close_executor import (
     compute_close_chunks,
     register_close_accounting_reconciliation,
 )
-from lightfee.engine.lifecycle import enter_fail_closed
+from lightfee.engine.lifecycle import (
+    enter_fail_closed, lifecycle_diagnostic_fields, lifecycle_diagnostic_snapshot,
+)
 from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     is_order_truth_gap,
@@ -5838,6 +5840,7 @@ class PassiveCloseExecutor:
             dict(item) for item in state.pending_close_reconciliations
         ]
         failure_reason = "pending_close_reconciliation_registration_failed"
+        core_decision = None
         try:
             reconciliation_registered = False
             if not external_recovery_observation:
@@ -5917,6 +5920,7 @@ class PassiveCloseExecutor:
                         closure_fields=closure_fields,
                     )
         except Exception as error:
+            lifecycle_before_rollback = lifecycle_diagnostic_snapshot(state)
             state.pending_close_reconciliations = original_reconciliations
             if original_pending is missing:
                 state.pending_passive_closes.pop(pending.position_id, None)
@@ -5940,6 +5944,13 @@ class PassiveCloseExecutor:
                     "source": source,
                     "reason": failure_reason,
                     "error": str(error),
+                    **lifecycle_diagnostic_fields(
+                        state, lifecycle_before_rollback,
+                        writer="PassiveCloseExecutor._clear_live_flat_state.rollback",
+                        reason=failure_reason,
+                        core_decision=core_decision,
+                        core_decision_source="before_rollback",
+                    ),
                 },
             )
             return
@@ -7835,7 +7846,7 @@ class PassiveCloseExecutor:
 
         adapter = self._adapter(venue)
         transport = getattr(adapter, "_transport", None) if adapter is not None else None
-        if transport is not None and venue in (Venue.BYBIT, Venue.OKX):
+        if transport is not None and venue in (Venue.BYBIT, Venue.OKX, Venue.GATE):
             venue_symbol = symbol
             venue_symbol_fn = getattr(transport, "_venue_symbol", None)
             if callable(venue_symbol_fn):
@@ -7844,9 +7855,12 @@ class PassiveCloseExecutor:
                 except Exception:
                     venue_symbol = symbol
             try:
-                symbol_rule = await get_symbol_rules_cache().get(
-                    transport, venue, venue_symbol,
-                )
+                if venue == Venue.GATE:
+                    symbol_rule = await transport._gate_symbol_rule(venue_symbol)
+                else:
+                    symbol_rule = await get_symbol_rules_cache().get(
+                        transport, venue, venue_symbol,
+                    )
                 rule_source = str(getattr(symbol_rule, "rule_source", "") or "")
                 rule_min_notional = float(
                     getattr(symbol_rule, "min_notional", 0.0) or 0.0
@@ -7854,10 +7868,12 @@ class PassiveCloseExecutor:
                 if (
                     rule_source
                     and rule_source != "spec_fallback"
-                    and (rule_min_notional > 0.0 or venue == Venue.OKX)
+                    and (rule_min_notional > 0.0 or venue in (Venue.OKX, Venue.GATE))
                 ):
                     return rule_min_notional, rule_source
             except Exception:
+                if venue == Venue.GATE:
+                    raise
                 pass
 
         if venue in (Venue.BYBIT, Venue.OKX):

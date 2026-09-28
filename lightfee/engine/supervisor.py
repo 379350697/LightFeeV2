@@ -14,6 +14,7 @@ from lightfee.config.schema import AppConfig
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue
 from lightfee.engine.close_executor import CloseExecutor
+from lightfee.engine.lifecycle import lifecycle_diagnostic_fields, lifecycle_diagnostic_snapshot
 from lightfee.engine.risk_actions import (
     AccountRiskSnapshot,
     PositionRiskView,
@@ -51,8 +52,8 @@ class Supervisor:
         self.close_executor = close_executor
         # V1: current_venue_health_views (risk.rs)
         self._venue_health_views: dict[Venue, VenueHealthView] = {}
-        # V1: per-venue risk snapshot cache (set by runtime before each tick)
-        self._risk_snapshot_cache: dict[Venue, dict] = {}
+        # Runtime owns cache decoding and freshness; supervision receives domain snapshots.
+        self._risk_snapshots: dict[Venue, Optional[AccountRiskSnapshot]] = {}
         # V1: risk_warning_positions — positions currently in the warning state
         self.risk_warning_positions: set[str] = set()
 
@@ -112,7 +113,7 @@ class Supervisor:
                 continue
 
             # Risk snapshot
-            risk_snapshot = self._fetch_risk_snapshot_for_venue(venue, adapter, now_ms)
+            risk_snapshot = self._risk_snapshots.get(venue) if adapter.supports_risk_health else None
 
             # Private health
             supports_private = adapter.supports_private_health
@@ -169,6 +170,19 @@ class Supervisor:
                         "degraded": view.degraded,
                         "reasons": view.reasons,
                         "order_health_risk_score": view.order_health_risk_score,
+                        "supports_risk_health": adapter.supports_risk_health,
+                        "risk_snapshot_present": risk_snapshot is not None,
+                        "risk_snapshot_source": risk_snapshot.source if risk_snapshot is not None else None,
+                        "risk_snapshot_age_ms": risk_snapshot.age_ms(now_ms) if risk_snapshot is not None else None,
+                        "risk_snapshot_stale": (
+                            risk_snapshot.is_effectively_stale(now_ms, strategy.max_risk_snapshot_age_ms)
+                            if risk_snapshot is not None else None
+                        ),
+                        "risk_snapshot_supported": risk_snapshot.supported if risk_snapshot is not None else None,
+                        "risk_snapshot_input_present": venue in self._risk_snapshots,
+                        "unsupported_risk_snapshot_behavior": strategy.unsupported_risk_snapshot_behavior,
+                        "risk_monitor_enabled": strategy.risk_monitor_enabled,
+                        "ts_ms": now_ms,
                     },
                 )
 
@@ -209,27 +223,6 @@ class Supervisor:
             add_venue(rec.get("long_venue") or snapshot.get("long_venue"))
             add_venue(rec.get("short_venue") or snapshot.get("short_venue"))
         return venues
-
-    def _fetch_risk_snapshot_for_venue(
-        self, venue: Venue, adapter: VenueAdapter, now_ms: int
-    ) -> Optional[AccountRiskSnapshot]:
-        """Fetch account risk snapshot from the runtime cache.
-
-        V1: fetch_account_risk_with_runtime_cache (risk.rs:169-188).
-        The runtime populates self._risk_snapshot_cache before each supervision tick.
-        """
-        if not adapter.supports_risk_health:
-            return None
-        entry = self._risk_snapshot_cache.get(venue)
-        if entry is None:
-            return None
-        result = entry.get("result")
-        if result is None:
-            return None
-        if isinstance(result, AccountRiskSnapshot):
-            return result
-        # result may be an error string (V1 Err variant) — treat as None
-        return None
 
     def _venue_private_position_confirmed(
         self, venue: Venue, symbol: str, adapter: VenueAdapter
@@ -290,6 +283,8 @@ class Supervisor:
                     self.state.global_risk_reason = reason
 
         old_mode = self.state.risk_mode
+        lifecycle_before = lifecycle_diagnostic_snapshot(self.state)
+        auto_resumed = False
 
         # V1: fail_closed_latch_can_clear — auto-recover from FAIL_CLOSED when
         # health has recovered and no blocking conditions remain (state.rs:476-487)
@@ -298,14 +293,7 @@ class Supervisor:
                 self.state.lifecycle = EngineLifecycle.RUNNING
                 self.state.last_error = None
                 self.state.global_risk_reason = None
-                self.journal.append(
-                    "risk.fail_closed_auto_resumed",
-                    {
-                        "from_mode": old_mode.value,
-                        "to_mode": new_mode.value,
-                        "min_health_ratio": health.min_health_ratio,
-                    },
-                )
+                auto_resumed = True
             else:
                 return old_mode
 
@@ -330,6 +318,20 @@ class Supervisor:
             if old_mode == GlobalRiskMode.ENTRY_PAUSED and new_mode == GlobalRiskMode.RUNNING:
                 self.journal.append("risk.entry_pause_cleared", {})
 
+        if auto_resumed or lifecycle_before != lifecycle_diagnostic_snapshot(self.state):
+            self.journal.append(
+                "risk.fail_closed_auto_resumed" if auto_resumed else "runtime.lifecycle_decision_observed",
+                {
+                    "from_mode": old_mode.value,
+                    "to_mode": new_mode.value,
+                    "min_health_ratio": health.min_health_ratio,
+                    **lifecycle_diagnostic_fields(
+                        self.state, lifecycle_before,
+                        writer="Supervisor.update_global_risk_mode",
+                        reason="fail_closed_health_recovered" if auto_resumed else "risk_health_mode_changed",
+                    ),
+                },
+            )
         return new_mode
 
     def _fail_closed_can_clear(self) -> bool:
@@ -734,7 +736,7 @@ class Supervisor:
         now_ms: int,
         venue_health_ratios: dict[str, float],
         adapters: Optional[dict[Venue, VenueAdapter]] = None,
-        risk_snapshot_cache: Optional[dict[Venue, dict]] = None,
+        risk_snapshots: Optional[dict[Venue, Optional[AccountRiskSnapshot]]] = None,
     ) -> None:
         """Run supervision tick: evaluate global risk, update mode, log conditions.
 
@@ -742,9 +744,8 @@ class Supervisor:
         Collects per-venue health views (including private-stream health),
         aggregates them into global risk mode via V1's supervisor_action_mode.
 
-        risk_snapshot_cache is the runtime's per-venue AccountRiskSnapshot cache,
-        populated during the current tick BEFORE this call.  Must be injected
-        before _collect_venue_health_views so the supervisor sees fresh data.
+        risk_snapshots contains runtime fetch results for every supervised venue.
+        Cache TTL and success/error decoding remain owned by the runtime fetch path.
         """
         strategy = self.config.strategy
 
@@ -753,6 +754,7 @@ class Supervisor:
                 self.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
                 and self._fail_closed_can_clear()
             ):
+                lifecycle_before = lifecycle_diagnostic_snapshot(self.state)
                 self.state.lifecycle = EngineLifecycle.RUNNING
                 self.state.risk_mode = GlobalRiskMode.RUNNING
                 self.state.last_error = None
@@ -764,13 +766,17 @@ class Supervisor:
                         "to_mode": GlobalRiskMode.RUNNING.value,
                         "min_health_ratio": None,
                         "reason": "risk_monitor_disabled_clean_state",
+                        **lifecycle_diagnostic_fields(
+                            self.state, lifecycle_before,
+                            writer="Supervisor.supervise",
+                            reason="risk_monitor_disabled_clean_state",
+                        ),
                     },
                 )
             return
 
-        # V1: sync risk snapshot cache from runtime BEFORE health evaluation
-        if risk_snapshot_cache is not None:
-            self._risk_snapshot_cache = risk_snapshot_cache
+        # Missing current evidence must not reuse a previous healthy input.
+        self._risk_snapshots = risk_snapshots or {}
 
         # V1: Collect per-venue health views including private-stream health
         venue_health_views: Optional[dict[Venue, VenueHealthView]] = None

@@ -6,6 +6,7 @@ Do not change residual repair business conditions while extracting it.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
@@ -26,7 +27,10 @@ from lightfee.engine.exchange_truth import (
     require_open_orders_response,
     request_venue_operation,
 )
-from lightfee.engine.lifecycle import clear_risk_mode_for_recovery, enter_fail_closed
+from lightfee.engine.lifecycle import (
+    clear_risk_mode_for_recovery, enter_fail_closed,
+    lifecycle_diagnostic_fields, lifecycle_diagnostic_snapshot,
+)
 from lightfee.engine.order_submit_uncertainty import (
     build_order_submit_uncertainty_payload,
     order_truth_probe_paths,
@@ -47,6 +51,23 @@ from lightfee.venues.specs import VenueOperation
 class ResidualRepairRuntime:
     def __init__(self, ctx: ResidualRepairRuntimeContext) -> None:
         self.ctx = ctx
+
+    def _record_residual_repair_outcome(self, kind: str, payload: dict) -> None:
+        # Replay the exact remaining owners, including cleared ACK evidence
+        # and rebuilt directions, rather than duplicating live transitions.
+        scope = ("position_id", "pair_id", "symbol", "origin")
+        payload["remaining_residual_repairs"] = deepcopy([
+            task for task in self.ctx.state.pending_residual_repairs
+            if isinstance(task, dict) and all(task.get(k, "") == payload.get(k, "") for k in scope)
+        ])
+        pair_id, symbol = payload.get("pair_id", ""), payload.get("symbol", "")
+        payload["remaining_pair_gates"] = deepcopy([
+            gate for gate in self.ctx.state.live_recovery_reduce_only_pairs
+            if isinstance(gate, dict) and (
+                gate.get("pair_id", "") == pair_id if pair_id else gate.get("symbol", "") == symbol
+            )
+        ])
+        self.ctx.journal.append(kind, payload)
 
     def get_venue_adapter(self, venue: Venue) -> VenueAdapter | None:
         return self.ctx.get_venue_adapter(venue)
@@ -205,7 +226,7 @@ class ResidualRepairRuntime:
                         "fill_price": float(getattr(accepted_fill, "price", 0.0) or 0.0),
                     }
                     completed_payload.update(accepted_payload)
-                    self.ctx.journal.append(
+                    self._record_residual_repair_outcome(
                         "execution.residual_repair_completed",
                         completed_payload,
                     )
@@ -223,9 +244,10 @@ class ResidualRepairRuntime:
                         "repair_venue": repair_venue.value,
                         "repair_side": repair_side.value,
                         "result": "accepted_order_live_flat",
+                        "remaining_quantity": 0.0,
                     }
                     completed_payload.update(accepted_payload)
-                    self.ctx.journal.append(
+                    self._record_residual_repair_outcome(
                         "execution.residual_repair_completed",
                         completed_payload,
                     )
@@ -389,7 +411,7 @@ class ResidualRepairRuntime:
                     self.ctx.state.pending_residual_repairs.remove(task)
                     self._release_residual_repair_pair_gate(pair_id, symbol)
                     repaired += 1
-                    self.ctx.journal.append(
+                    self._record_residual_repair_outcome(
                         "execution.residual_repair_completed",
                         {
                             "position_id": position_id,
@@ -399,6 +421,7 @@ class ResidualRepairRuntime:
                             "repair_venue": repair_venue.value,
                             "repair_side": repair_side.value,
                             "result": "already_flat",
+                            "remaining_quantity": 0.0,
                             "open_order_count": open_order_count,
                             "open_order_counts_by_venue": open_order_counts_by_venue,
                             "live_truth_venues": [venue.value for venue in probe_venues],
@@ -649,7 +672,7 @@ class ResidualRepairRuntime:
                         self.ctx.state.pending_residual_repairs.remove(task)
                         self._release_residual_repair_pair_gate(pair_id, symbol)
                         repaired += 1
-                        self.ctx.journal.append(
+                        self._record_residual_repair_outcome(
                             "execution.residual_repair_completed",
                             {
                                 "position_id": position_id,
@@ -659,6 +682,7 @@ class ResidualRepairRuntime:
                                 "repair_venue": repair_venue.value,
                                 "repair_side": repair_side.value,
                                 "result": "duplicate_client_order_reconciled",
+                                "remaining_quantity": 0.0,
                                 "client_order_id": req.client_order_id,
                                 "order_id": duplicate_reconcile.order_id,
                                 "reconciled_qty": duplicate_reconcile.reconciled_qty,
@@ -839,7 +863,7 @@ class ResidualRepairRuntime:
                                 ),
                             }
                             completed_payload.update(accepted_payload)
-                            self.ctx.journal.append(
+                            self._record_residual_repair_outcome(
                                 "execution.residual_repair_completed",
                                 completed_payload,
                             )
@@ -862,7 +886,7 @@ class ResidualRepairRuntime:
                                 "remaining_quantity": 0.0,
                             }
                             completed_payload.update(accepted_payload)
-                            self.ctx.journal.append(
+                            self._record_residual_repair_outcome(
                                 "execution.residual_repair_completed",
                                 completed_payload,
                             )
@@ -970,7 +994,7 @@ class ResidualRepairRuntime:
             else:
                 self._release_residual_repair_pair_gate(pair_id, symbol)
                 repaired += 1
-            self.ctx.journal.append(
+            self._record_residual_repair_outcome(
                 "execution.residual_repair_completed",
                 {
                     "position_id": position_id,
@@ -1029,6 +1053,7 @@ class ResidualRepairRuntime:
                 and self.ctx.state.recovery_blocked_reason
                 in CORE_CLEARABLE_BLOCK_REASONS
             ):
+                lifecycle_before = lifecycle_diagnostic_snapshot(self.ctx.state)
                 clear_risk_mode_for_recovery(self.ctx.state, core_decision)
                 self.ctx.journal.append(
                     "recovery.residual_repairs_core_clear",
@@ -1036,6 +1061,13 @@ class ResidualRepairRuntime:
                         "reason": core_decision.clear_reason,
                         "decision": core_decision.kind.value,
                         "ts_ms": now_ms,
+                        **lifecycle_diagnostic_fields(
+                            self.ctx.state, lifecycle_before,
+                            writer="ResidualRepairRuntime.recover_residual_repairs",
+                            reason=core_decision.clear_reason,
+                            core_decision=core_decision,
+                            core_decision_source="current",
+                        ),
                     },
                 )
             self.ctx.journal.append(
@@ -1470,7 +1502,7 @@ class ResidualRepairRuntime:
         fetch_open_orders = getattr(adapter, "fetch_open_orders", None)
         if callable(fetch_open_orders):
             open_orders = await fetch_open_orders(symbol)
-            return self._residual_repair_open_order_items(open_orders)
+            return self._residual_repair_open_order_items(open_orders, venue=venue)
 
         transport = getattr(adapter, "_transport", None)
         if transport is None or not hasattr(transport, "_request"):
@@ -1635,7 +1667,7 @@ class ResidualRepairRuntime:
         except ValueError:
             pass
         self._release_residual_repair_pair_gate(pair_id, symbol)
-        self.ctx.journal.append(
+        self._record_residual_repair_outcome(
             "execution.residual_repair_terminal",
             {
                 "position_id": position_id,

@@ -401,7 +401,7 @@ class TestGatePrivateParserExtended:
                 "update_time_ms": 1700000000000,
             }],
         })
-        handle_gate_private_message(state, symbol_map, raw)
+        handle_gate_private_message(state, symbol_map, raw, {"ETH_USDT": 1})
         await _sleep_short()
         pos = state.position("ETHUSDT")
         assert pos is not None
@@ -420,12 +420,12 @@ class TestGatePrivateParserExtended:
                 "contract": "ETH_USDT",
                 "id": "gate-canceled-1",
                 "text": "gate-client-canceled",
-                "fill_total": "0",
+                "size": "5", "left": "5", "status": "finished",
                 "finish_as": "CANCELLED",
                 "finish_time_ms": 1700000000000,
             }],
         })
-        handle_gate_private_message(state, symbol_map, raw)
+        handle_gate_private_message(state, symbol_map, raw, {"ETH_USDT": 1})
         await _sleep_short()
         update = state.order_by_order_id("gate-canceled-1")
         assert update is not None
@@ -613,6 +613,11 @@ def _fake_connect_awaitable(fake_ws: _FakeWebSocket):
 
 class _FakeTransport:
     """Minimal transport that records success/failure calls for testing."""
+
+    async def _gate_symbol_rule(self, symbol):
+        from lightfee.venues.symbol_rules import parse_gate_symbol_rule
+        return parse_gate_symbol_rule({"name": symbol, "quanto_multiplier": "1",
+                                       "order_price_round": ".01", "order_size_min": "1"}, symbol)
 
     def __init__(self, venue: Venue = Venue.BINANCE):
         self._success_count = 0
@@ -1640,21 +1645,25 @@ class TestGateWorkerLifecycle:
             "lightfee.venues.gate_private_ws.websockets.connect",
             side_effect=_fake_connect_awaitable(_FakeWebSocket(
                 messages=[
+                    json.dumps({"channel": "futures.orders", "event": "subscribe", "error": None, "result": {"status": "success"}}),
+                    json.dumps({"channel": "futures.positions", "event": "subscribe", "error": None, "result": {"status": "success"}}),
                     json.dumps({
                         "channel": "futures.orders",
                         "event": "update",
                         "result": [{
-                            "contract": "ETH_USDT",
+                            "contract": "ETHUSDT",
                             "id": "gate-lifecycle-1",
-                            "text": "gate-lifecycle-client-1",
-                            "fill_total": "0.02",
+                            "text": "t-gate-lifecycle-client-1",
+                            "size": "0.03",
+                            "left": "0.01",
+                            "status": "open",
                             "fill_price": "2140.0",
-                            "finish_as": "PARTIAL",
+                            "finish_as": "",
                             "finish_time_ms": 1700000000000,
                         }],
                     }),
                 ],
-                close_after=1,
+                close_after=3,
             )),
         ):
             transport.start_private_ws(["ETHUSDT"])
@@ -1663,8 +1672,11 @@ class TestGateWorkerLifecycle:
             transport.stop_private_ws()
             await _sleep_short()
 
-        # connect success + message success (at least 2)
+        # Both subscription acknowledgements + normalized message (at least 2)
         assert transport._success_count >= 2
+        update = transport.private_ws_state.order_by_order_id("gate-lifecycle-1")
+        assert update is not None
+        assert update.filled_quantity == pytest.approx(.02)
 
     @pytest.mark.asyncio
     async def test_failure_on_connect_error(self):

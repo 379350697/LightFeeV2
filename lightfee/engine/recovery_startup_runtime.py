@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any
 
 from lightfee.core.contracts import VenueAdapter
@@ -11,6 +12,8 @@ from lightfee.engine.exchange_truth import require_open_orders_response, request
 from lightfee.engine.lifecycle import (
     clear_risk_mode_for_recovery,
     enter_fail_closed,
+    lifecycle_diagnostic_fields,
+    lifecycle_diagnostic_snapshot,
     set_lifecycle,
 )
 from lightfee.engine.recovery_decision_core import (
@@ -27,6 +30,17 @@ from lightfee.engine.state import is_terminal_automatic_history_evidence_debt
 from lightfee.engine.v1_lifecycle_closure import closure_event_fields
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 from lightfee.venues.specs import VenueOperation
+from lightfee.venues.transport import TransportError, TransportErrorCategory
+
+
+def _partial_truth_evidence(error: BaseException) -> list[dict[str, Any]]:
+    # asyncio.wait_for wraps a cancelled normalization task in TimeoutError.
+    # Keep the existing TransportError payload through that standard chain.
+    while error is not None:
+        if isinstance(error, TransportError) and error.truth_evidence:
+            return error.truth_evidence
+        error = error.__cause__
+    return []
 
 
 class RecoveryStartupRuntime:
@@ -98,9 +112,14 @@ class RecoveryStartupRuntime:
         # Block and clear are both driven by V1RecoveryDecisionCore so
         # evidence-gap states cannot oscillate between ledger block and stale
         # block cleanup.
+        lifecycle_before = lifecycle_diagnostic_snapshot(self.ctx.state)
         if recovery_block_policy == "block" and recovery_block_reason:
+            if (
+                self.ctx.state.recovery_blocked_reason != recovery_block_reason
+                or not self.ctx.state.recovery_blocked_at_ms
+            ):
+                self.ctx.state.recovery_blocked_at_ms = now_ms
             self.ctx.state.recovery_blocked_reason = recovery_block_reason
-            self.ctx.state.recovery_blocked_at_ms = now_ms
             set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
             self.ctx.journal.append(
                 "recovery.ledger_blocked",
@@ -115,6 +134,13 @@ class RecoveryStartupRuntime:
                     ],
                     "ts_ms": now_ms,
                     **recovery_closure_fields,
+                    **lifecycle_diagnostic_fields(
+                        self.ctx.state, lifecycle_before,
+                        writer="RecoveryStartupRuntime._refresh_recovery_ledger_from_exchange_truth",
+                        reason=recovery_block_reason,
+                        core_decision=core_decision,
+                        core_decision_source="current",
+                    ),
                 },
             )
         elif recovery_block_policy in {"clear", "warn_evidence_gap"} and (
@@ -129,6 +155,13 @@ class RecoveryStartupRuntime:
                     "decision": core_decision.kind.value,
                     "ts_ms": now_ms,
                     **recovery_closure_fields,
+                    **lifecycle_diagnostic_fields(
+                        self.ctx.state, lifecycle_before,
+                        writer="RecoveryStartupRuntime._refresh_recovery_ledger_from_exchange_truth",
+                        reason=core_decision.clear_reason,
+                        core_decision=core_decision,
+                        core_decision_source="current",
+                    ),
                 },
             )
         else:
@@ -173,6 +206,7 @@ class RecoveryStartupRuntime:
 
         previous_lifecycle = self.ctx.state.lifecycle.value
         previous_risk_mode = self.ctx.state.risk_mode.value
+        lifecycle_before = lifecycle_diagnostic_snapshot(self.ctx.state)
         if not clear_risk_mode_for_recovery(self.ctx.state, core_decision):
             return False
         self.ctx.journal.append(
@@ -186,6 +220,13 @@ class RecoveryStartupRuntime:
                 "position_row_count": len(exchange_truth.get("positions") or []),
                 "open_order_count": len(exchange_truth.get("open_orders") or []),
                 "ts_ms": now_ms,
+                **lifecycle_diagnostic_fields(
+                    self.ctx.state, lifecycle_before,
+                    writer="RecoveryStartupRuntime._clear_stale_recovery_lifecycle_if_core_clean",
+                    reason=reason,
+                    core_decision=core_decision,
+                    core_decision_source="cached",
+                ),
             },
         )
         return True
@@ -315,12 +356,12 @@ class RecoveryStartupRuntime:
                     "error": "",
                     "timed_out": False,
                 }
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 return {
                     "collection": collection,
                     "venue": venue_name,
                     "endpoint": default_endpoint,
-                    "rows": [],
+                    "rows": _partial_truth_evidence(exc),
                     "error": (
                         "account_truth_probe_timeout:"
                         f"timeout_budget_ms={timeout_budget_ms}"
@@ -328,11 +369,14 @@ class RecoveryStartupRuntime:
                     "timed_out": True,
                 }
             except Exception as exc:
+                observed = _partial_truth_evidence(exc)
+                if collection == "open_orders" and observed:
+                    observed = self.ctx._recovery_ledger_open_order_payloads(observed, venue_name=venue_name, symbol="*")
                 return {
                     "collection": collection,
                     "venue": venue_name,
                     "endpoint": default_endpoint,
-                    "rows": [],
+                    "rows": observed,
                     "error": str(exc),
                     "timed_out": False,
                 }
@@ -357,17 +401,19 @@ class RecoveryStartupRuntime:
                         "fetch_all_positions_invalid_response:"
                         f"{type(rows).__name__}"
                     )
-                return (
-                    "fetch_all_positions",
-                    [
-                        self.ctx._recovery_ledger_position_payload(
-                            position,
-                            venue_name=venue_name,
-                            symbol="*",
-                        )
-                        for position in rows
-                    ],
-                )
+                evidence = []
+                row_errors = []
+                for position in rows:
+                    try:
+                        evidence.append(self.ctx._recovery_ledger_position_payload(position, venue_name=venue_name, symbol="*"))
+                    except Exception as exc:
+                        row_errors.append(str(exc))
+                        evidence.append({"venue": venue_name, "symbol": "*", "quantity": None,
+                                         "raw": position, "normalization_error": str(exc)})
+                if row_errors:
+                    raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                                         ";".join(row_errors), truth_evidence=evidence)
+                return "fetch_all_positions", evidence
 
             async def fetch_open_orders(
                 venue=venue,
@@ -410,6 +456,11 @@ class RecoveryStartupRuntime:
             venue_name = result["venue"]
             error = result["error"]
             timed_out = result["timed_out"]
+            rows = result["rows"]
+            if collection == "positions":
+                positions.extend(rows)
+            else:
+                open_orders.extend(rows)
             if error:
                 errors.append(f"{venue_name}:*:{collection}:{error}")
                 classification = (
@@ -440,11 +491,6 @@ class RecoveryStartupRuntime:
                 )
                 continue
 
-            rows = result["rows"]
-            if collection == "positions":
-                positions.extend(rows)
-            else:
-                open_orders.extend(rows)
             probe_evidence.append(
                 {
                     "venue": venue_name,
@@ -536,7 +582,7 @@ class RecoveryStartupRuntime:
         if isinstance(rows, dict) and rows.get("error"):
             raise RuntimeError(str(rows.get("error")))
         return (
-            self.ctx._recovery_ledger_order_rows(rows),
+            self.ctx._recovery_ledger_order_rows(rows, venue=venue),
             f"fetch_open_orders({symbol or 'None'})",
         )
 
@@ -600,6 +646,8 @@ class RecoveryStartupRuntime:
                         )
                     except Exception as exc:
                         truth_probe_count += 1
+                        if isinstance(exc, TransportError):
+                            positions.extend(exc.truth_evidence)
                         errors.append(f"{venue_name}:{symbol}:position:{exc}")
                         probe_evidence.append(
                             {
@@ -651,6 +699,9 @@ class RecoveryStartupRuntime:
                     )
                 except Exception as exc:
                     truth_probe_count += 1
+                    if isinstance(exc, TransportError) and exc.truth_evidence:
+                        open_orders.extend(self.ctx._recovery_ledger_open_order_payloads(
+                            exc.truth_evidence, venue_name=venue_name, symbol=symbol))
                     errors.append(f"{venue_name}:{symbol}:open_orders:{exc}")
                     probe_evidence.append(
                         {
@@ -721,6 +772,9 @@ class RecoveryStartupRuntime:
                 )
             result.append(
                 {
+                    **row,
+                    "raw": row.get("raw", row),
+                    "normalization_errors": [],
                     "venue": str(row.get("venue") or venue_name).lower(),
                     "symbol": str(
                         row.get("symbol")
@@ -730,7 +784,7 @@ class RecoveryStartupRuntime:
                         or symbol
                     ).upper(),
                     "side": str(row.get("side") or "").lower(),
-                    "quantity": float(
+                    "quantity": (
                         row.get(
                             "quantity",
                             row.get(
@@ -739,16 +793,15 @@ class RecoveryStartupRuntime:
                                     "qty",
                                     row.get(
                                         "size",
-                                        row.get("sz", row.get("amount", 0.0)),
+                                        row.get("sz", row.get("amount")),
                                     ),
                                 ),
                             ),
                         )
-                        or 0.0
                     ),
-                    "price": float(row.get("price", row.get("px", 0.0)) or 0.0),
+                    "price": row.get("price", row.get("px")),
                     "reduce_only": RecoveryStartupRuntime._truthy_recovery_order_field(
-                        row.get("reduce_only", row.get("reduceOnly", False))
+                        row.get("reduce_only", row.get("reduceOnly", row.get("is_reduce_only", False)))
                     ),
                     "order_id": str(
                         row.get("order_id")
@@ -771,6 +824,15 @@ class RecoveryStartupRuntime:
                     ),
                 }
             )
+            for field in ("quantity", "price"):
+                try:
+                    value = float(result[-1][field])
+                    if not math.isfinite(value):
+                        raise ValueError("nonfinite")
+                    result[-1][field] = value
+                except (TypeError, ValueError):
+                    result[-1][field] = None
+                    result[-1].setdefault("normalization_errors", []).append(field)
         return result
 
     @staticmethod

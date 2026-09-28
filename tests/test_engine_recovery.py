@@ -33,6 +33,39 @@ from lightfee.persistence.snapshot_store import SnapshotStore
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
 
 
+@pytest.mark.parametrize("operator_fail_closed", [False, True])
+def test_recovery_lifecycle_diagnostic_does_not_become_replay_state(tmp_path, operator_fail_closed):
+    store = SnapshotStore(tmp_path / "state.json")
+    journal = Journal(tmp_path / "events.jsonl")
+    journal.open()
+    if operator_fail_closed:
+        journal.append("ops.command_applied", {
+            "command": "fail_closed", "new_risk": "fail_closed", "new_lifecycle": "risk_only",
+        })
+    journal.close()
+    first = recover_from_snapshot(store, journal)
+    payload = next(e["payload"] for e in journal.read_all()
+                   if e["kind"] == "runtime.lifecycle_decision_observed")
+    assert payload["lifecycle_writer"] == "recover_from_snapshot"
+    assert payload["recovery_decision_source"] == "current"
+    assert payload["lifecycle_after"] == first.lifecycle.value
+    assert payload["recovery_decision"]["entry_allowed"] is not operator_fail_closed
+    # Startup without exchange truth retains the core's evidence-gap warning.
+    assert payload["recovery_decision"]["diagnostic_severity"] == ("critical" if operator_fail_closed else "warning")
+    # A diagnostic containing conflicting lifecycle values must not act as a command.
+    journal.open()
+    journal.append("runtime.lifecycle_decision_observed", {
+        "lifecycle": "running" if operator_fail_closed else "risk_only",
+        "risk_mode": "running" if operator_fail_closed else "fail_closed",
+        "lifecycle_after": "running" if operator_fail_closed else "risk_only",
+        "to": "running" if operator_fail_closed else "risk_only",
+    })
+    journal.close()
+    second = recover_from_snapshot(store, journal)
+    assert second.lifecycle == first.lifecycle
+    assert second.risk_mode == first.risk_mode
+
+
 class TestEngineState:
     def test_empty_state_starts_booting(self):
         state = EngineState()

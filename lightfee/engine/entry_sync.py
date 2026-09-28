@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import OrderFill, OrderRequest, PassiveOrderState, Side, Venue
@@ -107,7 +107,13 @@ class EntrySyncExecutor:
     # Main execution entry point
     # ------------------------------------------------------------------
 
-    async def execute(self, ctx: EntryContext) -> EntryExecutionResult:
+    async def execute(
+        self, ctx: EntryContext, *,
+        before_open: Callable[
+            [OpenPosition, OrderFill, OrderFill, OrderRequest, OrderRequest],
+            Awaitable[bool],
+        ] | None = None,
+    ) -> EntryExecutionResult:
         """Execute a full entry flow: maker → hedge, with outcome handling.
 
         V1 parity additions:
@@ -379,43 +385,30 @@ class EntrySyncExecutor:
         result.maker_fill = maker_fill
         result.hedge_fill = hedge_fill
 
+        # Pending-entry fallback already owns a possibly recovered exposure.
+        # Its runtime must persist new identities and validate the handoff
+        # before this event can replace that owner during journal replay.
+        if before_open is not None and not await before_open(
+            position, maker_fill, hedge_fill, maker_req, hedge_req,
+        ):
+            result.open_position = None
+            result.has_uncertainty = True
+            result.state = EntryState.HEDGE_PENDING
+            return result
+
         # V1: entry.opened is a critical event — synchronous durability
+        from lightfee.engine.recovery import _serialize_open_position
+
         self.journal.append_critical(
             now_ms, "entry.opened",
             {
-                "position_id": position.position_id,
+                **_serialize_open_position(position),
                 "internal_entry_id": position.position_id,
-                "symbol": position.symbol,
-                "long_venue": position.long_venue.value,
-                "short_venue": position.short_venue.value,
                 "quantity": position.matched_quantity,
-                "long_quantity": position.long_quantity,
-                "short_quantity": position.short_quantity,
-                "long_entry_price": position.long_entry_price,
-                "short_entry_price": position.short_entry_price,
-                "opened_at_ms": position.opened_at_ms,
-                "matched_quantity": position.matched_quantity,
-                "current_net_quote": position.current_net_quote,
-                "peak_net_quote": position.peak_net_quote,
-                "captured_funding_quote": position.captured_funding_quote,
-                "second_stage_funding_quote": position.second_stage_funding_quote,
-                "funding_timestamp_ms": position.funding_timestamp_ms,
-                "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
-                "opportunity_type": position.opportunity_type,
-                "second_stage_enabled_at_entry": position.second_stage_enabled_at_entry,
-                "exit_after_first_stage": position.exit_after_first_stage,
-                "funding_edge_bps_entry": position.funding_edge_bps_entry,
-                "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
-                "expected_edge_bps_entry": position.expected_edge_bps_entry,
-                "long_entry_fee_quote": position.long_entry_fee_quote,
-                "short_entry_fee_quote": position.short_entry_fee_quote,
-                "funding_captured": position.funding_captured,
-                "second_stage_funding_captured": position.second_stage_funding_captured,
                 "maker_order_id": maker_fill.order_id,
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": maker_req.client_order_id,
                 "hedge_client_order_id": hedge_req.client_order_id,
-                "review_id": review_id or "",
             },
         )
         return result
@@ -784,6 +777,7 @@ class EntrySyncExecutor:
                     "exchange_error": evidence.to_dict(),
                 }
             else:
+                accepted_order_id = str(getattr(e, "accepted_order_id", "") or "")
                 self.journal.append(
                     "order.uncertain",
                     {
@@ -793,6 +787,7 @@ class EntrySyncExecutor:
                         "venue": request.venue.value,
                         "symbol": request.symbol,
                         "reason": str(e),
+                        "order_id": accepted_order_id,
                         "client_order_id": request.client_order_id,
                         "is_maker": is_maker,
                         "exchange_error": evidence.to_dict(),
@@ -800,7 +795,7 @@ class EntrySyncExecutor:
                         "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
-                return {"outcome": "uncertain", "fill": None, "order_id": ""}
+                return {"outcome": "uncertain", "fill": None, "order_id": accepted_order_id}
 
         except Exception as e:
             self._flush_adapter_order_diagnostics(adapter)
@@ -905,6 +900,7 @@ class EntrySyncExecutor:
                     "exchange_error": evidence.to_dict(),
                 }
             else:
+                accepted_order_id = str(getattr(e, "accepted_order_id", "") or "")
                 self.journal.append(
                     "order.uncertain",
                     {
@@ -914,6 +910,7 @@ class EntrySyncExecutor:
                         "venue": request.venue.value,
                         "symbol": request.symbol,
                         "reason": str(e),
+                        "order_id": accepted_order_id,
                         "client_order_id": request.client_order_id,
                         "is_maker": True,
                         "exchange_error": evidence.to_dict(),
@@ -921,7 +918,7 @@ class EntrySyncExecutor:
                         "evidence_completeness": evidence.evidence_completeness,
                     },
                 )
-                return {"outcome": "uncertain", "fill": None, "order_id": ""}
+                return {"outcome": "uncertain", "fill": None, "order_id": accepted_order_id}
 
         except Exception as e:
             self._flush_adapter_order_diagnostics(adapter)

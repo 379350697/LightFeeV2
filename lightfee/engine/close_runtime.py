@@ -12,7 +12,11 @@ from typing import Any
 from lightfee.core.contracts import VenueAdapter
 from lightfee.core.domain import Venue, close_order_side_for_position
 from lightfee.engine.bootstrap import wall_clock_now_ms
-from lightfee.engine.lifecycle import set_lifecycle
+from lightfee.engine.lifecycle import (
+    lifecycle_diagnostic_fields,
+    lifecycle_diagnostic_snapshot,
+    set_lifecycle,
+)
 from lightfee.engine.order_truth_ledger import ORDER_TRUTH_LEDGER
 from lightfee.engine.reconciliation import _recon_fill_price
 from lightfee.engine.runtime_context import CloseRuntimeContext
@@ -1934,6 +1938,8 @@ class CloseRuntime:
             "price_pnl": price_pnl,
             "segment_price_pnl": segment_price_pnl,
             "funding_pnl_quote": funding_quote,
+            "funding_pnl_source": "entry_edge_estimate",
+            "funding_statement_reconciled": False,
             "entry_fee_quote": entry_fee,
             "entry_fee_source": entry_fee_source,
             "entry_fee_evidence_complete": entry_fee_evidence_complete,
@@ -2679,6 +2685,7 @@ class CloseRuntime:
 
         self.ctx.state.pending_close_reconciliations = retained
         if changed:
+            lifecycle_before = lifecycle_diagnostic_snapshot(self.ctx.state)
             active_empty = not self.ctx.state.open_positions
             pending_entries_empty = not self.ctx.state.pending_entries
             pending_passive_empty = not self.ctx.state.pending_passive_closes
@@ -2687,6 +2694,7 @@ class CloseRuntime:
                 self.ctx.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
                 or self.ctx.state.operator.requested_mode == GlobalRiskMode.FAIL_CLOSED
             )
+            lifecycle_reason = "existing_lifecycle_preserved"
             if (
                 active_empty
                 and pending_reconciliations_empty
@@ -2695,15 +2703,33 @@ class CloseRuntime:
             ):
                 set_lifecycle(self.ctx.state, EngineLifecycle.RUNNING)
                 self.ctx.state.last_error = None
+                lifecycle_reason = "no_active_or_pending_close_work"
             elif fail_closed:
                 set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
                 self.ctx.state.last_error = "pending_close_reconciliations_fail_closed"
+                lifecycle_reason = "pending_close_reconciliations_fail_closed"
             elif active_empty or self._call_open_positions_private_confirmation_ready():
                 set_lifecycle(self.ctx.state, EngineLifecycle.RUNNING)
                 self.ctx.state.last_error = None
+                lifecycle_reason = "no_active_positions" if active_empty else "open_positions_private_confirmed"
             elif self.ctx.state.pending_close_reconciliations:
                 set_lifecycle(self.ctx.state, EngineLifecycle.RISK_ONLY)
                 self.ctx.state.last_error = "pending_close_reconciliations_active"
+                lifecycle_reason = "pending_close_reconciliations_active"
+            self.ctx.journal.append("runtime.close_reconciliation_lifecycle_decision", {
+                "source": "_process_pending_close_reconciliations",
+                "risk_mode": self.ctx.state.risk_mode.value,
+                "recovery_blocked_reason": self.ctx.state.recovery_blocked_reason,
+                "last_error": self.ctx.state.last_error,
+                "ts_ms": now_ms,
+                **lifecycle_diagnostic_fields(
+                    self.ctx.state, lifecycle_before,
+                    writer="CloseRuntime._process_pending_close_reconciliations",
+                    reason=lifecycle_reason,
+                    core_decision=getattr(self.ctx, "recovery_decision", None),
+                    core_decision_source="cached",
+                ),
+            })
     async def _maybe_process_normal_exits(self, now_ms: int) -> None:
         """Evaluate normal exit reasons for open positions and route to close path.
 
@@ -2716,6 +2742,7 @@ class CloseRuntime:
         This method CONSUMES the predicate that was previously only unit-tested.
         """
         from lightfee.engine.exit_decision import (
+            _paired_entry_notional_quote,
             force_close_due,
             normal_close_reason_uses_passive_maker_taker,
             standard_close_reason,
@@ -2755,6 +2782,7 @@ class CloseRuntime:
 
             funding_captured_before = position.funding_captured
             second_stage_before = position.second_stage_funding_captured
+            funding_quote_before = position.captured_funding_quote + position.second_stage_funding_quote
             post_funding_hold_ms = int(
                 getattr(self.ctx.config.strategy, "post_funding_hold_secs", 0) or 0
             ) * 1000
@@ -2778,6 +2806,27 @@ class CloseRuntime:
                         "post_funding_hold_ms": post_funding_hold_ms,
                         "funding_captured_before": funding_captured_before,
                         "funding_captured_after": position.funding_captured,
+                        "funding_pnl_source": "entry_edge_estimate",
+                        "funding_statement_reconciled": False,
+                        "captured_funding_quote": position.captured_funding_quote,
+                        "second_stage_funding_quote": position.second_stage_funding_quote,
+                        "entry_notional_quote": position.entry_notional_quote,
+                        "effective_entry_notional_quote": _paired_entry_notional_quote(position),
+                        "entry_notional_source": (
+                            "stored" if position.entry_notional_quote > 0
+                            else "matched_quantity_and_entry_prices"
+                        ),
+                        "matched_quantity": position.matched_quantity,
+                        "long_entry_price": position.long_entry_price,
+                        "short_entry_price": position.short_entry_price,
+                        "long_venue": position.long_venue.value,
+                        "short_venue": position.short_venue.value,
+                        "funding_edge_bps_entry": position.funding_edge_bps_entry,
+                        "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
+                        "second_stage_enabled_at_entry": position.second_stage_enabled_at_entry,
+                        "funding_quote_before": funding_quote_before,
+                        "funding_quote_after": position.captured_funding_quote + position.second_stage_funding_quote,
+                        "funding_delta_quote": position.captured_funding_quote + position.second_stage_funding_quote - funding_quote_before,
                         "second_stage_funding_captured_before": second_stage_before,
                         "second_stage_funding_captured_after": (
                             position.second_stage_funding_captured

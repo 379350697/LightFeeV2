@@ -27,6 +27,7 @@ from lightfee.venues.entry_tradability import (
     entry_tradability_unavailable,
 )
 from lightfee.venues.specs import gate_spec
+from lightfee.venues.symbol_rules import parse_gate_symbol_rule
 from lightfee.venues.transport import (
     LiveCredential,
     TransportError,
@@ -246,9 +247,8 @@ class GateAdapter(VenueAdapter):
         order_id: str,
         client_order_id: Optional[str] = None,
     ) -> Optional[OrderFillReconciliation]:
-        # Gate keeps no client order id on futures orders: identity is the
-        # exchange order id, and the transport branch enriches the order row
-        # with the order's own my_trades commission.
+        # Gate accepts numeric order IDs and custom text (t-CID). The transport
+        # resolves the exact order and enriches it with its my_trades commission.
         return await self._transport.fetch_order_status(
             symbol, order_id=order_id, client_order_id=client_order_id or ""
         )
@@ -275,6 +275,8 @@ class GateAdapter(VenueAdapter):
             raise ValueError("Gate historical close query requires quantity and closed_at_ms")
         venue_symbol = self._transport._venue_symbol(symbol)
         time_window_ms = 300_000
+        rule = await self._transport._gate_symbol_rule(venue_symbol)
+        contract_quantity = quantity / rule.ct_val
         window_sec = time_window_ms // 1000
         from_sec = max(0, int(closed_at_ms / 1000) - window_sec)
         to_sec = int(closed_at_ms / 1000) + window_sec
@@ -302,7 +304,7 @@ class GateAdapter(VenueAdapter):
             raw_trades,
             contract=venue_symbol,
             side=side,
-            quantity=quantity,
+            quantity=contract_quantity,
             closed_at_ms=closed_at_ms,
             time_window_ms=time_window_ms,
         )
@@ -349,7 +351,7 @@ class GateAdapter(VenueAdapter):
             or executed_quantity is None
             or not math.isclose(
                 executed_quantity,
-                quantity,
+                contract_quantity,
                 rel_tol=1e-9,
                 abs_tol=1e-12,
             )
@@ -410,6 +412,21 @@ class GateAdapter(VenueAdapter):
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return await self._transport.normalize_quantity(symbol, quantity)
+
+    def passive_metadata(self, symbol: str) -> dict:
+        if self._mode != "live":
+            return super().passive_metadata(symbol)
+        venue_symbol = self._transport._venue_symbol(symbol)
+        rule = parse_gate_symbol_rule(self._transport._symbol_metadata.get(venue_symbol), venue_symbol)
+        if rule is None:
+            return {}
+        return {"quantity_step": rule.qty_step, "min_quantity": rule.min_qty,
+                "price_tick": rule.tick_size, "min_notional": rule.min_notional,
+                "contract_size": rule.ct_val,
+                "max_quantity": rule.max_market_qty * rule.ct_val}
+
+    async def precheck_order_admission(self, request: OrderRequest) -> dict:
+        return await self._transport.precheck_order_admission(request)
 
     def _gate_catalog_entry_leverage_limit(
         self, symbol: str, venue_symbol: str

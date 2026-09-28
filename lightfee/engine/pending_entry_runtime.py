@@ -8,6 +8,8 @@ pending-entry removal authority, and recovery-core refresh timing stable.
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import replace
+import math
 
 from lightfee.core.domain import OrderFill, PassiveOrderState, PositionSnapshot, Side, Venue
 from lightfee.engine.bootstrap import wall_clock_now_ms
@@ -18,6 +20,7 @@ from lightfee.engine.pending_entry_terminalizer import (
 )
 from lightfee.engine.pending_entry_lifecycle import has_pending_entry_zero_fill_retry
 from lightfee.engine.reconciliation import _recon_fill_price
+from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 from lightfee.engine.runtime_context import RuntimeContext
 from lightfee.risk.modes import EngineLifecycle
 
@@ -240,6 +243,32 @@ class PendingEntryRuntime:
                     },
                 )
 
+            conflicts = [
+                {"leg": leg, "source": source, "venue": evidence.venue.value,
+                 "actual_side": evidence.side.value, "expected_side": expected.value,
+                 "quantity": evidence.quantity, "order_id": getattr(evidence, "order_id", "")}
+                for leg, expected, fill, position in (
+                    ("long", Side.BUY, result.long_fill, result.long_position),
+                    ("short", Side.SELL, result.short_fill, result.short_position))
+                for source, evidence in (("fill", fill), ("position", position))
+                if evidence is not None and evidence.quantity > 1e-9 and evidence.side != expected
+            ]
+            if conflicts:
+                pending.uncertain_outcome = True
+                self.ctx.journal.append("pending_entry.direction_conflict", {
+                    "entry_id": entry_id, "symbol": pending.symbol, "evidence": conflicts,
+                    "reason": "actual_exchange_direction_conflicts_with_planned_leg",
+                })
+                if await self._cleanup_owned_single_leg_live_truth_conflict(
+                    pending=pending, entry_id=entry_id, live_long_quantity=0,
+                    live_short_quantity=0, matched_quantity=0,
+                    reason="direction_conflict", now_ms=now_ms,
+                ):
+                    resolved_entry_ids.append(entry_id)
+                else:
+                    self.ctx._apply_reconcile_backoff(pending, now_ms)
+                continue
+
             if result.long_fill is not None and result.long_fill.quantity > 0:
                 if pending.maker_leg == "long":
                     if result.long_fill.quantity > pending.maker_leg_filled:
@@ -442,6 +471,12 @@ class PendingEntryRuntime:
                         matched_quantity=0.0,
                         reason="maker_exact_terminal_zero_fill_with_owned_single_leg",
                         now_ms=now_ms,
+                        live_truth=PendingEntryLiveTruth(
+                            available=result.long_position is not None and result.short_position is not None,
+                            has_live_position=True,
+                            live_positions=tuple(p for p in (result.long_position, result.short_position)
+                                                 if p is not None and p.quantity > 1e-9),
+                        ),
                     ):
                         resolved_entry_ids.append(entry_id)
                     else:
@@ -726,12 +761,26 @@ class PendingEntryRuntime:
             and not self.ctx.state.pending_entries
             and not self.ctx.state.pending_closes
         ):
-            from lightfee.engine.lifecycle import transition_to_running
+            from lightfee.engine.lifecycle import (
+                lifecycle_diagnostic_fields,
+                lifecycle_diagnostic_snapshot,
+                transition_to_running,
+            )
 
+            lifecycle_before = lifecycle_diagnostic_snapshot(self.ctx.state)
             transition_to_running(self.ctx.state)
             self.ctx.journal.append(
                 "runtime.reconciling_complete",
-                {"reason": "all_pending_resolved", "ts_ms": now_ms},
+                {
+                    "reason": "all_pending_resolved", "ts_ms": now_ms,
+                    **lifecycle_diagnostic_fields(
+                        self.ctx.state, lifecycle_before,
+                        writer="PendingEntryRuntime._reconcile_pending_state",
+                        reason="all_pending_resolved",
+                        core_decision=getattr(self.ctx, "recovery_decision", None),
+                        core_decision_source="cached",
+                    ),
+                },
             )
 
     @staticmethod
@@ -1384,6 +1433,11 @@ class PendingEntryRuntime:
 
         try:
             position = await fetch_position(pending.symbol)
+            if position is None or getattr(position, "quantity", None) is None:
+                raise ValueError("missing_live_position_truth")
+            live_qty = abs(float(position.quantity))
+            if not math.isfinite(live_qty) or (live_qty > 1e-9 and position.side not in (Side.BUY, Side.SELL)):
+                raise ValueError("invalid_live_position_truth")
         except Exception as exc:
             pending.uncertain_outcome = True
             pending.reconcile_next_attempt_ms = max(
@@ -1407,7 +1461,6 @@ class PendingEntryRuntime:
                 error=str(exc) or exc.__class__.__name__,
             )
 
-        live_qty = abs(float(getattr(position, "quantity", 0.0) or 0.0)) if position else 0.0
         if live_qty <= 1e-9:
             return PendingEntryLiveTruth(
                 available=True,
@@ -1457,6 +1510,28 @@ class PendingEntryRuntime:
             live_long_quantity=live_long_quantity,
             live_short_quantity=live_short_quantity,
             live_balanced_quantity=0.0,
+            live_positions=(position,),
+        )
+
+    async def _pending_entry_pair_open_order_truth(self, pending, entry_id: str) -> PendingEntryLiveTruth:
+        """Require both symbol-scoped order lists before net-position cleanup."""
+        errors = []
+        orders_by_venue = {}
+        for venue in dict.fromkeys((pending.long_venue, pending.short_venue)):
+            try:
+                rows = await self.ctx._fetch_residual_repair_open_orders(
+                    self.ctx.get_venue_adapter(venue), venue, pending.symbol)
+                orders_by_venue[venue.value] = len(rows)
+            except Exception as exc:
+                errors.append(f"{venue.value}:open_orders:{str(exc) or type(exc).__name__}")
+        self.ctx.journal.append("pending_entry.pair_open_order_truth", {
+            "entry_id": entry_id, "symbol": pending.symbol,
+            "source": "symbol_scoped_open_orders", "orders_by_venue": orders_by_venue,
+            "available": not errors, "errors": errors,
+        })
+        return PendingEntryLiveTruth(
+            available=not errors, has_live_open_order=any(orders_by_venue.values()),
+            error=";".join(errors), open_orders_verified=not errors,
         )
 
     async def _pending_entry_positive_fill_live_truth(
@@ -1464,8 +1539,10 @@ class PendingEntryRuntime:
         pending,
         entry_id: str,
         now_ms: int,
+        *,
+        probe_paper: bool = False,
     ) -> PendingEntryLiveTruth:
-        if str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live":
+        if not probe_paper and str(getattr(self.ctx.config.runtime, "mode", "") or "") != "live":
             return PendingEntryLiveTruth(
                 available=True,
                 has_live_open_order=False,
@@ -1473,23 +1550,11 @@ class PendingEntryRuntime:
                 positive_fill_requires_live_position=False,
             )
 
-        open_order_truth = PendingEntryLiveTruth(available=True)
-        if self.ctx._pending_entry_has_maker_order_reference(pending):
-            open_order_truth = await self.ctx._pending_entry_zero_fill_has_live_maker_open_order(
-                pending,
-                entry_id,
-                now_ms,
-            )
-            if open_order_truth.has_live_open_order:
-                return PendingEntryLiveTruth(
-                    available=True,
-                    has_live_open_order=True,
-                    has_live_position=False,
-                    positive_fill_requires_live_position=True,
-                )
+        open_order_truth = await self._pending_entry_pair_open_order_truth(pending, entry_id)
 
         live_positions: dict[str, float] = {}
         live_position_details: dict[str, dict[str, Any]] = {}
+        actual_positions: list[PositionSnapshot] = []
         live_long_quantity = 0.0
         live_short_quantity = 0.0
         errors: list[str] = []
@@ -1508,10 +1573,18 @@ class PendingEntryRuntime:
             except Exception as exc:
                 errors.append(f"{venue_name}:{str(exc) or exc.__class__.__name__}")
                 continue
+            if position is None or getattr(position, "quantity", None) is None:
+                errors.append(f"{venue_name}:missing_live_position_truth")
+                continue
             raw_quantity = abs(
                 float(getattr(position, "quantity", 0.0) or 0.0)
             ) if position else 0.0
             position_side = getattr(position, "side", None) if position else None
+            if not math.isfinite(raw_quantity) or (raw_quantity > 1e-9 and position_side not in (Side.BUY, Side.SELL)):
+                errors.append(f"{venue_name}:invalid_live_position")
+                continue
+            if raw_quantity > 1e-9:
+                actual_positions.append(position)
             side_matches = position_side == expected_side
             matched_quantity = raw_quantity if side_matches else 0.0
             live_positions[venue_name] = raw_quantity
@@ -1527,7 +1600,7 @@ class PendingEntryRuntime:
             else:
                 live_short_quantity = matched_quantity
 
-        if errors:
+        if errors or not open_order_truth.available:
             error_text = ";".join(
                 [error for error in (open_order_truth.error, *errors) if error]
             )
@@ -1552,24 +1625,28 @@ class PendingEntryRuntime:
             return PendingEntryLiveTruth(
                 available=False,
                 has_live_open_order=open_order_truth.has_live_open_order,
-                has_live_position=False,
+                has_live_position=bool(actual_positions),
                 error=error_text or "positive_fill_live_truth_unavailable",
                 positive_fill_requires_live_position=True,
                 live_long_quantity=live_long_quantity,
                 live_short_quantity=live_short_quantity,
                 live_balanced_quantity=min(live_long_quantity, live_short_quantity),
+                live_positions=tuple(actual_positions),
+                open_orders_verified=open_order_truth.open_orders_verified,
             )
 
         has_live_position = any(qty > 1e-9 for qty in live_positions.values())
         live_balanced_quantity = min(live_long_quantity, live_short_quantity)
         return PendingEntryLiveTruth(
             available=True,
-            has_live_open_order=False,
+            has_live_open_order=open_order_truth.has_live_open_order,
             has_live_position=has_live_position,
             positive_fill_requires_live_position=True,
             live_long_quantity=live_long_quantity,
             live_short_quantity=live_short_quantity,
             live_balanced_quantity=live_balanced_quantity,
+            live_positions=tuple(actual_positions),
+            open_orders_verified=open_order_truth.open_orders_verified,
         )
 
     async def _finalize_pending_entry(self, pending, entry_id: str, now_ms: int) -> bool:
@@ -1594,6 +1671,7 @@ class PendingEntryRuntime:
         cleanup but does NOT create an open position or emit entry.opened.
         """
         from lightfee.engine.entry import build_open_position, EntryContext, EntryType
+        from lightfee.engine.close_executor import _residual_task_to_dict
         from lightfee.engine.residual import (
             split_entry_fill_residual,
             residual_pair_id,
@@ -1695,33 +1773,26 @@ class PendingEntryRuntime:
             "long_venue_metadata": long_venue_metadata,
             "short_venue_metadata": short_venue_metadata,
         }
+        residual_successors = [_residual_task_to_dict(residual_task)] if residual_task is not None else []
 
         if balanced_quantity <= 0.0:
             if not pending.has_any_fill():
-                open_order_truth = await self.ctx._pending_entry_zero_fill_has_live_maker_open_order(
-                    pending,
-                    entry_id,
-                    now_ms,
-                )
-                live_position_truth = await self.ctx._pending_entry_zero_fill_has_live_maker_position(
-                    pending,
-                    entry_id,
-                    now_ms,
-                )
-                missing_truth_errors = [
-                    truth.error
-                    for truth in (open_order_truth, live_position_truth)
-                    if not truth.available and truth.error
-                ]
-                live_truth = PendingEntryLiveTruth(
-                    available=open_order_truth.available and live_position_truth.available,
-                    has_live_open_order=open_order_truth.has_live_open_order,
-                    has_live_position=live_position_truth.has_live_position,
-                    error=";".join(missing_truth_errors),
-                    live_long_quantity=live_position_truth.live_long_quantity,
-                    live_short_quantity=live_position_truth.live_short_quantity,
-                    live_balanced_quantity=live_position_truth.live_balanced_quantity,
-                )
+                if (self.ctx.config.runtime.mode == "live"
+                        and not self.ctx._pending_entry_has_maker_order_reference(pending)):
+                    live_truth = await self.ctx._pending_entry_zero_fill_has_live_maker_open_order(
+                        pending, entry_id, now_ms)
+                elif self.ctx.config.runtime.mode == "live":
+                    live_truth = await self.ctx._pending_entry_positive_fill_live_truth(
+                        pending, entry_id, now_ms)
+                else:
+                    open_order_truth = await self.ctx._pending_entry_zero_fill_has_live_maker_open_order(
+                        pending, entry_id, now_ms)
+                    position_truth = await self.ctx._pending_entry_zero_fill_has_live_maker_position(
+                        pending, entry_id, now_ms)
+                    live_truth = replace(position_truth,
+                        available=open_order_truth.available and position_truth.available,
+                        has_live_open_order=open_order_truth.has_live_open_order,
+                        error=";".join(t.error for t in (open_order_truth, position_truth) if t.error))
                 decision = PendingEntryTerminalizer().decide(
                     pending,
                     live_truth=live_truth,
@@ -1775,23 +1846,21 @@ class PendingEntryRuntime:
                         "finalized_as": "unfilled_zero_balanced",
                     },
                 )
-                await self.ctx._complete_pending_entry_terminal_removal(
+                return await self.ctx._complete_pending_entry_terminal_removal(
                     entry_id,
                     reason="zero_fill_unfilled_removal",
                     symbol=pending.symbol,
                     now_ms=now_ms,
+                    live_truth=live_truth,
                 )
-                return True
 
             # V1: balanced_quantity == 0 but has_any_fill → one-sided exposure.
             # No open position, no entry.opened. Persist residual task if asymmetric.
             # entry_sync.rs:5436-5443: if let Some(task) = residual_task {
             #   persist_pending_residual_repair(task, "incremental_entry_open_unmatched_residual")
             # }
-            decision = PendingEntryTerminalizer().decide(
-                pending,
-                live_truth=PendingEntryLiveTruth(available=True),
-            )
+            live_truth = await self.ctx._pending_entry_positive_fill_live_truth(pending, entry_id, now_ms)
+            decision = PendingEntryTerminalizer().decide(pending, live_truth=live_truth)
             self.ctx.journal.append(
                 "pending_entry.terminalizer_decision",
                 self.ctx._pending_entry_terminalizer_decision_payload(
@@ -1802,6 +1871,11 @@ class PendingEntryRuntime:
                 ),
             )
             if not decision.allows_pending_removal:
+                return False
+            if not self._pending_entry_successor_covers_live_truth(
+                pending, entry_id, now_ms, reason="unmatched_residual_before_publication",
+                truth=live_truth, successor=None, residual_successors=residual_successors,
+            ):
                 return False
             if residual_task is not None:
                 self.ctx._queue_pending_residual_repair(
@@ -1837,13 +1911,13 @@ class PendingEntryRuntime:
                     "finalized_as": "unmatched_residual",
                 },
             )
-            await self.ctx._complete_pending_entry_terminal_removal(
+            return await self.ctx._complete_pending_entry_terminal_removal(
                 entry_id,
                 reason="unmatched_residual_terminalized",
                 symbol=pending.symbol,
                 now_ms=now_ms,
+                live_truth=live_truth,
             )
-            return True
 
         # --- balanced_quantity > 0: create OpenPosition and entry.opened ---
         live_truth = await self.ctx._pending_entry_positive_fill_live_truth(
@@ -1976,24 +2050,22 @@ class PendingEntryRuntime:
         )
 
         position = build_open_position(ctx, maker_fill, hedge_fill, now_ms)
+        if not self._pending_entry_successor_covers_live_truth(
+            pending, entry_id, now_ms, reason="open_position_before_publication",
+            truth=live_truth, successor=position, residual_successors=residual_successors,
+        ):
+            return False
 
         self.ctx.state.open_positions[position.position_id] = position
+
+        from lightfee.engine.recovery import _serialize_open_position
 
         self.ctx.journal.append_critical(
             now_ms, "entry.opened",
             {
-                "position_id": position.position_id,
+                **_serialize_open_position(position),
                 "internal_entry_id": position.position_id,
-                "symbol": position.symbol,
-                "long_venue": position.long_venue.value,
-                "short_venue": position.short_venue.value,
                 "quantity": position.matched_quantity,
-                "long_quantity": position.long_quantity,
-                "short_quantity": position.short_quantity,
-                "long_entry_price": position.long_entry_price,
-                "short_entry_price": position.short_entry_price,
-                "opened_at_ms": position.opened_at_ms,
-                "matched_quantity": position.matched_quantity,
                 "balanced_quantity": balanced_quantity,
                 "raw_maker_leg_filled": raw_maker_leg_filled,
                 "raw_hedge_leg_filled": raw_hedge_leg_filled,
@@ -2003,21 +2075,10 @@ class PendingEntryRuntime:
                 "hedge_order_id": hedge_fill.order_id,
                 "maker_client_order_id": pending.maker_client_order_id,
                 "hedge_client_order_id": pending.hedge_client_order_id,
-                "long_entry_fee_quote": position.long_entry_fee_quote,
-                "short_entry_fee_quote": position.short_entry_fee_quote,
-                "total_entry_fee_quote": position.total_entry_fee_quote,
-                "entry_fee_evidence_complete": position.entry_fee_evidence_complete,
-                "funding_timestamp_ms": position.funding_timestamp_ms,
-                "second_funding_timestamp_ms": position.second_funding_timestamp_ms,
-                "opportunity_type": position.opportunity_type,
-                "second_stage_enabled_at_entry": position.second_stage_enabled_at_entry,
-                "exit_after_first_stage": position.exit_after_first_stage,
-                "funding_edge_bps_entry": position.funding_edge_bps_entry,
-                "total_funding_edge_bps_entry": position.total_funding_edge_bps_entry,
-                "expected_edge_bps_entry": position.expected_edge_bps_entry,
                 "quantity_source": "matched_fill_open_position",
                 "long_venue_metadata": long_venue_metadata,
                 "short_venue_metadata": short_venue_metadata,
+                "pending_residual_repairs": residual_successors,
             },
         )
 
@@ -2068,7 +2129,10 @@ class PendingEntryRuntime:
                 "incremental_entry_open_partially_matched",
                 residual_evidence,
             )
-        return True
+        return await self.ctx._complete_pending_entry_terminal_removal(
+            entry_id, reason="pending_entry_finalized", symbol=pending.symbol,
+            now_ms=now_ms, live_truth=live_truth,
+        )
 
     def _remove_pending_entry_after_terminal_decision(
         self,
@@ -2106,10 +2170,9 @@ class PendingEntryRuntime:
         closure_row_key = closure_fields.get("closure_row_key", "")
         closure_decision_id = closure_fields.get("closure_decision_id", "")
         # _remove_pending_entry_after_terminal_decision is the only direct pop authority.
-        removed = self.ctx.state.pending_entries.pop(entry_id, None)
-        if removed is not None:
-            self.ctx.journal.append(
-                "pending_entry.removed_by_v1_lifecycle_closure",
+        if entry_id in self.ctx.state.pending_entries:
+            self.ctx.journal.append_critical(
+                wall_clock_now_ms(), "pending_entry.removed_by_v1_lifecycle_closure",
                 {
                     "entry_id": entry_id,
                     "owner_id": owner_id,
@@ -2117,8 +2180,13 @@ class PendingEntryRuntime:
                     "closure_phase": closure_phase,
                     "closure_row_key": closure_row_key,
                     "closure_decision_id": closure_decision_id,
+                    "pending_residual_repairs": [
+                        dict(task) for task in self.ctx.state.pending_residual_repairs
+                        if isinstance(task, dict) and task.get("position_id") == entry_id
+                    ],
                 },
             )
+            self.ctx.state.pending_entries.pop(entry_id, None)
 
     async def _cleanup_positive_fill_live_truth_conflict(
         self,
@@ -2140,6 +2208,7 @@ class PendingEntryRuntime:
             live_long_quantity=decision.live_long_quantity,
             live_short_quantity=decision.live_short_quantity,
             matched_quantity=decision.matched_quantity,
+            live_truth=live_truth,
             reason=decision.reason,
             now_ms=now_ms,
         )
@@ -2181,15 +2250,22 @@ class PendingEntryRuntime:
         matched_quantity: float,
         reason: str,
         now_ms: int,
+        live_truth: PendingEntryLiveTruth | None = None,
     ) -> bool:
         """Flatten one owned live leg and release pending only after fresh flat truth."""
 
         eps = 1e-9
         live_long_quantity = max(float(live_long_quantity or 0.0), 0.0)
         live_short_quantity = max(float(live_short_quantity or 0.0), 0.0)
-        has_live_long = live_long_quantity > eps
-        has_live_short = live_short_quantity > eps
-        if has_live_long == has_live_short:
+        truth = live_truth or await self.ctx._pending_entry_positive_fill_live_truth(pending, entry_id, now_ms)
+        if not truth.open_orders_verified:
+            orders = await self._pending_entry_pair_open_order_truth(pending, entry_id)
+            truth = replace(truth, available=truth.available and orders.available,
+                            has_live_open_order=truth.has_live_open_order or orders.has_live_open_order,
+                            open_orders_verified=orders.open_orders_verified,
+                            error=";".join(e for e in (truth.error, orders.error) if e))
+        actual = truth.live_positions
+        if not truth.available or truth.has_live_open_order or len(actual) != 1:
             self.ctx.journal.append(
                 "pending_entry.owned_live_conflict_cleanup_skipped",
                 {
@@ -2198,20 +2274,42 @@ class PendingEntryRuntime:
                     "live_long_quantity": live_long_quantity,
                     "live_short_quantity": live_short_quantity,
                     "reason": (
-                        "ambiguous_live_position_shape"
-                        if has_live_long
-                        else "no_live_single_leg_to_cleanup"
+                        "live_truth_unavailable" if not truth.available else
+                        "live_order_present" if truth.has_live_open_order else
+                        "ambiguous_live_position_shape" if actual else "no_live_single_leg_to_cleanup"
                     ),
+                    "actual_positions": [{"venue": p.venue.value, "side": p.side.value,
+                                           "quantity": p.quantity} for p in actual],
+                    "truth_error": truth.error,
                 },
             )
             return False
 
-        cleanup_venue = pending.long_venue if has_live_long else pending.short_venue
-        live_side = Side.BUY if has_live_long else Side.SELL
-        live_quantity = live_long_quantity if has_live_long else live_short_quantity
+        position = actual[0]
+        cleanup_venue = position.venue
+        live_side = position.side
+        live_quantity = abs(position.quantity)
+        if cleanup_venue not in (pending.long_venue, pending.short_venue):
+            return False
+        # A local owner must still exist, and another active owner for this
+        # symbol prevents treating the whole exchange position as this entry.
+        competing = [p for p in self.ctx.state.pending_entries.values()
+                     if p.pending_id != entry_id and p.symbol == pending.symbol]
+        other_owners = RecoveryOwnerIndex.from_state({
+            "open_positions": self.ctx.state.open_positions,
+            "pending_residual_repairs": self.ctx.state.pending_residual_repairs,
+        })
+        if other_owners.has_position_claim(position):
+            competing.append(other_owners)
+        if entry_id not in self.ctx.state.pending_entries or competing:
+            self.ctx.journal.append("pending_entry.owned_live_conflict_cleanup_skipped", {
+                "entry_id": entry_id, "symbol": pending.symbol, "venue": cleanup_venue.value,
+                "reason": "missing_or_competing_owner", "competing_owner_count": len(competing),
+            })
+            return False
         stage = (
             "owned_pending_entry_live_conflict_long"
-            if has_live_long
+            if live_side == Side.BUY
             else "owned_pending_entry_live_conflict_short"
         )
         self.ctx.journal.append(
@@ -2313,13 +2411,58 @@ class PendingEntryRuntime:
                 "reason": "owned_single_leg_flattened_and_fresh_truth_flat",
             },
         )
-        await self.ctx._complete_pending_entry_terminal_removal(
+        return await self.ctx._complete_pending_entry_terminal_removal(
             entry_id,
             reason="owned_live_conflict_cleanup_succeeded",
             symbol=pending.symbol,
             now_ms=now_ms,
+            live_truth=fresh_truth,
         )
-        return True
+
+    def _pending_entry_successor_covers_live_truth(
+        self, pending, entry_id: str, now_ms: int, *, reason: str,
+        truth: PendingEntryLiveTruth, successor, residual_successors: list[dict],
+    ) -> bool:
+        """Validate a proposed handoff before its first durable publication."""
+        if self.ctx.config.runtime.mode != "live":
+            return True
+        covered: dict[tuple[Venue, Side], float] = {}
+        if successor is not None and successor.symbol == pending.symbol:
+            covered[(successor.long_venue, Side.BUY)] = successor.long_quantity
+            covered[(successor.short_venue, Side.SELL)] = successor.short_quantity
+        for task in residual_successors:
+            if task.get("position_id") != entry_id or task.get("symbol") != pending.symbol:
+                continue
+            fields = self.ctx._pending_residual_repair_fields(task)
+            if fields is not None:
+                venue, repair_side, quantity = fields
+                if math.isfinite(quantity):
+                    key = (venue, repair_side.opposite())
+                    covered[key] = covered.get(key, 0.0) + quantity
+        has_successor = bool(covered) and all(
+            math.isfinite(covered.get((p.venue, p.side), 0.0))
+            and covered.get((p.venue, p.side), 0.0) + 1e-9 >= abs(p.quantity)
+            for p in truth.live_positions)
+        allowed = (truth.available and truth.open_orders_verified
+                   and not truth.has_live_open_order
+                   and (has_successor or not truth.has_live_position))
+        self.ctx.journal.append("pending_entry.terminal_removal_evidence", {
+            "entry_id": entry_id, "symbol": pending.symbol, "source": reason,
+            "allowed": allowed, "available": truth.available,
+            "open_orders_verified": truth.open_orders_verified,
+            "has_live_open_order": truth.has_live_open_order,
+            "has_live_position": truth.has_live_position, "error": truth.error,
+            "successor": "open_position" if successor is not None else
+                         "residual_repair" if residual_successors else "flat",
+            "live_positions": [{"venue": p.venue.value, "side": p.side.value,
+                                "quantity": p.quantity} for p in truth.live_positions],
+            "covered_positions": [{"venue": v.value, "side": s.value, "quantity": q}
+                                  for (v, s), q in covered.items()],
+        })
+        if not allowed:
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(pending.reconcile_next_attempt_ms, now_ms + 1000)
+        return allowed
 
     async def _complete_pending_entry_terminal_removal(
         self,
@@ -2328,7 +2471,8 @@ class PendingEntryRuntime:
         reason: str,
         symbol: str = "",
         now_ms: int | None = None,
-    ) -> None:
+        live_truth: PendingEntryLiveTruth | None = None,
+    ) -> bool:
         """Remove a terminal pending entry and re-run recovery-core release.
 
         V1 terminalizes a pending entry only after order/fill/position truth
@@ -2339,10 +2483,26 @@ class PendingEntryRuntime:
         pending = self.ctx.state.pending_entries.get(entry_id)
         pending_symbol = str(symbol or getattr(pending, "symbol", "") or "").upper()
         if pending is None and not pending_symbol:
-            return
+            return True
+        now_ms = now_ms if now_ms is not None else wall_clock_now_ms()
+        if pending is not None and self.ctx.config.runtime.mode == "live":
+            # Every runtime release route converges here. Submit certainty,
+            # local zero-fill and elapsed time are not exchange flat proof.
+            truth = live_truth
+            if truth is None or not truth.open_orders_verified:
+                truth = await self.ctx._pending_entry_positive_fill_live_truth(pending, entry_id, now_ms)
+            successor = self.ctx.state.open_positions.get(entry_id)
+            residual_successors = [task for task in self.ctx.state.pending_residual_repairs
+                                   if isinstance(task, dict) and task.get("position_id") == entry_id
+                                   and task.get("symbol") == pending.symbol]
+            if not self._pending_entry_successor_covers_live_truth(
+                pending, entry_id, now_ms, reason=reason, truth=truth,
+                successor=successor, residual_successors=residual_successors,
+            ):
+                return False
         self.ctx._remove_pending_entry_after_terminal_decision(entry_id, reason=reason)
         if not self.ctx._pending_entry_terminal_needs_recovery_core_refresh():
-            return
+            return True
         startup_terminal_symbols = getattr(
             self.ctx,
             "_startup_pending_entry_terminal_symbols",
@@ -2350,7 +2510,7 @@ class PendingEntryRuntime:
         )
         if startup_terminal_symbols is not None and pending_symbol:
             startup_terminal_symbols.add(pending_symbol)
-            return
+            return True
         source_symbols = self.ctx._truth_required_recovery_probe_symbol_sources(
             [pending_symbol] if pending_symbol else []
         )
@@ -2358,8 +2518,9 @@ class PendingEntryRuntime:
             reason=reason,
             symbol=pending_symbol,
             source_symbols=source_symbols,
-            now_ms=now_ms if now_ms is not None else wall_clock_now_ms(),
+            now_ms=now_ms,
         )
+        return True
 
     def _pending_entry_terminal_needs_recovery_core_refresh(self) -> bool:
         if self.ctx.state.lifecycle == EngineLifecycle.RISK_ONLY:

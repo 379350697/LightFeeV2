@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, MutableMapping
+from lightfee.core.domain import PositionSnapshot
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class PendingEntryLiveTruth:
     live_long_quantity: float = 0.0
     live_short_quantity: float = 0.0
     live_balanced_quantity: float = 0.0
+    live_positions: tuple[PositionSnapshot, ...] = ()
+    open_orders_verified: bool = False
 
 
 @dataclass(frozen=True)

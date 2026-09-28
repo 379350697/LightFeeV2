@@ -269,6 +269,16 @@ REMOTE_PYTHONPATH="PYTHONPATH=$REMOTE_PATH"
 SSH_OPTS="-p {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 SCP_OPTS="-P {ssh_port} -o BatchMode=yes -o ConnectTimeout=10"
 
+echo "=== Checking remote WebSocket dependency before sync ==="
+ssh $SSH_OPTS "$REMOTE_HOST" "$REMOTE_PYTHON -" <<'PY'
+import inspect
+import websockets
+
+if "additional_headers" not in inspect.signature(websockets.connect).parameters:
+    raise SystemExit("Deployment blocked: install websockets>=14.0 in the remote .venv first")
+print(f"websockets {{websockets.__version__}}: Gate decimal handshake supported")
+PY
+
 echo "=== Generating deploy manifest ==="
 python3 "$LOCAL/scripts/verify_deploy_manifest.py" --local
 

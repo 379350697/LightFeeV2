@@ -108,6 +108,174 @@ def test_supervised_venues_normalizes_pending_close_reconciliation_snapshot():
     assert supervisor._supervised_venues() == {Venue.OKX, Venue.BYBIT}
 
 
+@pytest.mark.parametrize("policy,action", [
+    ("death_line", "fail_closed"), ("warning_only", "pause_entry"), ("ignore", "normal"),
+])
+@pytest.mark.parametrize("evidence", ["unsupported", "missing", "error", "stale", "fresh"])
+@pytest.mark.parametrize("owner", ["active", "pending_close"])
+@pytest.mark.asyncio
+async def test_supervisor_diagnoses_runtime_risk_evidence(risk_runtime, policy, action, evidence, owner):
+    runtime = risk_runtime
+    runtime.config.strategy.unsupported_risk_snapshot_behavior = policy
+    adapter = runtime._venue_adapters[Venue.BINANCE]
+    adapter.supports_risk_health = evidence != "unsupported"
+    if evidence == "missing":
+        adapter.result = None
+    elif evidence == "error":
+        adapter.result = RuntimeError("risk endpoint unavailable")
+    elif evidence == "stale":
+        adapter.result = _snapshot(Venue.BINANCE, 100, 10, 1)
+    if owner == "pending_close":
+        runtime.state.open_positions.clear()
+        runtime.state.pending_close_reconciliations.append({
+            "position_id": "risk-diagnostic", "symbol": "BTCUSDT",
+            "position_snapshot": {"long_venue": "binance", "short_venue": "okx"},
+        })
+
+    await runtime._post_tick_housekeeping(100_000)
+    payloads = {
+        e["payload"]["venue"]: e["payload"] for e in runtime.journal.read_all()
+        if e["kind"] == "venue.health_changed"
+    }
+    payload = payloads["binance"]
+    assert adapter.calls == (0 if evidence == "unsupported" else 1)
+    assert payload["supports_risk_health"] is (evidence != "unsupported")
+    assert payload["risk_snapshot_present"] is (evidence in {"stale", "fresh"})
+    assert payload["risk_snapshot_age_ms"] == ({"stale": 99_999, "fresh": 0}.get(evidence))
+    assert payload["risk_snapshot_stale"] == (evidence == "stale" if evidence in {"stale", "fresh"} else None)
+    assert payload["risk_snapshot_source"] == ("test" if evidence in {"stale", "fresh"} else None)
+    assert payload["unsupported_risk_snapshot_behavior"] == policy
+    assert payload["risk_monitor_enabled"] is True
+    assert payload["action"] == ("normal" if evidence == "fresh" else action)
+    assert payloads["okx"]["action"] == "normal"
+    expected_mode = "running" if evidence == "fresh" or policy == "ignore" else {
+        "death_line": "fail_closed", "warning_only": "entry_paused",
+    }[policy]
+    assert runtime.state.risk_mode.value == expected_mode
+
+    # Same-tick consumers share successes and failures; unchanged health emits no new event.
+    await runtime._post_tick_housekeeping(100_001)
+    assert adapter.calls == (0 if evidence == "unsupported" else 1)
+    assert sum(e["kind"] == "venue.health_changed" for e in runtime.journal.read_all()) == 2
+
+
+class _RiskAdapter:
+    supports_risk_health = True
+    supports_private_health = False
+
+    def __init__(self, venue):
+        self.result = _snapshot(venue, 100, 10, 100_000)
+        self.calls = 0
+
+    async def fetch_account_risk_snapshot(self):
+        self.calls += 1
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.fixture
+def risk_runtime(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+    from lightfee.config.schema import PersistenceConfig
+    from lightfee.engine.runtime import LiveRuntime
+
+    config = _make_config()
+    config.runtime.mode = "paper"
+    config.persistence = PersistenceConfig(
+        event_log_path=str(tmp_path / "risk.jsonl"), snapshot_path=str(tmp_path / "state.json"),
+    )
+    runtime = LiveRuntime(config, venue_adapters={v: _RiskAdapter(v) for v in (Venue.BINANCE, Venue.OKX)})
+    runtime.state.lifecycle = EngineLifecycle.RUNNING
+    runtime.state.open_positions["p001"] = _make_position()
+    # Isolate later housekeeping lanes; risk fetching, cache, supervision and mode writes stay real.
+    for name in (
+        "_reconcile_pending_state", "_recover_residual_repairs",
+        "_maybe_recover_clean_live_positions", "_activate_private_ws_startup_phase",
+    ):
+        monkeypatch.setattr(runtime, name, AsyncMock())
+    runtime.journal.open()
+    try:
+        yield runtime
+    finally:
+        runtime.journal.close()
+
+
+@pytest.mark.parametrize("operator_blocked", [False, True])
+@pytest.mark.asyncio
+async def test_supervisor_reuses_runtime_cache_and_refreshes_error_after_ttl(risk_runtime, operator_blocked):
+    runtime = risk_runtime
+    # Produce the exact tuple cache used by active-position ticks before housekeeping.
+    for venue, adapter in runtime._venue_adapters.items():
+        snapshot, supported = await runtime._fetch_venue_risk_snapshot(venue, adapter, True, 100_000)
+        assert supported and snapshot.health_ratio == 10
+    await runtime._post_tick_housekeeping(100_000)
+    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    assert all(a.calls == 1 for a in runtime._venue_adapters.values())
+
+    failed_adapter = runtime._venue_adapters[Venue.BINANCE]
+    failed_adapter.result = RuntimeError("temporary failure")
+    await runtime._post_tick_housekeeping(101_000)
+    assert failed_adapter.calls == 1  # TTL boundary is still valid.
+    assert runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    await runtime._post_tick_housekeeping(101_001)
+    assert failed_adapter.calls == 2
+    assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+    assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
+    await runtime._post_tick_housekeeping(101_500)
+    assert failed_adapter.calls == 2  # Errors are cached, avoiding a retry storm.
+    if operator_blocked:
+        runtime.state.operator.requested_mode = GlobalRiskMode.FAIL_CLOSED
+    failed_adapter.result = _snapshot(Venue.BINANCE, 100, 10, 102_002)
+    await runtime._post_tick_housekeeping(102_002)
+    assert failed_adapter.calls == 3
+    assert all(view.health_ratio == 10 for view in runtime.supervisor._venue_health_views.values())
+    # V1 EngineRecoveryWorkSnapshot.has_resume_blocking_work: open positions retain the latch.
+    assert runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+    runtime.state.open_positions.clear()
+    await runtime._post_tick_housekeeping(102_003)
+    assert runtime.state.risk_mode == (GlobalRiskMode.FAIL_CLOSED if operator_blocked else GlobalRiskMode.RUNNING)
+    assert runtime.state.lifecycle == (EngineLifecycle.RISK_ONLY if operator_blocked else EngineLifecycle.RUNNING)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_disabled_does_not_fetch_runtime_risk(risk_runtime):
+    risk_runtime.config.strategy.risk_monitor_enabled = False
+    await risk_runtime._post_tick_housekeeping(100_000)
+    assert all(a.calls == 0 for a in risk_runtime._venue_adapters.values())
+
+
+@pytest.mark.parametrize("current_inputs", [None, {}])
+@pytest.mark.asyncio
+async def test_supervisor_missing_current_inputs_do_not_reuse_healthy_snapshots(risk_runtime, current_inputs):
+    await risk_runtime._post_tick_housekeeping(100_000)
+    assert risk_runtime.state.risk_mode == GlobalRiskMode.RUNNING
+    risk_runtime.supervisor.supervise(
+        100_001, {}, adapters=risk_runtime._venue_adapters, risk_snapshots=current_inputs,
+    )
+    assert risk_runtime.state.risk_mode == GlobalRiskMode.FAIL_CLOSED
+    assert all(view.health_ratio is None for view in risk_runtime.supervisor._venue_health_views.values())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_supervisor_resume_diagnostic_captures_completed_transition(enabled):
+    state = EngineState(lifecycle=EngineLifecycle.RISK_ONLY, risk_mode=GlobalRiskMode.FAIL_CLOSED)
+    journal = _make_journal()
+    supervisor = Supervisor(_make_config(risk_monitor_enabled=enabled), state, journal)
+    try:
+        supervisor.supervise(5000, {"gate": 5.0})
+        payload = next(e["payload"] for e in journal.read_all() if e["kind"] == "risk.fail_closed_auto_resumed")
+        assert payload["lifecycle_before"] == "risk_only"
+        assert payload["lifecycle_after"] == "running"
+        assert payload["risk_mode_before"] == "fail_closed"
+        assert payload["risk_mode_after"] == "running"
+        assert payload["lifecycle_writer"] == ("Supervisor.update_global_risk_mode" if enabled else "Supervisor.supervise")
+        assert payload["pending_residual_repair_count"] == 0
+        assert payload["recovery_decision_source"] == "unavailable"
+    finally:
+        journal.close()
+
+
 def test_supervised_venues_normalizes_dict_shaped_pending_close_reconciliation_snapshot():
     state = EngineState()
     state.pending_close_reconciliations = {

@@ -164,17 +164,46 @@ def parse_open_orders_response(
     failure returns (None, reason) so the caller treats the probe as untrusted —
     an empty/None/unknown response is NOT equivalent to a proven flat.
     """
+    rows, error = _parse_open_orders_evidence(raw, venue=venue, require_venue_success=require_venue_success)
+    return (None if error else rows), error
+
+
+def _parse_open_orders_evidence(
+    raw: Any,
+    *,
+    venue: Venue | None = None,
+    require_venue_success: bool = False,
+) -> tuple[list[Any] | None, str | None]:
+    """Retain observed rows on partial failure; strict public APIs still fail."""
     def trusted_rows(rows: Any, *, source: str) -> tuple[list[Any] | None, str | None]:
         if not isinstance(rows, list):
             return None, f"open_orders_response_field_not_list:{source}"
+        normalized = []
+        errors = []
         for index, row in enumerate(rows):
             if not isinstance(row, dict):
-                return (
-                    None,
-                    "open_orders_response_row_not_mapping:"
-                    f"{source}:{index}:{type(row).__name__}",
-                )
-        return list(rows), None
+                error = f"open_orders_response_row_not_mapping:{source}:{index}:{type(row).__name__}"
+                errors.append(error)
+                normalized.append({"quantity": None, "raw": row, "normalization_error": error})
+                continue
+            if venue == Venue.GATE:
+                symbol = str(row.get("symbol") or row.get("contract") or "")
+                order_id = str(row.get("order_id") or row.get("id") or "")
+                text = str(row.get("text") or "")
+                client_id = str(row.get("client_order_id") or (
+                    text[2:] if text.startswith("t-") else ""))
+                item = {**row, "symbol": symbol, "order_id": order_id,
+                        "client_order_id": client_id, "raw": row}
+                if "reduce_only" not in item:
+                    item["reduce_only"] = row.get("is_reduce_only", False)
+                if not symbol or not (order_id or client_id):
+                    error = f"gate_open_order_identity_missing:{source}:{index}"
+                    errors.append(error)
+                    item["normalization_error"] = error
+                normalized.append(item)
+            else:
+                normalized.append(row)
+        return normalized, ";".join(errors) or None
 
     if isinstance(raw, list):
         if venue == Venue.BITGET and require_venue_success:
@@ -261,13 +290,16 @@ def require_open_orders_response(
     """Return trusted open-order rows or raise; never synthesize an empty list."""
     if isinstance(raw, dict) and raw.get("error"):
         raise RuntimeError(str(raw["error"]))
-    rows, error = parse_open_orders_response(
+    rows, error = _parse_open_orders_evidence(
         raw,
         venue=venue,
         require_venue_success=require_venue_success,
     )
     if rows is None:
         raise RuntimeError(error or "open_orders_response_untrusted")
+    if error:
+        raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                             error or "open_orders_response_untrusted", truth_evidence=rows)
     return rows
 
 

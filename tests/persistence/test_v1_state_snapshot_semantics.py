@@ -1102,13 +1102,15 @@ class TestEngineStateFieldCompleteness:
             "short_legs": [],
         }
 
+        # The immutable quantity owner validates the pair atomically. An
+        # invalid leg cannot turn its partner into trusted zero exposure.
         assert pending_close_reconciliation_missing_legs(reconciliation) == (
-            "long",
+            "long", "short",
         )
 
     def test_pending_close_reconciliation_identity_evidence_classifies_lookup_sources(self):
         reconciliation = {
-            "position_snapshot": {"short_quantity": 0.0},
+            "position_snapshot": {"long_quantity": 20.0, "short_quantity": 0.0},
             "long_legs": [
                 {"order_id": "exchange-close"},
                 {"client_order_id": "client-close"},

@@ -27,9 +27,38 @@ class SymbolRule:
     qty_step: float
     min_qty: float
     min_notional: float
-    ct_val: float = 0.0  # OKX contract value (ctVal) for base→contract sizing
+    ct_val: float = 0.0  # OKX ctVal / Gate quanto_multiplier: base units per contract
     max_market_qty: float = 0.0  # OKX maxMktSz, contract units for derivatives
     rule_source: str = ""  # "exchangeInfo", "instruments-info", "instrument", "contracts", "spec_fallback"
+
+
+def parse_gate_symbol_rule(row: Any, venue_symbol: str) -> SymbolRule | None:
+    """Gate rules in domain base units; wire quantities are signed contracts."""
+    if not isinstance(row, dict) or row.get("name", row.get("contract")) != venue_symbol:
+        return None
+    try:
+        tick = Decimal(str(row["order_price_round"]))
+        multiplier = Decimal(str(row["quanto_multiplier"]))
+        minimum = Decimal(str(row["order_size_min"]))
+        step = Decimal(str(row.get("order_size_round") or (
+            minimum if row.get("enable_decimal") is True and minimum % 1 else 1
+        )))
+        maximum = Decimal(str(row.get("market_order_size_max") or 0))
+        if maximum == 0:
+            maximum = Decimal(str(row.get("order_size_max") or 0))
+        if not all(v.is_finite() and v > 0 for v in (tick, multiplier, minimum, step)):
+            return None
+        if not maximum.is_finite() or maximum < 0:
+            return None
+        normalized = (float(tick), float(step * multiplier), float(minimum * multiplier), float(multiplier))
+        if not all(math.isfinite(v) and v > 0 for v in normalized) or not math.isfinite(float(maximum)):
+            return None
+        return SymbolRule(tick_size=float(tick), qty_step=float(step * multiplier),
+                          min_qty=float(minimum * multiplier), min_notional=0.0,
+                          ct_val=float(multiplier), max_market_qty=float(maximum),
+                          rule_source="gate_contract")
+    except (KeyError, ValueError, TypeError, InvalidOperation):
+        return None
 
 
 class SymbolRulesCache:
@@ -49,6 +78,11 @@ class SymbolRulesCache:
         venue: Venue,
         venue_symbol: str,
     ) -> SymbolRule:
+        # Gate also needs this same metadata in synchronous REST/WS parsers.
+        # Keep its authoritative cache on the transport, avoiding a global hit
+        # that leaves a second transport without its contract multiplier.
+        if venue == Venue.GATE:
+            return await self._fetch_gate(transport, venue_symbol)
         key = (venue, venue_symbol)
         if key in self._rules:
             return self._rules[key]
@@ -78,6 +112,23 @@ class SymbolRulesCache:
             return await self._fetch_bitget(transport, venue_symbol)
         else:
             return self._spec_fallback(transport, venue_symbol)
+
+    async def _fetch_gate(self, transport: Any, venue_symbol: str) -> SymbolRule:
+        metadata = transport._symbol_metadata
+        rule = parse_gate_symbol_rule(metadata.get(venue_symbol), venue_symbol)
+        if rule is not None:
+            return rule
+        try:
+            row = await transport._public_get(
+                f"/api/v4/futures/usdt/contracts/{venue_symbol}"
+            )
+        except Exception:
+            return self._spec_fallback(transport, venue_symbol)
+        rule = parse_gate_symbol_rule(row, venue_symbol)
+        if rule is None:
+            return self._spec_fallback(transport, venue_symbol)
+        metadata[venue_symbol] = dict(row)
+        return rule
 
     async def _fetch_binance_aster(
         self, transport: Any, venue: Venue, venue_symbol: str,

@@ -46,6 +46,8 @@ from lightfee.engine.bootstrap import (
 from lightfee.engine.lifecycle import (
     can_enter_new_positions,
     enter_fail_closed,
+    lifecycle_diagnostic_fields,
+    lifecycle_diagnostic_snapshot,
     set_lifecycle,
     transition_to_reconciling,
 )
@@ -1194,7 +1196,10 @@ class LiveRuntime:
                     metadata.get("min_notional", metadata.get("min_notional_quote", 0.0))
                     or 0.0
                 )
-                if min_notional > 0:
+                if min_notional > 0 or (
+                    venue == Venue.GATE and min_notional == 0
+                    and metadata.get("min_notional") is not None
+                ):
                     return min_notional
             except Exception:
                 pass
@@ -1800,10 +1805,20 @@ class LiveRuntime:
                     },
                 )
             elif self.state.risk_mode != GlobalRiskMode.FAIL_CLOSED:
+                lifecycle_before = lifecycle_diagnostic_snapshot(self.state)
                 set_lifecycle(self.state, EngineLifecycle.RUNNING)
                 self.journal.append(
                     "runtime.running",
-                    {"reason": "startup_no_recovery_work", "ts_ms": wall_clock_now_ms()},
+                    {
+                        "reason": "startup_no_recovery_work", "ts_ms": wall_clock_now_ms(),
+                        **lifecycle_diagnostic_fields(
+                            self.state, lifecycle_before,
+                            writer="LiveRuntime.start",
+                            reason="startup_no_recovery_work",
+                            core_decision=getattr(self, "recovery_decision", None),
+                            core_decision_source="cached",
+                        ),
+                    },
                 )
             else:
                 self.journal.append(
@@ -4564,6 +4579,17 @@ class LiveRuntime:
         Failed fetches are cached to avoid retry storms; same-tick same-venue
         calls share the cached result.
         """
+        capability = (bool(supports), type(adapter).__name__ if adapter is not None else None)
+        capabilities = getattr(self, "_risk_snapshot_logged_capabilities", {})
+        if capabilities.get(venue) != capability:
+            self.journal.append("runtime.risk_snapshot_capability", {
+                "venue": venue.value, "supports_risk_health": bool(supports),
+                "adapter": capability[1], "ts_ms": now_ms,
+                "source": "adapter_capability" if adapter is not None else "adapter_missing",
+                "fetch_enabled": bool(supports and adapter is not None),
+            })
+            capabilities[venue] = capability
+            self._risk_snapshot_logged_capabilities = capabilities
         if not supports or adapter is None:
             return None, supports
 
@@ -4587,6 +4613,11 @@ class LiveRuntime:
         try:
             snapshot = await adapter.fetch_account_risk_snapshot()
             self._store_risk_snapshot(venue, now_ms, (True, snapshot))
+            if snapshot is None:
+                self.journal.append("runtime.risk_snapshot_unavailable", {
+                    "venue": venue.value, "source": "adapter_returned_none", "ts_ms": now_ms,
+                    "supports_risk_health": True, "cache_ttl_ms": self._risk_snapshot_ttl_ms(venue),
+                })
             return snapshot, True
         except Exception as e:
             error_str = str(e)
@@ -5289,7 +5320,7 @@ class LiveRuntime:
         if self.entry_executor is None:
             return False
 
-        from lightfee.engine.entry import EntryContext, EntryType
+        from lightfee.engine.entry import EntryContext, EntryType, build_entry_orders
 
         maker_leg = Side.SELL if getattr(pending, "maker_leg", "long") == "short" else Side.BUY
         target_quantity, long_price_hint, short_price_hint = (
@@ -5391,7 +5422,76 @@ class LiveRuntime:
             blocked_reasons=list(getattr(candidate, "blocked_reasons", []) or []),
             exit_after_first_stage=pending.exit_after_first_stage,
         )
-        result = await self.entry_executor.execute(ctx)
+        fallback_live_truth = None
+
+        def persist_fallback_pending():
+            self.state.pending_entries[entry_id] = pending
+            self.journal.append_critical(now_ms, "entry.pending_registered", {
+                "pending_id": entry_id, "position_id": entry_id,
+                "symbol": pending.symbol, "source": "terminal_taker_fallback",
+                "pending_entry": self.entry_dispatch_runtime._pending_entry_recovery_payload(entry_id),
+                "persistence_schema": "engine_state.pending_entry.v1",
+            })
+
+        # Replace the completed passive order's identity before any new submit.
+        # A crash or lost ACK must recover the deterministic taker CIDs, and
+        # this owner must be reconciled rather than passively reposted.
+        maker_request, hedge_request = build_entry_orders(ctx)
+        pending.maker_client_order_id = maker_request.client_order_id or ""
+        pending.hedge_client_order_id = hedge_request.client_order_id or ""
+        pending.maker_order_id = ""
+        pending.hedge_order_id = ""
+        pending.passive_order = None
+        pending.entry_type = ctx.entry_type.value
+        pending.uncertain_outcome = True
+        pending.metadata["passive_zero_fill_retry_pending"] = False
+        persist_fallback_pending()
+
+        async def before_open(position, maker_fill, hedge_fill, maker_req, hedge_req):
+            from lightfee.engine.pending_entry_terminalizer import PendingEntryTerminalizer
+            nonlocal fallback_live_truth
+            # The fallback is a new pair of orders owned by this pending entry.
+            # Persist their exact identities before awaiting exchange proof.
+            pending.maker_leg_filled = maker_fill.quantity
+            pending.hedge_leg_filled = hedge_fill.quantity
+            pending.maker_fill_price = maker_fill.price
+            pending.hedge_fill_price = hedge_fill.price
+            pending.maker_order_id = maker_fill.order_id
+            pending.hedge_order_id = hedge_fill.order_id
+            pending.maker_client_order_id = maker_req.client_order_id or ""
+            pending.hedge_client_order_id = hedge_req.client_order_id or ""
+            pending.maker_fee_quote = maker_fill.fee_quote
+            pending.hedge_fee_quote = hedge_fill.fee_quote
+            pending.passive_order = None
+            pending.uncertain_outcome = True
+            persist_fallback_pending()
+            fallback_live_truth = await self._pending_entry_positive_fill_live_truth(
+                pending, entry_id, now_ms)
+            decision = PendingEntryTerminalizer().decide(pending, live_truth=fallback_live_truth)
+            if not decision.allows_pending_removal:
+                self.journal.append("pending_entry.terminalizer_decision",
+                    self._pending_entry_terminalizer_decision_payload(entry_id, pending, decision, now_ms))
+                return False
+            return self.pending_entry_runtime._pending_entry_successor_covers_live_truth(
+                pending, entry_id, now_ms, reason="terminal_taker_before_publication",
+                truth=fallback_live_truth, successor=position, residual_successors=[],
+            )
+
+        result = await self.entry_executor.execute(ctx, before_open=before_open)
+        if getattr(result, "pending_entry", None) is not None:
+            successor = result.pending_entry
+            successor.metadata = {**pending.metadata, **successor.metadata,
+                                  "passive_zero_fill_retry_pending": False}
+            successor.frozen_candidate = pending.frozen_candidate
+            successor.phase_state = pending.phase_state
+            successor.created_cycle = pending.created_cycle
+            for leg in ("maker", "hedge"):
+                fill = getattr(result, f"{leg}_fill", None)
+                if fill is not None:
+                    setattr(successor, f"{leg}_fill_price", fill.price)
+                    setattr(successor, f"{leg}_fee_quote", fill.fee_quote)
+            pending = successor
+            persist_fallback_pending()
         if getattr(result, "open_position", None) is not None:
             self.state.open_positions[result.open_position.position_id] = result.open_position
             self.journal.append(
@@ -5403,6 +5503,7 @@ class LiveRuntime:
                 reason="pending_entry_terminal_fallback_to_taker",
                 symbol=pending.symbol,
                 now_ms=now_ms,
+                live_truth=fallback_live_truth,
             )
             return True
 
@@ -6980,44 +7081,17 @@ class LiveRuntime:
             )
             return False
 
-        # Probe both venues for live position size
-        try:
-            from lightfee.core.domain import Venue as VenueEnum
-            long_ven = VenueEnum.from_str(pending.long_venue) if isinstance(pending.long_venue, str) else pending.long_venue
-            short_ven = VenueEnum.from_str(pending.short_venue) if isinstance(pending.short_venue, str) else pending.short_venue
-            long_adapter = self._venue_adapters.get(long_ven)
-            short_adapter = self._venue_adapters.get(short_ven)
-        except (ValueError, KeyError):
-            long_adapter = None
-            short_adapter = None
-
-        long_zero = True
-        short_zero = True
-        try:
-            if long_adapter is not None:
-                pos = await long_adapter.fetch_position(pending.symbol)
-                long_zero = pos is None or abs(pos.quantity) <= 1e-9
-        except Exception:
-            long_zero = False  # can't probe → assume not zero
-
-        try:
-            if short_adapter is not None:
-                pos = await short_adapter.fetch_position(pending.symbol)
-                short_zero = pos is None or abs(pos.quantity) <= 1e-9
-        except Exception:
-            short_zero = False
-
-        if long_zero and short_zero:
-            if await self._pending_entry_has_unresolved_maker_order(pending, entry_id):
-                self.journal.append(
-                    "reconciliation.entry_abandon_retained_unresolved_maker",
-                    {
-                        "entry_id": entry_id,
-                        "symbol": pending.symbol,
-                        "reason": "both_venues_zero_but_maker_order_not_terminal",
-                    },
-                )
-                return False
+        if await self._pending_entry_has_unresolved_maker_order(pending, entry_id):
+            self.journal.append(
+                "reconciliation.entry_abandon_retained_unresolved_maker",
+                {"entry_id": entry_id, "symbol": pending.symbol,
+                 "reason": "maker_order_not_terminal"},
+            )
+            return False
+        truth = await self._pending_entry_positive_fill_live_truth(
+            pending, entry_id, wall_clock_now_ms(), probe_paper=True)
+        if (truth.available and truth.open_orders_verified
+                and not truth.has_live_open_order and not truth.has_live_position):
             self.journal.append(
                 "reconciliation.entry_abandoned_flat",
                 {"entry_id": entry_id, "reason": "both_venues_zero"},
@@ -7520,6 +7594,12 @@ class LiveRuntime:
             return False
 
         # Tier 1: cleanup/flatten residual exposure on both legs
+        if self.config.runtime.mode == "live":
+            orders = await self.pending_entry_runtime._pending_entry_pair_open_order_truth(pending, entry_id)
+            if not orders.available or orders.has_live_open_order:
+                enter_fail_closed(self.state)
+                self.state.last_error = reason
+                return False
         maker_cleaned = await self._cleanup_failed_leg_exposure(
             maker_venue, symbol, entry_id, "maker"
         )
@@ -7556,12 +7636,13 @@ class LiveRuntime:
                 return False
 
         # Success: remove pending entry
-        await self._complete_pending_entry_terminal_removal(
+        if not await self._complete_pending_entry_terminal_removal(
             entry_id,
             reason="abort_pending_entry_cleanup_succeeded",
             symbol=symbol,
             now_ms=wall_clock_now_ms(),
-        )
+        ):
+            return False
         self.state.last_error = reason
         self.journal.append(
             "entry.aborted",
@@ -9587,6 +9668,7 @@ class LiveRuntime:
         """Gate entry.opened on confirmed price and order id for both legs."""
         reconciliation_by_leg: dict[str, Any] = {}
         reconciliation_attempted: set[str] = set()
+        direction_conflicts: list[str] = []
 
         async def _reconcile_leg(label: str, venue: Venue) -> None:
             adapter = self.get_venue_adapter(venue)
@@ -9623,6 +9705,17 @@ class LiveRuntime:
                 )
                 return
             if reconciliation is None:
+                return
+            expected_side = pending.maker_side() if label == "maker" else pending.hedge_side()
+            if float(getattr(reconciliation, "quantity", 0.0) or 0.0) > 0 and reconciliation.side != expected_side:
+                direction_conflicts.append(label)
+                self.journal.append("pending_entry.finalize_direction_conflict", {
+                    "entry_id": entry_id, "symbol": pending.symbol, "leg": label,
+                    "venue": venue.value, "order_id": order_id, "client_order_id": client_order_id,
+                    "expected_side": expected_side.value,
+                    "actual_side": getattr(reconciliation.side, "value", str(reconciliation.side)),
+                    "actual_quantity": reconciliation.quantity, "ts_ms": now_ms,
+                })
                 return
             reconciliation_by_leg[label] = reconciliation
             truth_decision = ORDER_TRUTH_LEDGER.resolve_order_success(
@@ -9737,6 +9830,11 @@ class LiveRuntime:
             or int(getattr(pending, "hedge_attempt_count", 0) or 0) > 0
         ):
             await _reconcile_leg("hedge", pending.hedge_venue())
+
+        if direction_conflicts:
+            pending.uncertain_outcome = True
+            pending.reconcile_next_attempt_ms = max(pending.reconcile_next_attempt_ms, now_ms + 1_000)
+            return False
 
         balanced_quantity = min(
             float(getattr(pending, "maker_leg_filled", 0.0) or 0.0),
@@ -9908,11 +10006,19 @@ class LiveRuntime:
         ):
             # All clear — transition to RUNNING
             from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
+            lifecycle_before = lifecycle_diagnostic_snapshot(self.state)
             if clear_risk_mode_for_recovery(self.state, core_decision):
                 self.state.last_error = None
                 self._try_journal("runtime.running",
                     {
                         "reason": "startup_recovery_completed",
+                        **lifecycle_diagnostic_fields(
+                            self.state, lifecycle_before,
+                            writer="LiveRuntime._finalize_startup_recovery",
+                            reason="startup_recovery_completed",
+                            core_decision=core_decision,
+                            core_decision_source="current",
+                        ),
                         "decision": core_decision.kind.value,
                         "management_action": core_decision.management_action.value,
                         "ts_ms": wall_clock_now_ms(),
@@ -9941,10 +10047,18 @@ class LiveRuntime:
                 })
             else:
                 from lightfee.engine.lifecycle import clear_risk_mode_for_recovery
+                lifecycle_before = lifecycle_diagnostic_snapshot(self.state)
                 if clear_risk_mode_for_recovery(self.state, core_decision):
                     self.state.last_error = None
                     self._try_journal("runtime.running", {
                         "reason": "startup_recovery_completed_with_positions",
+                        **lifecycle_diagnostic_fields(
+                            self.state, lifecycle_before,
+                            writer="LiveRuntime._finalize_startup_recovery",
+                            reason="startup_recovery_completed_with_positions",
+                            core_decision=core_decision,
+                            core_decision_source="current",
+                        ),
                         "decision": core_decision.kind.value,
                         "management_action": core_decision.management_action.value,
                         "open_positions": len(self.state.open_positions),
@@ -10503,15 +10617,23 @@ class LiveRuntime:
     async def _post_tick_housekeeping(self, now_ms: int) -> None:
         """Run after every tick cycle: supervisor, reconciliation, periodic exports."""
         # Risk-line supervision — V1: refresh_venue_health_supervisor + recompute_global_risk_mode
-        # CRITICAL: risk_snapshot_cache must be injected BEFORE supervise() so
-        # _collect_venue_health_views() sees current-tick AccountRiskSnapshot data.
-        # If the cache is stale/empty, supervisor misdiagnoses risk_snapshot_unavailable
-        # and enters fail-closed despite healthy venues.
+        # Use the same cache owner as active-position risk checks, including venues
+        # with only pending close reconciliation work (V1 risk.rs:151-188).
+        risk_snapshots = {}
+        if self.config.strategy.risk_monitor_enabled:
+            for venue in self.supervisor._supervised_venues():
+                adapter = self._venue_adapters.get(venue)
+                if adapter is None:
+                    continue
+                snapshot, _ = await self._fetch_venue_risk_snapshot(
+                    venue, adapter, adapter.supports_risk_health, now_ms,
+                )
+                risk_snapshots[venue] = snapshot
         self.supervisor.supervise(
             now_ms,
             self.state.venue_health,
             adapters=self._venue_adapters,
-            risk_snapshot_cache=self._risk_snapshot_cache,
+            risk_snapshots=risk_snapshots,
         )
 
         # Reconciliation of pending/uncertain outcomes

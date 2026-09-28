@@ -321,6 +321,12 @@ class TestFixtureDrivenPosition:
         transport = adapter._transport
         _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
+        if venue_id == Venue.GATE:
+            transport.set_symbol_metadata({"BTC_USDT": {
+                "name": "BTC_USDT", "quanto_multiplier": "0.0001",
+                "order_price_round": "0.1", "order_size_min": "1",
+                "order_size_max": "1000000",
+            }})
         if venue_id == Venue.OKX:
             transport.set_symbol_metadata({
                 "BTC-USDT-SWAP": {
@@ -385,6 +391,12 @@ class TestFixtureDrivenOrderSuccess:
         transport = adapter._transport
         _attach_mock_transport(adapter, transport, mock)
         transport._time_offset_ms = 0  # V1 fail-closed compat; transport._time_offset_ms = 0
+        if venue_id == Venue.GATE:
+            transport.set_symbol_metadata({"BTC_USDT": {
+                "name": "BTC_USDT", "quanto_multiplier": "0.0001",
+                "order_price_round": "0.1", "order_size_min": "1",
+                "order_size_max": "1000000",
+            }})
 
         # Hyperliquid needs the asset index pre-populated so the mock
         # transport (single-response) doesn't need to serve metadata.
@@ -449,7 +461,7 @@ class TestFixtureDrivenOrderSuccess:
                 venue=venue_id,
                 symbol=symbol,
                 side=Side.BUY,
-                quantity=1.0 if venue_id in (Venue.GATE, Venue.HYPERLIQUID) else 0.01,
+                quantity=0.0001 if venue_id == Venue.GATE else 1.0 if venue_id == Venue.HYPERLIQUID else 0.01,
                 price=50000.0 if venue_id == Venue.HYPERLIQUID else None,
             )
             fill = await adapter.place_order(req)
@@ -1335,6 +1347,9 @@ class TestAdditionalVenueEntryLeverage:
             "/api/v3/account/set-leverage",
             None,
             {"category": "USDT-FUTURES", "symbol": "HUSDT", "leverage": "4"},
+        )
+        assert calls[0] == calls[2] == (
+            "GET", "/api/v3/account/settings", {"category": "USDT-FUTURES"}, None,
         )
 
     @pytest.mark.asyncio

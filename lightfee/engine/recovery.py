@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from lightfee.core.domain import OrderFill
 
 from lightfee.engine.pending_entry_hedge_delta import note_pending_entry_hedge_filled
+from lightfee.engine.lifecycle import lifecycle_diagnostic_fields, lifecycle_diagnostic_snapshot
 from lightfee.engine.pending_entry_runtime import apply_pending_entry_hedge_progress
 from lightfee.engine.pending_entry_terminalizer import (
     PendingEntryTerminalDecision,
@@ -323,7 +324,7 @@ def _deserialize_order_fill(data: dict[str, Any] | None) -> "OrderFill | None":
     except (ValueError, AttributeError):
         venue = OFVenue.BINANCE
     try:
-        side = OFSide.from_str(side_str) if hasattr(OFSide, 'from_str') else OFSide.BUY
+        side = OFSide(side_str)
     except (ValueError, AttributeError):
         side = OFSide.BUY
     return OF(
@@ -950,9 +951,53 @@ def _apply_journal_replay_to_state(
         kind = record.get("kind", "")
         payload = record.get("payload", {})
 
-        if kind in ("entry.opened", "recovery.live_detected"):
+        if kind in {"entry.opened", "pending_entry.removed_by_v1_lifecycle_closure"}:
+            # A terminal handoff is one durable record: restore its residual
+            # successors before consuming the pending owner, even if the next
+            # diagnostic event or snapshot never reached disk.
+            residuals = payload.get("pending_residual_repairs", [])
+            if not isinstance(residuals, list) or any(not isinstance(t, dict) for t in residuals):
+                continue
+            for task in residuals:
+                identity = ("position_id", "pair_id", "origin", "repair_venue", "repair_side")
+                state.pending_residual_repairs = [
+                    existing for existing in state.pending_residual_repairs
+                    if not isinstance(existing, dict) or any(
+                        existing.get(key) != task.get(key) for key in identity)
+                ]
+                state.pending_residual_repairs.append(dict(task))
+
+        if kind in {"execution.residual_repair_completed", "execution.residual_repair_terminal"}:
+            # Only the producer's full scoped state can retire/replace owners.
+            # Legacy or incomplete completion evidence retains them for live
+            # reconciliation; a numeric fill is not a complete state snapshot.
+            remaining = payload.get("remaining_residual_repairs")
+            pair_gates = payload.get("remaining_pair_gates")
+            scope = ("position_id", "pair_id", "symbol", "origin")
+            if not isinstance(remaining, list) or not isinstance(pair_gates, list):
+                continue
+            if any(not isinstance(t, dict) or any(t.get(k, "") != payload.get(k, "") for k in scope)
+                   for t in remaining):
+                continue
+            pair_id, symbol = payload.get("pair_id", ""), payload.get("symbol", "")
+            gate_key, gate_value = ("pair_id", pair_id) if pair_id else ("symbol", symbol)
+            if any(not isinstance(g, dict) or g.get(gate_key, "") != gate_value for g in pair_gates):
+                continue
+            state.pending_residual_repairs = [
+                t for t in state.pending_residual_repairs
+                if not isinstance(t, dict) or any(t.get(k, "") != payload.get(k, "") for k in scope)
+            ] + [dict(t) for t in remaining]
+            state.live_recovery_reduce_only_pairs = [
+                g for g in state.live_recovery_reduce_only_pairs
+                if not isinstance(g, dict) or g.get(gate_key, "") != gate_value
+            ] + [dict(g) for g in pair_gates]
+
+        elif kind in ("entry.opened", "recovery.live_detected"):
             pid = payload.get("position_id", "")
-            if pid and pid not in state.open_positions:
+            # A post-checkpoint entry publication replaces its prior successor
+            # just as live finalization does. Recovery audit rows are partial
+            # observations and must not overwrite an already restored position.
+            if pid and (kind == "entry.opened" or pid not in state.open_positions):
                 state.open_positions[pid] = _deserialize_open_position(payload)
             if kind == "entry.opened" and pid:
                 # A durable position is the terminal successor of its pending
@@ -977,7 +1022,8 @@ def _apply_journal_replay_to_state(
                 or payload.get("entry_id")
                 or ""
             )
-            if pid and pid not in state.pending_entries:
+            if pid and (pid not in state.pending_entries or
+                        payload.get("persistence_schema") == "engine_state.pending_entry.v1"):
                 pe = _restore_pending_entry_from_journal(payload)
                 if pe is not None:
                     state.pending_entries[pid] = pe
@@ -1801,6 +1847,7 @@ def recover_from_snapshot(
     snap = snapshot_store.read()
     has_snapshot = snap is not None
     state = _restore_state_from_snapshot_dict(snap) if has_snapshot else EngineState()
+    lifecycle_before = lifecycle_diagnostic_snapshot(state)
 
     # Emit recovery.live_detected for each position restored from snapshot
     # (V1: recovery.live_detected is recorded when live positions are detected at startup)
@@ -1918,6 +1965,17 @@ def recover_from_snapshot(
 
     # V1: normalize_engine_state_positions — applied after every recovery load
     normalize_engine_state(state)
+    _try_emit_recovery(journal, "runtime.lifecycle_decision_observed", {
+        **lifecycle_diagnostic_fields(
+            state, lifecycle_before,
+            writer="recover_from_snapshot",
+            reason="snapshot_and_journal_recovery_completed",
+            core_decision=core_decision,
+            core_decision_source="current",
+        ),
+        "has_snapshot": has_snapshot,
+        "replayed_event_count": len(journal_records),
+    })
 
     return state
 
@@ -2308,6 +2366,7 @@ def clear_legacy_recovery_block_via_core(
         return False
 
     previous_reason = state.recovery_blocked_reason
+    lifecycle_before = lifecycle_diagnostic_snapshot(state)
     previous_lifecycle = state.lifecycle.value
     previous_risk_mode = state.risk_mode.value
     state.lifecycle = EngineLifecycle.RUNNING
@@ -2324,6 +2383,13 @@ def clear_legacy_recovery_block_via_core(
             "previous_risk_mode": previous_risk_mode,
             "decision": core_decision.kind.value,
             "clear_reason": core_decision.clear_reason,
+            **lifecycle_diagnostic_fields(
+                state, lifecycle_before,
+                writer="clear_legacy_recovery_block_via_core",
+                reason="core_allowed_legacy_recovery_block_clear",
+                core_decision=core_decision,
+                core_decision_source="caller",
+            ),
         })
     return True
 

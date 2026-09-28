@@ -308,8 +308,15 @@ def test_binance_invalid_opening_position_status_is_an_admission_block():
 
 
 class FlatAdapter:
+    def __init__(self, venue: Venue = Venue.BYBIT):
+        self.venue = venue
+
     async def fetch_position(self, symbol: str):
-        return None
+        return PositionSnapshot(venue=self.venue, symbol=symbol, side=Side.BUY,
+                                quantity=0.0, entry_price=0.0, observed_at_ms=1778787001000)
+
+    async def fetch_open_orders(self, symbol: str):
+        return []
 
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         return quantity
@@ -317,6 +324,7 @@ class FlatAdapter:
 
 class BalanceAdapter(FlatAdapter):
     def __init__(self, balance: AccountBalanceSnapshot | None = None, error: Exception | None = None):
+        super().__init__(Venue.HYPERLIQUID)
         self.balance = balance
         self.error = error
         self.balance_calls = 0
@@ -329,7 +337,8 @@ class BalanceAdapter(FlatAdapter):
 
 
 class RejectingHedgeAdapter(FlatAdapter):
-    def __init__(self, message: str):
+    def __init__(self, message: str, venue: Venue = Venue.BYBIT):
+        super().__init__(venue)
         self.message = message
         self.place_order_calls = 0
 
@@ -381,7 +390,7 @@ async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
         )
         runtime = LiveRuntime(
             make_test_config(td),
-            venue_adapters={Venue.ASTER: FlatAdapter(), Venue.BYBIT: bybit},
+            venue_adapters={Venue.ASTER: FlatAdapter(Venue.ASTER), Venue.BYBIT: bybit},
         )
         runtime.journal.open()
         pending = _pending_for_hedge_reject(
@@ -420,7 +429,7 @@ async def test_pending_hedge_bybit_trading_terms_reject_aborts_without_retry():
 async def test_pending_hedge_binance_leverage_reject_aborts_without_retry():
     with tempfile.TemporaryDirectory() as td:
         binance = RejectingHedgeAdapter(
-            'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}'
+            'HTTP 400: {"code":-2027,"msg":"Exceeded the maximum allowable position at current leverage."}', Venue.BINANCE,
         )
         runtime = LiveRuntime(
             make_test_config(td),
@@ -465,7 +474,7 @@ async def test_pending_hedge_binance_leverage_reject_aborts_without_retry():
 async def test_pending_hedge_hyperliquid_insufficient_margin_reject_aborts_without_retry():
     with tempfile.TemporaryDirectory() as td:
         hyperliquid = RejectingHedgeAdapter(
-            "Insufficient margin to place order. asset=40"
+            "Insufficient margin to place order. asset=40", Venue.HYPERLIQUID,
         )
         runtime = LiveRuntime(
             make_test_config(td),
@@ -858,11 +867,11 @@ async def test_hyperliquid_balance_recovery_is_journaled_after_cached_failure_ex
 async def test_pending_hedge_aster_max_notional_reject_arms_v1_venue_cooldown():
     with tempfile.TemporaryDirectory() as td:
         aster = RejectingHedgeAdapter(
-            'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}'
+            'HTTP 400: {"code":-5018,"msg":"maximum notional value limit"}', Venue.ASTER,
         )
         runtime = LiveRuntime(
             make_test_config(td),
-            venue_adapters={Venue.BINANCE: FlatAdapter(), Venue.ASTER: aster},
+            venue_adapters={Venue.BINANCE: FlatAdapter(Venue.BINANCE), Venue.ASTER: aster},
         )
         runtime.journal.open()
         pending = _pending_for_hedge_reject(

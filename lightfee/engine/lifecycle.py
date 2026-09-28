@@ -3,9 +3,57 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from lightfee.engine.state import EngineState
 from lightfee.risk.modes import EngineLifecycle, GlobalRiskMode
+
+
+def lifecycle_diagnostic_snapshot(state: EngineState) -> dict[str, Any]:
+    """Capture the state before a business boundary writes lifecycle fields."""
+    return {
+        "lifecycle": state.lifecycle.value,
+        "risk_mode": state.risk_mode.value,
+        "recovery_blocked_reason": state.recovery_blocked_reason,
+        "last_error": getattr(state, "last_error", None),
+    }
+
+
+def lifecycle_diagnostic_fields(
+    state: EngineState,
+    before: dict[str, Any],
+    *,
+    writer: str,
+    reason: str,
+    core_decision: object | None = None,
+    core_decision_source: str = "unavailable",
+) -> dict[str, Any]:
+    """Observation only: enrich existing events without changing replay inputs."""
+    after = lifecycle_diagnostic_snapshot(state)
+    fields = {f"{key}_before": value for key, value in before.items()}
+    fields.update({f"{key}_after": value for key, value in after.items()})
+    fields.update({
+        "lifecycle_writer": writer,
+        "lifecycle_decision_reason": reason,
+        "operator_requested_mode": getattr(state.operator.requested_mode, "value", None),
+        "open_position_count": len(state.open_positions),
+        "pending_entry_count": len(state.pending_entries),
+        "pending_close_count": len(state.pending_closes),
+        "pending_passive_close_count": len(state.pending_passive_closes),
+        "pending_close_reconciliation_count": len(state.pending_close_reconciliations),
+        "pending_residual_repair_count": len(state.pending_residual_repairs),
+        "tick_count": state.tick_count,
+        "recovery_decision_source": core_decision_source if core_decision is not None else "unavailable",
+        "recovery_decision": None if core_decision is None else {
+            "kind": getattr(getattr(core_decision, "kind", None), "value", None),
+            "diagnostic_severity": getattr(core_decision, "diagnostic_severity", None),
+            "block_reason": getattr(core_decision, "block_reason", None),
+            "entry_allowed": getattr(core_decision, "entry_allowed", None),
+            "evidence_quality": getattr(core_decision, "evidence_quality", None),
+            "management_action": getattr(getattr(core_decision, "management_action", None), "value", None),
+        },
+    })
+    return fields
 
 
 class LiveStartupPhase(Enum):

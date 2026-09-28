@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from lightfee.engine.recovery_ledger import ExchangeArtifact
 from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
 
@@ -71,6 +73,8 @@ def test_live_position_matches_open_position_owner():
                     "symbol": "SEIUSDT",
                     "long_venue": "bybit",
                     "short_venue": "hyperliquid",
+                    "long_quantity": 455.0,
+                    "short_quantity": 455.0,
                 }
             ]
         }
@@ -82,6 +86,7 @@ def test_live_position_matches_open_position_owner():
             venue="bybit",
             symbol="SEIUSDT",
             quantity=455.0,
+            side="buy",
         )
     )
 
@@ -100,6 +105,8 @@ def test_okx_wire_symbol_matches_canonical_local_open_position_owner():
                     "symbol": "HOMEUSDT",
                     "long_venue": "okx",
                     "short_venue": "bybit",
+                    "long_quantity": 1600.0,
+                    "short_quantity": 1600.0,
                 }
             ]
         }
@@ -111,6 +118,7 @@ def test_okx_wire_symbol_matches_canonical_local_open_position_owner():
             venue="okx",
             symbol="HOME-USDT-SWAP",
             quantity=1600.0,
+            side="buy",
         )
     )
 
@@ -161,7 +169,9 @@ def test_residual_repair_matches_symbol_and_repair_venue():
                 {
                     "repair_id": "repair-sei",
                     "symbol": "SEIUSDT",
-                    "venue": "bybit",
+                    "repair_venue": "bybit",
+                    "repair_side": "sell",
+                    "repair_quantity": 455.0,
                 }
             ]
         }
@@ -173,6 +183,7 @@ def test_residual_repair_matches_symbol_and_repair_venue():
             venue="bybit",
             symbol="SEIUSDT",
             quantity=455.0,
+            side="buy",
         )
     )
 
@@ -708,3 +719,102 @@ def test_trxusdt_order_without_owner_remains_orphan():
     assert owner.owner_type == "exchange_order"
     assert owner.owner_id == "a84df707-efb3-4e40-bab1-641a4eb0f3d4"
     assert owner.confidence == "orphan"
+
+
+@pytest.mark.parametrize("owner_kind", ["open", "pending", "entry_residual", "close_residual", "pending_successor"])
+@pytest.mark.parametrize("quantity,owned", [(10, True), (11, False), (9, False)])
+def test_position_claims_count_distinct_exposure_once(owner_kind, quantity, owned):
+    from lightfee.engine.recovery_ledger import RecoveryLedger
+    local = {"open_positions": [{"position_id": "paired", "symbol": "SAGAUSDT",
+        "long_venue": "gate", "short_venue": "binance", "long_quantity": 8, "short_quantity": 8}]}
+    pending = {"pending_id": "new", "symbol": "SAGAUSDT", "long_venue": "gate",
+               "short_venue": "binance", "maker_leg": "long", "maker_leg_filled": 2, "hedge_leg_filled": 0}
+    residual = {"position_id": "paired", "symbol": "SAGAUSDT", "origin": "entry_open",
+                "repair_venue": "gate", "repair_side": "sell", "repair_quantity": 2}
+    if owner_kind == "open":
+        local["open_positions"].append({**local["open_positions"][0], "position_id": "other", "long_quantity": 2, "short_quantity": 2})
+    elif owner_kind == "pending":
+        local["pending_entries"] = [pending]
+    elif owner_kind == "entry_residual":
+        local["pending_residual_repairs"] = [residual]
+    elif owner_kind == "close_residual":
+        local["open_positions"][0]["long_quantity"] = 10
+        local["pending_residual_repairs"] = [{**residual, "origin": "close_residual"}]
+    elif owner_kind == "pending_successor":
+        local["pending_entries"] = [{**pending, "pending_id": "paired", "maker_leg_filled": 10, "hedge_leg_filled": 8}]
+        local["pending_residual_repairs"] = [residual]
+    artifact = ExchangeArtifact("position", "SAGA_USDT", "gate", "buy", quantity)
+    index = RecoveryOwnerIndex.from_state(local)
+    assert (index.owner_for_position(artifact).confidence != "orphan") is owned
+    assert index.has_position_claim(artifact)
+    # Omitted optional index must take the identical contract path.
+    ledger = RecoveryLedger.from_local_and_exchange_truth(local=local,
+        exchange_truth={"truth_available": True, "positions": [artifact], "open_orders": []})
+    assert any(w.kind == "unpaired_live_position" for w in ledger.work_items) is (not owned)
+
+
+@pytest.mark.parametrize("quantity", [0, None, "bad", float("nan"), float("inf"), -10])
+def test_invalid_or_partial_claim_protects_cleanup_without_proving_ownership(quantity):
+    index = RecoveryOwnerIndex.from_state({"open_positions": [{"position_id": "partial", "symbol": "SAGAUSDT",
+        "long_venue": "gate", "short_venue": "binance", "long_quantity": quantity, "short_quantity": 10}]})
+    artifact = ExchangeArtifact("position", "SAGAUSDT", "gate", "buy", 10)
+    assert index.owner_for_position(artifact).confidence == "orphan"
+    assert index.has_position_claim(artifact)
+
+
+@pytest.mark.parametrize("kind", ["open", "pending", "residual"])
+@pytest.mark.parametrize("unknown", [None, "bad", float("nan"), float("inf"), -1])
+def test_unknown_claim_cannot_hide_behind_matching_known_exposure(kind, unknown):
+    from lightfee.engine.recovery_ledger import RecoveryLedger
+
+    known = {"position_id": "known", "symbol": "SAGAUSDT", "long_venue": "gate",
+             "short_venue": "binance", "long_quantity": 10, "short_quantity": 10}
+    local = {"open_positions": [known]}
+    if kind == "open":
+        local["open_positions"].append({**known, "position_id": "unknown", "long_quantity": unknown})
+    elif kind == "pending":
+        local["pending_entries"] = [{"pending_id": "unknown", "symbol": "SAGAUSDT", "long_venue": "gate",
+            "short_venue": "binance", "maker_leg": "long", "maker_leg_filled": unknown, "hedge_leg_filled": 0}]
+    else:
+        local["pending_residual_repairs"] = [{"position_id": "unknown", "symbol": "SAGAUSDT",
+            "repair_venue": "gate", "repair_side": "sell", "repair_quantity": unknown}]
+    artifact = ExchangeArtifact("position", "SAGAUSDT", "gate", "buy", 10)
+    index = RecoveryOwnerIndex.from_state(local)
+    assert index.has_position_claim(artifact)
+    assert index.owner_for_position(artifact).confidence == "orphan"
+    ledger = RecoveryLedger.from_local_and_exchange_truth(local=local,
+        exchange_truth={"truth_available": True, "positions": [artifact], "open_orders": []})
+    assert any(item.kind == "unpaired_live_position" for item in ledger.work_items)
+
+
+def test_zero_claim_cannot_prove_positive_position_within_quantity_epsilon():
+    index = RecoveryOwnerIndex.from_state({"open_positions": [{"position_id": "zero", "symbol": "SAGAUSDT",
+        "long_venue": "gate", "short_venue": "binance", "long_quantity": 0, "short_quantity": 0}]})
+    owner = index.owner_for_position(ExchangeArtifact("position", "SAGAUSDT", "gate", "buy", 1e-7))
+    assert owner.confidence == "orphan"
+
+
+@pytest.mark.parametrize("unknown_scope", ["open_venue", "residual_venue", "residual_side", "pending_leg", "pending_venue"])
+def test_unknown_scope_cannot_be_hidden_by_a_known_owner(unknown_scope):
+    from lightfee.engine.recovery_ledger import RecoveryLedger
+    known = {"position_id": "known", "symbol": "SAGAUSDT", "long_venue": "gate",
+             "short_venue": "binance", "long_quantity": 10, "short_quantity": 10}
+    local = {"open_positions": [known]}
+    if unknown_scope == "open_venue":
+        local["open_positions"].append({**known, "position_id": "unknown", "long_venue": None})
+    elif unknown_scope.startswith("residual"):
+        task = {"position_id": "unknown", "symbol": "SAGAUSDT", "repair_venue": "gate", "repair_side": "sell", "repair_quantity": 2}
+        task["repair_venue" if unknown_scope == "residual_venue" else "repair_side"] = None
+        local["pending_residual_repairs"] = [task]
+    else:
+        task = {"pending_id": "unknown", "symbol": "SAGAUSDT", "long_venue": "gate", "short_venue": "binance",
+                "maker_leg": "long", "maker_leg_filled": 2, "hedge_leg_filled": 0}
+        task["long_venue" if unknown_scope == "pending_venue" else "maker_leg"] = None
+        local["pending_entries"] = [task]
+    artifact = ExchangeArtifact("position", "SAGAUSDT", "gate", "buy", 10)
+    index = RecoveryOwnerIndex.from_state(local)
+    assert index.has_position_claim(artifact)
+    assert index.owner_for_position(artifact).confidence == "orphan"
+    ledger = RecoveryLedger.from_local_and_exchange_truth(local=local,
+        exchange_truth={"truth_available": True, "positions": [artifact], "open_orders": []})
+    assert any(item.kind == "unpaired_live_position" for item in ledger.work_items)

@@ -97,6 +97,22 @@ The minimum semantic surface from V1 is:
 
 ## Unified Invariants
 
+2026-09-25 recurrence: [Gate contract incident and repair evidence](../2026-09-25-gate-live-contract-repair.md).
+Status is **implemented but not closed**, with no production deployment.
+This recurrence extends PE-01/02/09/10/16/18, RC-02/04/11 and DG-01/05:
+both venues' orders and actual positions must be verified before any owner
+release; known-zero, stale and forced-startup branches have no bypass.
+`entry.opened` is itself a terminal owner publication during replay, so proposed
+open/residual successors must cover actual exposure before that event is
+durable. Residual handoff and later completion must replay their complete
+remaining owner state. Taker fallback persists its new identities before
+submit and retains uncertain/partial execution results for reconciliation.
+An ordered `entry.opened` after the snapshot checkpoint replaces an existing
+same-entry position before retiring pending; partial recovery audit records
+must not overwrite that successor. Later terminal closes still take precedence.
+See the incident matrix for complementary allow/block and every-prefix replay
+tests; scoped GREEN is not production closure.
+
 1. Exchange truth dominates local truth.
    Local `open_positions=[]` or `pending_entries=[]` is not healthy if a
    credentialed venue probe reports a nonzero position or live open order.

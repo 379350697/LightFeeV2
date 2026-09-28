@@ -331,12 +331,12 @@ class TestGatePrivateParser:
             "result": [{
                 "contract": "ETH_USDT", "id": "gate-1",
                 "text": "gate-client-1",
-                "fill_total": "0.01", "fill_price": "2140.00",
-                "fee": "0.001", "finish_as": "PARTIAL",
+                "size": "2", "left": "1", "fill_price": "2140.00",
+                "fee": "0.001", "status": "open", "finish_as": "",
                 "finish_time_ms": 1700000000000,
             }],
         })
-        handle_gate_private_message(state, symbol_map, raw)
+        handle_gate_private_message(state, symbol_map, raw, {"ETH_USDT": .01})
         await asyncio_sleep_short()
         update = state.order_by_order_id("gate-1")
         assert update is not None

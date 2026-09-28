@@ -4979,6 +4979,8 @@ class TestRealPathAbortCleanupDeadline:
             maker_cycle_retry_delays_ms=[0],
         )
         maker = PassiveRepostAdapter(Venue.BYBIT)
+        maker.position = PositionSnapshot(venue=Venue.BYBIT, symbol="USTCUSDT", side=Side.BUY,
+                                          quantity=0, entry_price=0, observed_at_ms=1_000_000)
         runtime._venue_adapters[Venue.BYBIT] = maker
 
         pending = PendingEntry(
@@ -5182,7 +5184,7 @@ class TestRealPathAbortCleanupDeadline:
         # Fake adapters with no position → flat → cleanup succeeds
         for ven in (Venue.BYBIT, Venue.HYPERLIQUID):
             fake = _FakeVenueAdapter(ven)
-            fake.position = None  # No residual position
+            fake.position = PositionSnapshot(venue=ven, symbol="BTC-USDT", side=Side.BUY, quantity=0, entry_price=0, observed_at_ms=1778985600000)
             runtime._venue_adapters[ven] = fake
 
         now_ms = 1778985600000
@@ -5439,7 +5441,7 @@ class TestRealPathAbortCleanupDeadline:
         runtime.config.runtime.mode = "live"
         for venue in (Venue.BINANCE, Venue.OKX):
             adapter = _FakeVenueAdapter(venue)
-            adapter.position = None
+            adapter.position = PositionSnapshot(venue=venue, symbol="LINK-USDT", side=Side.BUY, quantity=0, entry_price=0, observed_at_ms=1000)
             runtime._venue_adapters[venue] = adapter
 
         pending = PendingEntry(

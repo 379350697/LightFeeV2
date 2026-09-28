@@ -3559,7 +3559,8 @@ class TestRuntimePreflight:
             assert runtime.state.recovery_blocked_reason == block_reason
             assert runtime.state.recovery_blocked_at_ms == 1234
             assert runtime.recovery_decision is not None
-            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            assert runtime.recovery_decision.entry_allowed is False
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
             runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -3623,9 +3624,18 @@ class TestRuntimePreflight:
             assert truth["truth_available"] is False
             assert any(error_fragment in error for error in truth["errors"])
             assert runtime.recovery_decision is not None
-            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            assert runtime.recovery_decision.entry_allowed is False
+            # Observed malformed rows are blocking evidence, distinct from a
+            # missing/unrecognized endpoint response that only retains a latch.
+            observed_bad_rows = bool(positions_response) or isinstance(orders_response, list) and bool(orders_response)
+            assert runtime.recovery_decision.kind == (
+                RecoveryDecisionKind.BLOCK_OR_FLATTEN_LIVE_ARTIFACT if observed_bad_rows else
+                RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH)
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY
-            assert runtime.state.recovery_blocked_reason == "orphan_reduce_only_order"
+            expected_reason = ("unpaired_live_position" if positions_response else "orphan_maker_order") if observed_bad_rows else "orphan_reduce_only_order"
+            assert runtime.state.recovery_blocked_reason == expected_reason
+            if observed_bad_rows:
+                assert len(truth["positions"] or truth["open_orders"]) == 1
             runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -4589,10 +4599,12 @@ class TestRuntimePreflight:
             assert bybit.account_position_calls == 1
             assert binance.account_open_order_calls == 1
             assert bybit.account_open_order_calls == 1
-            assert binance.symbol_position_calls == 0
-            assert bybit.symbol_position_calls == 0
-            assert binance.symbol_open_order_calls == 0
-            assert bybit.symbol_open_order_calls == 0
+            # Pair proof validates owner transfer; account proof still owns
+            # the subsequent global recovery-latch release.
+            assert binance.symbol_position_calls == 1
+            assert bybit.symbol_position_calls == 1
+            assert binance.symbol_open_order_calls == 1
+            assert bybit.symbol_open_order_calls == 1
             runtime.journal.close()
 
     @pytest.mark.asyncio
@@ -4700,7 +4712,8 @@ class TestRuntimePreflight:
 
             assert not any(item.blocking for item in ledger.work_items)
             assert runtime.recovery_decision is not None
-            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
+            assert runtime.recovery_decision.entry_allowed is False
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
             assert runtime.recovery_decision.clear_previous_block is False
             assert runtime.state.recovery_blocked_reason == "orphan_maker_order"
             assert runtime.state.recovery_blocked_at_ms == 123
@@ -4744,7 +4757,8 @@ class TestRuntimePreflight:
 
             assert runtime._last_recovery_exchange_truth["truth_scope"] == "symbols"
             assert runtime.recovery_decision is not None
-            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RUNNING_CLEAN
+            assert runtime.recovery_decision.entry_allowed is False
+            assert runtime.recovery_decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
             assert runtime.recovery_decision.clear_previous_block is False
             assert runtime.state.recovery_blocked_reason == "unpaired_live_position"
             assert runtime.state.lifecycle == EngineLifecycle.RISK_ONLY

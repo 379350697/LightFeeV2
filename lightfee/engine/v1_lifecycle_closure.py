@@ -21,11 +21,14 @@ from lightfee.engine.pending_entry_terminalizer import (
 )
 from lightfee.engine.recovery_decision_core import (
     LIVE_ARTIFACT_BLOCK_REASONS,
+    _flatten_exchange_collection as _core_flatten_exchange_collection,
     RecoveryEvidenceSnapshot,
     V1RecoveryDecisionCore,
+    exchange_truth_available,
+    has_partial_exchange_evidence,
     pending_passive_close_evidence,
 )
-from lightfee.engine.recovery_ledger import RecoveryLedger
+from lightfee.engine.recovery_ledger import RecoveryLedger, _symbol
 
 EPSILON = 1e-9
 VERSION = "v1.lifecycle_closure.v1"
@@ -819,13 +822,6 @@ def _owner_id(obj: Any, *keys: str, default: str = "") -> str:
     return str(default or "")
 
 
-def _symbol(obj: Any) -> str:
-    symbol = str(_get(obj, "symbol", "") or "").upper()
-    if symbol:
-        return symbol
-    return str(_get(_get(obj, "position_snapshot", {}), "symbol", "") or "").upper()
-
-
 def _venue(obj: Any) -> str:
     return _venue_text(_get(obj, "venue", ""))
 
@@ -873,8 +869,7 @@ def _has_live_open_order(exchange_truth: Mapping[str, Any] | None, symbol: str) 
     for order in _exchange_open_orders(exchange_truth):
         if symbol and _symbol(order) != symbol:
             continue
-        if _quantity(order) > EPSILON:
-            return True
+        return True
     return False
 
 
@@ -925,37 +920,18 @@ def _normalized_exchange_truth(
     if not isinstance(exchange_truth, Mapping):
         return None
     normalized = dict(exchange_truth)
-    normalized["open_orders"] = _exchange_open_orders(exchange_truth)
-    normalized["positions"] = _exchange_positions(exchange_truth)
+    normalized["truth_available"] = (
+        exchange_truth_available(exchange_truth)
+        and not has_partial_exchange_evidence(exchange_truth)
+    )
+    for key in ("open_orders", "positions"):
+        if exchange_truth.get(key) is not None:
+            normalized[key] = _flatten_exchange_collection(exchange_truth[key])
     return normalized
 
 
 def _flatten_exchange_collection(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, Mapping):
-        items: list[Any] = []
-        for venue, venue_value in value.items():
-            if isinstance(venue_value, Mapping):
-                for symbol, symbol_value in venue_value.items():
-                    if isinstance(symbol_value, Mapping):
-                        item = dict(symbol_value)
-                        item.setdefault("venue", venue)
-                        item.setdefault("symbol", symbol)
-                        items.append(item)
-                    else:
-                        for item in _as_items(symbol_value):
-                            if isinstance(item, Mapping):
-                                merged = dict(item)
-                                merged.setdefault("venue", venue)
-                                merged.setdefault("symbol", symbol)
-                                items.append(merged)
-                            else:
-                                items.append(item)
-            else:
-                items.extend(_as_items(venue_value))
-        return items
-    return _as_items(value)
+    return list(_core_flatten_exchange_collection(value))
 
 
 def _quantity(obj: Any) -> float:

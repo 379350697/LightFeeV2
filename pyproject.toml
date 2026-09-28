@@ -18,7 +18,7 @@ dependencies = [
     "pycryptodome>=3.20",
     "eth-account>=0.10",
     "msgpack>=1.0",
-    "websockets>=12.0",
+    "websockets>=14.0",
     "aiosqlite>=0.19",
     "orjson>=3.9",
 ]

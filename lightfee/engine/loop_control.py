@@ -139,6 +139,8 @@ def _export_current_state_snapshot(state: EngineState, path: str, config: Option
             "long_venue": pos.long_venue.value if hasattr(pos.long_venue, "value") else str(pos.long_venue),
             "short_venue": pos.short_venue.value if hasattr(pos.short_venue, "value") else str(pos.short_venue),
             "quantity": pos.matched_quantity,
+            "long_quantity": pos.long_quantity,
+            "short_quantity": pos.short_quantity,
         })
 
     mode = config.runtime.mode

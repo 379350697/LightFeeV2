@@ -1,1 +1,1 @@
-{"id": 456, "contract": "BTCUSDT", "size": "1", "price": "50001.0", "status": "finished"}
+{"id": 456, "contract": "BTC_USDT", "size": "1", "left": "0", "price": "50001.0", "fill_price": "50001.0", "status": "finished", "finish_as": "filled"}

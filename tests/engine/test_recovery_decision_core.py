@@ -230,8 +230,8 @@ def test_symbol_scoped_flat_truth_does_not_release_prior_live_conflict():
 
     decision = V1RecoveryDecisionCore().decide(snapshot)
 
-    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
-    assert decision.entry_allowed is True
+    assert decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
+    assert decision.entry_allowed is False
     assert decision.clear_previous_block is False
 
 
@@ -300,8 +300,8 @@ def test_unsupported_account_truth_never_releases_prior_live_artifact_block():
         )
     )
 
-    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
-    assert decision.entry_allowed is True
+    assert decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
+    assert decision.entry_allowed is False
     assert decision.clear_previous_block is False
 
 
@@ -569,9 +569,9 @@ def test_evidence_gap_does_not_clear_prior_live_artifact_block():
 
     decision = V1RecoveryDecisionCore().decide(snapshot)
 
-    assert decision.kind == RecoveryDecisionKind.RUNNING_WITH_EVIDENCE_GAP
-    assert decision.entry_allowed is True
-    assert decision.block_reason is None
+    assert decision.kind == RecoveryDecisionKind.RISK_ONLY_WAIT_FOR_TRUTH
+    assert decision.entry_allowed is False
+    assert decision.block_reason == "unpaired_live_position"
     assert decision.clear_previous_block is False
 
 
@@ -683,6 +683,8 @@ def test_managed_local_open_position_owns_matching_live_position():
                 symbol="ARIAUSDT",
                 long_venue="bybit",
                 short_venue="binance",
+                long_quantity=619.0,
+                short_quantity=619.0,
             ),
         ),
         pending_entries=(),

@@ -28,6 +28,7 @@ class VenueOperation(Enum):
     POSITION = "position"
     ALL_POSITIONS = "all_positions"
     ACCOUNT_RISK = "account_risk"
+    ACCOUNT_SETTINGS = "account_settings"
     L2_BOOK = "l2_book"
     INFO = "info"
     USER_ABSTRACTION = "user_abstraction"
@@ -389,6 +390,13 @@ def bitget_spec() -> VenueSpec:
             "GET",
             "/api/v3/account/assets",
             payload="params",
+        ),
+        VenueOperation.ACCOUNT_SETTINGS: _contract(
+            "GET",
+            "/api/v3/account/settings",
+            payload="params",
+            required_params=("category=USDT-FUTURES",),
+            official_doc_url="https://www.bitget.com/docs/catalog/account/account-settings",
         ),
     }
     return VenueSpec(

@@ -169,6 +169,44 @@ def binance_fake():
     return FakeVenueAdapter(Venue.BINANCE, _min_notional_quote=10.0)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_notional", [0.0, 500.0])
+async def test_funding_diagnostics_reproduce_both_capture_stages(config, tmp_journal, stored_notional):
+    config.strategy.post_funding_hold_secs = 1
+    runtime = LiveRuntime(config, venue_adapters={})
+    runtime.journal = tmp_journal
+    runtime.passive_close_executor = None
+    runtime.close_executor = None
+    position = OpenPosition(
+        position_id="funding-diagnostic", symbol="SAGAUSDT",
+        long_venue=Venue.BINANCE, short_venue=Venue.GATE,
+        long_quantity=100, short_quantity=100, matched_quantity=100,
+        long_entry_price=2.0, short_entry_price=2.2, opened_at_ms=1000,
+        entry_notional_quote=stored_notional, funding_timestamp_ms=10_000,
+        second_funding_timestamp_ms=20_000, second_stage_enabled_at_entry=True,
+        funding_edge_bps_entry=10.0, total_funding_edge_bps_entry=7.0,
+    )
+    runtime.state.open_positions[position.position_id] = position
+    await runtime._maybe_process_normal_exits(10_999)
+    assert not any(e["kind"] == "runtime.funding_capture_state_updated" for e in tmp_journal.read_all())
+    await runtime._maybe_process_normal_exits(11_000)
+    await runtime._maybe_process_normal_exits(21_000)
+    await runtime._maybe_process_normal_exits(21_001)
+    captures = [e["payload"] for e in tmp_journal.read_all() if e["kind"] == "runtime.funding_capture_state_updated"]
+    assert len(captures) == 2
+    notional = stored_notional or 210.0
+    for i, payload in enumerate(captures):
+        assert payload["funding_pnl_source"] == "entry_edge_estimate"
+        assert payload["funding_statement_reconciled"] is False
+        assert payload["effective_entry_notional_quote"] == pytest.approx(notional)
+        assert payload["entry_notional_source"] == ("stored" if stored_notional else "matched_quantity_and_entry_prices")
+        assert payload["total_funding_edge_bps_entry"] == 7.0
+        assert payload["second_stage_enabled_at_entry"] is True
+        assert payload["funding_delta_quote"] == pytest.approx(notional * (10.0 if i == 0 else -3.0) / 10_000)
+    assert captures[1]["funding_quote_before"] == captures[0]["funding_quote_after"]
+    assert captures[1]["funding_quote_after"] == pytest.approx(notional * 7 / 10_000)
+
+
 @pytest.fixture
 def okx_fake():
     return FakeVenueAdapter(Venue.OKX, _min_notional_quote=10.0)

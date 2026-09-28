@@ -6,12 +6,17 @@ work. It intentionally performs no venue I/O and submits no orders.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping
+from math import isfinite
 
 from lightfee.engine.recovery_decision_core import (
     LIVE_ARTIFACT_BLOCK_REASONS,
+    _flatten_exchange_collection as _core_flatten_exchange_collection,
     complete_flat_truth_for_pair,
+    exchange_truth_available,
+    has_partial_exchange_evidence,
+    is_complete_account_truth,
     pending_close_reconciliation_evidence,
 )
 from lightfee.venues.specs import canonical_symbol_from_venue
@@ -92,9 +97,13 @@ class RecoveryLedger:
         exchange_truth: Any,
         owner_index: Any | None = None,
     ) -> "RecoveryLedger":
+        from lightfee.engine.recovery_owner_index import RecoveryOwnerIndex
+
+        if owner_index is None:
+            owner_index = RecoveryOwnerIndex.from_state(local)
         truth_available = _truth_available(exchange_truth)
         work_items: list[RecoveryWorkItem] = []
-        seen_work: set[tuple[str, str, str]] = set()
+        seen_work: dict[tuple[str, str, str], int] = {}
         live_symbols: set[str] = set()
         positive_fill_symbols: set[str] = set()
 
@@ -105,11 +114,16 @@ class RecoveryLedger:
                 item.owner.owner_id if item.owner is not None else "",
             )
             if key in seen_work:
+                index = seen_work[key]
+                previous = work_items[index]
+                work_items[index] = replace(previous,
+                    artifacts=previous.artifacts + item.artifacts,
+                    venues=previous.venues | item.venues,
+                )
                 return
-            seen_work.add(key)
+            seen_work[key] = len(work_items)
             work_items.append(item)
 
-        local_open_positions = list(_local_collection(local, "open_positions"))
         local_pending_entries = list(_local_collection(local, "pending_entries"))
         local_residuals = list(_local_collection(local, "pending_residual_repairs"))
         local_passive_closes = list(_local_collection(local, "pending_passive_closes"))
@@ -130,12 +144,6 @@ class RecoveryLedger:
                     blocking=False,
                 )
             )
-
-        open_position_symbols = {
-            _symbol(item)
-            for item in local_open_positions
-            if _symbol(item)
-        }
 
         for pending in local_pending_entries:
             symbol = _symbol(pending)
@@ -223,9 +231,21 @@ class RecoveryLedger:
         positions = _exchange_positions(exchange_truth)
         open_orders = _exchange_open_orders(exchange_truth)
 
-        for position in positions:
-            quantity = _float(_get(position, "quantity", 0.0))
-            if quantity <= EPSILON:
+        if is_complete_account_truth(exchange_truth):
+            for missing in owner_index.missing_position_claims(positions):
+                add_work(RecoveryWorkItem(
+                    kind="unpaired_live_position", symbol=missing.symbol,
+                    venues=frozenset({missing.venue}), artifacts=(missing,),
+                    owner=RecoveryOwner("exchange_position", missing.symbol, "orphan", missing.raw),
+                    decision=RecoveryDecision("fail_closed_operator_block", "owned_live_pair_missing_leg"),
+                ))
+        position_owners = owner_index.owners_for_positions(positions)
+        for position, owner in zip(positions, position_owners):
+            try:
+                quantity = float(_get(position, "quantity", None))
+            except (TypeError, ValueError):
+                quantity = float("nan")
+            if isfinite(quantity) and abs(quantity) <= EPSILON:
                 continue
             artifact = ExchangeArtifact(
                 kind="position",
@@ -237,7 +257,6 @@ class RecoveryLedger:
                 raw=_raw_mapping(position),
             )
             live_symbols.add(artifact.symbol)
-            owner = _owner_for_position(owner_index, artifact)
             if owner is not None and owner.confidence != "orphan":
                 if owner.owner_type in {
                     "pending_entry",
@@ -278,52 +297,27 @@ class RecoveryLedger:
                     )
                 )
                 continue
-            if artifact.symbol in open_position_symbols:
-                add_work(
-                    RecoveryWorkItem(
-                        kind="owned_open_position",
-                        symbol=artifact.symbol,
-                        venues=frozenset(filter(None, [artifact.venue])),
-                        artifacts=(artifact,),
-                        owner=RecoveryOwner(
-                            owner_type="open_position",
-                            owner_id=artifact.symbol,
-                            confidence="probable",
-                            evidence={"source": "local_open_position_symbol"},
-                        ),
-                        decision=RecoveryDecision(
-                            outcome="managed_open_position",
-                            reason="exchange_position_matches_local_symbol",
-                            blocking=False,
-                        ),
-                        blocking=False,
-                    )
+            add_work(
+                RecoveryWorkItem(
+                    kind="unpaired_live_position",
+                    symbol=artifact.symbol,
+                    venues=frozenset(filter(None, [artifact.venue])),
+                    artifacts=(artifact,),
+                    owner=owner,
+                    decision=RecoveryDecision(
+                        outcome="fail_closed_operator_block",
+                        reason="live_position_without_runtime_owner",
+                    ),
+                    blocking=True,
                 )
-            else:
-                add_work(
-                    RecoveryWorkItem(
-                        kind="unpaired_live_position",
-                        symbol=artifact.symbol,
-                        venues=frozenset(filter(None, [artifact.venue])),
-                        artifacts=(artifact,),
-                        owner=RecoveryOwner(
-                            owner_type="exchange_position",
-                            owner_id=artifact.symbol,
-                            confidence="orphan",
-                            evidence={"source": "exchange_truth"},
-                        ),
-                        decision=RecoveryDecision(
-                            outcome="fail_closed_operator_block",
-                            reason="live_position_without_runtime_owner",
-                        ),
-                        blocking=True,
-                    )
-                )
+            )
 
         for order in open_orders:
-            quantity = _float(_get(order, "quantity", _get(order, "qty", 0.0)))
-            if quantity <= EPSILON:
-                continue
+            # Membership in open-orders proves existence independently of size.
+            try:
+                quantity = float(_get(order, "quantity", _get(order, "qty", None)))
+            except (TypeError, ValueError):
+                quantity = float("nan")
             artifact = ExchangeArtifact(
                 kind="open_order",
                 symbol=_symbol(order),
@@ -593,13 +587,8 @@ def _as_items(value: Any) -> list[Any]:
 
 
 def _truth_available(exchange_truth: Any) -> bool:
-    if exchange_truth is None:
-        return False
-    if isinstance(exchange_truth, Mapping) and "truth_available" in exchange_truth:
-        return bool(exchange_truth.get("truth_available"))
-    if isinstance(exchange_truth, Mapping) and "available" in exchange_truth:
-        return bool(exchange_truth.get("available"))
-    return bool(_get(exchange_truth, "truth_available", True))
+    return (exchange_truth_available(exchange_truth)
+            and not has_partial_exchange_evidence(exchange_truth))
 
 
 def _exchange_positions(exchange_truth: Any) -> list[Any]:
@@ -611,38 +600,7 @@ def _exchange_open_orders(exchange_truth: Any) -> list[Any]:
 
 
 def _flatten_exchange_collection(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, Mapping):
-        items: list[Any] = []
-        for venue, venue_value in value.items():
-            if isinstance(venue_value, Mapping):
-                for symbol, symbol_value in venue_value.items():
-                    if isinstance(symbol_value, Mapping):
-                        item = dict(symbol_value)
-                        item.setdefault("venue", venue)
-                        item.setdefault("symbol", symbol)
-                        items.append(item)
-                    elif isinstance(symbol_value, (int, float)):
-                        items.append(
-                            {
-                                "venue": venue,
-                                "symbol": symbol,
-                                "quantity": float(symbol_value),
-                            }
-                        )
-                    else:
-                        items.extend(_as_items(symbol_value))
-            else:
-                for item in _as_items(venue_value):
-                    if isinstance(item, Mapping):
-                        merged = dict(item)
-                        merged.setdefault("venue", venue)
-                        items.append(merged)
-                    else:
-                        items.append(item)
-        return items
-    return _as_items(value)
+    return list(_core_flatten_exchange_collection(value))
 
 
 def _symbol(obj: Any) -> str:
@@ -721,13 +679,6 @@ def _owner_for_order(owner_index: Any | None, artifact: ExchangeArtifact) -> Rec
     if owner_index is None or not hasattr(owner_index, "owner_for_order"):
         return None
     owner = owner_index.owner_for_order(artifact)
-    return _coerce_owner(owner)
-
-
-def _owner_for_position(owner_index: Any | None, artifact: ExchangeArtifact) -> RecoveryOwner | None:
-    if owner_index is None or not hasattr(owner_index, "owner_for_position"):
-        return None
-    owner = owner_index.owner_for_position(artifact)
     return _coerce_owner(owner)
 
 

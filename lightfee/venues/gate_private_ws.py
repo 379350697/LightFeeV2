@@ -10,20 +10,23 @@ import hashlib
 import hmac
 import json
 import logging
-from typing import Any, Optional
+import math
+from typing import Any
 
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from lightfee.core.domain import PassiveOrderState
 from lightfee.marketdata.private_ws import (
     PrivateOrderUpdate,
     _now_ms,
 )
 
+from lightfee.venues.transport import _gate_order_execution
+
 logger = logging.getLogger(__name__)
 
 GATE_PRIVATE_PING_INTERVAL_SECS = 20
+GATE_PRIVATE_SUBSCRIBE_TIMEOUT_SECS = 10
 
 
 def _gate_ws_url(base_url: str) -> str:
@@ -45,39 +48,35 @@ def _gate_ws_auth(api_key: str, api_secret: str, channel: str, event: str, now_s
     return {"method": "api_key", "KEY": api_key, "SIGN": signature}
 
 
-def _gate_passive_order_state(status: str) -> Optional[PassiveOrderState]:
-    s = status.upper()
-    if s in ("OPEN", "UNTRI"):
-        return PassiveOrderState.OPEN
-    if s == "PARTIAL":
-        return PassiveOrderState.PARTIALLY_FILLED
-    if s in ("FINISHED", "CLOSED", "FILLED"):
-        return PassiveOrderState.FILLED
-    if s in ("CANCELLED", "CANCELED"):
-        return PassiveOrderState.CANCELED
-    if s == "EXPIRED":
-        return PassiveOrderState.EXPIRED
-    return None
-
-
 def _handle_gate_order_data(
     data: list[dict[str, Any]],
     symbol_map: dict[str, str],
     private_state,
-) -> None:
+    contract_multipliers: dict[str, float],
+) -> bool:
     loop = asyncio.get_running_loop()
+    validated = bool(data)
     for row in data:
         contract = row.get("contract", "")
         symbol = symbol_map.get(contract)
         if symbol is None:
+            validated = False
             continue
-        order_id = str(row.get("id", ""))
-        client_id = row.get("text", "")
-        filled_qty = float(row.get("fill_total", 0) or 0)
+        raw_id = row.get("id")
+        if raw_id is not None and (isinstance(raw_id, bool) or not isinstance(raw_id, (str, int))
+                                   or (isinstance(raw_id, int) and raw_id <= 0)):
+            raise ValueError("gate_invalid_order_id")
+        order_id = str(raw_id).strip() if raw_id is not None else ""
+        text = row.get("text")
+        if text is not None and not isinstance(text, str):
+            raise ValueError("gate_invalid_client_order_id")
+        # Source labels such as web/api/app must not merge unrelated orders.
+        client_id = text[2:] if text and text.startswith("t-") and text[2:].strip() else None
+        if not order_id and not client_id:
+            raise ValueError("gate_order_identity_missing")
+        _, filled_qty, state = _gate_order_execution(row, contract_multipliers[contract])
         avg_price = float(row.get("fill_price", 0) or 0)
         fee_quote = float(row.get("fee", 0) or 0)
-        status = row.get("finish_as", row.get("status", ""))
-        state = _gate_passive_order_state(status)
         ts = int(row.get("finish_time_ms", row.get("update_time_ms", _now_ms())))
         update = PrivateOrderUpdate(
             symbol=symbol,
@@ -90,34 +89,51 @@ def _handle_gate_order_data(
             updated_at_ms=ts,
         )
         loop.create_task(private_state.record_order(update))
+    return validated
 
 
 def _handle_gate_position_data(
     data: list[dict[str, Any]],
     symbol_map: dict[str, str],
     private_state,
-) -> None:
+    contract_multipliers: dict[str, float],
+) -> bool:
     loop = asyncio.get_running_loop()
+    # A single signed cache slot cannot represent independent hedge legs.
+    # REST remains the authoritative position source for Gate.
+    dual = any(str(row.get("mode", "")).startswith("dual") for row in data)
+    validated = bool(data)
+    updates = {}
     for row in data:
         contract = row.get("contract", "")
         symbol = symbol_map.get(contract)
         if symbol is None:
+            validated = False
             continue
-        size = float(row.get("size", 0) or 0)
+        size = float(row["size"]) * contract_multipliers[contract]
+        if not math.isfinite(size) or (not dual and symbol in updates):
+            raise ValueError("gate_ambiguous_position_update")
         ts = int(row.get("update_time_ms", _now_ms()))
+        updates[symbol] = (size, ts)
+    if dual:
+        logger.warning("gate dual position update requires REST truth")
+        return validated
+    for symbol, (size, ts) in updates.items():
         loop.create_task(private_state.update_position(symbol, size, ts))
+    return validated
 
 
 def handle_gate_private_message(
     private_state,
     symbol_map: dict[str, str],
     raw: str,
-) -> None:
+    contract_multipliers: dict[str, float],
+) -> bool:
     """V1 handle_gate_private_message()."""
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return
+        return False
 
     channel = payload.get("channel", "")
     event = payload.get("event", "")
@@ -125,19 +141,20 @@ def handle_gate_private_message(
 
     # Subscription ack
     if event == "subscribe" and result is not None:
-        return
+        return False
 
     # Data messages
     if isinstance(result, list):
         if channel == "futures.orders":
-            _handle_gate_order_data(result, symbol_map, private_state)
+            return _handle_gate_order_data(result, symbol_map, private_state, contract_multipliers)
         elif channel == "futures.positions":
-            _handle_gate_position_data(result, symbol_map, private_state)
+            return _handle_gate_position_data(result, symbol_map, private_state, contract_multipliers)
     elif isinstance(result, dict):
         if channel == "futures.orders":
-            _handle_gate_order_data([result], symbol_map, private_state)
+            return _handle_gate_order_data([result], symbol_map, private_state, contract_multipliers)
         elif channel == "futures.positions":
-            _handle_gate_position_data([result], symbol_map, private_state)
+            return _handle_gate_position_data([result], symbol_map, private_state, contract_multipliers)
+    return False
 
 
 async def _gate_private_ws_loop(
@@ -154,9 +171,11 @@ async def _gate_private_ws_loop(
     from lightfee.marketdata.resilience import compute_backoff_ms
 
     failures = 0
+    # Subscription ACKs cannot erase a data-normalization failure on reconnect.
+    awaiting_valid_updates: set[str | None] = set()
     while True:
         try:
-            ws = await websockets.connect(ws_url)
+            ws = await websockets.connect(ws_url, additional_headers={"X-Gate-Size-Decimal": "1"})
         except Exception as e:
             transport.record_private_ws_failure(
                 _now_ms(), f"gate private ws connect failed: {e}", unhealthy_after_failures
@@ -165,8 +184,6 @@ async def _gate_private_ws_loop(
             delay = compute_backoff_ms(reconnect_initial_ms, reconnect_max_ms, failures)
             await asyncio.sleep(delay / 1000.0)
             continue
-
-        transport.record_private_ws_success(_now_ms())
 
         # Build signed subscriptions
         now_s = int(_now_ms() / 1000)
@@ -207,13 +224,14 @@ async def _gate_private_ws_loop(
             await asyncio.sleep(delay / 1000.0)
             continue
 
-        failures = 0
+        pending_channels = {"futures.orders", "futures.positions"}
+        subscribe_deadline = asyncio.get_running_loop().time() + GATE_PRIVATE_SUBSCRIBE_TIMEOUT_SECS
 
         async def _ping_loop():
             while True:
                 await asyncio.sleep(GATE_PRIVATE_PING_INTERVAL_SECS)
                 try:
-                    await ws.send("ping")
+                    await ws.send(json.dumps({"time": int(_now_ms() / 1000), "channel": "futures.ping"}))
                 except Exception:
                     break
 
@@ -221,8 +239,12 @@ async def _gate_private_ws_loop(
 
         try:
             while True:
+                if pending_channels and asyncio.get_running_loop().time() >= subscribe_deadline:
+                    raise TimeoutError(f"gate subscribe timeout: missing={sorted(pending_channels)}")
                 try:
-                    message = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    timeout = (min(1.0, max(subscribe_deadline - asyncio.get_running_loop().time(), 0.001))
+                               if pending_channels else 1.0)
+                    message = await asyncio.wait_for(ws.recv(), timeout=timeout)
                 except asyncio.TimeoutError:
                     continue
                 except ConnectionClosed as e:
@@ -234,11 +256,53 @@ async def _gate_private_ws_loop(
                 if isinstance(message, bytes):
                     continue
 
+                channel = event = None
                 try:
-                    handle_gate_private_message(private_state, symbol_map, message)
-                    transport.record_private_ws_success(_now_ms())
+                    payload = json.loads(message)
+                    if not isinstance(payload, dict):
+                        raise ValueError("gate private ws response must be an object")
+                    channel, event = payload.get("channel"), payload.get("event")
+                    if payload.get("error") is not None:
+                        raise ValueError(f"channel={channel} event={event} error={payload['error']}")
+                    if event == "subscribe":
+                        if channel not in {"futures.orders", "futures.positions"}:
+                            continue
+                        result = payload.get("result")
+                        if not isinstance(result, dict) or result.get("status") != "success":
+                            raise ValueError(f"channel={channel} event={event} result={result}")
+                        pending_channels.discard(channel)
+                        if not pending_channels and not awaiting_valid_updates:
+                            failures = 0
+                            transport.record_private_ws_success(_now_ms())
+                        continue
+                    if channel not in {"futures.orders", "futures.positions"} or event != "update":
+                        continue
+                    rows = payload.get("result")
+                    rows = [rows] if isinstance(rows, dict) else rows
+                    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                        raise ValueError(f"channel={channel} event={event} invalid update result={rows!r}")
+                    multipliers = {}
+                    if isinstance(rows, list):
+                        for row in rows:
+                            contract = row.get("contract") if isinstance(row, dict) else None
+                            if contract in symbol_map and contract not in multipliers:
+                                rule = await transport._gate_symbol_rule(contract)
+                                multipliers[contract] = rule.ct_val
+                    validated = handle_gate_private_message(private_state, symbol_map, message, multipliers)
+                    if validated:
+                        awaiting_valid_updates.discard(channel)
+                        awaiting_valid_updates.discard(None)
+                    if validated and not pending_channels and not awaiting_valid_updates:
+                        failures = 0
+                        transport.record_private_ws_success(_now_ms())
                 except Exception as e:
-                    logger.debug("gate private ws message ignored: %s", e)
+                    if event != "subscribe":
+                        awaiting_valid_updates.add(channel if channel in {"futures.orders", "futures.positions"} else None)
+                    transport.record_private_ws_failure(
+                        _now_ms(), f"gate private ws normalization failed: {e}", unhealthy_after_failures
+                    )
+                    logger.warning("gate private ws normalization failed: %s", e)
+                    break
 
         except Exception as e:
             transport.record_private_ws_failure(

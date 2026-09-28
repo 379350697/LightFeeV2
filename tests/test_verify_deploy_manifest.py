@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+import sys
+
+import pytest
 
 from scripts import verify_deploy_manifest as manifest
 
@@ -72,6 +75,31 @@ def test_generate_deploy_script_uses_remote_venv_for_production_checks(tmp_path,
 def test_health_monitor_templates_are_manifest_critical():
     assert "deploy/systemd/lightfee-production-health.service" in manifest.CRITICAL_FILES
     assert "deploy/systemd/lightfee-production-health.timer" in manifest.CRITICAL_FILES
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_generated_deploy_checks_ws_dependency_before_sync(tmp_path, monkeypatch, compatible):
+    _stub_manifest_generation(monkeypatch)
+    script = manifest.generate_deploy_script(tmp_path, "test-host", "/opt/lightfee-v2")
+    start = script.index("<<'PY'\n") + len("<<'PY'\n")
+    end = script.index("\nPY", start)
+    assert end < script.index("rsync -avz") < script.index("systemctl restart")
+
+    def modern_connect(uri, additional_headers=None):
+        pass
+
+    def legacy_connect(uri, extra_headers=None):
+        pass
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(
+        __version__="14.0" if compatible else "13.1",
+        connect=modern_connect if compatible else legacy_connect,
+    ))
+    if compatible:
+        exec(compile(script[start:end], "deployment-preflight", "exec"), {})
+    else:
+        with pytest.raises(SystemExit, match="Deployment blocked"):
+            exec(compile(script[start:end], "deployment-preflight", "exec"), {})
 
 
 def test_verify_remote_manifest_uses_configured_ssh_port(monkeypatch):

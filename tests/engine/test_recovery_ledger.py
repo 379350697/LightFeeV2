@@ -78,6 +78,8 @@ def test_okx_wire_symbol_is_owned_by_matching_canonical_open_position():
                 "symbol": "HOMEUSDT",
                 "long_venue": "okx",
                 "short_venue": "bybit",
+                "long_quantity": 1600.0,
+                "short_quantity": 1600.0,
             }
         ],
         "pending_entries": [],

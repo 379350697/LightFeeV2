@@ -17,7 +17,7 @@ import random
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -59,7 +59,7 @@ from lightfee.venues.specs import (
     get_operation_contract,
     get_spec,
 )
-from lightfee.venues.symbol_rules import get_symbol_rules_cache
+from lightfee.venues.symbol_rules import get_symbol_rules_cache, parse_gate_symbol_rule
 
 if TYPE_CHECKING:
     from lightfee.core.domain import (
@@ -272,11 +272,15 @@ class TransportError(Exception):
                  request_method: str = "",
                  request_path: str = "",
                  request_started_at_ms: int = 0,
-                 request_elapsed_ms: int = 0) -> None:
+                 request_elapsed_ms: int = 0,
+                 truth_evidence: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
         self.category = category
         self.status_code = status_code
         self.body = body
+        # Partial normalization evidence is for recovery blocking/diagnostics,
+        # never a successful adapter result usable for trading.
+        self.truth_evidence = truth_evidence or []
         self.headers: dict[str, str] = headers or {}
         # Keep request identity alongside the typed transport failure.  The
         # public MarketDataClient and private VenueTransport share this error
@@ -1207,6 +1211,36 @@ def _parse_binance_like_position(raw: dict[str, Any], symbol: str, now_ms: int,
     )
 
 
+def _gate_order_execution(row: dict[str, Any], multiplier: float):
+    """Decode Gate contracts once for REST and private WS consumers."""
+    from lightfee.core.domain import PassiveOrderState
+
+    size = float(row["size"])
+    left = abs(float(row["left"]))
+    if (not all(math.isfinite(v) for v in (size, left, multiplier))
+            or size == 0 or multiplier <= 0 or left > abs(size)):
+        raise ValueError("invalid_gate_order_execution")
+    filled = (abs(size) - left) * multiplier
+    if not math.isfinite(filled):
+        raise ValueError("invalid_gate_filled_quantity")
+    if row.get("fill_price") not in (None, ""):
+        fill_price = _parse_optional_float(row["fill_price"])
+        if fill_price is None or fill_price < 0:
+            raise ValueError("invalid_gate_fill_price")
+    status = str(row.get("status", "")).lower()
+    finish = str(row.get("finish_as", "")).lower()
+    if status == "open" and not finish:
+        state = PassiveOrderState.PARTIALLY_FILLED if filled > 0 else PassiveOrderState.OPEN
+    elif finish == "filled" and left == 0:
+        state = PassiveOrderState.FILLED
+    elif finish in {"cancelled", "canceled", "ioc", "poc", "reduce_only", "reduce_out", "position_closed",
+                    "liquidated", "auto_deleveraged", "stp"}:
+        state = PassiveOrderState.CANCELED
+    else:
+        state = PassiveOrderState.UNKNOWN
+    return size, filled, state
+
+
 def _parse_gate_position(raw: dict[str, Any], symbol: str, now_ms: int, *, contract_size: float = 1.0) -> "PositionSnapshot":
     """Parse Gate.io position (flat dict or list).
 
@@ -1218,12 +1252,20 @@ def _parse_gate_position(raw: dict[str, Any], symbol: str, now_ms: int, *, contr
     entry_price = 0.0
     for row in rows:
         if not isinstance(row, dict):
-            continue
+            raise ValueError("invalid_gate_position_row")
+        if not row.get("contract"):
+            raise ValueError("missing_gate_position_identity")
         if row.get("contract") and row.get("contract") != symbol:
             continue
-        size = _safe_float(row.get("size"), default=0.0) * contract_size
+        size = float(row["size"]) * contract_size
+        if not math.isfinite(size):
+            raise ValueError("invalid_gate_position_size")
+        if size and net and (size > 0) != (net > 0):
+            raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                                 "gate_multiple_live_position_sides")
         net += size
-        entry_price = _safe_float(row.get("entry_price"), default=entry_price)
+        if size:
+            entry_price = _safe_float(row.get("entry_price"), default=entry_price)
     return PositionSnapshot(
         venue=Venue.GATE,
         symbol=symbol,
@@ -2086,7 +2128,7 @@ class VenueTransport(MarketDataClient):
                 if symbol_rule is not None and symbol_rule.min_qty > 0
                 else float(spec.min_quantity or 0.0)
             )
-        if symbol_rule is not None and spec.venue_id == Venue.OKX:
+        if symbol_rule is not None and spec.venue_id in (Venue.OKX, Venue.GATE):
             min_notional = float(symbol_rule.min_notional or 0.0)
         else:
             min_notional = (
@@ -2102,9 +2144,17 @@ class VenueTransport(MarketDataClient):
 
         raw_qty = float(request.quantity)
         raw_price = float(request.price) if request.price is not None else None
+        if spec.venue_id == Venue.GATE:
+            if not math.isfinite(raw_qty) or raw_qty <= 0 or (raw_price is not None and not math.isfinite(raw_price)):
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, "gate_invalid_order_number")
+            cid = (request.client_order_id or "").removeprefix("t-")
+            if cid and (len(cid.encode("utf-8")) > 28 or any(
+                not (ch.isascii() and (ch.isalnum() or ch in "-_.")) for ch in cid
+            )):
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, "gate_invalid_client_order_id")
         quantized_qty = _floor_to_step(raw_qty, quantity_step) if quantity_step > 0 else raw_qty
         quantized_qty = round(quantized_qty, _step_decimals(quantity_step))
-        if spec.venue_id == Venue.GATE:
+        if spec.venue_id == Venue.GATE and symbol_rule is None:
             quantized_qty = float(int(quantized_qty))
         quantized_price = raw_price
         if raw_price is not None and tick_size > 0:
@@ -2132,6 +2182,20 @@ class VenueTransport(MarketDataClient):
             "min_notional": min_notional,
             "rule_source": rule_source,
         }
+        if spec.venue_id == Venue.GATE and symbol_rule is not None:
+            multiplier = float(symbol_rule.ct_val)
+            if not math.isfinite(multiplier) or multiplier <= 0:
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, "gate_contract_metadata_missing")
+            payload.update(contract_multiplier=multiplier, base_qty=quantized_qty,
+                           contract_qty=quantized_qty / multiplier)
+            maximum = float(symbol_rule.max_market_qty)
+            if maximum > 0 and quantized_qty / multiplier > maximum + 1e-9:
+                raise OrderSubmitError(SubmitFailureClass.REJECTED, "gate_max_contract_quantity_exceeded")
+        if raw_price is not None and (quantized_price is None
+                or not math.isfinite(quantized_price) or quantized_price <= 0):
+            payload.update(response_classification="precision_rejected", reason="invalid_normalized_price")
+            self._record_order_diagnostic("order.submit_result", payload)
+            raise OrderSubmitError(SubmitFailureClass.REJECTED, "invalid_normalized_price")
         if quantized_qty <= 0 or not math.isfinite(quantized_qty):
             payload["response_classification"] = "precision_rejected"
             payload["reason"] = "quantity_step_rejected"
@@ -2233,6 +2297,11 @@ class VenueTransport(MarketDataClient):
         """Validate a Bybit order through the official non-mutating pre-check API."""
         spec = self._spec
         venue_sym = self._venue_symbol(request.symbol)
+        if spec.venue_id == Venue.GATE and self.mode == "live":
+            probe = replace(request, price=request.price or request.price_hint)
+            _, preflight, _ = await self.prepare_order_request(probe, require_exchange_rules=True)
+            self._record_order_diagnostic("order.precheck_result", {**preflight, "status": "validated"})
+            return preflight
         if spec.venue_id != Venue.BYBIT:
             return {
                 "venue": spec.venue_id.value,
@@ -3404,7 +3473,43 @@ class VenueTransport(MarketDataClient):
                     params["productType"] = "USDT-FUTURES"
                     params["marginCoin"] = "USDT"
                 raw = await self._request("GET", spec.position_path, params=params, private=True)
-            if spec.venue_id == Venue.OKX:
+            if spec.venue_id == Venue.GATE:
+                if not isinstance(raw, list):
+                    raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE, "gate_invalid_position_collection")
+                positions = []
+                evidence = [{"venue": "gate", "symbol": _canonical_position_symbol(spec,
+                    str(row.get("contract") or "") if isinstance(row, dict) else "") or "*",
+                    "quantity": None, "raw": row, "normalization_error": "gate_position_normalization_incomplete"}
+                    for row in raw]
+                errors = []
+                for index, row in enumerate(raw):
+                    venue_symbol = str(row.get("contract") or "") if isinstance(row, dict) else ""
+                    try:
+                        if not venue_symbol or not math.isfinite(float(row["size"])):
+                            raise ValueError("gate_invalid_position_row")
+                        if float(row["size"]) == 0:
+                            evidence[index]["quantity"] = 0.0
+                            evidence[index].pop("normalization_error")
+                            continue
+                        await self._gate_symbol_rule(venue_symbol)
+                        pos = replace(self._parse_position(row, venue_symbol, now_ms),
+                                      symbol=_canonical_position_symbol(spec, venue_symbol))
+                        positions.append(pos)
+                        evidence[index] = {**asdict(pos), "venue": pos.venue.value, "side": pos.side.value, "raw": row}
+                    except asyncio.CancelledError as exc:
+                        # Preserve cancellation semantics. wait_for's timeout
+                        # retains this cause, including rows observed before a
+                        # metadata wait; recovery must not erase those rows.
+                        exc.__cause__ = TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                            "gate_position_normalization_interrupted", truth_evidence=evidence)
+                        raise
+                    except Exception as exc:
+                        errors.append(str(exc))
+                        evidence[index]["normalization_error"] = str(exc)
+                if errors:
+                    raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                        "gate_invalid_position_collection:" + ";".join(errors), truth_evidence=evidence)
+            elif spec.venue_id == Venue.OKX:
                 positions = await self._parse_all_positions_okx(raw, now_ms)
             else:
                 positions = self._parse_all_positions(raw, now_ms)
@@ -3435,6 +3540,20 @@ class VenueTransport(MarketDataClient):
                 entry_price=0.0,
                 observed_at_ms=now_ms,
             )
+            self._position_cache[symbol] = (snapshot, now_ms)
+            return snapshot
+
+        if spec.venue_id == Venue.GATE:
+            # The endpoint is account-wide. Share its strict, per-row evidence
+            # path instead of netting opposite legs into a false flat snapshot.
+            positions = await self.fetch_all_positions()
+            positions = [pos for pos in positions if self._venue_symbol(pos.symbol) == venue_sym]
+            if len(positions) > 1:
+                raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                    "gate_multiple_live_position_sides", truth_evidence=[
+                        {**asdict(pos), "venue": pos.venue.value, "side": pos.side.value} for pos in positions])
+            snapshot = replace(positions[0], symbol=venue_sym) if positions else PositionSnapshot(
+                venue=Venue.GATE, symbol=venue_sym, side=Side.BUY, quantity=0.0, entry_price=0.0, observed_at_ms=now_ms)
             self._position_cache[symbol] = (snapshot, now_ms)
             return snapshot
 
@@ -3513,6 +3632,8 @@ class VenueTransport(MarketDataClient):
         spec = self._spec
         positions: list[PositionSnapshot] = []
         for row in _venue_position_rows(raw, spec.venue_id):
+            if spec.venue_id == Venue.GATE and float(row["size"]) == 0:
+                continue
             venue_symbol = _position_row_symbol(row, spec.venue_id)
             if not venue_symbol:
                 continue
@@ -3700,10 +3821,8 @@ class VenueTransport(MarketDataClient):
                 return result
             return _parse_generic_position(raw, spec, venue_sym, now_ms)
         if spec.venue_id == Venue.GATE:
-            result = _parse_gate_position(raw, venue_sym, now_ms, contract_size=spec.contract_size)
-            if result.quantity > 0 or not isinstance(raw, dict):
-                return result
-            return _parse_generic_position(raw, spec, venue_sym, now_ms)
+            return _parse_gate_position(raw, venue_sym, now_ms,
+                                        contract_size=self._gate_contract_multiplier(venue_sym))
         if spec.venue_id == Venue.HYPERLIQUID:
             return _parse_hyperliquid_position(raw, venue_sym, now_ms)
 
@@ -3716,6 +3835,68 @@ class VenueTransport(MarketDataClient):
             entry_price=0.0,
             observed_at_ms=now_ms,
         )
+
+    async def _gate_symbol_rule(self, symbol: str):
+        venue_symbol = self._venue_symbol(symbol)
+        rule = await get_symbol_rules_cache().get(self, Venue.GATE, venue_symbol)
+        if rule.rule_source != "gate_contract":
+            self._record_order_diagnostic("venue.contract_metadata_unavailable", {
+                "venue": "gate", "symbol": venue_symbol, "rule_source": rule.rule_source,
+                "required_fields": ["order_price_round", "quanto_multiplier", "order_size_min"],
+            })
+            raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                                 f"gate_contract_metadata_missing:{venue_symbol}")
+        return rule
+
+    def _gate_contract_multiplier(self, venue_symbol: str) -> float:
+        rule = parse_gate_symbol_rule(self._symbol_metadata.get(venue_symbol), venue_symbol)
+        if rule is not None:
+            return rule.ct_val
+        if self.mode == "paper":
+            return self._spec.contract_size
+        raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE,
+                             f"gate_contract_metadata_missing:{venue_symbol}")
+
+    def _gate_order_progress(self, raw: dict[str, Any], venue_symbol: str, now_ms: int):
+        from lightfee.core.domain import PassiveOrderProgress
+
+        if not isinstance(raw, dict) or raw.get("contract") != venue_symbol or not raw.get("id"):
+            raise ValueError("gate_order_identity_missing_or_mismatched")
+        size, filled, state = _gate_order_execution(raw, self._gate_contract_multiplier(venue_symbol))
+        return PassiveOrderProgress(
+            venue=Venue.GATE, symbol=venue_symbol, side=Side.BUY if size > 0 else Side.SELL,
+            order_id=str(raw["id"]), client_order_id=str(raw.get("text") or "").removeprefix("t-"),
+            cumulative_quantity=filled, average_price=_safe_float(raw.get("fill_price")),
+            fee_quote=_parse_optional_float(raw.get("fee")),
+            last_fill_time_ms=int(_safe_float(raw.get("finish_time", raw.get("create_time"))) * 1000),
+            observed_at_ms=now_ms, state=state,
+        )
+
+    def _gate_submission_progress(self, raw, request, venue_symbol, now_ms):
+        """Accepted but contradictory evidence keeps exact identity for recovery."""
+        try:
+            progress = self._gate_order_progress(raw, venue_symbol, now_ms)
+            if request.quantity > 0 and progress.side != request.side:
+                raise ValueError("gate_order_side_mismatch")
+            if request.quantity > 0 and not math.isclose(
+                abs(float(raw["size"])) * self._gate_contract_multiplier(venue_symbol),
+                request.quantity, rel_tol=1e-9, abs_tol=1e-12,
+            ):
+                raise ValueError("gate_order_quantity_mismatch")
+            return progress
+        except (ValueError, KeyError, TypeError, TransportError) as exc:
+            error = OrderSubmitError(SubmitFailureClass.UNCERTAIN, str(exc))
+            error.accepted_order_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
+            error.accepted_client_order_id = request.client_order_id
+            error.order_ack_only = True
+            self._record_order_diagnostic("order.execution_contract_conflict", {
+                "venue": "gate", "symbol": venue_symbol, "expected_side": request.side.value,
+                "order_id": error.accepted_order_id, "reason": str(exc),
+                "exchange_evidence": {key: raw.get(key) for key in
+                    ("contract", "size", "left", "status", "finish_as", "fill_price", "tif")}
+                    if isinstance(raw, dict) else {},
+            })
+            raise error from exc
 
     # ------------------------------------------------------------------
     # Account balance snapshot (entry admission)
@@ -4296,7 +4477,7 @@ class VenueTransport(MarketDataClient):
                     )
                 request = replace(request, quantity=wire_qty, price=limit_px)
             else:
-                if spec.venue_id in (Venue.BINANCE, Venue.ASTER):
+                if spec.venue_id in (Venue.BINANCE, Venue.ASTER, Venue.GATE):
                     request, preflight, symbol_rule = await self.prepare_order_request(
                         request,
                         require_exchange_rules=self.mode == "live",
@@ -4423,13 +4604,14 @@ class VenueTransport(MarketDataClient):
                 if request.reduce_only:
                     body["reduceOnly"] = "true"
             elif spec.venue_id == Venue.GATE:
-                signed_size = int(request.quantity)
+                signed_size = request.quantity / self._gate_contract_multiplier(venue_sym)
                 if request.side == Side.SELL:
                     signed_size = -signed_size
                 gate_ioc = request.time_in_force == TimeInForce.IOC
                 body = {
                     "contract": venue_sym,
-                    "size": signed_size,
+                    "size": int(round(signed_size)) if math.isclose(signed_size, round(signed_size), rel_tol=0, abs_tol=1e-9)
+                            else _format_decimal(signed_size),
                     "price": (
                         _format_decimal(request.price)
                         if request.price is not None and not gate_ioc
@@ -4439,6 +4621,8 @@ class VenueTransport(MarketDataClient):
                 }
                 if request.reduce_only:
                     body["reduce_only"] = True
+                if request.client_order_id:
+                    body["text"] = "t-" + request.client_order_id.removeprefix("t-")
             elif spec.venue_id == Venue.HYPERLIQUID:
                 is_buy = request.side == Side.BUY
                 tif = "Ioc"
@@ -4648,6 +4832,18 @@ class VenueTransport(MarketDataClient):
         contract_size_override: float | None = None,
     ) -> OrderFill:
         spec = self._spec
+        if spec.venue_id == Venue.GATE:
+            progress = self._gate_submission_progress(raw, request, venue_sym, now_ms)
+            if progress.cumulative_quantity <= 0 or progress.average_price <= 0:
+                error = OrderSubmitError(SubmitFailureClass.UNCERTAIN, "gate_fill_not_confirmed")
+                error.accepted_order_id = progress.order_id
+                error.accepted_client_order_id = request.client_order_id
+                error.order_ack_only = True
+                raise error
+            return OrderFill(venue=Venue.GATE, symbol=venue_sym, side=progress.side,
+                             quantity=progress.cumulative_quantity, price=progress.average_price,
+                             order_id=progress.order_id, client_order_id=request.client_order_id,
+                             filled_at_ms=progress.last_fill_time_ms or now_ms)
 
         # Hyperliquid exchange response: {"status": "ok", "response": {"type": "order", "data": {"statuses": [...]}}}
         if spec.venue_id == Venue.HYPERLIQUID:
@@ -5055,20 +5251,8 @@ class VenueTransport(MarketDataClient):
                 uncertain_subtype="execution_not_found",
             )
             return None
-        if not str(order_id).strip():
-            # A client-order-id-only identity has no exact Gate wire query.
-            self._record_order_reconcile_query(
-                symbol=venue_sym,
-                order_id=order_id,
-                client_order_id=client_order_id,
-                queried_endpoints=["/api/v4/futures/usdt/orders/{order_id}"],
-                response_classification="gate_client_order_id_not_queryable",
-                uncertain_subtype="execution_not_found",
-                next_action="check_live_position",
-            )
-            return None
-
-        path = f"/api/v4/futures/usdt/orders/{str(order_id).strip()}"
+        query_id = str(order_id).strip() or "t-" + str(client_order_id).removeprefix("t-")
+        path = f"/api/v4/futures/usdt/orders/{query_id}"
         queried_endpoints = [path]
         try:
             raw = await self._request("GET", path, private=True)
@@ -5099,8 +5283,14 @@ class VenueTransport(MarketDataClient):
             )
             return None
 
-        size = _safe_float(raw.get("size", "0"))
-        executed = abs(size) - abs(_safe_float(raw.get("left", "0")))
+        await self._gate_symbol_rule(venue_sym)
+        progress = self._gate_order_progress(raw, venue_sym, now_ms)
+        if (order_id and progress.order_id != str(order_id).strip()) or (
+            not order_id and progress.client_order_id != str(client_order_id).removeprefix("t-")
+        ):
+            raise TransportError(TransportErrorCategory.NORMALIZATION_FAILURE, "gate_order_identity_mismatch")
+        order_id = progress.order_id
+        executed = progress.cumulative_quantity
         if executed <= 0.0:
             self._record_order_reconcile_query(
                 symbol=venue_sym,
@@ -5117,7 +5307,7 @@ class VenueTransport(MarketDataClient):
             )
             return None
 
-        side = Side.BUY if size > 0 else Side.SELL
+        side = progress.side
         average_price = _parse_optional_float(raw.get("fill_price"))
 
         trade_raw = await self._request(
@@ -6412,7 +6602,7 @@ class VenueTransport(MarketDataClient):
                     "price_decimals": hl_meta["price_decimals"],
                 }
             else:
-                if spec.venue_id == Venue.ASTER:
+                if spec.venue_id in (Venue.ASTER, Venue.GATE):
                     request, preflight, symbol_rule = await self.prepare_order_request(
                         request,
                         require_exchange_rules=self.mode == "live",
@@ -6477,6 +6667,8 @@ class VenueTransport(MarketDataClient):
                         SubmitFailureClass.REJECTED,
                         str(reject_reason),
                     )
+            elif spec.venue_id == Venue.GATE:
+                contract_qty = quantized_qty / self._gate_contract_multiplier(venue_sym)
             else:
                 contract_qty = quantized_qty
 
@@ -6506,6 +6698,9 @@ class VenueTransport(MarketDataClient):
                 "body_field_names": sorted(body.keys()),
                 "post_only": True,
             }
+            if spec.venue_id == Venue.GATE:
+                attempt_payload.update(contract_multiplier=ct_val_sz, contract_qty=contract_qty,
+                                       wire_size=body["size"], wire_tif=body["tif"])
             if aster_headroom_payload:
                 attempt_payload.update(aster_headroom_payload)
             if spec.venue_id == Venue.OKX:
@@ -7114,16 +7309,19 @@ class VenueTransport(MarketDataClient):
         self, request: OrderRequest, venue_sym: str,
         quantized_qty: float, quantized_price: Any,
     ) -> dict[str, Any]:
+        signed_size = quantized_qty if request.side == Side.BUY else -quantized_qty
         body: dict[str, Any] = {
             "contract": venue_sym,
-            "size": int(quantized_qty),
-            "tif": "gtc",
-            "post_only": True,
+            "size": int(round(signed_size)) if math.isclose(signed_size, round(signed_size), rel_tol=0, abs_tol=1e-9)
+                    else _format_decimal(signed_size),
+            "tif": "poc",
         }
         if quantized_price is not None and float(quantized_price) > 0:
             body["price"] = _format_decimal(float(quantized_price))
         if request.reduce_only:
             body["reduce_only"] = True
+        if request.client_order_id:
+            body["text"] = "t-" + request.client_order_id.removeprefix("t-")
         return body
 
     def _build_hyperliquid_passive_body(
@@ -7171,6 +7369,16 @@ class VenueTransport(MarketDataClient):
         from lightfee.core.domain import PassiveOrderAck, PassiveOrderState
 
         spec = self._spec
+        if spec.venue_id == Venue.GATE:
+            progress = self._gate_submission_progress(raw, request, venue_sym, now_ms)
+            return PassiveOrderAck(
+                venue=Venue.GATE, symbol=venue_sym, side=progress.side,
+                order_id=progress.order_id,
+                client_order_id=progress.client_order_id or request.client_order_id or "",
+                price=_safe_float(raw.get("price")),
+                quantity=abs(float(raw["size"])) * self._gate_contract_multiplier(venue_sym),
+                accepted_at_ms=now_ms, state=progress.state,
+            )
 
         if spec.venue_id == Venue.HYPERLIQUID:
             resp_status = str(raw.get("status", "")).lower()
@@ -7381,13 +7589,16 @@ class VenueTransport(MarketDataClient):
                 symbol, venue_sym, order_id, client_order_id, side, now_ms,
             )
 
+        if spec.venue_id == Venue.GATE:
+            await self._gate_symbol_rule(venue_sym)
+
         # Other venues: private-first, REST fallback
         private_progress = self.private_order_progress(
             client_order_id=client_order_id,
             order_id=order_id,
             max_age_ms=15_000,
         )
-        if private_progress is not None:
+        if private_progress is not None and spec.venue_id != Venue.GATE:
             resolved_side = side or Side.BUY
             return PassiveOrderProgress(
                 venue=spec.venue_id,
@@ -7418,6 +7629,8 @@ class VenueTransport(MarketDataClient):
                 elif client_order_id:
                     params["clOrdId"] = client_order_id
             elif spec.venue_id == Venue.GATE:
+                if not order_id and client_order_id:
+                    order_id = "t-" + client_order_id.removeprefix("t-")
                 if order_id:
                     params["order_id"] = order_id
             elif spec.venue_id == Venue.HYPERLIQUID:
@@ -7450,11 +7663,23 @@ class VenueTransport(MarketDataClient):
                     body=params,
                     private=contract.private,
                 )
-            return self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
+            progress = self._parse_passive_order_progress(raw, spec, venue_sym, now_ms)
+            if spec.venue_id == Venue.GATE and progress is not None:
+                if order_id and not order_id.startswith("t-") and progress.order_id != str(order_id):
+                    raise ValueError("gate_order_id_mismatch")
+                if order_id.startswith("t-") and progress.client_order_id != order_id.removeprefix("t-"):
+                    raise ValueError("gate_client_order_id_mismatch")
+            return progress
 
         except TransportError:
             return None
-        except Exception:
+        except Exception as exc:
+            if spec.venue_id == Venue.GATE:
+                self._record_order_diagnostic("order.execution_contract_conflict", {
+                    "venue": "gate", "symbol": venue_sym, "order_id": order_id,
+                    "client_order_id": client_order_id, "source": "passive_progress",
+                    "reason": str(exc),
+                })
             return None
 
     async def _query_passive_order_progress_bybit(
@@ -7900,6 +8125,9 @@ class VenueTransport(MarketDataClient):
     ) -> Optional["PassiveOrderProgress"]:
         from lightfee.core.domain import PassiveOrderProgress, PassiveOrderState, Side
 
+        if spec.venue_id == Venue.GATE:
+            return self._gate_order_progress(raw, venue_sym, now_ms)
+
         data = raw.get("data", raw)
         if isinstance(data, dict) and "result" in data:
             r = data["result"]
@@ -8297,8 +8525,11 @@ class VenueTransport(MarketDataClient):
                     extra=identifiers,
                 )
             elif spec.venue_id == Venue.GATE:
+                if not order_id and client_order_id:
+                    order_id = "t-" + client_order_id.removeprefix("t-")
                 if order_id:
                     params["order_id"] = order_id
+                await self._gate_symbol_rule(venue_sym)
             elif spec.venue_id == Venue.HYPERLIQUID:
                 try:
                     oid = int(order_id)
@@ -8462,6 +8693,10 @@ class VenueTransport(MarketDataClient):
     async def normalize_quantity(self, symbol: str, quantity: float) -> float:
         spec = self._spec
         venue_sym = self._venue_symbol(symbol)
+        if spec.venue_id == Venue.GATE and self.mode == "live":
+            rule = await self._gate_symbol_rule(venue_sym)
+            return normalize_venue_quantity(quantity=quantity, step_size=rule.qty_step,
+                                            contract_size=1.0, min_quantity=rule.min_qty)
         if spec.venue_id == Venue.BYBIT and self.mode == "live":
             try:
                 symbol_rule = await get_symbol_rules_cache().get(self, Venue.BYBIT, venue_sym)

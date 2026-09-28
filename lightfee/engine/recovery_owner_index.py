@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 from math import isfinite
 from typing import Any, Iterable, Mapping
 
 from lightfee.engine.recovery_ledger import ExchangeArtifact, RecoveryOwner
+from lightfee.engine.recovery_decision_core import V1_PAIR_QUANTITY_EPSILON
 from lightfee.venues.specs import canonical_symbol_from_venue
 
 
@@ -14,9 +16,8 @@ from lightfee.venues.specs import canonical_symbol_from_venue
 class RecoveryOwnerIndex:
     _orders_by_id: dict[str, RecoveryOwner] = field(default_factory=dict)
     _orders_by_client_id: dict[str, RecoveryOwner] = field(default_factory=dict)
-    _positions_by_key: dict[tuple[str, str], RecoveryOwner] = field(default_factory=dict)
-    _residuals_by_key: dict[tuple[str, str], RecoveryOwner] = field(default_factory=dict)
-    _residuals_by_symbol: dict[str, RecoveryOwner] = field(default_factory=dict)
+    _positions_by_key: dict[tuple[str, str, str], list[tuple[float, RecoveryOwner]]] = field(default_factory=dict)
+    _position_scopes: set[tuple[str, str]] = field(default_factory=set)
     _journal_position_facts: list[tuple[str, str, str, float, RecoveryOwner]] = field(
         default_factory=list
     )
@@ -139,27 +140,111 @@ class RecoveryOwnerIndex:
             evidence={"source": "exchange_truth"},
         )
 
+    def has_position_claim(self, artifact: ExchangeArtifact | Any) -> bool:
+        """Protect another owner's partial or malformed claim during cleanup."""
+        symbol = _symbol_for_venue(artifact)
+        return (_venue(artifact), symbol) in self._position_scopes or ("", symbol) in self._position_scopes
+
+    def owners_for_positions(self, positions: Iterable[Any]) -> list[RecoveryOwner]:
+        """A venue position is one aggregate per contract/direction, never two."""
+        positions = list(positions)
+        keys = [(_venue(p), _symbol_for_venue(p), _side(_get(p, "side", ""))) for p in positions]
+        duplicates = {key for key, count in Counter(keys).items() if count > 1}
+        return [
+            RecoveryOwner("exchange_position", key[1], "orphan", {
+                "source": "exchange_truth", "reason": "duplicate_position_scope",
+            }) if key in duplicates else self.owner_for_position(position)
+            for key, position in zip(keys, positions)
+        ]
+
     def owner_for_position(self, artifact: ExchangeArtifact | Any) -> RecoveryOwner:
-        key = (_venue(artifact), _symbol_for_venue(artifact))
-        if key in self._positions_by_key:
-            return self._positions_by_key[key]
-        if key in self._residuals_by_key:
-            return self._residuals_by_key[key]
-        symbol = key[1]
-        if symbol in self._residuals_by_symbol:
-            return self._residuals_by_symbol[symbol]
-        journal_owner = self._owner_for_journal_position_fact(artifact)
-        if journal_owner is not None:
-            return journal_owner
-        return RecoveryOwner(
-            owner_type="exchange_position",
-            owner_id=symbol,
-            confidence="orphan",
-            evidence={"source": "exchange_truth"},
+        venue, symbol = _venue(artifact), _symbol_for_venue(artifact)
+        side = _side(_get(artifact, "side", ""))
+        quantity = _float(_get(artifact, "quantity", 0.0))
+        claims = self._positions_by_key.get((venue, symbol, side), [])
+        ambiguous_scope = any(
+            claim_symbol == symbol and (not claim_venue or (claim_venue == venue and not claim_side))
+            for claim_venue, claim_symbol, claim_side in self._positions_by_key
         )
+        expected = sum(q for q, _ in claims)
+        evidence = {
+            "source": "exchange_truth", "expected_quantity": expected,
+            "observed_quantity": quantity, "expected_side": side,
+            "owner_ids": sorted({owner.owner_id for _, owner in claims}),
+        }
+        if (claims and not ambiguous_scope and side in {"long", "short"} and isfinite(quantity) and quantity > 0 and expected > 0
+                and all(isfinite(q) and q >= 0 and owner.confidence != "orphan" for q, owner in claims)
+                and abs(quantity - expected) <= V1_PAIR_QUANTITY_EPSILON):
+            # A pending component must retain its recovery classification even
+            # when an open position also covers part of the same exchange leg.
+            owner = min((owner for q, owner in claims if q > 0), key=lambda o: (
+                {"pending_entry": 0, "residual_repair": 1, "open_position": 2}.get(o.owner_type, 3),
+                o.owner_id,
+            ))
+            return RecoveryOwner(owner.owner_type, owner.owner_id, owner.confidence,
+                                 {**dict(owner.evidence), **evidence, "source": owner.evidence["source"]})
+        if not self.has_position_claim(artifact):
+            journal_owner = self._owner_for_journal_position_fact(artifact)
+            if journal_owner is not None:
+                return journal_owner
+        return RecoveryOwner("exchange_position", symbol, "orphan", evidence)
+
+    def missing_position_claims(self, positions: Iterable[Any]) -> list[ExchangeArtifact]:
+        """Missing legs of still-live owners; callers must prove account coverage.
+
+        Both legs absent means V1 flat retirement, not a synthetic live position.
+        Each returned artifact records observed zero separately from expected size.
+        """
+        observed = {
+            (_venue(p), _symbol_for_venue(p), _side(_get(p, "side", "")))
+            for p in positions
+            if isfinite(q := _float(_get(p, "quantity"))) and q > 1e-9
+        }
+        live_owners = {
+            (owner.owner_type, owner.owner_id)
+            for key, claims in self._positions_by_key.items() if key in observed
+            for _, owner in claims
+        }
+        missing = []
+        for (venue, symbol, side), claims in self._positions_by_key.items():
+            if not venue or side not in {"long", "short"} or (venue, symbol, side) in observed:
+                continue
+            if not any(q != 0 and (owner.owner_type, owner.owner_id) in live_owners for q, owner in claims):
+                continue
+            missing.append(ExchangeArtifact(
+                kind="missing_position", venue=venue, symbol=symbol, side=side, quantity=0.0,
+                raw={"reason": "owned_live_pair_missing_leg", "observed_quantity": 0.0,
+                     "expected_quantity": sum(q for q, _ in claims),
+                     "owner_ids": sorted({owner.owner_id for _, owner in claims})},
+            ))
+        return missing
+
+    def _index_position(self, owner: RecoveryOwner, venue: str, symbol: str, side: str, quantity: float) -> None:
+        if not symbol:
+            return
+        self._position_scopes.add((venue, symbol))
+        claims = self._positions_by_key.setdefault((venue, symbol, side), [])
+        for old_quantity, old_owner in claims:
+            if (old_owner.owner_type, old_owner.owner_id) == (owner.owner_type, owner.owner_id):
+                # Repeated state records are not additive evidence. Conflicting
+                # versions cannot prove quantity until recovery reconciles them.
+                if old_quantity != quantity:
+                    claims.append((float("nan"), owner))
+                return
+        claims.append((quantity, owner))
 
     def _add_state(self, state: Any) -> None:
-        for pending in _collection(state, "pending_entries"):
+        open_positions = _collection(state, "open_positions")
+        open_ids = {_text(_get(p, "position_id", "")) for p in open_positions}
+        pending_entries = _collection(state, "pending_entries")
+        pending_ids = {_text(_get(p, "pending_id", "")) for p in pending_entries}
+        managed_open_ids = pending_ids | {
+            _text(_get(task, "position_id", ""))
+            for collection in ("pending_residual_repairs", "pending_passive_closes")
+            for task in _collection(state, collection)
+        }
+        managed_open_ids.discard("")
+        for pending in pending_entries:
             owner = RecoveryOwner(
                 owner_type="pending_entry",
                 owner_id=_text(
@@ -179,41 +264,52 @@ class RecoveryOwnerIndex:
                     _get(pending, "hedge_client_order_id", ""),
                 ),
             )
-            self._index_pending_entry_position_keys(owner, pending)
+            if not owner.owner_id or owner.owner_id not in open_ids:
+                self._index_pending_entry_position_keys(owner, pending)
 
-        for position in _collection(state, "open_positions"):
+        for position in open_positions:
+            position_id = _text(_get(position, "position_id", _get(position, "symbol", "")))
+            long_quantity = _float(_get(position, "long_quantity"))
+            short_quantity = _float(_get(position, "short_quantity"))
+            balanced_pair = (
+                isfinite(long_quantity) and isfinite(short_quantity)
+                and min(long_quantity, short_quantity) > 0
+                and abs(long_quantity - short_quantity) <= V1_PAIR_QUANTITY_EPSILON
+            )
             owner = RecoveryOwner(
                 owner_type="open_position",
-                owner_id=_text(
-                    _get(position, "position_id", _get(position, "symbol", ""))
-                ),
-                confidence="proven",
-                evidence={"source": "local_open_position"},
+                owner_id=position_id,
+                confidence="proven" if balanced_pair or position_id in managed_open_ids else "orphan",
+                evidence={"source": "local_open_position", "balanced_pair": balanced_pair},
             )
-            for venue in (
-                _venue_from_key(position, "long_venue"),
-                _venue_from_key(position, "short_venue"),
-            ):
-                symbol = _symbol_for_venue(position, venue)
-                if venue and symbol:
-                    self._positions_by_key[(venue, symbol)] = owner
+            for leg in ("long", "short"):
+                venue = _venue_from_key(position, f"{leg}_venue")
+                self._index_position(owner, venue, _symbol_for_venue(position, venue), leg,
+                                     _float(_get(position, f"{leg}_quantity")))
 
         for residual in _collection(state, "pending_residual_repairs"):
+            position_id = _text(_get(residual, "position_id", ""))
+            origin = _leg_text(_get(residual, "origin", ""))
+            # Pending fills already include entry residuals; remaining open
+            # legs already include close residuals. Count each exposure once.
+            if position_id and (
+                (position_id in pending_ids and position_id not in open_ids)
+                or (position_id in open_ids and origin != "entry_open")
+            ):
+                continue
             owner = RecoveryOwner(
                 owner_type="residual_repair",
-                owner_id=_text(
-                    _get(residual, "repair_id", _get(residual, "task_id", ""))
-                    or _get(residual, "symbol", "")
-                ),
+                owner_id=_text(_get(residual, "repair_id", _get(residual, "task_id", "")))
+                         or position_id or _symbol(residual),
                 confidence="probable",
                 evidence={"source": "local_residual_repair"},
             )
-            venue = _venue(residual)
-            symbol = _symbol_for_venue(residual, venue)
-            if symbol:
-                self._residuals_by_symbol[symbol] = owner
-            if venue and symbol:
-                self._residuals_by_key[(venue, symbol)] = owner
+            venue = _normalize_venue(_get(residual, "repair_venue") or _get(residual, "exposure_venue")
+                                     or _get(residual, "venue", ""))
+            close_side = _side(_get(residual, "repair_side") or _get(residual, "exposure_side", ""))
+            side = {"long": "short", "short": "long"}.get(close_side, "")
+            quantity = _float(_get(residual, "repair_quantity", _get(residual, "exposure_quantity")))
+            self._index_position(owner, venue, _symbol_for_venue(residual, venue), side, quantity)
 
     def _add_journal_events(self, journal_events: Iterable[Any]) -> None:
         for event in self.active_journal_owner_events(journal_events):
@@ -330,9 +426,9 @@ class RecoveryOwnerIndex:
         owner: RecoveryOwner,
         pending: Any,
     ) -> None:
-        maker_fill = _float(_get(pending, "maker_leg_filled", 0.0))
-        hedge_fill = _float(_get(pending, "hedge_leg_filled", 0.0))
-        if maker_fill <= 0.0 and hedge_fill <= 0.0:
+        maker_fill = _float(_get(pending, "maker_leg_filled"))
+        hedge_fill = _float(_get(pending, "hedge_leg_filled"))
+        if maker_fill == 0 and hedge_fill == 0:
             return
         maker_leg = _leg_text(_get(pending, "maker_leg", ""))
         if maker_leg not in {"long", "short"}:
@@ -342,6 +438,9 @@ class RecoveryOwnerIndex:
             elif maker_side in {"sell", "short"}:
                 maker_leg = "short"
         if maker_leg not in {"long", "short"}:
+            for leg in ("long", "short"):
+                venue = _venue_from_key(pending, f"{leg}_venue")
+                self._index_position(owner, venue, _symbol_for_venue(pending, venue), "", float("nan"))
             return
         long_fill = 0.0
         short_fill = 0.0
@@ -360,16 +459,14 @@ class RecoveryOwnerIndex:
                 "position_scope": "positive_fill_pending_entry",
             },
         )
-        if long_fill > 0.0:
+        if long_fill != 0.0:
             long_venue = _venue_from_key(pending, "long_venue")
             symbol = _symbol_for_venue(pending, long_venue)
-            if long_venue and symbol:
-                self._positions_by_key[(long_venue, symbol)] = position_owner
-        if short_fill > 0.0:
+            self._index_position(position_owner, long_venue, symbol, "long", long_fill)
+        if short_fill != 0.0:
             short_venue = _venue_from_key(pending, "short_venue")
             symbol = _symbol_for_venue(pending, short_venue)
-            if short_venue and symbol:
-                self._positions_by_key[(short_venue, symbol)] = position_owner
+            self._index_position(position_owner, short_venue, symbol, "short", short_fill)
 
 
 def _collection(source: Any, key: str) -> list[Any]:
@@ -416,9 +513,9 @@ def _normalize_venue(value: Any) -> str:
 
 def _float(value: Any) -> float:
     try:
-        return float(value or 0.0)
+        return float(value)
     except (TypeError, ValueError):
-        return 0.0
+        return float("nan")
 
 
 def _leg_text(value: Any) -> str:

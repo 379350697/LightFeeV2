@@ -2269,7 +2269,7 @@ class TestAllFixtureParsers:
         ("okx", okx_spec, "BTC-USDT-SWAP", 0.01),
         ("bybit", bybit_spec, "BTCUSDT", 0.001),
         ("bitget", bitget_spec, "BTCUSDT", 0.001),
-        ("gate", gate_spec, "BTCUSDT", 0.0),
+        ("gate", gate_spec, "BTC_USDT", 1.0),
         ("hyperliquid", hyperliquid_spec, "BTC", 0.001),
     ])
     def test_position_fixture_parses_non_empty(self, venue_name, spec_fn, expected_symbol, min_qty):
@@ -3011,11 +3011,13 @@ class TestPositionSideParsing:
 
     @pytest.mark.parametrize("side_str,label", SELL_CASES)
     def test_parse_position_side_sell_variants(self, side_str, label):
+        # Generic aliases are a helper contract, not a Gate wire schema.
+        from lightfee.venues.transport import _parse_generic_position
         spec = gate_spec()
         transport = VenueTransport(spec=spec, mode="paper")
         raw = {"positionSide": side_str, "positionAmt": "0.01",
                "entryPrice": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        pos = _parse_generic_position(raw, spec, "BTCUSDT", 1000)
         assert pos.side == Side.SELL, (
             f"side_str={side_str!r} ({label}) should parse as SELL, got {pos.side}"
         )
@@ -3023,11 +3025,12 @@ class TestPositionSideParsing:
 
     @pytest.mark.parametrize("side_str,label", BUY_CASES)
     def test_parse_position_side_buy_variants(self, side_str, label):
+        from lightfee.venues.transport import _parse_generic_position
         spec = gate_spec()
         transport = VenueTransport(spec=spec, mode="paper")
         raw = {"positionSide": side_str, "positionAmt": "0.01",
                "entryPrice": "50000.0"}
-        pos = transport._parse_position(raw, "BTCUSDT", 1000)
+        pos = _parse_generic_position(raw, spec, "BTCUSDT", 1000)
         assert pos.side == Side.BUY, (
             f"side_str={side_str!r} ({label}) should parse as BUY, got {pos.side}"
         )
@@ -3119,7 +3122,7 @@ class TestPositionSideParsing:
     def test_gate_short_position(self):
         spec = gate_spec()
         transport = VenueTransport(spec=spec, mode="paper")
-        raw = {"contract": "BTCUSDT", "size": "-1",
+        raw = {"contract": "BTC_USDT", "size": "-1",
                "entry_price": "50000.0"}
         pos = transport._parse_position(raw, "BTCUSDT", 1000)
         assert pos.side == Side.SELL
@@ -3183,15 +3186,15 @@ class TestOrderAckNotFill:
         assert fill.quantity == 0.01
         assert fill.price == 50001.0
 
-    def test_filled_status_without_explicit_qty_falls_back_to_size(self):
+    def test_gate_finished_without_remaining_quantity_is_uncertain(self):
         spec = gate_spec()
         transport = VenueTransport(spec=spec, mode="paper")
         raw = {"id": 456, "contract": "BTCUSDT", "size": "1", "price": "50001.0", "status": "finished"}
         req = OrderRequest(venue=Venue.GATE, symbol="BTCUSDT", side=Side.BUY, quantity=1.0)
-        fill = transport._parse_order_fill(raw, req, "BTCUSDT", 1000)
-        assert fill.order_id == "456"
-        assert fill.quantity == 1.0
-        assert fill.price == 50001.0
+        with pytest.raises(OrderSubmitError) as exc:
+            transport._parse_order_fill(raw, req, "BTCUSDT", 1000)
+        assert exc.value.class_ == SubmitFailureClass.UNCERTAIN
+        assert exc.value.accepted_order_id == "456"
 
     def test_reject_response_raises_rejected(self):
         spec = okx_spec()
@@ -10496,7 +10499,8 @@ class TestPassiveBodyBuilders:
         req = self._make_passive_req(Venue.GATE, reduce_only=False)
         body = transport._build_passive_order_body(req, "BTC_USDT", 1.0, 50000.0, req.client_order_id or "")
 
-        assert body["post_only"] is True
+        assert body["tif"] == "poc"
+        assert "post_only" not in body
         assert "reduce_only" not in body  # not hardcoded when false
 
     @pytest.mark.asyncio
@@ -10505,10 +10509,14 @@ class TestPassiveBodyBuilders:
         seen_body = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
+            if "/contracts/" in request.url.path:
+                return httpx.Response(200, json={"name": "SKYAI_USDT", "quanto_multiplier": "1",
+                                                "order_price_round": ".00001", "order_size_min": "1"})
             seen_body.update(_json.loads(request.content.decode()))
             return httpx.Response(
                 200,
-                json={"id": "gate-close-long-001", "status": "closed", "size": -69, "price": "0"},
+                json={"id": "gate-close-long-001", "contract": "SKYAI_USDT", "status": "finished",
+                      "finish_as": "filled", "size": -69, "left": 0, "price": "0", "fill_price": ".05"},
             )
 
         transport = VenueTransport(
@@ -10543,10 +10551,14 @@ class TestPassiveBodyBuilders:
         seen_body = {}
 
         async def handler(request: httpx.Request) -> httpx.Response:
+            if "/contracts/" in request.url.path:
+                return httpx.Response(200, json={"name": "INJ_USDT", "quanto_multiplier": "1",
+                                                "order_price_round": ".001", "order_size_min": "1"})
             seen_body.update(_json.loads(request.content.decode()))
             return httpx.Response(
                 200,
-                json={"id": "gate-close-short-001", "status": "closed", "size": 11, "price": "0"},
+                json={"id": "gate-close-short-001", "contract": "INJ_USDT", "status": "finished",
+                      "finish_as": "filled", "size": 11, "left": 0, "price": "0", "fill_price": "15"},
             )
 
         transport = VenueTransport(
@@ -12987,6 +12999,10 @@ class TestGateOrderStatus:
             return await handler(method, path, params or {})
 
         transport._request = fake_request
+        async def public_metadata(path, **kwargs):
+            return {"name": path.rsplit("/", 1)[-1], "quanto_multiplier": "1",
+                    "order_price_round": ".0001", "order_size_min": "1"}
+        transport._public_get = public_metadata
 
     @pytest.mark.asyncio
     async def test_filled_sell_order_returns_fee_complete_reconciliation(self):
@@ -13083,11 +13099,13 @@ class TestGateOrderStatus:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_client_order_id_only_lookup_is_not_queryable(self):
+    async def test_client_order_id_lookup_miss_is_not_zero_fill_proof(self):
         transport = self._transport()
 
         async def handler(method, path, params):
-            raise AssertionError("gate has no client-order-id wire query")
+            assert path == "/api/v4/futures/usdt/orders/t-lfex-abc"
+            raise TransportError(TransportErrorCategory.REQUEST_REJECTED, "ORDER_NOT_FOUND",
+                                 status_code=404, body='{"label":"ORDER_NOT_FOUND"}')
 
         await self._stub(transport, handler)
         result = await transport.fetch_order_status(

@@ -21,11 +21,15 @@ import pytest
 
 from lightfee.core.contracts import VenueAdapter
 
-# Monkeypatch VenueAdapter to define fetch_open_orders by default returning []
-# so mock adapters in tests are trusted to have no open orders.
 async def _default_fetch_open_orders(self, symbol: str) -> list:
     return []
-VenueAdapter.fetch_open_orders = _default_fetch_open_orders
+
+
+@pytest.fixture(autouse=True)
+def _local_open_order_truth(monkeypatch):
+    # Scope fake-adapter truth to this module; collection must not modify live
+    # adapters used by other modules' REST contract tests.
+    monkeypatch.setattr(VenueAdapter, "fetch_open_orders", _default_fetch_open_orders, raising=False)
 
 from lightfee.core.domain import (
     OrderFill,
@@ -5914,6 +5918,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
 
         runtime_ctx = MagicMock()
         runtime_ctx.state = state
+        runtime_ctx.recovery_decision = None
         runtime_ctx.config.runtime.mode = "live"
         runtime_ctx.journal = journal
         runtime_ctx.venue_adapters = {
@@ -6082,6 +6087,7 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
         ))
         runtime_ctx = MagicMock()
         runtime_ctx.state = state
+        runtime_ctx.recovery_decision = None
         runtime_ctx.config.runtime.mode = "live"
         runtime_ctx.journal = journal
         runtime_ctx.venue_adapters = {
@@ -6361,6 +6367,11 @@ class TestProcessPendingPassiveCloseLiveFlatReconcile:
             if e.get("kind") == "exit.passive_close_live_flat_cleanup_failed"
         )
         assert failure["payload"]["reason"] == "recovery_core_clear_failed"
+        assert failure["payload"]["lifecycle_writer"] == "PassiveCloseExecutor._clear_live_flat_state.rollback"
+        assert failure["payload"]["lifecycle_before"] == "running"
+        assert failure["payload"]["lifecycle_after"] == "risk_only"
+        assert failure["payload"]["risk_mode_before"] == "running"
+        assert failure["payload"]["risk_mode_after"] == "fail_closed"
 
     def test_live_flat_cleanup_records_v1_recovery_payload_fields(self):
         """V1 recovery logs exact flat-probe position and venue sizing evidence."""

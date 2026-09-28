@@ -892,18 +892,23 @@ class BitgetAdapter(VenueAdapter):
             family = await self.resolve_contract_family()
             payload["account_family"] = family.value
             if family == BitgetContractFamily.UTA_V3:
-                settings_params = {"category": "USDT-FUTURES"}
+                settings_contract = get_operation_contract(
+                    self._transport._spec,
+                    VenueOperation.ACCOUNT_SETTINGS,
+                    resolved_account_family=family,
+                )
+                settings_params = _bitget_contract_params(settings_contract)
                 payload.update(
                     {
-                        "settings_endpoint": "/api/v3/account/settings",
+                        "settings_endpoint": settings_contract.path,
                         "set_leverage_endpoint": "/api/v3/account/set-leverage",
                     }
                 )
                 before_raw = await self._transport._request(
-                    "GET",
-                    "/api/v3/account/settings",
+                    settings_contract.method,
+                    settings_contract.path,
                     params=settings_params,
-                    private=True,
+                    private=settings_contract.private,
                 )
                 before = self._bitget_uta_entry_leverage(before_raw, venue_symbol)
                 payload["before_leverage"] = before
@@ -924,10 +929,10 @@ class BitgetAdapter(VenueAdapter):
                 )
                 _require_bitget_success(response, "Bitget UTA entry leverage set failed")
                 after_raw = await self._transport._request(
-                    "GET",
-                    "/api/v3/account/settings",
+                    settings_contract.method,
+                    settings_contract.path,
                     params=settings_params,
-                    private=True,
+                    private=settings_contract.private,
                 )
                 after = self._bitget_uta_entry_leverage(after_raw, venue_symbol)
                 payload["after_leverage"] = after

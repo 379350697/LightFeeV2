@@ -35,7 +35,11 @@ class CapturingEntryExecutor:
 
 class TrustedVenueAdapter:
     trading_capability_trusted = True
+    supports_entry_leverage_preparation = True
     okx_base_quantity_step = 0.001
+
+    async def ensure_entry_leverage(self, symbol: str, leverage: int) -> None:
+        pass
 
     def l2_book_quantity_to_base_scale(self, symbol: str) -> float:
         del symbol

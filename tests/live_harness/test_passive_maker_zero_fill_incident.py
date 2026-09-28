@@ -137,11 +137,12 @@ class _ZeroFillMakerAdapter:
         return None
 
     async def fetch_position(self, symbol: str) -> PositionSnapshot:
+        request = self.place_order_calls[-1] if self.place_order_calls else None
         return PositionSnapshot(
             venue=self.venue,
             symbol=symbol,
-            side=Side.BUY,
-            quantity=0.0,
+            side=request.side if request is not None else Side.BUY,
+            quantity=request.quantity if request is not None else 0.0,
             entry_price=0.0,
             observed_at_ms=1779816047600,
         )
@@ -294,7 +295,7 @@ class _RecordingEntryExecutor:
     def __init__(self) -> None:
         self.contexts: list[object] = []
 
-    async def execute(self, ctx):
+    async def execute(self, ctx, **kwargs):
         self.contexts.append(ctx)
         return type("EntryResult", (), {"open_position": None})()
 
@@ -711,6 +712,90 @@ async def test_low_slippage_zero_fill_exhaustion_arms_dual_taker_terminal(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [
+    "complete", "undersized", "open_order", "unavailable", "flat",
+    "maker_uncertain", "hedge_rejected", "hedge_uncertain", "partial",
+])
+async def test_terminal_taker_publication_keeps_owner_when_pair_proof_fails(tmp_path, evidence):
+    import copy
+    from dataclasses import replace
+    from lightfee.engine.recovery import _apply_journal_replay_to_state
+    from lightfee.engine.state import EngineState
+    from lightfee.core.errors import OrderSubmitError, SubmitFailureClass
+
+    submit_prefixes = []
+
+    class Adapter(_ZeroFillMakerAdapter):
+        async def place_order(self, request):
+            submit_prefixes.append((request, runtime.journal.read_all()))
+            failed_leg = ((evidence == "maker_uncertain" and self.venue == Venue.OKX)
+                or (evidence in {"hedge_rejected", "hedge_uncertain"} and self.venue == Venue.BYBIT))
+            if failed_leg:
+                self.place_order_calls.append(request)
+                kind = SubmitFailureClass.REJECTED if evidence == "hedge_rejected" else SubmitFailureClass.UNCERTAIN
+                raise OrderSubmitError(kind, evidence)
+            fill = await super().place_order(request)
+            if evidence == "partial" and self.venue == Venue.BYBIT:
+                return replace(fill, quantity=fill.quantity / 2)
+            return fill
+
+        async def fetch_position(self, symbol):
+            result = await super().fetch_position(symbol)
+            if evidence == "undersized" and self.place_order_calls:
+                return replace(result, quantity=result.quantity + 1)
+            if evidence == "flat":
+                return replace(result, quantity=0)
+            return result
+
+        async def fetch_open_orders(self, symbol):
+            if self.place_order_calls and evidence == "unavailable":
+                raise RuntimeError("open order truth unavailable")
+            if self.place_order_calls and evidence == "open_order":
+                return [{"orderId": "other", "symbol": symbol}]
+            return []
+
+    config = make_test_config(str(tmp_path))
+    config.symbols = ["RIVERUSDT"]
+    okx, bybit = Adapter(Venue.OKX, PassiveOrderState.CANCELED), Adapter(Venue.BYBIT, PassiveOrderState.CANCELED)
+    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx, Venue.BYBIT: bybit})
+    runtime.journal.open()
+    runtime.entry_executor = EntrySyncExecutor(adapters={Venue.OKX: okx, Venue.BYBIT: bybit}, journal=runtime.journal)
+    _install_current_final_l2_books(runtime)
+    pending = _pending_from_fixture()
+    pending.metadata["passive_zero_fill_retry_pending"] = True
+    pending.frozen_candidate = _tradeable_frozen_candidate(entry_notional_quote=25.0)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    before = EngineState()
+    before.pending_entries[pending.pending_id] = copy.deepcopy(pending)
+    executed = await runtime._execute_pending_entry_terminal_taker_fallback(
+        pending, pending.pending_id, pending.passive_order.accepted_at_ms + 1000,
+        "maker_entry_dual_taker_after_phase_exhaustion")
+    assert executed
+    rows = runtime.journal.read_all()
+    assert okx.place_order_calls
+    assert bool(bybit.place_order_calls) == (evidence != "maker_uncertain")
+    for request, prefix in submit_prefixes:
+        restored = copy.deepcopy(before)
+        _apply_journal_replay_to_state(restored, prefix)
+        owner = restored.pending_entries[pending.pending_id]
+        assert request.client_order_id in {owner.maker_client_order_id, owner.hedge_client_order_id}
+        assert owner.metadata.get("passive_zero_fill_retry_pending") is False
+    assert any(e["kind"] == "entry.opened" for e in rows) == (evidence == "complete")
+    _apply_journal_replay_to_state(before, rows)
+    assert (pending.pending_id in before.pending_entries) == (evidence != "complete")
+    if evidence != "complete":
+        pending = runtime.state.pending_entries[pending.pending_id]
+        assert before.pending_entries[pending.pending_id].maker_order_id == pending.maker_order_id
+        assert pending.metadata.get("passive_zero_fill_retry_pending") is False
+        assert before.pending_entries[pending.pending_id].metadata.get("passive_zero_fill_retry_pending") is False
+        if evidence != "maker_uncertain":
+            assert before.pending_entries[pending.pending_id].maker_leg_filled > 0
+        if evidence == "partial":
+            assert pending.hedge_leg_filled == pytest.approx(pending.maker_leg_filled / 2)
+    runtime.journal.close()
+
+
+@pytest.mark.asyncio
 async def test_terminal_taker_fallback_rechecks_runtime_guards_before_force_standard(tmp_path):
     """V1: terminal taker fallback must reuse runtime entry guards before taker open."""
 
@@ -791,7 +876,8 @@ async def test_force_standard_terminal_fallback_uses_rechecked_candidate_sizing(
     assert ctx.long_price_hint == pytest.approx(7.0)
     assert ctx.short_price_hint == pytest.approx(8.0)
     assert ctx.blocked_reasons == []
-    assert pending.next_progress_poll_ms > pending.passive_order.accepted_at_ms
+    assert pending.next_progress_poll_ms > ctx.created_at_ms
+    assert pending.passive_order is None
     assert any(
         record["kind"] == "execution.entry_fallback_to_taker_deferred"
         for record in runtime.journal.read_all()
@@ -1189,7 +1275,9 @@ async def test_zero_fill_repost_missing_price_hint_finalizes_without_stale_submi
     config.symbols = ["RIVERUSDT"]
 
     okx = _ZeroFillMakerAdapter(Venue.OKX, PassiveOrderState.CANCELED)
-    runtime = LiveRuntime(config, venue_adapters={Venue.OKX: okx})
+    runtime = LiveRuntime(config, venue_adapters={
+        Venue.OKX: okx, Venue.BYBIT: _ZeroFillMakerAdapter(Venue.BYBIT, PassiveOrderState.CANCELED),
+    })
     await runtime.start()
     pending = _pending_from_fixture()
     pending.passive_order.cancel_requested_at_ms = pending.passive_order.accepted_at_ms + 1500
@@ -1257,3 +1345,49 @@ def test_pending_entry_post_only_price_uses_v1_edge_and_inventory_profile(tmp_pa
 
     assert edge_aware > neutral
     assert inventory_biased < neutral
+
+
+@pytest.mark.parametrize("fees", [(0.1, 0.2), (0.0, 0.0), (None, None)])
+async def test_terminal_fallback_journal_replays_complete_position_and_close_accounting(tmp_path, fees):
+    from dataclasses import replace
+    from lightfee.engine.recovery import build_persistent_state_view, recover_from_snapshot, _serialize_open_position
+
+    class Adapter(_ZeroFillMakerAdapter):
+        async def place_order(self, request):
+            fill = await super().place_order(request)
+            return replace(fill, fee_quote=fees[0 if self.venue == Venue.OKX else 1])
+        async def fetch_open_orders(self, symbol):
+            return []
+
+    cfg = make_test_config(str(tmp_path))
+    cfg.symbols = ["RIVERUSDT"]
+    adapters = {v: Adapter(v, PassiveOrderState.CANCELED) for v in (Venue.OKX, Venue.BYBIT)}
+    runtime = LiveRuntime(cfg, venue_adapters=adapters)
+    runtime.journal.open()
+    runtime.entry_executor = EntrySyncExecutor(adapters=adapters, journal=runtime.journal)
+    _install_current_final_l2_books(runtime)
+    pending = _pending_from_fixture()
+    pending.frozen_candidate = _tradeable_frozen_candidate(entry_notional_quote=25.)
+    runtime.state.pending_entries[pending.pending_id] = pending
+    runtime.snapshot_store.write(build_persistent_state_view(runtime.state,
+        journal_checkpoint=runtime.journal.snapshot_checkpoint()))
+    try:
+        assert await runtime._execute_pending_entry_terminal_taker_fallback(pending, pending.pending_id,
+            pending.passive_order.accepted_at_ms + 1000, "maker_entry_dual_taker_after_phase_exhaustion")
+        live = runtime.state.open_positions[pending.pending_id]
+        restored = recover_from_snapshot(runtime.snapshot_store, runtime.journal).open_positions[pending.pending_id]
+        assert _serialize_open_position(restored) == _serialize_open_position(live)
+        bills = []
+        for position in (live, restored):
+            fills = [OrderFill(venue=venue, symbol=position.symbol, side=side, quantity=qty,
+                price=price, order_id="exit-" + venue.value, fee_quote=0, filled_at_ms=999999)
+                for venue, side, qty, price in (
+                    (position.long_venue, Side.SELL, position.long_quantity, position.long_entry_price),
+                    (position.short_venue, Side.BUY, position.short_quantity, position.short_entry_price))]
+            bills.append(runtime.close_runtime._exit_reconciled_payload_from_leg_fills(
+                {"position_id": position.position_id, "symbol": position.symbol, "kind": "final",
+                 "position_snapshot": _serialize_open_position(position)}, [fills[0]], [fills[1]], 999999))
+        assert bills[0] == bills[1]
+        assert bills[0]["entry_fee_evidence_complete"] is (fees[0] is not None)
+    finally:
+        runtime.journal.close()

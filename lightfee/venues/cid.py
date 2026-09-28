@@ -23,7 +23,7 @@ _CID_MAX_LEN: dict[Venue, int] = {
     Venue.BYBIT: 36,
     Venue.OKX: 32,
     Venue.BITGET: 36,
-    Venue.GATE: 36,
+    Venue.GATE: 28,  # Gate text excludes the wire-only t- prefix.
     Venue.HYPERLIQUID: 36,
 }
 

@@ -84,6 +84,96 @@ def _flat_position(venue: Venue, symbol: str, now_ms: int) -> PositionSnapshot:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["flat", "full", "partial", "accepted_partial", "rebuilt_side", "dust"])
+async def test_residual_outcome_replay_restores_exact_remaining_owners(tmp_path, outcome):
+    import copy
+    from lightfee.engine.recovery import _apply_journal_replay_to_state
+
+    runtime = _make_open_runtime(tmp_path)
+    now_ms = 1779803978233
+    task = {
+        "position_id": "durable-residual", "pair_id": "opgusdt:binance->okx",
+        "symbol": "OPGUSDT", "origin": "entry_open", "repair_venue": "okx",
+        "repair_side": "buy", "repair_quantity": 10.0,
+        "created_at_ms": now_ms, "deadline_ms": now_ms + 300_000,
+        "retry_count": 0, "last_attempt_at_ms": 0, "next_attempt_ms": 0,
+    }
+    if outcome == "accepted_partial":
+        task.update(accepted_order_truth_gap=True, accepted_order_id="old-order",
+                    accepted_client_order_id="old-cid", order_truth_state="resolved_position",
+                    ledger_decision="retain")
+    other = {**task, "position_id": "other", "pair_id": "other:binance->okx",
+             "next_attempt_ms": now_ms + 1_000_000}
+    runtime.state.pending_residual_repairs = [task, other]
+    runtime.state.live_recovery_reduce_only_pairs = [
+        {"pair_id": task["pair_id"], "symbol": "OPGUSDT"},
+        {"pair_id": other["pair_id"], "symbol": "OTHER"},
+    ]
+    before = copy.deepcopy(runtime.state)
+    okx, binance = IncidentVenueAdapter(Venue.OKX), IncidentVenueAdapter(Venue.BINANCE)
+    binance.position = _flat_position(Venue.BINANCE, "OPGUSDT", now_ms)
+    okx.position = PositionSnapshot(venue=Venue.OKX, symbol="OPGUSDT",
+        side=Side.BUY if outcome == "rebuilt_side" else Side.SELL,
+        quantity=0 if outcome == "flat" else 10, entry_price=1, observed_at_ms=now_ms)
+    okx.place_order_fill = OrderFill(venue=Venue.OKX, symbol="OPGUSDT",
+        side=Side.SELL if outcome == "rebuilt_side" else Side.BUY,
+        quantity=4 if outcome == "partial" else 10, price=1, order_id="repair-fill")
+    if outcome == "accepted_partial":
+        okx.order_fill_reconciliation = OrderFillReconciliation(
+            venue=Venue.OKX, symbol="OPGUSDT", side=Side.BUY, quantity=4,
+            average_price=1, order_id="old-order", client_order_id="old-cid",
+            filled_at_ms=now_ms, metadata={"evidence_source": "okx_fills_history",
+                "queried_endpoints": ["/api/v5/trade/fills-history"], "response_classification": "filled"})
+    if outcome == "dust":
+        okx.normalized_quantity = 0
+    runtime._venue_adapters = {Venue.OKX: okx, Venue.BINANCE: binance}
+    await runtime._recover_residual_repairs(now_ms)
+    expected = copy.deepcopy(runtime.state.pending_residual_repairs)
+    own = [t for t in expected if t["position_id"] == "durable-residual"]
+    assert len(own) == (1 if outcome in {"partial", "accepted_partial"} else 0)
+    if own:
+        assert own[0]["repair_quantity"] == pytest.approx(6)
+        assert "accepted_order_truth_gap" not in own[0]
+    records = runtime.journal.read_all()
+    assert any(r["kind"] in {"execution.residual_repair_completed", "execution.residual_repair_terminal"}
+               for r in records)
+    for _ in range(2):
+        _apply_journal_replay_to_state(before, records)
+        assert before.pending_residual_repairs == expected
+        assert sorted(before.live_recovery_reduce_only_pairs, key=lambda t: t["pair_id"]) == sorted(
+            runtime.state.live_recovery_reduce_only_pairs, key=lambda t: t["pair_id"])
+    runtime.journal.close()
+
+
+@pytest.mark.parametrize("invalid", ["legacy", "null", "wrong_shape", "wrong_owner", "wrong_gate"])
+def test_residual_replay_incomplete_state_retains_owners(invalid):
+    import copy
+    from lightfee.engine.recovery import _apply_journal_replay_to_state
+    from lightfee.engine.state import EngineState
+
+    task = {"position_id": "owner", "pair_id": "pair", "symbol": "SAGAUSDT",
+            "origin": "entry_open", "repair_venue": "gate", "repair_side": "sell", "repair_quantity": 501}
+    state = EngineState()
+    state.pending_residual_repairs = [dict(task)]
+    state.live_recovery_reduce_only_pairs = [{"pair_id": "pair", "symbol": "SAGAUSDT"}]
+    before = copy.deepcopy(state)
+    payload = {**task, "remaining_quantity": 0, "remaining_residual_repairs": [], "remaining_pair_gates": []}
+    if invalid == "legacy":
+        payload.pop("remaining_residual_repairs")
+    elif invalid == "null":
+        payload["remaining_residual_repairs"] = None
+    elif invalid == "wrong_shape":
+        payload["remaining_residual_repairs"] = [None]
+    elif invalid == "wrong_owner":
+        payload["remaining_residual_repairs"] = [{**task, "position_id": "another"}]
+    else:
+        payload["remaining_pair_gates"] = [{"pair_id": "another"}]
+    _apply_journal_replay_to_state(state, [{"kind": "execution.residual_repair_completed", "payload": payload}])
+    assert state.pending_residual_repairs == before.pending_residual_repairs
+    assert state.live_recovery_reduce_only_pairs == before.live_recovery_reduce_only_pairs
+
+
+@pytest.mark.asyncio
 async def test_exhausted_residual_repair_already_flat_clears_lyn_opg(tmp_path):
     runtime = _make_open_runtime(tmp_path)
     now_ms = 1779803978233

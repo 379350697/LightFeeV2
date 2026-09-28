@@ -787,6 +787,13 @@ class EntryDispatchRuntime:
             return okx_step, okx_missing_fields
 
         adapter = self.get_venue_adapter(venue)
+        if venue == Venue.GATE and str(self.ctx.config.runtime.mode) == "live":
+            transport = getattr(adapter, "_transport", None)
+            if transport is not None:
+                try:
+                    await transport._gate_symbol_rule(symbol)
+                except Exception:
+                    return None, ["gate_contract_metadata"]
         passive_metadata = getattr(adapter, "passive_metadata", None) if adapter else None
         if callable(passive_metadata):
             try:

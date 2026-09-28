@@ -99,8 +99,12 @@ with explicit evidence, not emit `entry.opened`.
 `uncertain_outcome` describes submit certainty, not terminality or ownership.
 Any `PendingEntry.has_any_fill()` result, including a journal-confirmed partial
 or full hedge fill, must pass through exchange reconciliation and the shared
-V1 finalizer/residual decision before removal. Only an explicit known zero-fill
-outcome may bypass that path; a deferred finalizer retains the pending owner.
+V1 finalizer/residual decision before removal. A known zero-fill outcome still
+requires both venues' current positions and symbol-scoped orders to be clear;
+submit certainty never bypasses that evidence. A deferred finalizer retains
+the pending owner, including through journal replay. Proposed open/residual
+successors must cover every actual venue/side quantity before any terminal
+event is published.
 
 Zero-fill reconciliation is terminal evidence only when the maker/order status
 is terminal no-fill. A nonterminal maker order with zero fill keeps the pending

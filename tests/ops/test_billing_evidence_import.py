@@ -306,7 +306,7 @@ def test_operator_import_refuses_partial_without_recorded_segment_quantities():
     ]
 
     assert pending_close_reconciliation_import_reason(debt) == (
-        "missing_or_invalid_long_closed_qty"
+        "missing_close_order_identity"
     )
 
     debt["original_payload"] = {
