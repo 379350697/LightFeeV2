@@ -1,6 +1,48 @@
 # Gate live contract incident — 2026-09-25
 
-## 当前结论（北京时间 2026-09-27）
+## 当前发布状态（北京时间 2026-09-28）
+
+**代码已推送 main 并部署到云端；实盘运行验收仍阻断，live 保持停止。**
+经用户明确授权，59 个修复文件提交为 `d43136de66d720df0465d51dd4c86d7123602ab1`
+并推送 main。云端 `/opt/lightfee-v2` 已从 detached HEAD 切换 main，使用
+`git pull --ff-only origin main` 拉取；本发布记录作为后续文档提交同步。
+原有本地 manifest、egg-info、`.dev-flow/` 等无关改动没有包含在提交中。
+
+- 已核对全部 **433 个部署文件 SHA256**，不是只检查 manifest 的 16 个关键文件。
+  清单从已提交的 Git blob 生成；源码/测试/依赖与上一轮通过全量的 55 文件冻结树一致。
+- 云端 Python 3.12.3、websockets 16.0；全部项目运行依赖满足当前约束，Gate 小数数量
+  协商参数可用。compileall 和 manifest 检查通过；本次唯一依赖变化为 websockets
+  最低版本从 12 提高至 14，现有版本已满足，没有重建虚拟环境。
+- sidecar 已于 **16:36:48** 启动，新鲜快照覆盖 7 个交易所；启动后的错误日志计数为 0。
+  live 已停止、MainPID=0；健康 timer 保留。没有绕过失败验收或清除恢复任务。
+- 云端两份服务 unit 的既有漂移已对齐仓库模板；原 `LimitNOFILE=65536` 移入各自的
+  `20-resource-limits.conf` drop-in 保留。仅 daemon-reload，未启动 live。
+- 配置保持不变；源码、unit、配置及持久化状态/日志备份在
+  `/root/lightfee-release-backup-20260928T083418Z`。停止后的 live-state.json 与
+  live-events.jsonl 和备份哈希一致，没有编辑 operator 或策略状态。
+
+**恢复实盘的阻断仍存在：**16:38:39 GET-only 核验 Gate `SAGA_USDT dual_long=501`、
+`dual_short=0`，Binance `SAGAUSDT quantity=0`，双方 SAGA 挂单为 0。部署前还有
+1 个 pending entry、2 个 pending close reconciliation。部署后的官方验收仍返回
+`deployment_acceptable=false`；live 停止产生的 stale tick/缺进程指标也明确保留。
+不能把文件上线、sidecar 正常或历史测试通过写成实盘开平仓验收成功。
+
+独立发布审查用真实 `LiveRuntime.start()` 和替代交易所 I/O 复现：
+auto_trade_enabled true/false × operator fail_closed 有/无，4 种组合都会对
+无 owner 的 Gate 单边多仓执行风险清理。该行为是既存恢复语义；这些状态不能保证
+启动不下单。因此本次没有执行自动重启 live 的生成脚本，也没有直接提交/撤销订单。
+异常仓须先由用户在交易所处置，并取得新的仓位/挂单与恢复队列验收证据，才能继续
+评估实盘服务恢复；当前总体状态仍为 **implemented but not closed**。
+
+发布证据在 `/tmp/lightfee-root-repair-20260925/`：
+`deploy-20260928-staged-scope.json`、`deploy-20260928-precommit-impact.log`、
+`deploy-20260928-release-manifest.json`、`deploy-20260928-pre-health.json`、
+`deploy-20260928-post-health.json`、`deploy-20260928-post-exchange.json`、
+`review-release-startup-controls.py/.json` 及最终 `deploy-20260928-result.json`。
+初次部署后仓位探针依赖已停止 live 的 PID，未发请求即退出；改从同一 EnvironmentFile
+的运行中 sidecar 读取凭据后，GET-only 探针成功。该失败不计作交易所或应用故障。
+
+## 上一轮代码验收结论（北京时间 2026-09-27，历史记录）
 
 **implemented but not closed：本轮 P2 本地代码收口，完整生产事故仍未闭环。**
 当前冻结版本全量为 **5163 passed / 9 skipped / 1 warning**，full profile **10/10 通过**。
